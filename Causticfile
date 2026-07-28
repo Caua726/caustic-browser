@@ -27,12 +27,27 @@ target "surftest" { src "tests/surftest.cst" out "build/surftest" }
 // ── Scripts ──────────────────────────────────────────────────────────
 
 // The surface test exercises the platform seam without opening a window, so it
-// runs anywhere. `browser` is built and not run, for the opposite reason.
+// runs anywhere SDL3 is installed. `browser` is built and not run, because it
+// opens one.
 script "test" {
     "caustic-mk build surftest"
     "./build/surftest"
     "caustic-mk build browser"
     "echo 'test: surface green, window builds'"
+}
+
+// Build both and run neither.
+//
+// Everything here links SDL3 — the dependency's `system "SDL3"` is collected
+// transitively, so even surftest is dynamically linked against libSDL3.so and
+// will not load without it. Ubuntu's current LTS has no SDL3 package, so a
+// runner cannot have it without building SDL from source, which would say
+// nothing about this repository. Compiling is what CI can honestly check here:
+// that the dependency resolves and both targets build.
+script "test-ci" {
+    "caustic-mk build surftest"
+    "caustic-mk build browser"
+    "echo 'test-ci: both targets build (not run — no SDL3 on the runner)'"
 }
 
 script "clean" {

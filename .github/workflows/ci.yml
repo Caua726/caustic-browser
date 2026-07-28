@@ -37,4 +37,4 @@ jobs:
              "$GITHUB_WORKSPACE/caustic-x86_64-linux/bin/caustic-mk"
 
       - name: Test
-        run: caustic-mk run test
+        run: caustic-mk run test-ci
