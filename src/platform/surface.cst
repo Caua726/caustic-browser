@@ -1,0 +1,96 @@
+// platform/surface.cst — the engine's window/pixel seam.
+//
+// The whole engine draws into OUR pixel buffer (`base`) and never talks to a
+// backend directly. Linux backend: caustic-sdl3 window-surface (no GPU — we own
+// every pixel; SDL only opens the window and publishes the finished buffer).
+// Same shape as CausticOS std/causticos/gfx.cst, so the backend is swappable.
+
+use "caustic-sdl3/init.cst" as sdl_init;
+use "caustic-sdl3/video.cst" as sdl_video;
+use "caustic-sdl3/windowsurface.cst" as sdl_ws;
+use "caustic-sdl3/events.cst" as sdl_ev;
+use "caustic-sdl3/timer.cst" as sdl_timer;
+
+// Event types (backend-agnostic names; values mirror SDL_EventType).
+let is i32 as EV_NONE          with imut = 0;
+let is i32 as EV_QUIT          with imut = 256;
+let is i32 as EV_WINDOW_CLOSE  with imut = 528;
+let is i32 as EV_KEYDOWN       with imut = 768;
+let is i32 as EV_KEYUP         with imut = 769;
+let is i32 as EV_MOUSEMOTION   with imut = 1024;
+let is i32 as EV_MOUSEDOWN     with imut = 1025;
+let is i32 as EV_MOUSEUP       with imut = 1026;
+
+struct Surface {
+    win    as *u8;    // SDL_Window*  (backend handle)
+    surf   as *u8;    // SDL_Surface* (window surface)
+    base   as *u8;    // pixel buffer we draw into (= window surface pixels)
+    width  as i64;    // pixels
+    height as i64;    // rows
+    pitch  as i64;    // bytes per row
+    bpp    as i64;    // bytes per pixel (4 = XRGB/ARGB8888)
+    ok     as i64;    // 1 when open() succeeded
+}
+
+// Opaque-but-opaque-safe color helper: 0xAARRGGBB with alpha forced opaque, so
+// it renders correctly whether the window surface is XRGB8888 or ARGB8888.
+fn rgb(r as i64, g as i64, b as i64) as u32 {
+    return cast(u32, 4278190080 + r * 65536 + g * 256 + b);  // 4278190080 = 0xFF000000
+}
+
+// open — init video, create window, grab its CPU surface. Returns 0 on success,
+// or a positive stage code on failure (1 init, 2 window, 3 surface).
+fn open(s as *Surface, title as *u8, w as i32, h as i32) as i64 {
+    s.win = cast(*u8, 0); s.surf = cast(*u8, 0); s.base = cast(*u8, 0);
+    s.width = 0; s.height = 0; s.pitch = 0; s.bpp = 0; s.ok = 0;
+
+    let is bool as ir = sdl_init.init(sdl_init.VIDEO);
+    if (cast(i32, ir) == 0) { return 1; }
+
+    let is *u8 as win = sdl_video.create_window(title, w, h, 0);
+    if (cast(i64, win) == 0) { sdl_init.quit(); return 2; }
+
+    let is *u8 as surf = sdl_ws.get_window_surface(win);
+    if (cast(i64, surf) == 0) { sdl_video.destroy_window(win); sdl_init.quit(); return 3; }
+
+    s.win = win;
+    s.surf = surf;
+    s.base = sdl_ws.surf_pixels(surf);
+    s.width = cast(i64, sdl_ws.surf_w(surf));
+    s.height = cast(i64, sdl_ws.surf_h(surf));
+    s.pitch = cast(i64, sdl_ws.surf_pitch(surf));
+    s.bpp = 4;
+    s.ok = 1;
+    return 0;
+}
+
+// put_pixel — one pixel (0xAARRGGBB), bounds-checked, indexed by pitch.
+fn put_pixel(s as *Surface, x as i64, y as i64, color as u32) as void {
+    if (x < 0 || y < 0 || x >= s.width || y >= s.height) { return; }
+    let is *u32 as p = cast(*u32, cast(i64, s.base) + y * s.pitch + x * s.bpp);
+    p[0] = color;
+}
+
+fn fill_rect(s as *Surface, x as i64, y as i64, w as i64, h as i64, color as u32) as void {
+    let is i64 as yy with mut = y;
+    while (yy < y + h) {
+        let is i64 as xx with mut = x;
+        while (xx < x + w) { put_pixel(s, xx, yy, color); xx = xx + 1; }
+        yy = yy + 1;
+    }
+}
+
+fn clear(s as *Surface, color as u32) as void { fill_rect(s, 0, 0, s.width, s.height, color); }
+
+// present — publish the finished buffer to the window.
+fn present(s as *Surface) as void { sdl_ws.update_window_surface(s.win); }
+
+// poll — next pending event type, or EV_NONE (0) if the queue is empty.
+fn poll() as i32 { return sdl_ev.poll(); }
+
+fn delay(ms as i32) as void { sdl_timer.delay(ms); }
+
+fn close(s as *Surface) as void {
+    if (cast(i64, s.win) != 0) { sdl_video.destroy_window(s.win); }
+    sdl_init.quit();
+}

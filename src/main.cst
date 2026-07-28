@@ -1,0 +1,42 @@
+// caustic-browser — M0: open a window and paint OUR pixels into it.
+//
+// Everything you see is written by us into the Surface buffer (put_pixel/
+// fill_rect) — SDL only opens the window and publishes the buffer. No SDL
+// drawing calls, no GPU. This proves the platform seam end to end.
+
+use "platform/surface.cst" as gfx;
+
+fn main() as i32 {
+    let is gfx.Surface as s;
+    let is i64 as r = gfx.open(&s, "Caustic Browser", 1024, 720);
+    if (r != 0) { return 1; }
+
+    // A tiny hand-painted "browser" mock, all our own pixels.
+    gfx.clear(&s, gfx.rgb(245, 245, 247));                      // page background
+    gfx.fill_rect(&s, 0, 0, s.width, 56, gfx.rgb(32, 40, 48));  // chrome / top bar
+    gfx.fill_rect(&s, 16, 14, s.width - 32, 28, gfx.rgb(58, 66, 76)); // url bar
+
+    // two content cards with a colored accent stripe on top
+    gfx.fill_rect(&s, 24, 88, 384, 232, gfx.rgb(255, 255, 255));
+    gfx.fill_rect(&s, 24, 88, 384, 6,   gfx.rgb(59, 130, 246)); // blue
+    gfx.fill_rect(&s, 440, 88, 384, 232, gfx.rgb(255, 255, 255));
+    gfx.fill_rect(&s, 440, 88, 384, 6,   gfx.rgb(239, 68, 68)); // red
+
+    gfx.present(&s);
+
+    // event loop — idle until quit/close (event-driven, not a busy spin)
+    let is i32 as running with mut = 1;
+    while (running == 1) {
+        let is i32 as ev with mut = gfx.poll();
+        while (ev != gfx.EV_NONE) {
+            if (ev == gfx.EV_QUIT) { running = 0; }
+            if (ev == gfx.EV_WINDOW_CLOSE) { running = 0; }
+            ev = gfx.poll();
+        }
+        gfx.present(&s);
+        gfx.delay(16);
+    }
+
+    gfx.close(&s);
+    return 0;
+}

@@ -1,0 +1,48 @@
+name "caustic-browser"
+version "0.0.1"
+author "Cauã Alvarenga Neves"
+
+// caustic-browser — build and test surface.
+//
+//   caustic-mk run test        the surface test, then the window build
+//   caustic-mk build browser   the window
+//   caustic-mk run clean       build artifacts
+//
+// caustic-sdl3 used to be both a git submodule and a `depend` on the local
+// directory that submodule checked out into. That is two mechanisms for one
+// dependency and neither of them pinned anything useful: the submodule pinned a
+// commit that `depend` then ignored, and `depend` read whatever happened to be
+// on disk. It also relied on a file — windowsurface.cst — that was never
+// committed to caustic-sdl3 at all, so this could only ever have been built on
+// the one machine that had it.
+//
+// One mechanism now, pinned to a tag, resolved from the published repository.
+depend "caustic-sdl3" in "https://github.com/Caua726/caustic-sdl3" tag "v0.1.0"
+
+// ── Targets ──────────────────────────────────────────────────────────
+
+target "browser"  { src "src/main.cst"       out "build/browser" }
+target "surftest" { src "tests/surftest.cst" out "build/surftest" }
+
+// ── Scripts ──────────────────────────────────────────────────────────
+
+// The surface test exercises the platform seam without opening a window, so it
+// runs anywhere. `browser` is built and not run, for the opposite reason.
+script "test" {
+    "caustic-mk build surftest"
+    "./build/surftest"
+    "caustic-mk build browser"
+    "echo 'test: surface green, window builds'"
+}
+
+script "clean" {
+    "rm -rf .caustic build"
+    "echo 'clean: build artifacts and resolved dependencies removed'"
+}
+
+script "distclean" {
+    "caustic-mk run clean"
+    "find . -name '*.cst.s' -delete"
+    "find . -name '*.cst.s.o' -delete"
+    "echo 'distclean: generated assembly and objects removed too'"
+}

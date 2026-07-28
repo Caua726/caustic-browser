@@ -1,0 +1,16 @@
+// headless: cria uma SDL_Surface offscreen de dimensão conhecida e lê os
+// acessores de windowsurface.cst pra validar os offsets (sem abrir janela).
+use "std/io.cst" as io;
+use "caustic-sdl3/surface.cst" as sdlsurf;
+use "caustic-sdl3/windowsurface.cst" as ws;
+
+fn main() as i32 {
+    let is *u8 as s = sdlsurf.create(100, 50, sdlsurf.PIXELFORMAT_ARGB8888);
+    if (cast(i64, s) == 0) { io.printf("create fail\n"); return 1; }
+    let is *i32 as fp = cast(*i32, cast(i64, s) + 4);   // format @4
+    io.printf("w=%d\n", cast(i64, ws.surf_w(s)));        // esperado 100
+    io.printf("h=%d\n", cast(i64, ws.surf_h(s)));        // esperado 50
+    io.printf("pitch=%d\n", cast(i64, ws.surf_pitch(s))); // esperado 400
+    io.printf("format=%d\n", cast(i64, *fp));            // esperado 372645892 (ARGB8888)
+    return 0;
+}
