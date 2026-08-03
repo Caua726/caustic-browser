@@ -1,0 +1,1759 @@
+// =======================================================
+// caustic-browser/src/html/tokenizer.cst
+// The HTML tokenizer, WHATWG §13.2.5.
+//
+// This is the first thing a page touches, and the shape of its output decides
+// every layer above it — tree builder, cascade, layout. So it is the whole
+// state machine rather than the subset that gets `<p>hello</p>` working: the
+// subset is what turns into a rewrite the first time a real page arrives.
+//
+// WHAT "REAL PAGE" MEANS HERE, concretely. Three things break a naive
+// tokenizer on the first site anyone tries:
+//
+//   * `<script>if (a<b) {}</script>` — inside a script, `<` is not markup.
+//     Worse: `<!--` inside a script enters an escaped state where `</` IS
+//     markup again, and `<script` inside THAT enters a double-escaped state
+//     where it is not. Fourteen states exist for this one problem and every
+//     one is reachable from a page that ships an ad tag.
+//   * `&notin;` and `&not` are both named references and one is a prefix of
+//     the other. Matching is longest-first over 2231 names, and in an
+//     attribute value `?a=1&nots=2` must NOT become `?a=1¬s=2`.
+//   * `<title>a < b</title>` — RCDATA. `<` is text unless what follows is the
+//     end tag for THIS element, so the tokenizer has to remember which start
+//     tag opened the region.
+//
+// BYTES, NOT CODEPOINTS. The spec is written over codepoints; this reads
+// bytes. Not a shortcut: every character the machine branches on is ASCII, and
+// in UTF-8 no byte of a multi-byte sequence is ever below 0x80, so a
+// byte-oriented scanner takes exactly the same transitions. The two places it
+// would matter are handled — U+0000 becomes U+FFFD, and numeric references are
+// encoded to UTF-8 by _emit_cp. Malformed input passes through as the bytes it
+// was, which is what a browser wants: rejecting a page is not the tokenizer's
+// job.
+//
+// ONE TOKEN PER CALL. Characters accumulate into a RUN rather than arriving
+// one at a time, because that is what a tree builder wants and because
+// flushing a temporary buffer — `</xyz` that turned out not to be an end tag —
+// is then one token instead of five. When a run and a tag end together the run
+// goes first and the tag waits in `pending`.
+//
+// Parse errors are COUNTED, not itemised. Every one has a defined recovery and
+// the recovery is what this emits; the count lets a caller tell "parsed
+// cleanly" from "parsed at all".
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "./entities.cst" as ent;
+
+// --- token kinds. 0 means "no token", so kinds start at 1. ---------------
+let is i64 as TOK_EOF     with imut = 1;
+let is i64 as TOK_CHAR    with imut = 2;
+let is i64 as TOK_START   with imut = 3;
+let is i64 as TOK_END     with imut = 4;
+let is i64 as TOK_COMMENT with imut = 5;
+let is i64 as TOK_DOCTYPE with imut = 6;
+
+// --- states, in the spec's order ----------------------------------------
+let is i64 as ST_DATA                      with imut = 0;
+let is i64 as ST_RCDATA                    with imut = 1;
+let is i64 as ST_RAWTEXT                   with imut = 2;
+let is i64 as ST_SCRIPT                    with imut = 3;
+let is i64 as ST_PLAINTEXT                 with imut = 4;
+let is i64 as ST_TAG_OPEN                  with imut = 5;
+let is i64 as ST_END_TAG_OPEN               with imut = 6;
+let is i64 as ST_TAG_NAME                  with imut = 7;
+let is i64 as ST_RCDATA_LT                 with imut = 8;
+let is i64 as ST_RCDATA_END_OPEN           with imut = 9;
+let is i64 as ST_RCDATA_END_NAME           with imut = 10;
+let is i64 as ST_RAWTEXT_LT                with imut = 11;
+let is i64 as ST_RAWTEXT_END_OPEN          with imut = 12;
+let is i64 as ST_RAWTEXT_END_NAME          with imut = 13;
+let is i64 as ST_SCRIPT_LT                 with imut = 14;
+let is i64 as ST_SCRIPT_END_OPEN           with imut = 15;
+let is i64 as ST_SCRIPT_END_NAME           with imut = 16;
+let is i64 as ST_SCRIPT_ESC_START          with imut = 17;
+let is i64 as ST_SCRIPT_ESC_START_DASH     with imut = 18;
+let is i64 as ST_SCRIPT_ESC                with imut = 19;
+let is i64 as ST_SCRIPT_ESC_DASH           with imut = 20;
+let is i64 as ST_SCRIPT_ESC_DASH_DASH      with imut = 21;
+let is i64 as ST_SCRIPT_ESC_LT             with imut = 22;
+let is i64 as ST_SCRIPT_ESC_END_OPEN       with imut = 23;
+let is i64 as ST_SCRIPT_ESC_END_NAME       with imut = 24;
+let is i64 as ST_SCRIPT_DESC_START         with imut = 25;
+let is i64 as ST_SCRIPT_DESC               with imut = 26;
+let is i64 as ST_SCRIPT_DESC_DASH          with imut = 27;
+let is i64 as ST_SCRIPT_DESC_DASH_DASH     with imut = 28;
+let is i64 as ST_SCRIPT_DESC_LT            with imut = 29;
+let is i64 as ST_SCRIPT_DESC_END           with imut = 30;
+let is i64 as ST_BEFORE_ATTR_NAME          with imut = 31;
+let is i64 as ST_ATTR_NAME                 with imut = 32;
+let is i64 as ST_AFTER_ATTR_NAME           with imut = 33;
+let is i64 as ST_BEFORE_ATTR_VALUE         with imut = 34;
+let is i64 as ST_ATTR_VALUE_DQ             with imut = 35;
+let is i64 as ST_ATTR_VALUE_SQ             with imut = 36;
+let is i64 as ST_ATTR_VALUE_UQ             with imut = 37;
+let is i64 as ST_AFTER_ATTR_VALUE_Q        with imut = 38;
+let is i64 as ST_SELF_CLOSING              with imut = 39;
+let is i64 as ST_BOGUS_COMMENT             with imut = 40;
+let is i64 as ST_MARKUP_DECL               with imut = 41;
+let is i64 as ST_COMMENT_START             with imut = 42;
+let is i64 as ST_COMMENT_START_DASH        with imut = 43;
+let is i64 as ST_COMMENT                   with imut = 44;
+let is i64 as ST_COMMENT_LT                with imut = 45;
+let is i64 as ST_COMMENT_LT_BANG           with imut = 46;
+let is i64 as ST_COMMENT_LT_BANG_DASH      with imut = 47;
+let is i64 as ST_COMMENT_LT_BANG_DASH_DASH with imut = 48;
+let is i64 as ST_COMMENT_END_DASH          with imut = 49;
+let is i64 as ST_COMMENT_END               with imut = 50;
+let is i64 as ST_COMMENT_END_BANG          with imut = 51;
+let is i64 as ST_DOCTYPE                   with imut = 52;
+let is i64 as ST_BEFORE_DOCTYPE_NAME       with imut = 53;
+let is i64 as ST_DOCTYPE_NAME              with imut = 54;
+let is i64 as ST_AFTER_DOCTYPE_NAME        with imut = 55;
+let is i64 as ST_AFTER_DOCTYPE_PUBLIC_KW   with imut = 56;
+let is i64 as ST_BEFORE_DOCTYPE_PUBLIC_ID  with imut = 57;
+let is i64 as ST_DOCTYPE_PUBLIC_ID_DQ      with imut = 58;
+let is i64 as ST_DOCTYPE_PUBLIC_ID_SQ      with imut = 59;
+let is i64 as ST_AFTER_DOCTYPE_PUBLIC_ID   with imut = 60;
+let is i64 as ST_BETWEEN_DOCTYPE_PUB_SYS   with imut = 61;
+let is i64 as ST_AFTER_DOCTYPE_SYSTEM_KW   with imut = 62;
+let is i64 as ST_BEFORE_DOCTYPE_SYSTEM_ID  with imut = 63;
+let is i64 as ST_DOCTYPE_SYSTEM_ID_DQ      with imut = 64;
+let is i64 as ST_DOCTYPE_SYSTEM_ID_SQ      with imut = 65;
+let is i64 as ST_AFTER_DOCTYPE_SYSTEM_ID   with imut = 66;
+let is i64 as ST_BOGUS_DOCTYPE             with imut = 67;
+let is i64 as ST_CDATA                     with imut = 68;
+let is i64 as ST_CDATA_BRACKET             with imut = 69;
+let is i64 as ST_CDATA_END                 with imut = 70;
+let is i64 as ST_CHAR_REF                  with imut = 71;
+let is i64 as ST_NAMED_REF                 with imut = 72;
+let is i64 as ST_AMBIGUOUS_AMP             with imut = 73;
+let is i64 as ST_NUMERIC_REF               with imut = 74;
+let is i64 as ST_HEX_REF_START             with imut = 75;
+let is i64 as ST_DEC_REF_START             with imut = 76;
+let is i64 as ST_HEX_REF                   with imut = 77;
+let is i64 as ST_DEC_REF                   with imut = 78;
+let is i64 as ST_NUMERIC_REF_END           with imut = 79;
+
+let is i64 as TOK_ERR_ALLOC with imut = 0 - 1;
+
+// Text and attribute storage grow; these are starting sizes. The rest are
+// ceilings a page cannot talk us past.
+let is i64 as INIT_TEXT  with imut = 65536;
+let is i64 as INIT_ARENA with imut = 65536;
+let is i64 as MAX_NAME   with imut = 1024;   // a tag or DOCTYPE name
+let is i64 as MAX_TMP    with imut = 4096;   // entity name, or end-tag name
+let is i64 as MAX_ATTRS  with imut = 512;
+let is i64 as MAX_ID     with imut = 4096;   // DOCTYPE public/system identifier
+
+struct Tokenizer {
+    src as *u8;
+    len as i64;
+    pos as i64;
+    owns_src as i64;          // src is our normalized copy, not the caller's
+
+    state     as i64;
+    ret_state as i64;         // where a character reference (or `<`) returns to
+
+    tagkind as i64;           // TOK_START / TOK_END: which tag is being built
+    staged  as i64;           // token _step finished; 0 = none
+    pending as i64;           // token held back while a character run goes first
+
+    text    as *u8;
+    textlen as i64;
+    textcap as i64;
+
+    name    as [MAX_NAME]u8;  // tag name, DOCTYPE name, or comment data
+    namelen as i64;
+    self_closing as i64;
+
+    // The start tag that opened the current RCDATA/RAWTEXT/script region.
+    // `</p>` inside <title> is text; `</title>` is not. This is the only thing
+    // that tells them apart.
+    last_start     as [MAX_NAME]u8;
+    last_start_len as i64;
+
+    // Attributes as OFFSETS into one arena, so growing it keeps them valid.
+    arena    as *u8;
+    arenalen as i64;
+    arenacap as i64;
+    an_off as [MAX_ATTRS]i64;   an_len as [MAX_ATTRS]i64;
+    av_off as [MAX_ATTRS]i64;   av_len as [MAX_ATTRS]i64;
+    nattr  as i64;
+    cur_dup as i64;           // the attribute being built repeats a name: drop it
+    // Is there an attribute in progress at all? The spec appends an attribute
+    // to the token when it STARTS; this appends when it ends, which is simpler
+    // everywhere except here — `<a >` reaches the after-attribute-name state
+    // with nothing open, and closing what was never opened invented an
+    // attribute out of whatever the arena offsets happened to hold.
+    attr_open as i64;
+
+    tmp    as [MAX_TMP]u8;    // entity name being matched, or end-tag name
+    tmplen as i64;
+
+    pub_id as [MAX_ID]u8;  pub_len as i64;  has_pub as i64;
+    sys_id as [MAX_ID]u8;  sys_len as i64;  has_sys as i64;
+    force_quirks as i64;
+
+    num      as i64;          // numeric character reference accumulator
+    num_over as i64;          // ...and whether it ran past U+10FFFF
+
+    errors as i64;
+    inited as i64;
+}
+
+// --- character classes ---------------------------------------------------
+fn _is_ws(c as i64) as i64 {
+    if (c == 9 || c == 10 || c == 12 || c == 32) { return 1; }
+    return 0;
+}
+fn _is_upper(c as i64) as i64 { if (c >= 65 && c <= 90) { return 1; } return 0; }
+fn _is_lower(c as i64) as i64 { if (c >= 97 && c <= 122) { return 1; } return 0; }
+fn _is_alpha(c as i64) as i64 {
+    if (_is_upper(c) == 1) { return 1; }
+    if (_is_lower(c) == 1) { return 1; }
+    return 0;
+}
+fn _is_digit(c as i64) as i64 { if (c >= 48 && c <= 57) { return 1; } return 0; }
+fn _is_alnum(c as i64) as i64 {
+    if (_is_alpha(c) == 1) { return 1; }
+    if (_is_digit(c) == 1) { return 1; }
+    return 0;
+}
+fn _is_hex(c as i64) as i64 {
+    if (_is_digit(c) == 1) { return 1; }
+    if (c >= 65 && c <= 70) { return 1; }
+    if (c >= 97 && c <= 102) { return 1; }
+    return 0;
+}
+fn _lower(c as i64) as i64 { if (_is_upper(c) == 1) { return c + 32; } return c; }
+fn _hexval(c as i64) as i64 {
+    if (_is_digit(c) == 1) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return c - 87;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+// --- growable buffers ----------------------------------------------------
+fn _grow(old as *u8, oldcap as i64, need as i64, newcap as *i64) as *u8 {
+    let is i64 as cap with mut = oldcap;
+    while (cap < need) { cap = cap * 2; }
+    let is *u8 as p = mem.core.mmap_anon(cap);
+    if (_map_ok(p) == 0) { return cast(*u8, 0); }
+    mem.core.memcpy(p, old, oldcap);
+    mem.core.munmap(old, oldcap);
+    *newcap = cap;
+    return p;
+}
+
+fn _text_push(t as *Tokenizer, b as i64) as void {
+    if (t.textlen + 1 > t.textcap) {
+        let is i64 as nc with mut = 0;
+        let is *u8 as p = _grow(t.text, t.textcap, t.textlen + 1, &nc);
+        if (cast(i64, p) == 0) { return; }
+        t.text = p;
+        t.textcap = nc;
+    }
+    t.text[t.textlen] = cast(u8, b);
+    t.textlen = t.textlen + 1;
+}
+
+fn _arena_push(t as *Tokenizer, b as i64) as void {
+    if (t.arenalen + 1 > t.arenacap) {
+        let is i64 as nc with mut = 0;
+        let is *u8 as p = _grow(t.arena, t.arenacap, t.arenalen + 1, &nc);
+        if (cast(i64, p) == 0) { return; }
+        t.arena = p;
+        t.arenacap = nc;
+    }
+    t.arena[t.arenalen] = cast(u8, b);
+    t.arenalen = t.arenalen + 1;
+}
+
+fn _name_push(t as *Tokenizer, b as i64) as void {
+    if (t.namelen < MAX_NAME - 1) {
+        t.name[t.namelen] = cast(u8, b);
+        t.namelen = t.namelen + 1;
+    }
+}
+fn _tmp_push(t as *Tokenizer, b as i64) as void {
+    if (t.tmplen < MAX_TMP - 2) {
+        t.tmp[t.tmplen] = cast(u8, b);
+        t.tmplen = t.tmplen + 1;
+    }
+}
+fn _pub_push(t as *Tokenizer, b as i64) as void {
+    if (t.pub_len < MAX_ID - 1) {
+        t.pub_id[t.pub_len] = cast(u8, b);
+        t.pub_len = t.pub_len + 1;
+    }
+}
+fn _sys_push(t as *Tokenizer, b as i64) as void {
+    if (t.sys_len < MAX_ID - 1) {
+        t.sys_id[t.sys_len] = cast(u8, b);
+        t.sys_len = t.sys_len + 1;
+    }
+}
+
+// U+FFFD. Every NUL becomes this — the spec says so, and a real NUL would be
+// read as a string terminator by something downstream.
+fn _name_push_fffd(t as *Tokenizer) as void {
+    _name_push(t, 239); _name_push(t, 191); _name_push(t, 189);
+}
+fn _text_push_fffd(t as *Tokenizer) as void {
+    _text_push(t, 239); _text_push(t, 191); _text_push(t, 189);
+}
+
+fn _tmp_is(t as *Tokenizer, s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < t.tmplen) {
+        if (s[i] == 0) { return 0; }
+        if (t.tmp[i] != s[i]) { return 0; }
+        i = i + 1;
+    }
+    if (s[i] != 0) { return 0; }
+    return 1;
+}
+
+// --- lifecycle -----------------------------------------------------------
+// Preprocess the input stream, WHATWG §13.2.3.5: CRLF becomes LF and a lone
+// CR becomes LF.
+//
+// Not cosmetic. The state machine's whitespace class is tab, LF, FF and space —
+// CR is absent from it BECAUSE this pass removes CR entirely. Skip the pass and
+// `<!DOCTYPE html\r>` puts a carriage return in the doctype name instead of
+// ending it, and `<!--x--!\r>` keeps a CR in the comment. Both were live
+// failures against html5lib before this existed.
+//
+// A copy rather than a translation at the read: `_match_at` and every position
+// in the machine would otherwise have to know that one input character can be
+// two source bytes. A browser copies the decoded document anyway.
+fn _preprocess(src as *u8, len as i64, out_len as *i64) as *u8 {
+    let is i64 as cap with mut = len + 1;
+    let is *u8 as p = mem.core.mmap_anon(cap);
+    if (_map_ok(p) == 0) { return cast(*u8, 0); }
+    let is i64 as i with mut = 0;
+    let is i64 as n with mut = 0;
+    while (i < len) {
+        let is i64 as c = cast(i64, src[i]);
+        if (c == 13) {
+            p[n] = cast(u8, 10);
+            n = n + 1;
+            i = i + 1;
+            if (i < len && cast(i64, src[i]) == 10) { i = i + 1; }
+        } else {
+            p[n] = cast(u8, c);
+            n = n + 1;
+            i = i + 1;
+        }
+    }
+    *out_len = n;
+    return p;
+}
+
+fn tok_init(t as *Tokenizer, src as *u8, len as i64) as i64 {
+    let is i64 as plen with mut = 0;
+    let is *u8 as psrc = _preprocess(src, len, &plen);
+    if (cast(i64, psrc) == 0) { return TOK_ERR_ALLOC; }
+    t.src = psrc;
+    t.len = plen;
+    t.owns_src = len + 1;
+    t.pos = 0;
+    t.state = ST_DATA;
+    t.ret_state = ST_DATA;
+    t.tagkind = 0;
+    t.staged = 0;
+    t.pending = 0;
+    t.textlen = 0;
+    t.namelen = 0;
+    t.self_closing = 0;
+    t.last_start_len = 0;
+    t.nattr = 0;
+    t.cur_dup = 0;
+    t.attr_open = 0;
+    t.tmplen = 0;
+    t.pub_len = 0; t.has_pub = 0;
+    t.sys_len = 0; t.has_sys = 0;
+    t.force_quirks = 0;
+    t.num = 0; t.num_over = 0;
+    t.errors = 0;
+    t.arenalen = 0;
+
+    t.text = mem.core.mmap_anon(INIT_TEXT);
+    if (_map_ok(t.text) == 0) {
+        mem.core.munmap(t.src, t.owns_src);
+        t.src = cast(*u8, 0);
+        t.text = cast(*u8, 0);
+        return TOK_ERR_ALLOC;
+    }
+    t.textcap = INIT_TEXT;
+
+    t.arena = mem.core.mmap_anon(INIT_ARENA);
+    if (_map_ok(t.arena) == 0) {
+        mem.core.munmap(t.text, t.textcap);
+        mem.core.munmap(t.src, t.owns_src);
+        t.src = cast(*u8, 0);
+        t.text = cast(*u8, 0);
+        t.arena = cast(*u8, 0);
+        return TOK_ERR_ALLOC;
+    }
+    t.arenacap = INIT_ARENA;
+
+    ent.ent_ensure();
+    t.inited = 1;
+    return 0;
+}
+
+fn tok_free(t as *Tokenizer) as void {
+    if (t.inited != 1) { return; }
+    if (cast(i64, t.text) != 0) { mem.core.munmap(t.text, t.textcap); }
+    if (cast(i64, t.arena) != 0) { mem.core.munmap(t.arena, t.arenacap); }
+    if (cast(i64, t.src) != 0) { mem.core.munmap(t.src, t.owns_src); }
+    t.text = cast(*u8, 0);
+    t.arena = cast(*u8, 0);
+    t.src = cast(*u8, 0);
+    t.inited = 0;
+}
+
+// The seams. A tree builder switches the tokenizer into RCDATA or RAWTEXT when
+// it sees <title> or <style>, and tells it which tag opened the region; the
+// tests use the same two entry points.
+fn tok_set_state(t as *Tokenizer, s as i64) as void { t.state = s; t.ret_state = s; }
+fn tok_set_last_start(t as *Tokenizer, name as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (name[i] != 0 && i < MAX_NAME - 1) {
+        t.last_start[i] = name[i];
+        i = i + 1;
+    }
+    t.last_start_len = i;
+}
+
+// --- attributes ----------------------------------------------------------
+fn _attr_start(t as *Tokenizer) as void {
+    t.attr_open = 1;
+    if (t.nattr >= MAX_ATTRS) { t.cur_dup = 1; return; }
+    t.cur_dup = 0;
+    t.an_off[t.nattr] = t.arenalen;
+    t.an_len[t.nattr] = 0;
+    t.av_off[t.nattr] = t.arenalen;
+    t.av_len[t.nattr] = 0;
+}
+fn _attr_name_push(t as *Tokenizer, b as i64) as void {
+    if (t.nattr >= MAX_ATTRS) { return; }
+    _arena_push(t, b);
+    t.an_len[t.nattr] = t.an_len[t.nattr] + 1;
+}
+fn _attr_value_push(t as *Tokenizer, b as i64) as void {
+    if (t.nattr >= MAX_ATTRS) { return; }
+    if (t.cur_dup == 1) { return; }
+    _arena_push(t, b);
+    t.av_len[t.nattr] = t.av_len[t.nattr] + 1;
+}
+fn _arena_eq(t as *Tokenizer, o1 as i64, l1 as i64, o2 as i64, l2 as i64) as i64 {
+    if (l1 != l2) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < l1) {
+        if (t.arena[o1 + i] != t.arena[o2 + i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Close the attribute name and decide whether this attribute survives.
+//
+// A repeated name is a parse error and the LATER one is dropped — not the
+// earlier, and the direction is the point: `<a href=good href=evil>` keeps
+// `good`. Marking it here rather than at emit time means the value still
+// parses, because the state machine has to walk past it either way, and simply
+// goes nowhere.
+fn _attr_name_done(t as *Tokenizer) as void {
+    if (t.nattr >= MAX_ATTRS) { t.cur_dup = 1; return; }
+    let is i64 as i with mut = 0;
+    while (i < t.nattr) {
+        if (_arena_eq(t, t.an_off[i], t.an_len[i],
+                      t.an_off[t.nattr], t.an_len[t.nattr]) == 1) {
+            t.errors = t.errors + 1;
+            t.cur_dup = 1;
+            t.arenalen = t.an_off[t.nattr];   // the name just written is not kept
+            return;
+        }
+        i = i + 1;
+    }
+    t.av_off[t.nattr] = t.arenalen;
+    t.av_len[t.nattr] = 0;
+}
+fn _attr_done(t as *Tokenizer) as void {
+    if (t.attr_open == 0) { return; }
+    t.attr_open = 0;
+    if (t.cur_dup == 1) {
+        t.cur_dup = 0;
+        return;
+    }
+    if (t.nattr < MAX_ATTRS) { t.nattr = t.nattr + 1; }
+}
+
+// --- character references ------------------------------------------------
+fn _in_attr(t as *Tokenizer) as i64 {
+    if (t.ret_state == ST_ATTR_VALUE_DQ) { return 1; }
+    if (t.ret_state == ST_ATTR_VALUE_SQ) { return 1; }
+    if (t.ret_state == ST_ATTR_VALUE_UQ) { return 1; }
+    return 0;
+}
+
+// A reference inside an attribute value lands in the arena; anywhere else, in
+// the character run.
+fn _ref_push(t as *Tokenizer, b as i64) as void {
+    if (_in_attr(t) == 1) { _attr_value_push(t, b); return; }
+    _text_push(t, b);
+}
+
+fn _emit_cp(t as *Tokenizer, cp as i64) as void {
+    if (cp < 128) { _ref_push(t, cp); return; }
+    if (cp < 2048) {
+        _ref_push(t, 192 | (cp >> 6));
+        _ref_push(t, 128 | (cp & 63));
+        return;
+    }
+    if (cp < 65536) {
+        _ref_push(t, 224 | (cp >> 12));
+        _ref_push(t, 128 | ((cp >> 6) & 63));
+        _ref_push(t, 128 | (cp & 63));
+        return;
+    }
+    _ref_push(t, 240 | (cp >> 18));
+    _ref_push(t, 128 | ((cp >> 12) & 63));
+    _ref_push(t, 128 | ((cp >> 6) & 63));
+    _ref_push(t, 128 | (cp & 63));
+}
+
+// The C1 substitutions, §13.2.5.80. Not a courtesy: pages written against
+// Windows-1252 encode a curly quote as 0x92, and `&#146;` means the curly
+// quote, not the C1 control.
+fn _c1_fix(cp as i64) as i64 {
+    if (cp == 128) { return 8364; }
+    if (cp == 130) { return 8218; }
+    if (cp == 131) { return 402; }
+    if (cp == 132) { return 8222; }
+    if (cp == 133) { return 8230; }
+    if (cp == 134) { return 8224; }
+    if (cp == 135) { return 8225; }
+    if (cp == 136) { return 710; }
+    if (cp == 137) { return 8240; }
+    if (cp == 138) { return 352; }
+    if (cp == 139) { return 8249; }
+    if (cp == 140) { return 338; }
+    if (cp == 142) { return 381; }
+    if (cp == 145) { return 8216; }
+    if (cp == 146) { return 8217; }
+    if (cp == 147) { return 8220; }
+    if (cp == 148) { return 8221; }
+    if (cp == 149) { return 8226; }
+    if (cp == 150) { return 8211; }
+    if (cp == 151) { return 8212; }
+    if (cp == 152) { return 732; }
+    if (cp == 153) { return 8482; }
+    if (cp == 154) { return 353; }
+    if (cp == 155) { return 8250; }
+    if (cp == 156) { return 339; }
+    if (cp == 158) { return 382; }
+    if (cp == 159) { return 376; }
+    return cp;
+}
+
+fn _num_reset(t as *Tokenizer) as void { t.num = 0; t.num_over = 0; }
+fn _num_hex(t as *Tokenizer, c as i64) as void {
+    if (t.num > 1114111) { t.num_over = 1; return; }
+    t.num = t.num * 16 + _hexval(c);
+}
+fn _num_dec(t as *Tokenizer, c as i64) as void {
+    if (t.num > 1114111) { t.num_over = 1; return; }
+    t.num = t.num * 10 + (c - 48);
+}
+
+fn _num_finish(t as *Tokenizer) as void {
+    let is i64 as cp with mut = t.num;
+    if (t.num_over == 1) { cp = 1114112; }
+    if (cp == 0) { t.errors = t.errors + 1; _emit_cp(t, 65533); return; }
+    if (cp > 1114111) { t.errors = t.errors + 1; _emit_cp(t, 65533); return; }
+    if (cp >= 55296 && cp <= 57343) { t.errors = t.errors + 1; _emit_cp(t, 65533); return; }
+    if (cp >= 128 && cp <= 159) {
+        t.errors = t.errors + 1;
+        _emit_cp(t, _c1_fix(cp));
+        return;
+    }
+    // Noncharacters and stray controls are parse errors that still emit the
+    // character. A page that writes &#11; means it.
+    if (cp >= 64976 && cp <= 65007) { t.errors = t.errors + 1; }
+    if (cp == 11 || (cp >= 1 && cp <= 8) || (cp >= 14 && cp <= 31) || cp == 127) {
+        t.errors = t.errors + 1;
+    }
+    _emit_cp(t, cp);
+}
+
+// Compare tmp[off .. off+n) against entity `i`'s name.
+fn _tmp_cmp_ent(t as *Tokenizer, off as i64, n as i64, i as i64) as i64 {
+    let is *u8 as nm = ent.ent_name(i);
+    let is i64 as nl = ent.ent_name_len(i);
+    let is i64 as m with mut = n;
+    if (nl < m) { m = nl; }
+    let is i64 as k with mut = 0;
+    while (k < m) {
+        let is i64 as a = cast(i64, t.tmp[off + k]);
+        let is i64 as b = cast(i64, nm[k]);
+        if (a < b) { return 0 - 1; }
+        if (a > b) { return 1; }
+        k = k + 1;
+    }
+    if (n < nl) { return 0 - 1; }
+    if (n > nl) { return 1; }
+    return 0;
+}
+
+// Is tmp[off .. off+n) exactly an entity name? The table is sorted, so binary
+// search.
+fn _ent_lookup(t as *Tokenizer, off as i64, n as i64) as i64 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = ent.ent_count() - 1;
+    while (lo <= hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as c = _tmp_cmp_ent(t, off, n, mid);
+        if (c == 0) { return mid; }
+        if (c < 0) { hi = mid - 1; }
+        else { lo = mid + 1; }
+    }
+    return 0 - 1;
+}
+
+// --- token construction --------------------------------------------------
+fn _stage(t as *Tokenizer, kind as i64) as void { t.staged = kind; }
+
+fn _new_tag(t as *Tokenizer, kind as i64) as void {
+    t.tagkind = kind;
+    t.namelen = 0;
+    t.nattr = 0;
+    t.cur_dup = 0;
+    t.attr_open = 0;
+    t.self_closing = 0;
+    t.arenalen = 0;
+}
+
+fn _remember_start(t as *Tokenizer) as void {
+    let is i64 as i with mut = 0;
+    while (i < t.namelen) { t.last_start[i] = t.name[i]; i = i + 1; }
+    t.last_start_len = t.namelen;
+}
+
+// Emit the tag being built, and remember it if it is a start tag.
+fn _emit_tag(t as *Tokenizer) as void {
+    if (t.tagkind == TOK_START) { _remember_start(t); }
+    _stage(t, t.tagkind);
+}
+
+// Does the end tag being built name the element that opened this region?
+fn _is_appropriate_end(t as *Tokenizer) as i64 {
+    if (t.last_start_len == 0) { return 0; }
+    if (t.tmplen != t.last_start_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < t.tmplen) {
+        if (_lower(cast(i64, t.tmp[i])) != _lower(cast(i64, t.last_start[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// `</` plus whatever the temp buffer collected, as text. The path taken when
+// an end tag turns out not to be one.
+fn _flush_end_as_text(t as *Tokenizer) as void {
+    _text_push(t, 60);
+    _text_push(t, 47);
+    let is i64 as i with mut = 0;
+    while (i < t.tmplen) { _text_push(t, cast(i64, t.tmp[i])); i = i + 1; }
+    t.tmplen = 0;
+}
+
+// --- input ---------------------------------------------------------------
+fn _at_eof(t as *Tokenizer) as i64 { if (t.pos >= t.len) { return 1; } return 0; }
+fn _peek(t as *Tokenizer) as i64 { return cast(i64, t.src[t.pos]); }
+
+// Does the input at `pos` start with `s`? Case-insensitively when `ci`.
+fn _match_at(t as *Tokenizer, s as *u8, ci as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        if (t.pos + i >= t.len) { return 0; }
+        let is i64 as a with mut = cast(i64, t.src[t.pos + i]);
+        let is i64 as b with mut = cast(i64, s[i]);
+        if (ci == 1) { a = _lower(a); b = _lower(b); }
+        if (a != b) { return 0; }
+        i = i + 1;
+    }
+    return i;
+}
+
+// --- end of input --------------------------------------------------------
+//
+// Every state has a defined behaviour here. Most are "parse error, emit EOF",
+// dropping whatever token was half-built; the ones that keep something are
+// spelled out. Separated from _step because it is a third of the machine and
+// reads as noise inside it.
+fn _step_eof(t as *Tokenizer) as void {
+    let is i64 as st = t.state;
+
+    if (st == ST_COMMENT || st == ST_COMMENT_START || st == ST_COMMENT_START_DASH
+        || st == ST_COMMENT_END || st == ST_COMMENT_END_DASH
+        || st == ST_COMMENT_END_BANG || st == ST_COMMENT_LT
+        || st == ST_COMMENT_LT_BANG || st == ST_COMMENT_LT_BANG_DASH
+        || st == ST_COMMENT_LT_BANG_DASH_DASH || st == ST_BOGUS_COMMENT) {
+        t.errors = t.errors + 1;
+        _stage(t, TOK_COMMENT);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_DOCTYPE || st == ST_BEFORE_DOCTYPE_NAME) {
+        t.errors = t.errors + 1;
+        t.namelen = 0;
+        t.has_pub = 0; t.has_sys = 0;
+        t.force_quirks = 1;
+        _stage(t, TOK_DOCTYPE);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_DOCTYPE_NAME || st == ST_AFTER_DOCTYPE_NAME
+        || st == ST_AFTER_DOCTYPE_PUBLIC_KW || st == ST_BEFORE_DOCTYPE_PUBLIC_ID
+        || st == ST_DOCTYPE_PUBLIC_ID_DQ || st == ST_DOCTYPE_PUBLIC_ID_SQ
+        || st == ST_AFTER_DOCTYPE_PUBLIC_ID || st == ST_BETWEEN_DOCTYPE_PUB_SYS
+        || st == ST_AFTER_DOCTYPE_SYSTEM_KW || st == ST_BEFORE_DOCTYPE_SYSTEM_ID
+        || st == ST_DOCTYPE_SYSTEM_ID_DQ || st == ST_DOCTYPE_SYSTEM_ID_SQ
+        || st == ST_AFTER_DOCTYPE_SYSTEM_ID) {
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        _stage(t, TOK_DOCTYPE);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_BOGUS_DOCTYPE) {
+        _stage(t, TOK_DOCTYPE);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_TAG_OPEN) {
+        t.errors = t.errors + 1;
+        _text_push(t, 60);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_END_TAG_OPEN) {
+        t.errors = t.errors + 1;
+        _text_push(t, 60);
+        _text_push(t, 47);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_RCDATA_LT || st == ST_RAWTEXT_LT || st == ST_SCRIPT_LT
+        || st == ST_SCRIPT_ESC_LT || st == ST_SCRIPT_DESC_LT) {
+        _text_push(t, 60);
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_RCDATA_END_OPEN || st == ST_RAWTEXT_END_OPEN
+        || st == ST_SCRIPT_END_OPEN || st == ST_SCRIPT_ESC_END_OPEN) {
+        _text_push(t, 60);
+        _text_push(t, 47);
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_RCDATA_END_NAME || st == ST_RAWTEXT_END_NAME
+        || st == ST_SCRIPT_END_NAME || st == ST_SCRIPT_ESC_END_NAME) {
+        _flush_end_as_text(t);
+        t.state = t.ret_state;
+        return;
+    }
+    // The brackets already consumed are text. Both states say "anything else:
+    // emit them, reconsume in the CDATA section state", and the end of input is
+    // an anything-else — so `foo]]` ends with the brackets, not without them.
+    if (st == ST_CDATA_BRACKET) {
+        _text_push(t, 93);
+        t.state = ST_CDATA;
+        return;
+    }
+    if (st == ST_CDATA_END) {
+        _text_push(t, 93);
+        _text_push(t, 93);
+        t.state = ST_CDATA;
+        return;
+    }
+    if (st == ST_CDATA) {
+        t.errors = t.errors + 1;
+        t.state = ST_DATA;
+        return;
+    }
+    // A reference cut short by the end of input: what was consumed is text,
+    // and the return state sees the EOF next time round.
+    if (st == ST_CHAR_REF || st == ST_NAMED_REF || st == ST_AMBIGUOUS_AMP
+        || st == ST_NUMERIC_REF || st == ST_HEX_REF_START || st == ST_DEC_REF_START) {
+        let is i64 as i with mut = 0;
+        while (i < t.tmplen) { _ref_push(t, cast(i64, t.tmp[i])); i = i + 1; }
+        t.tmplen = 0;
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_HEX_REF || st == ST_DEC_REF || st == ST_NUMERIC_REF_END) {
+        t.errors = t.errors + 1;
+        _num_finish(t);
+        t.tmplen = 0;
+        t.state = t.ret_state;
+        return;
+    }
+    // `<!` and nothing after it. _step never reaches this state's "anything
+    // else" branch, because it checks for the end of input first — so the
+    // branch is taken here instead, and the empty comment comes out of the
+    // bogus-comment state on the next turn.
+    if (st == ST_MARKUP_DECL) {
+        t.errors = t.errors + 1;
+        t.namelen = 0;
+        t.state = ST_BOGUS_COMMENT;
+        return;
+    }
+    if (st == ST_TAG_NAME || st == ST_BEFORE_ATTR_NAME || st == ST_ATTR_NAME
+        || st == ST_AFTER_ATTR_NAME || st == ST_BEFORE_ATTR_VALUE
+        || st == ST_ATTR_VALUE_DQ || st == ST_ATTR_VALUE_SQ
+        || st == ST_ATTR_VALUE_UQ || st == ST_AFTER_ATTR_VALUE_Q
+        || st == ST_SELF_CLOSING) {
+        t.errors = t.errors + 1;
+    }
+    _stage(t, TOK_EOF);
+}
+
+// --- one transition ------------------------------------------------------
+fn _step(t as *Tokenizer) as void {
+    if (_at_eof(t) == 1) { _step_eof(t); return; }
+
+    let is i64 as st = t.state;
+    let is i64 as c = _peek(t);
+
+    // ===== the text-bearing states =======================================
+    if (st == ST_DATA) {
+        t.pos = t.pos + 1;
+        if (c == 38) { t.ret_state = ST_DATA; t.tmplen = 0; _tmp_push(t, 38); t.state = ST_CHAR_REF; return; }
+        if (c == 60) { t.state = ST_TAG_OPEN; return; }
+        if (c == 0)  { t.errors = t.errors + 1; _text_push(t, 0); return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_RCDATA) {
+        t.pos = t.pos + 1;
+        if (c == 38) { t.ret_state = ST_RCDATA; t.tmplen = 0; _tmp_push(t, 38); t.state = ST_CHAR_REF; return; }
+        if (c == 60) { t.ret_state = ST_RCDATA; t.state = ST_RCDATA_LT; return; }
+        if (c == 0)  { t.errors = t.errors + 1; _text_push_fffd(t); return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_RAWTEXT) {
+        t.pos = t.pos + 1;
+        if (c == 60) { t.ret_state = ST_RAWTEXT; t.state = ST_RAWTEXT_LT; return; }
+        if (c == 0)  { t.errors = t.errors + 1; _text_push_fffd(t); return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_SCRIPT) {
+        t.pos = t.pos + 1;
+        if (c == 60) { t.ret_state = ST_SCRIPT; t.state = ST_SCRIPT_LT; return; }
+        if (c == 0)  { t.errors = t.errors + 1; _text_push_fffd(t); return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_PLAINTEXT) {
+        t.pos = t.pos + 1;
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); return; }
+        _text_push(t, c);
+        return;
+    }
+
+    // ===== tags ==========================================================
+    if (st == ST_TAG_OPEN) {
+        if (c == 33) { t.pos = t.pos + 1; t.state = ST_MARKUP_DECL; return; }
+        if (c == 47) { t.pos = t.pos + 1; t.state = ST_END_TAG_OPEN; return; }
+        if (_is_alpha(c) == 1) { _new_tag(t, TOK_START); t.state = ST_TAG_NAME; return; }
+        if (c == 63) {
+            t.errors = t.errors + 1;
+            t.namelen = 0;
+            t.state = ST_BOGUS_COMMENT;
+            return;
+        }
+        t.errors = t.errors + 1;
+        _text_push(t, 60);
+        t.state = ST_DATA;
+        return;
+    }
+    if (st == ST_END_TAG_OPEN) {
+        if (_is_alpha(c) == 1) { _new_tag(t, TOK_END); t.state = ST_TAG_NAME; return; }
+        if (c == 62) { t.pos = t.pos + 1; t.errors = t.errors + 1; t.state = ST_DATA; return; }
+        t.errors = t.errors + 1;
+        t.namelen = 0;
+        t.state = ST_BOGUS_COMMENT;
+        return;
+    }
+    if (st == ST_TAG_NAME) {
+        t.pos = t.pos + 1;
+        if (_is_ws(c) == 1) { t.state = ST_BEFORE_ATTR_NAME; return; }
+        if (c == 47) { t.state = ST_SELF_CLOSING; return; }
+        if (c == 62) { _emit_tag(t); t.state = ST_DATA; return; }
+        if (c == 0) { t.errors = t.errors + 1; _name_push_fffd(t); return; }
+        _name_push(t, _lower(c));
+        return;
+    }
+
+    // ===== RCDATA / RAWTEXT / script end tags ============================
+    if (st == ST_RCDATA_LT || st == ST_RAWTEXT_LT) {
+        if (c == 47) {
+            t.pos = t.pos + 1;
+            t.tmplen = 0;
+            if (st == ST_RCDATA_LT) { t.state = ST_RCDATA_END_OPEN; }
+            else { t.state = ST_RAWTEXT_END_OPEN; }
+            return;
+        }
+        _text_push(t, 60);
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_RCDATA_END_OPEN || st == ST_RAWTEXT_END_OPEN) {
+        if (_is_alpha(c) == 1) {
+            t.tmplen = 0;
+            if (st == ST_RCDATA_END_OPEN) { t.state = ST_RCDATA_END_NAME; }
+            else { t.state = ST_RAWTEXT_END_NAME; }
+            return;
+        }
+        _text_push(t, 60);
+        _text_push(t, 47);
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_RCDATA_END_NAME || st == ST_RAWTEXT_END_NAME
+        || st == ST_SCRIPT_END_NAME || st == ST_SCRIPT_ESC_END_NAME) {
+        let is i64 as closing with mut = 0;
+        if (_is_ws(c) == 1 || c == 47 || c == 62) { closing = 1; }
+        if (closing == 1 && _is_appropriate_end(t) == 1) {
+            _new_tag(t, TOK_END);
+            let is i64 as i with mut = 0;
+            while (i < t.tmplen) { _name_push(t, _lower(cast(i64, t.tmp[i]))); i = i + 1; }
+            t.tmplen = 0;
+            t.pos = t.pos + 1;
+            if (_is_ws(c) == 1) { t.state = ST_BEFORE_ATTR_NAME; return; }
+            if (c == 47) { t.state = ST_SELF_CLOSING; return; }
+            _emit_tag(t);
+            t.state = ST_DATA;
+            return;
+        }
+        if (_is_alpha(c) == 1) { t.pos = t.pos + 1; _tmp_push(t, c); return; }
+        _flush_end_as_text(t);
+        t.state = t.ret_state;
+        return;
+    }
+
+    // ===== script data, and the fourteen states it needs =================
+    if (st == ST_SCRIPT_LT) {
+        if (c == 47) { t.pos = t.pos + 1; t.tmplen = 0; t.state = ST_SCRIPT_END_OPEN; return; }
+        if (c == 33) {
+            t.pos = t.pos + 1;
+            _text_push(t, 60);
+            _text_push(t, 33);
+            t.state = ST_SCRIPT_ESC_START;
+            return;
+        }
+        _text_push(t, 60);
+        t.state = ST_SCRIPT;
+        return;
+    }
+    if (st == ST_SCRIPT_END_OPEN) {
+        if (_is_alpha(c) == 1) { t.tmplen = 0; t.ret_state = ST_SCRIPT; t.state = ST_SCRIPT_END_NAME; return; }
+        _text_push(t, 60);
+        _text_push(t, 47);
+        t.state = ST_SCRIPT;
+        return;
+    }
+    if (st == ST_SCRIPT_ESC_START) {
+        if (c == 45) { t.pos = t.pos + 1; _text_push(t, 45); t.state = ST_SCRIPT_ESC_START_DASH; return; }
+        t.state = ST_SCRIPT;
+        return;
+    }
+    if (st == ST_SCRIPT_ESC_START_DASH) {
+        if (c == 45) { t.pos = t.pos + 1; _text_push(t, 45); t.state = ST_SCRIPT_ESC_DASH_DASH; return; }
+        t.state = ST_SCRIPT;
+        return;
+    }
+    if (st == ST_SCRIPT_ESC) {
+        t.pos = t.pos + 1;
+        if (c == 45) { _text_push(t, 45); t.state = ST_SCRIPT_ESC_DASH; return; }
+        if (c == 60) { t.ret_state = ST_SCRIPT_ESC; t.state = ST_SCRIPT_ESC_LT; return; }
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_SCRIPT_ESC_DASH) {
+        t.pos = t.pos + 1;
+        if (c == 45) { _text_push(t, 45); t.state = ST_SCRIPT_ESC_DASH_DASH; return; }
+        if (c == 60) { t.ret_state = ST_SCRIPT_ESC; t.state = ST_SCRIPT_ESC_LT; return; }
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); t.state = ST_SCRIPT_ESC; return; }
+        _text_push(t, c);
+        t.state = ST_SCRIPT_ESC;
+        return;
+    }
+    if (st == ST_SCRIPT_ESC_DASH_DASH) {
+        t.pos = t.pos + 1;
+        if (c == 45) { _text_push(t, 45); return; }
+        if (c == 60) { t.ret_state = ST_SCRIPT_ESC; t.state = ST_SCRIPT_ESC_LT; return; }
+        if (c == 62) { _text_push(t, 62); t.state = ST_SCRIPT; return; }
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); t.state = ST_SCRIPT_ESC; return; }
+        _text_push(t, c);
+        t.state = ST_SCRIPT_ESC;
+        return;
+    }
+    if (st == ST_SCRIPT_ESC_LT) {
+        if (c == 47) { t.pos = t.pos + 1; t.tmplen = 0; t.state = ST_SCRIPT_ESC_END_OPEN; return; }
+        if (_is_alpha(c) == 1) {
+            t.tmplen = 0;
+            _text_push(t, 60);
+            t.state = ST_SCRIPT_DESC_START;
+            return;
+        }
+        _text_push(t, 60);
+        t.state = ST_SCRIPT_ESC;
+        return;
+    }
+    if (st == ST_SCRIPT_ESC_END_OPEN) {
+        if (_is_alpha(c) == 1) { t.tmplen = 0; t.ret_state = ST_SCRIPT_ESC; t.state = ST_SCRIPT_ESC_END_NAME; return; }
+        _text_push(t, 60);
+        _text_push(t, 47);
+        t.state = ST_SCRIPT_ESC;
+        return;
+    }
+    // `<script` inside an escaped script: the region stops answering to `</`
+    // until a matching `</script` at the same nesting. This is what makes
+    // `<script>document.write("<script>")</script>` behave.
+    if (st == ST_SCRIPT_DESC_START) {
+        if (_is_ws(c) == 1 || c == 47 || c == 62) {
+            t.pos = t.pos + 1;
+            _text_push(t, c);
+            if (_tmp_is(t, "script") == 1) { t.state = ST_SCRIPT_DESC; }
+            else { t.state = ST_SCRIPT_ESC; }
+            return;
+        }
+        if (_is_alpha(c) == 1) {
+            t.pos = t.pos + 1;
+            _tmp_push(t, _lower(c));
+            _text_push(t, c);
+            return;
+        }
+        t.state = ST_SCRIPT_ESC;
+        return;
+    }
+    if (st == ST_SCRIPT_DESC) {
+        t.pos = t.pos + 1;
+        if (c == 45) { _text_push(t, 45); t.state = ST_SCRIPT_DESC_DASH; return; }
+        if (c == 60) { _text_push(t, 60); t.state = ST_SCRIPT_DESC_LT; return; }
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_SCRIPT_DESC_DASH) {
+        t.pos = t.pos + 1;
+        if (c == 45) { _text_push(t, 45); t.state = ST_SCRIPT_DESC_DASH_DASH; return; }
+        if (c == 60) { _text_push(t, 60); t.state = ST_SCRIPT_DESC_LT; return; }
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); t.state = ST_SCRIPT_DESC; return; }
+        _text_push(t, c);
+        t.state = ST_SCRIPT_DESC;
+        return;
+    }
+    if (st == ST_SCRIPT_DESC_DASH_DASH) {
+        t.pos = t.pos + 1;
+        if (c == 45) { _text_push(t, 45); return; }
+        if (c == 60) { _text_push(t, 60); t.state = ST_SCRIPT_DESC_LT; return; }
+        if (c == 62) { _text_push(t, 62); t.state = ST_SCRIPT; return; }
+        if (c == 0) { t.errors = t.errors + 1; _text_push_fffd(t); t.state = ST_SCRIPT_DESC; return; }
+        _text_push(t, c);
+        t.state = ST_SCRIPT_DESC;
+        return;
+    }
+    if (st == ST_SCRIPT_DESC_LT) {
+        if (c == 47) {
+            t.pos = t.pos + 1;
+            t.tmplen = 0;
+            _text_push(t, 47);
+            t.state = ST_SCRIPT_DESC_END;
+            return;
+        }
+        t.state = ST_SCRIPT_DESC;
+        return;
+    }
+    if (st == ST_SCRIPT_DESC_END) {
+        if (_is_ws(c) == 1 || c == 47 || c == 62) {
+            t.pos = t.pos + 1;
+            _text_push(t, c);
+            if (_tmp_is(t, "script") == 1) { t.state = ST_SCRIPT_ESC; }
+            else { t.state = ST_SCRIPT_DESC; }
+            return;
+        }
+        if (_is_alpha(c) == 1) {
+            t.pos = t.pos + 1;
+            _tmp_push(t, _lower(c));
+            _text_push(t, c);
+            return;
+        }
+        t.state = ST_SCRIPT_DESC;
+        return;
+    }
+
+    // ===== attributes ====================================================
+    if (st == ST_BEFORE_ATTR_NAME) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 47 || c == 62) { t.state = ST_AFTER_ATTR_NAME; return; }
+        if (c == 61) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            _attr_start(t);
+            _attr_name_push(t, 61);
+            t.state = ST_ATTR_NAME;
+            return;
+        }
+        _attr_start(t);
+        t.state = ST_ATTR_NAME;
+        return;
+    }
+    if (st == ST_ATTR_NAME) {
+        if (_is_ws(c) == 1 || c == 47 || c == 62) {
+            _attr_name_done(t);
+            t.state = ST_AFTER_ATTR_NAME;
+            return;
+        }
+        t.pos = t.pos + 1;
+        if (c == 61) { _attr_name_done(t); t.state = ST_BEFORE_ATTR_VALUE; return; }
+        if (c == 0) {
+            t.errors = t.errors + 1;
+            _attr_name_push(t, 239); _attr_name_push(t, 191); _attr_name_push(t, 189);
+            return;
+        }
+        if (c == 34 || c == 39 || c == 60) { t.errors = t.errors + 1; }
+        _attr_name_push(t, _lower(c));
+        return;
+    }
+    if (st == ST_AFTER_ATTR_NAME) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 47) { t.pos = t.pos + 1; _attr_done(t); t.state = ST_SELF_CLOSING; return; }
+        if (c == 61) { t.pos = t.pos + 1; t.state = ST_BEFORE_ATTR_VALUE; return; }
+        if (c == 62) { t.pos = t.pos + 1; _attr_done(t); _emit_tag(t); t.state = ST_DATA; return; }
+        _attr_done(t);
+        _attr_start(t);
+        t.state = ST_ATTR_NAME;
+        return;
+    }
+    if (st == ST_BEFORE_ATTR_VALUE) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 34) { t.pos = t.pos + 1; t.state = ST_ATTR_VALUE_DQ; return; }
+        if (c == 39) { t.pos = t.pos + 1; t.state = ST_ATTR_VALUE_SQ; return; }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            _attr_done(t);
+            _emit_tag(t);
+            t.state = ST_DATA;
+            return;
+        }
+        t.state = ST_ATTR_VALUE_UQ;
+        return;
+    }
+    if (st == ST_ATTR_VALUE_DQ || st == ST_ATTR_VALUE_SQ) {
+        let is i64 as q with mut = 34;
+        if (st == ST_ATTR_VALUE_SQ) { q = 39; }
+        t.pos = t.pos + 1;
+        if (c == q) { t.state = ST_AFTER_ATTR_VALUE_Q; return; }
+        if (c == 38) { t.ret_state = st; t.tmplen = 0; _tmp_push(t, 38); t.state = ST_CHAR_REF; return; }
+        if (c == 0) {
+            t.errors = t.errors + 1;
+            _attr_value_push(t, 239); _attr_value_push(t, 191); _attr_value_push(t, 189);
+            return;
+        }
+        _attr_value_push(t, c);
+        return;
+    }
+    if (st == ST_ATTR_VALUE_UQ) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; _attr_done(t); t.state = ST_BEFORE_ATTR_NAME; return; }
+        if (c == 62) { t.pos = t.pos + 1; _attr_done(t); _emit_tag(t); t.state = ST_DATA; return; }
+        t.pos = t.pos + 1;
+        if (c == 38) { t.ret_state = ST_ATTR_VALUE_UQ; t.tmplen = 0; _tmp_push(t, 38); t.state = ST_CHAR_REF; return; }
+        if (c == 0) {
+            t.errors = t.errors + 1;
+            _attr_value_push(t, 239); _attr_value_push(t, 191); _attr_value_push(t, 189);
+            return;
+        }
+        if (c == 34 || c == 39 || c == 60 || c == 61 || c == 96) { t.errors = t.errors + 1; }
+        _attr_value_push(t, c);
+        return;
+    }
+    if (st == ST_AFTER_ATTR_VALUE_Q) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; _attr_done(t); t.state = ST_BEFORE_ATTR_NAME; return; }
+        if (c == 47) { t.pos = t.pos + 1; _attr_done(t); t.state = ST_SELF_CLOSING; return; }
+        if (c == 62) { t.pos = t.pos + 1; _attr_done(t); _emit_tag(t); t.state = ST_DATA; return; }
+        t.errors = t.errors + 1;
+        _attr_done(t);
+        t.state = ST_BEFORE_ATTR_NAME;
+        return;
+    }
+    if (st == ST_SELF_CLOSING) {
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.self_closing = 1;
+            _emit_tag(t);
+            t.state = ST_DATA;
+            return;
+        }
+        // RECONSUMED, not consumed: `<a/9>` has an attribute named `9`. The
+        // spec says "reconsume in the before attribute name state" and eating
+        // the character here swallowed the first letter of every attribute
+        // that followed a stray solidus.
+        t.errors = t.errors + 1;
+        t.state = ST_BEFORE_ATTR_NAME;
+        return;
+    }
+
+    // ===== comments and declarations =====================================
+    if (st == ST_MARKUP_DECL) {
+        if (_match_at(t, "--", 0) == 2) {
+            t.pos = t.pos + 2;
+            t.namelen = 0;
+            t.state = ST_COMMENT_START;
+            return;
+        }
+        if (_match_at(t, "doctype", 1) == 7) { t.pos = t.pos + 7; t.state = ST_DOCTYPE; return; }
+        if (_match_at(t, "[CDATA[", 0) == 7) {
+            // Legal only in foreign content, and the tokenizer does not know
+            // whether it is there — the tree builder does, and switches to
+            // ST_CDATA itself. Outside it the spec says bogus comment whose
+            // data is "[CDATA[", which is this.
+            t.pos = t.pos + 7;
+            t.errors = t.errors + 1;
+            t.namelen = 0;
+            _name_push(t, 91); _name_push(t, 67); _name_push(t, 68);
+            _name_push(t, 65); _name_push(t, 84); _name_push(t, 65);
+            _name_push(t, 91);
+            t.state = ST_BOGUS_COMMENT;
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.namelen = 0;
+        t.state = ST_BOGUS_COMMENT;
+        return;
+    }
+    if (st == ST_BOGUS_COMMENT) {
+        t.pos = t.pos + 1;
+        if (c == 62) { _stage(t, TOK_COMMENT); t.state = ST_DATA; return; }
+        if (c == 0) { t.errors = t.errors + 1; _name_push_fffd(t); return; }
+        _name_push(t, c);
+        return;
+    }
+    if (st == ST_COMMENT_START) {
+        if (c == 45) { t.pos = t.pos + 1; t.state = ST_COMMENT_START_DASH; return; }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            _stage(t, TOK_COMMENT);
+            t.state = ST_DATA;
+            return;
+        }
+        t.state = ST_COMMENT;
+        return;
+    }
+    if (st == ST_COMMENT_START_DASH) {
+        if (c == 45) { t.pos = t.pos + 1; t.state = ST_COMMENT_END; return; }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            _stage(t, TOK_COMMENT);
+            t.state = ST_DATA;
+            return;
+        }
+        _name_push(t, 45);
+        t.state = ST_COMMENT;
+        return;
+    }
+    if (st == ST_COMMENT) {
+        t.pos = t.pos + 1;
+        if (c == 60) { _name_push(t, 60); t.state = ST_COMMENT_LT; return; }
+        if (c == 45) { t.state = ST_COMMENT_END_DASH; return; }
+        if (c == 0) { t.errors = t.errors + 1; _name_push_fffd(t); return; }
+        _name_push(t, c);
+        return;
+    }
+    if (st == ST_COMMENT_LT) {
+        if (c == 33) { t.pos = t.pos + 1; _name_push(t, 33); t.state = ST_COMMENT_LT_BANG; return; }
+        if (c == 60) { t.pos = t.pos + 1; _name_push(t, 60); return; }
+        t.state = ST_COMMENT;
+        return;
+    }
+    // The dashes are NOT appended here, in either state. They come back from
+    // comment-end-dash or comment-end if the comment turns out not to close —
+    // and appending them as well is how `<!-- <!--test-->` became
+    // ` <!----test` instead of ` <!--test`. §13.2.5.46 and §13.2.5.47.
+    if (st == ST_COMMENT_LT_BANG) {
+        if (c == 45) { t.pos = t.pos + 1; t.state = ST_COMMENT_LT_BANG_DASH; return; }
+        t.state = ST_COMMENT;
+        return;
+    }
+    if (st == ST_COMMENT_LT_BANG_DASH) {
+        if (c == 45) { t.pos = t.pos + 1; t.state = ST_COMMENT_LT_BANG_DASH_DASH; return; }
+        t.state = ST_COMMENT_END_DASH;
+        return;
+    }
+    if (st == ST_COMMENT_LT_BANG_DASH_DASH) {
+        if (c == 62) { t.state = ST_COMMENT_END; return; }
+        t.errors = t.errors + 1;
+        t.state = ST_COMMENT_END;
+        return;
+    }
+    if (st == ST_COMMENT_END_DASH) {
+        if (c == 45) { t.pos = t.pos + 1; t.state = ST_COMMENT_END; return; }
+        _name_push(t, 45);
+        t.state = ST_COMMENT;
+        return;
+    }
+    if (st == ST_COMMENT_END) {
+        if (c == 62) { t.pos = t.pos + 1; _stage(t, TOK_COMMENT); t.state = ST_DATA; return; }
+        if (c == 33) { t.pos = t.pos + 1; t.state = ST_COMMENT_END_BANG; return; }
+        if (c == 45) { t.pos = t.pos + 1; _name_push(t, 45); return; }
+        _name_push(t, 45);
+        _name_push(t, 45);
+        t.state = ST_COMMENT;
+        return;
+    }
+    if (st == ST_COMMENT_END_BANG) {
+        if (c == 45) {
+            t.pos = t.pos + 1;
+            _name_push(t, 45); _name_push(t, 45); _name_push(t, 33);
+            t.state = ST_COMMENT_END_DASH;
+            return;
+        }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            _stage(t, TOK_COMMENT);
+            t.state = ST_DATA;
+            return;
+        }
+        _name_push(t, 45); _name_push(t, 45); _name_push(t, 33);
+        t.state = ST_COMMENT;
+        return;
+    }
+
+    // ===== DOCTYPE =======================================================
+    if (st == ST_DOCTYPE) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; t.state = ST_BEFORE_DOCTYPE_NAME; return; }
+        if (c == 62) { t.state = ST_BEFORE_DOCTYPE_NAME; return; }
+        t.errors = t.errors + 1;
+        t.state = ST_BEFORE_DOCTYPE_NAME;
+        return;
+    }
+    if (st == ST_BEFORE_DOCTYPE_NAME) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        t.namelen = 0;
+        t.pub_len = 0; t.has_pub = 0;
+        t.sys_len = 0; t.has_sys = 0;
+        t.force_quirks = 0;
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        t.pos = t.pos + 1;
+        if (c == 0) { t.errors = t.errors + 1; _name_push_fffd(t); }
+        else { _name_push(t, _lower(c)); }
+        t.state = ST_DOCTYPE_NAME;
+        return;
+    }
+    if (st == ST_DOCTYPE_NAME) {
+        t.pos = t.pos + 1;
+        if (_is_ws(c) == 1) { t.state = ST_AFTER_DOCTYPE_NAME; return; }
+        if (c == 62) { _stage(t, TOK_DOCTYPE); t.state = ST_DATA; return; }
+        if (c == 0) { t.errors = t.errors + 1; _name_push_fffd(t); return; }
+        _name_push(t, _lower(c));
+        return;
+    }
+    if (st == ST_AFTER_DOCTYPE_NAME) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 62) { t.pos = t.pos + 1; _stage(t, TOK_DOCTYPE); t.state = ST_DATA; return; }
+        if (_match_at(t, "public", 1) == 6) { t.pos = t.pos + 6; t.state = ST_AFTER_DOCTYPE_PUBLIC_KW; return; }
+        if (_match_at(t, "system", 1) == 6) { t.pos = t.pos + 6; t.state = ST_AFTER_DOCTYPE_SYSTEM_KW; return; }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_AFTER_DOCTYPE_PUBLIC_KW) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; t.state = ST_BEFORE_DOCTYPE_PUBLIC_ID; return; }
+        if (c == 34 || c == 39) {
+            t.errors = t.errors + 1;
+            t.pos = t.pos + 1;
+            t.pub_len = 0; t.has_pub = 1;
+            if (c == 34) { t.state = ST_DOCTYPE_PUBLIC_ID_DQ; } else { t.state = ST_DOCTYPE_PUBLIC_ID_SQ; }
+            return;
+        }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_BEFORE_DOCTYPE_PUBLIC_ID) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 34 || c == 39) {
+            t.pos = t.pos + 1;
+            t.pub_len = 0; t.has_pub = 1;
+            if (c == 34) { t.state = ST_DOCTYPE_PUBLIC_ID_DQ; } else { t.state = ST_DOCTYPE_PUBLIC_ID_SQ; }
+            return;
+        }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_DOCTYPE_PUBLIC_ID_DQ || st == ST_DOCTYPE_PUBLIC_ID_SQ) {
+        let is i64 as q with mut = 34;
+        if (st == ST_DOCTYPE_PUBLIC_ID_SQ) { q = 39; }
+        t.pos = t.pos + 1;
+        if (c == q) { t.state = ST_AFTER_DOCTYPE_PUBLIC_ID; return; }
+        if (c == 62) {
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        if (c == 0) { t.errors = t.errors + 1; _pub_push(t, 239); _pub_push(t, 191); _pub_push(t, 189); return; }
+        _pub_push(t, c);
+        return;
+    }
+    if (st == ST_AFTER_DOCTYPE_PUBLIC_ID) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; t.state = ST_BETWEEN_DOCTYPE_PUB_SYS; return; }
+        if (c == 62) { t.pos = t.pos + 1; _stage(t, TOK_DOCTYPE); t.state = ST_DATA; return; }
+        if (c == 34 || c == 39) {
+            t.errors = t.errors + 1;
+            t.pos = t.pos + 1;
+            t.sys_len = 0; t.has_sys = 1;
+            if (c == 34) { t.state = ST_DOCTYPE_SYSTEM_ID_DQ; } else { t.state = ST_DOCTYPE_SYSTEM_ID_SQ; }
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_BETWEEN_DOCTYPE_PUB_SYS) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 62) { t.pos = t.pos + 1; _stage(t, TOK_DOCTYPE); t.state = ST_DATA; return; }
+        if (c == 34 || c == 39) {
+            t.pos = t.pos + 1;
+            t.sys_len = 0; t.has_sys = 1;
+            if (c == 34) { t.state = ST_DOCTYPE_SYSTEM_ID_DQ; } else { t.state = ST_DOCTYPE_SYSTEM_ID_SQ; }
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_AFTER_DOCTYPE_SYSTEM_KW) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; t.state = ST_BEFORE_DOCTYPE_SYSTEM_ID; return; }
+        if (c == 34 || c == 39) {
+            t.errors = t.errors + 1;
+            t.pos = t.pos + 1;
+            t.sys_len = 0; t.has_sys = 1;
+            if (c == 34) { t.state = ST_DOCTYPE_SYSTEM_ID_DQ; } else { t.state = ST_DOCTYPE_SYSTEM_ID_SQ; }
+            return;
+        }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_BEFORE_DOCTYPE_SYSTEM_ID) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 34 || c == 39) {
+            t.pos = t.pos + 1;
+            t.sys_len = 0; t.has_sys = 1;
+            if (c == 34) { t.state = ST_DOCTYPE_SYSTEM_ID_DQ; } else { t.state = ST_DOCTYPE_SYSTEM_ID_SQ; }
+            return;
+        }
+        if (c == 62) {
+            t.pos = t.pos + 1;
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        t.errors = t.errors + 1;
+        t.force_quirks = 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_DOCTYPE_SYSTEM_ID_DQ || st == ST_DOCTYPE_SYSTEM_ID_SQ) {
+        let is i64 as q with mut = 34;
+        if (st == ST_DOCTYPE_SYSTEM_ID_SQ) { q = 39; }
+        t.pos = t.pos + 1;
+        if (c == q) { t.state = ST_AFTER_DOCTYPE_SYSTEM_ID; return; }
+        if (c == 62) {
+            t.errors = t.errors + 1;
+            t.force_quirks = 1;
+            _stage(t, TOK_DOCTYPE);
+            t.state = ST_DATA;
+            return;
+        }
+        if (c == 0) { t.errors = t.errors + 1; _sys_push(t, 239); _sys_push(t, 191); _sys_push(t, 189); return; }
+        _sys_push(t, c);
+        return;
+    }
+    if (st == ST_AFTER_DOCTYPE_SYSTEM_ID) {
+        if (_is_ws(c) == 1) { t.pos = t.pos + 1; return; }
+        if (c == 62) { t.pos = t.pos + 1; _stage(t, TOK_DOCTYPE); t.state = ST_DATA; return; }
+        t.errors = t.errors + 1;
+        t.state = ST_BOGUS_DOCTYPE;
+        return;
+    }
+    if (st == ST_BOGUS_DOCTYPE) {
+        t.pos = t.pos + 1;
+        if (c == 62) { _stage(t, TOK_DOCTYPE); t.state = ST_DATA; return; }
+        if (c == 0) { t.errors = t.errors + 1; }
+        return;
+    }
+
+    // ===== CDATA =========================================================
+    if (st == ST_CDATA) {
+        t.pos = t.pos + 1;
+        if (c == 93) { t.state = ST_CDATA_BRACKET; return; }
+        _text_push(t, c);
+        return;
+    }
+    if (st == ST_CDATA_BRACKET) {
+        if (c == 93) { t.pos = t.pos + 1; t.state = ST_CDATA_END; return; }
+        _text_push(t, 93);
+        t.state = ST_CDATA;
+        return;
+    }
+    if (st == ST_CDATA_END) {
+        if (c == 62) { t.pos = t.pos + 1; t.state = ST_DATA; return; }
+        if (c == 93) { t.pos = t.pos + 1; _text_push(t, 93); return; }
+        _text_push(t, 93);
+        _text_push(t, 93);
+        t.state = ST_CDATA;
+        return;
+    }
+
+    // ===== character references ==========================================
+    if (st == ST_CHAR_REF) {
+        if (_is_alnum(c) == 1) { t.state = ST_NAMED_REF; return; }
+        if (c == 35) { t.pos = t.pos + 1; _tmp_push(t, 35); _num_reset(t); t.state = ST_NUMERIC_REF; return; }
+        _ref_push(t, 38);
+        t.tmplen = 0;
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_NAMED_REF) {
+        // Consume alphanumerics and the ';' that may end them, then take the
+        // LONGEST prefix of what was consumed that is a real name. The table
+        // is sorted, so each candidate length is a binary search.
+        //
+        // `&notit;` is the case that makes this necessary: `&not` is a name,
+        // `&notit;` is not, and the answer is `¬it;` — the longest matching
+        // prefix, then the rest as ordinary text.
+        let is i64 as start = t.pos;
+        let is i64 as n with mut = 0;
+        let is i64 as more with mut = 1;
+        while (more == 1 && t.pos < t.len && n < MAX_TMP - 4) {
+            let is i64 as ch = _peek(t);
+            if (_is_alnum(ch) == 1) { _tmp_push(t, ch); t.pos = t.pos + 1; n = n + 1; }
+            else {
+                if (ch == 59) { _tmp_push(t, ch); t.pos = t.pos + 1; n = n + 1; }
+                more = 0;
+            }
+        }
+        // tmp[0] is the '&'; candidate names run from tmp[1].
+        let is i64 as best with mut = 0 - 1;
+        let is i64 as bestlen with mut = 0;
+        let is i64 as cand with mut = n;
+        while (cand > 0 && best < 0) {
+            let is i64 as hit = _ent_lookup(t, 1, cand);
+            if (hit >= 0) { best = hit; bestlen = cand; }
+            else { cand = cand - 1; }
+        }
+        if (best < 0) {
+            // Nothing matched: the '&' is text and everything after it is
+            // reconsumed as an ambiguous ampersand — `&foo` stays `&foo`.
+            _ref_push(t, 38);
+            t.pos = start;
+            t.tmplen = 0;
+            t.state = ST_AMBIGUOUS_AMP;
+            return;
+        }
+        let is i64 as semi with mut = 0;
+        if (t.tmp[bestlen] == cast(u8, 59)) { semi = 1; }
+        if (semi == 0) {
+            // A name missing its semicolon, inside an attribute value, followed
+            // by '=' or an alphanumeric, is NOT a reference: `?a=1&nots=2` must
+            // stay as written. Outside an attribute the same input IS the
+            // entity — the two contexts genuinely differ.
+            // The character after the matched name. It is inside tmp when the
+            // match stopped short of everything consumed, and is the NEXT
+            // INPUT character when the match used all of it — `&not=` consumes
+            // `not` and stops at `=`, which never enters tmp. Reading only tmp
+            // made that case an entity and turned `?a=1&not=2` into `?a=1¬=2`.
+            if (_in_attr(t) == 1) {
+                let is i64 as nxt with mut = 0;
+                if (bestlen < n) { nxt = cast(i64, t.tmp[bestlen + 1]); }
+                else {
+                    if (t.pos < t.len) { nxt = _peek(t); }
+                }
+                if (nxt == 61 || _is_alnum(nxt) == 1) {
+                    let is i64 as k with mut = 0;
+                    while (k <= n) { _ref_push(t, cast(i64, t.tmp[k])); k = k + 1; }
+                    t.tmplen = 0;
+                    t.state = t.ret_state;
+                    return;
+                }
+            }
+            t.errors = t.errors + 1;
+        }
+        let is *u8 as v = ent.ent_value(best);
+        let is i64 as i with mut = 0;
+        while (v[i] != 0) { _ref_push(t, cast(i64, v[i])); i = i + 1; }
+        i = bestlen + 1;
+        while (i <= n) { _ref_push(t, cast(i64, t.tmp[i])); i = i + 1; }
+        t.tmplen = 0;
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_AMBIGUOUS_AMP) {
+        if (_is_alnum(c) == 1) { t.pos = t.pos + 1; _ref_push(t, c); return; }
+        if (c == 59) { t.errors = t.errors + 1; }
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_NUMERIC_REF) {
+        if (c == 120 || c == 88) { t.pos = t.pos + 1; _tmp_push(t, c); t.state = ST_HEX_REF_START; return; }
+        t.state = ST_DEC_REF_START;
+        return;
+    }
+    if (st == ST_HEX_REF_START || st == ST_DEC_REF_START) {
+        let is i64 as ok with mut = 0;
+        if (st == ST_HEX_REF_START) { ok = _is_hex(c); } else { ok = _is_digit(c); }
+        if (ok == 1) {
+            if (st == ST_HEX_REF_START) { t.state = ST_HEX_REF; } else { t.state = ST_DEC_REF; }
+            return;
+        }
+        // `&#` or `&#x` with nothing usable after it stays as written.
+        t.errors = t.errors + 1;
+        let is i64 as i with mut = 0;
+        while (i < t.tmplen) { _ref_push(t, cast(i64, t.tmp[i])); i = i + 1; }
+        t.tmplen = 0;
+        t.state = t.ret_state;
+        return;
+    }
+    if (st == ST_HEX_REF) {
+        if (_is_hex(c) == 1) { t.pos = t.pos + 1; _num_hex(t, c); return; }
+        if (c == 59) { t.pos = t.pos + 1; t.state = ST_NUMERIC_REF_END; return; }
+        t.errors = t.errors + 1;
+        t.state = ST_NUMERIC_REF_END;
+        return;
+    }
+    if (st == ST_DEC_REF) {
+        if (_is_digit(c) == 1) { t.pos = t.pos + 1; _num_dec(t, c); return; }
+        if (c == 59) { t.pos = t.pos + 1; t.state = ST_NUMERIC_REF_END; return; }
+        t.errors = t.errors + 1;
+        t.state = ST_NUMERIC_REF_END;
+        return;
+    }
+    if (st == ST_NUMERIC_REF_END) {
+        _num_finish(t);
+        t.tmplen = 0;
+        t.state = t.ret_state;
+        return;
+    }
+
+    // Unreachable for any state above. Consuming a character rather than
+    // spinning means a state added later without a branch here makes progress
+    // and shows up as wrong output instead of a hang.
+    t.pos = t.pos + 1;
+}
+
+// --- the loop ------------------------------------------------------------
+//
+// Run the machine until it stages a token. A character run that ended goes out
+// first and the staged token waits in `pending`.
+fn tok_next(t as *Tokenizer) as i64 {
+    if (t.pending != 0) {
+        let is i64 as k = t.pending;
+        t.pending = 0;
+        return k;
+    }
+    t.textlen = 0;
+    while (t.staged == 0) { _step(t); }
+    let is i64 as k = t.staged;
+    t.staged = 0;
+    if (t.textlen > 0) {
+        t.pending = k;
+        return TOK_CHAR;
+    }
+    return k;
+}
+
+// --- reading the current token -------------------------------------------
+fn tok_text(t as *Tokenizer) as *u8 { return t.text; }
+fn tok_text_len(t as *Tokenizer) as i64 { return t.textlen; }
+fn tok_name(t as *Tokenizer) as *u8 { return cast(*u8, &t.name); }
+fn tok_name_len(t as *Tokenizer) as i64 { return t.namelen; }
+fn tok_self_closing(t as *Tokenizer) as i64 { return t.self_closing; }
+fn tok_nattr(t as *Tokenizer) as i64 { return t.nattr; }
+fn tok_attr_name(t as *Tokenizer, i as i64) as *u8 {
+    return cast(*u8, cast(i64, t.arena) + t.an_off[i]);
+}
+fn tok_attr_name_len(t as *Tokenizer, i as i64) as i64 { return t.an_len[i]; }
+fn tok_attr_value(t as *Tokenizer, i as i64) as *u8 {
+    return cast(*u8, cast(i64, t.arena) + t.av_off[i]);
+}
+fn tok_attr_value_len(t as *Tokenizer, i as i64) as i64 { return t.av_len[i]; }
+fn tok_doctype_public(t as *Tokenizer) as *u8 { return cast(*u8, &t.pub_id); }
+fn tok_doctype_public_len(t as *Tokenizer) as i64 { return t.pub_len; }
+fn tok_has_public(t as *Tokenizer) as i64 { return t.has_pub; }
+fn tok_doctype_system(t as *Tokenizer) as *u8 { return cast(*u8, &t.sys_id); }
+fn tok_doctype_system_len(t as *Tokenizer) as i64 { return t.sys_len; }
+fn tok_has_system(t as *Tokenizer) as i64 { return t.has_sys; }
+fn tok_force_quirks(t as *Tokenizer) as i64 { return t.force_quirks; }
+fn tok_errors(t as *Tokenizer) as i64 { return t.errors; }

@@ -1,0 +1,261 @@
+// =======================================================
+// caustic-browser/tests/test_tok.cst
+// The tokenizer against html5lib's conformance suite.
+//
+// 7032 cases, six initial states, generated into tests/vec_tok.cst by
+// tools/gen_tok_vectors.py. Using the suite every browser is checked against,
+// rather than cases written here, is the point: a tokenizer tested against its
+// own author's idea of HTML passes.
+//
+// Each case is replayed and the emitted tokens are flattened into the same
+// canonical string the generator produced from the expected stream. On a
+// mismatch both are printed, escaped, which locates the fault; "token 3
+// differs" would not.
+//
+// Attributes are SORTED before comparing. html5lib stores them as a JSON
+// object, so their order is already gone by the time the file is written.
+//
+// Character runs are JOINED. The suite splits them arbitrarily — a tokenizer
+// may emit `ab` as one token or as two and both conform.
+//
+// PARSE ERRORS ARE NOT COMPARED. Each case lists the errors it expects and
+// where; this tokenizer counts them without recording positions. So a case
+// that should have raised an error and did not still passes here, and that is
+// a real hole rather than an oversight — closing it means carrying a position
+// with every error, which the tree builder will want anyway.
+//
+// Exit 0 = all pass. Non-zero = the number of failures, capped at 100.
+// =======================================================
+
+use "std/io.cst" as io;
+use "../src/html/tokenizer.cst" as tk;
+use "./vec_tok.cst" as vec;
+
+let is i64 as OUT_CAP with imut = 262144;
+
+let is [262144]u8 as _got with mut;
+let is i64 as _gotlen with mut = 0;
+
+let is i64 as _fails with mut = 0;
+let is i64 as _shown with mut = 0;
+
+fn _put(b as i64) as void {
+    if (_gotlen < OUT_CAP) {
+        _got[_gotlen] = cast(u8, b);
+        _gotlen = _gotlen + 1;
+    }
+}
+fn _put_n(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { _put(cast(i64, p[i])); i = i + 1; }
+}
+
+// u32, big-endian, out of the blob.
+fn _u32(b as *u8, at as i64) as i64 {
+    return (cast(i64, b[at]) << 24) | (cast(i64, b[at + 1]) << 16)
+         | (cast(i64, b[at + 2]) << 8) | cast(i64, b[at + 3]);
+}
+
+fn _eq(a as *u8, alen as i64, b as *u8, blen as i64) as i64 {
+    if (alen != blen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _hexd(v as i64) as u8 {
+    if (v < 10) { return cast(u8, 48 + v); }
+    return cast(u8, 87 + v);
+}
+
+// Readable on a terminal: printable ASCII as itself, everything else as \xNN.
+fn _show(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, p[i]);
+        if (c >= 32 && c < 127 && c != 92) {
+            let is [2]u8 as one;
+            one[0] = cast(u8, c);
+            one[1] = cast(u8, 0);
+            io.write_str(1, cast(*u8, &one));
+        } else {
+            let is [5]u8 as h;
+            h[0] = cast(u8, 92);
+            h[1] = cast(u8, 120);
+            h[2] = _hexd((c >> 4) & 15);
+            h[3] = _hexd(c & 15);
+            h[4] = cast(u8, 0);
+            io.write_str(1, cast(*u8, &h));
+        }
+        i = i + 1;
+    }
+}
+
+// Lexicographic order of two attribute names, by bytes then by length.
+fn _attr_cmp(t as *tk.Tokenizer, x as i64, y as i64) as i64 {
+    let is *u8 as a = tk.tok_attr_name(t, x);
+    let is i64 as al = tk.tok_attr_name_len(t, x);
+    let is *u8 as b = tk.tok_attr_name(t, y);
+    let is i64 as bl = tk.tok_attr_name_len(t, y);
+    let is i64 as m with mut = al;
+    if (bl < m) { m = bl; }
+    let is i64 as k with mut = 0;
+    while (k < m) {
+        if (a[k] < b[k]) { return 0 - 1; }
+        if (a[k] > b[k]) { return 1; }
+        k = k + 1;
+    }
+    if (al < bl) { return 0 - 1; }
+    if (al > bl) { return 1; }
+    return 0;
+}
+
+// Attribute indices, sorted by name. Insertion sort: a tag with enough
+// attributes for the order to cost anything does not exist.
+//
+// The inner loop keeps its own `done` flag rather than breaking by setting the
+// index negative. Doing the latter loses the insertion POSITION — every key
+// landed at idx[0] and a two-attribute tag reported the second one twice.
+fn _sorted_attrs(t as *tk.Tokenizer, idx as *i64) as i64 {
+    let is i64 as n = tk.tok_nattr(t);
+    let is i64 as i with mut = 0;
+    while (i < n) { idx[i] = i; i = i + 1; }
+    i = 1;
+    while (i < n) {
+        let is i64 as key = idx[i];
+        let is i64 as j with mut = i - 1;
+        let is i64 as done with mut = 0;
+        while (j >= 0 && done == 0) {
+            if (_attr_cmp(t, idx[j], key) <= 0) { done = 1; }
+            else {
+                idx[j + 1] = idx[j];
+                j = j - 1;
+            }
+        }
+        idx[j + 1] = key;
+        i = i + 1;
+    }
+    return n;
+}
+
+// Run one case and leave the canonical output in _got.
+fn _run(state as i64, last as *u8, lastlen as i64, src as *u8, srclen as i64) as void {
+    _gotlen = 0;
+    let is tk.Tokenizer as t;
+    if (tk.tok_init(&t, src, srclen) != 0) { return; }
+    tk.tok_set_state(&t, state);
+    if (lastlen > 0) {
+        let is [1024]u8 as nm;
+        let is i64 as i with mut = 0;
+        while (i < lastlen && i < 1023) { nm[i] = last[i]; i = i + 1; }
+        nm[i] = cast(u8, 0);
+        tk.tok_set_last_start(&t, cast(*u8, &nm));
+    }
+
+    let is [512]i64 as idx;
+    let is i64 as going with mut = 1;
+    while (going == 1) {
+        let is i64 as k = tk.tok_next(&t);
+        if (k == tk.TOK_EOF) { going = 0; }
+        else if (k == tk.TOK_CHAR) {
+            // An empty run is not a token. The spec never emits one and
+            // html5lib never expects one.
+            if (tk.tok_text_len(&t) > 0) {
+                _put(84);                                   // 'T'
+                _put_n(tk.tok_text(&t), tk.tok_text_len(&t));
+                _put(2);
+            }
+        }
+        else if (k == tk.TOK_START) {
+            _put(83);                                       // 'S'
+            _put_n(tk.tok_name(&t), tk.tok_name_len(&t));
+            let is i64 as n = _sorted_attrs(&t, cast(*i64, &idx));
+            let is i64 as i with mut = 0;
+            while (i < n) {
+                _put(3);
+                _put_n(tk.tok_attr_name(&t, idx[i]), tk.tok_attr_name_len(&t, idx[i]));
+                _put(4);
+                _put_n(tk.tok_attr_value(&t, idx[i]), tk.tok_attr_value_len(&t, idx[i]));
+                i = i + 1;
+            }
+            if (tk.tok_self_closing(&t) == 1) { _put(5); }
+            _put(2);
+        }
+        else if (k == tk.TOK_END) {
+            _put(69);                                       // 'E'
+            _put_n(tk.tok_name(&t), tk.tok_name_len(&t));
+            _put(2);
+        }
+        else if (k == tk.TOK_COMMENT) {
+            _put(67);                                       // 'C'
+            _put_n(tk.tok_name(&t), tk.tok_name_len(&t));
+            _put(2);
+        }
+        else if (k == tk.TOK_DOCTYPE) {
+            _put(68);                                       // 'D'
+            if (tk.tok_name_len(&t) == 0) { _put(45); }
+            else { _put_n(tk.tok_name(&t), tk.tok_name_len(&t)); }
+            _put(1);
+            if (tk.tok_has_public(&t) == 0) { _put(45); }
+            else { _put_n(tk.tok_doctype_public(&t), tk.tok_doctype_public_len(&t)); }
+            _put(1);
+            if (tk.tok_has_system(&t) == 0) { _put(45); }
+            else { _put_n(tk.tok_doctype_system(&t), tk.tok_doctype_system_len(&t)); }
+            _put(1);
+            if (tk.tok_force_quirks(&t) == 1) { _put(48); } else { _put(49); }
+            _put(2);
+        }
+    }
+    tk.tok_free(&t);
+}
+
+fn main() as i32 {
+    let is i64 as total with mut = 0;
+    let is i64 as bi with mut = 0;
+    while (bi < vec.VEC_BLOBS) {
+        let is *u8 as b = vec.vec_blob(bi);
+        let is i64 as blen = vec.vec_blob_len(bi);
+        let is i64 as p with mut = 0;
+        while (p < blen) {
+            let is i64 as state = cast(i64, b[p]);
+            p = p + 1;
+            let is i64 as lastlen = _u32(b, p);   p = p + 4;
+            let is *u8 as last = cast(*u8, cast(i64, b) + p);  p = p + lastlen;
+            let is i64 as srclen = _u32(b, p);    p = p + 4;
+            let is *u8 as src = cast(*u8, cast(i64, b) + p);   p = p + srclen;
+            let is i64 as explen = _u32(b, p);    p = p + 4;
+            let is *u8 as exp = cast(*u8, cast(i64, b) + p);   p = p + explen;
+            let is i64 as dlen = _u32(b, p);      p = p + 4;
+            let is *u8 as desc = cast(*u8, cast(i64, b) + p);  p = p + dlen;
+
+            _run(state, last, lastlen, src, srclen);
+            total = total + 1;
+
+            if (_eq(cast(*u8, &_got), _gotlen, exp, explen) == 0) {
+                _fails = _fails + 1;
+                if (_shown < 25) {
+                    _shown = _shown + 1;
+                    io.write_str(1, "\nFAIL  ");
+                    _show(desc, dlen);
+                    io.write_str(1, "\n  in   "); _show(src, srclen);
+                    io.write_str(1, "\n  got  "); _show(cast(*u8, &_got), _gotlen);
+                    io.write_str(1, "\n  want "); _show(exp, explen);
+                    io.write_str(1, "\n");
+                }
+            }
+            bi = bi + 0;
+        }
+        bi = bi + 1;
+    }
+
+    if (_fails != 0) {
+        io.printf("\ntokenizer: %ld of %ld cases FAILED\n", _fails, total);
+        if (_fails > 100) { return cast(i32, 100); }
+        return cast(i32, _fails);
+    }
+    io.printf("tokenizer: %ld html5lib cases pass\n", total);
+    return 0;
+}
