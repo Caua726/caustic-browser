@@ -36,7 +36,8 @@ tests/surftest.cst         the seam, exercised without opening a window
 
 **The HTML tokeniser, WHATWG §13.2.5 — all of it.** 7032 of 7032 cases in the
 [html5lib conformance suite](https://github.com/html5lib/html5lib-tests) pass,
-at both optimization levels, in 0.1 s.
+at every optimization level the compiler offers — `-O0`, `-O1` and `-O2` — in
+0.1 s each.
 
 The whole state machine rather than the subset that gets `<p>hello</p>` working,
 because the subset is what turns into a rewrite the first time a real page
@@ -95,7 +96,7 @@ dependency, cloned into `.caustic/deps` at its pinned tag on the first build.
 
 ```sh
 caustic-mk run test         # the tokeniser suite, the surface test, the window build
-caustic-mk run test-opt     # the tokeniser suite through the optimizing backend
+caustic-mk run test-opt     # the tokeniser suite at -O1 and -O2
 caustic-mk build browser && ./build/browser
 ```
 

@@ -39,13 +39,18 @@ script "test" {
     "echo 'test: tokenizer green, surface green, window builds'"
 }
 
-// The tokenizer through the optimizing backend as well. It is a state machine
-// over a large generated table, which is the shape a second code generator is
-// most likely to disagree about.
+// The tokenizer through BOTH optimizing backends. It is a state machine over a
+// large generated table, which is the shape a second code generator is most
+// likely to disagree about — and a level nobody runs is how an -O1-only pass
+// in the compiler broke every threaded program while every test passed.
+//
+// It costs 0.1 s a level, so there is no argument for checking only one.
 script "test-opt" {
-    "caustic -q -O1 tests/test_tok.cst -o build/test_tok_opt"
-    "./build/test_tok_opt"
-    "echo 'test-opt: tokenizer green at -O1'"
+    "caustic -q -O1 tests/test_tok.cst -o build/test_tok_o1"
+    "./build/test_tok_o1"
+    "caustic -q -O2 tests/test_tok.cst -o build/test_tok_o2"
+    "./build/test_tok_o2"
+    "echo 'test-opt: tokenizer green at -O1 and -O2'"
 }
 
 // Build both and run neither.
@@ -56,13 +61,15 @@ script "test-opt" {
 // runner cannot have it without building SDL from source, which would say
 // nothing about this repository. Compiling is what CI can honestly check here:
 // that the dependency resolves and both targets build.
-// The tokenizer links nothing and CAN run on a runner, so it does.
+// The tokenizer links nothing and CAN run on a runner, so it does — at all
+// three levels, since that is the whole cost of knowing rather than assuming.
 script "test-ci" {
     "caustic-mk build test_tok"
     "./build/test_tok"
+    "caustic-mk run test-opt"
     "caustic-mk build surftest"
     "caustic-mk build browser"
-    "echo 'test-ci: tokenizer green; SDL3 targets build (not run — no SDL3 on the runner)'"
+    "echo 'test-ci: tokenizer green at -O0/-O1/-O2; SDL3 targets build (not run — no SDL3 on the runner)'"
 }
 
 script "clean" {
