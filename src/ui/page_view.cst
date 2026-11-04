@@ -1,0 +1,88 @@
+// ui/page_view.cst — the page's place in the window.
+//
+// A widget of our own among the toolkit's. It knows nothing about pages: it plays
+// a display list back through render/ and text/, inside the rectangle it is given.
+
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/render/shapes2d.cst" as shapes;
+use "caustic-media/text/layout/model.cst" as model;
+use "caustic-media/ui/tree.cst" as tree;
+use "caustic-media/ui/widget.cst" as widget;
+use "caustic-media/ui/geom.cst" as geom;
+use "caustic-media/ui/layout.cst" as layout;
+use "caustic-media/ui/painter.cst" as painter;
+use "caustic-media/ui/text.cst" as txt;
+use "../paint/display_list.cst" as dl;
+
+let is i64 as WHITE with imut = 16777215;
+
+struct Data {
+    list as *dl.List;
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+// Every text command is laid out into this and drawn at once, so one will do.
+let is txt.Run as _run with mut;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("page_view", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.paint = fn_ptr(_paint);
+    _run = txt.run();
+    _ready = 1;
+}
+
+// A new view of list as the last child of parent. The list stays the caller's and
+// has to outlive the view. Its handle, or 0 with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, list as *dl.List) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    cast(*Data, tree.data(t, w)).list = list;
+    return w;
+}
+
+fn list_of(t as *tree.Tree, w as i64) as *dl.List {
+    return cast(*Data, tree.data(t, w)).list;
+}
+
+// Show another list, or the same one after it moved.
+fn set_list(t as *tree.Tree, w as i64, list as *dl.List) as void {
+    cast(*Data, tree.data(t, w)).list = list;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// No size of its own: it takes what its parent gives it.
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _text(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd) as void {
+    let is txt.Style as st = txt.style_of(p.theme.fonts.body);
+    st.family = p.theme.fonts.family;
+    st.size = c.size;
+    st.weight = c.weight;
+    let is model.Params as pp = model.params();
+    pp.width = c.w;
+    if (txt.lay_plain(svc, &_run, c.text, c.len, &st, &pp) == 0) { return; }
+    txt.draw(svc, p.canvas, &_run, p.rect.x + c.x, p.rect.y + c.y, math.color.hex(c.color));
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, math.color.hex(WHITE));
+    let is *dl.List as l = cast(*Data, data).list;
+    let is *txt.Service as svc = txt.of(t);
+    let is i64 as i with mut = 0;
+    while (i < dl.count(l)) {
+        let is *dl.Cmd as c = dl.at(l, i);
+        if (c.kind == dl.RECT) {
+            shapes.fill_rect(p.canvas, p.rect.x + c.x, p.rect.y + c.y, c.w, c.h, math.color.hex(c.color));
+        }
+        if (c.kind == dl.TEXT && cast(i64, svc) != 0) { _text(svc, p, c); }
+        i = i + 1;
+    }
+}

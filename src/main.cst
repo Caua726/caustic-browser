@@ -1,50 +1,45 @@
-// caustic-browser — M0: open a window and paint OUR pixels into it.
+// caustic-browser — the window, and what will one day be a page inside it.
 //
-// Everything you see is written by us into the Surface buffer (put_pixel/
-// fill_rect) — caustic-media only opens the window and publishes the buffer. No
-// GPU. This proves the platform seam end to end.
+//   browser           run it
+//   browser --check   drive the window through its tabs and close; exit 0 = pass
 
-use "platform/surface.cst" as gfx;
-use "platform/pixels.cst" as px;
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "caustic-media/ui/ui.cst" as ui;
+use "ui/browser.cst" as browser;
 
-// A tiny hand-painted "browser" mock, all our own pixels.
-fn paint(c as *px.Canvas) as void {
-    px.clear(c, px.rgb(245, 245, 247));                      // page background
-    px.fill_rect(c, 0, 0, c.width, 56, px.rgb(32, 40, 48));  // chrome / top bar
-    px.fill_rect(c, 16, 14, c.width - 32, 28, px.rgb(58, 66, 76)); // url bar
+// Kept here because it must not move while it is open.
+let is ui.program.Program as prog with mut;
 
-    // two content cards with a colored accent stripe on top
-    px.fill_rect(c, 24, 88, 384, 232, px.rgb(255, 255, 255));
-    px.fill_rect(c, 24, 88, 384, 6,   px.rgb(59, 130, 246)); // blue
-    px.fill_rect(c, 440, 88, 384, 232, px.rgb(255, 255, 255));
-    px.fill_rect(c, 440, 88, 384, 6,   px.rgb(239, 68, 68)); // red
+fn _is_check(s as *u8) as i32 {
+    let is *u8 as want = "--check";
+    let is i64 as i with mut = 0;
+    while (want[i] != 0) {
+        if (s[i] != want[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, s[i] == 0);
 }
 
-fn main() as i32 {
-    let is gfx.Surface as s;
-    let is i64 as r = gfx.open(&s, "Caustic Browser", 1024, 720);
-    if (r != 0) { return 1; }
-
-    // Draw when the picture is stale and sleep otherwise: an idle window costs
-    // nothing. A frame the platform cannot take yet stays owed until it can.
-    let is i32 as dirty with mut = 1;
-    let is i32 as running with mut = 1;
-    while (running == 1) {
-        if (dirty == 1 && gfx.begin(&s) == 1) {
-            paint(&s.canvas);
-            gfx.present(&s);
-            dirty = 0;
-        }
-        gfx.wait_event(&s);
-        let is i32 as ev with mut = gfx.poll(&s);
-        while (ev != gfx.EV_NONE) {
-            if (ev == gfx.EV_CLOSE) { running = 0; }
-            if (ev == gfx.EV_REDRAW) { dirty = 1; }
-            ev = gfx.poll(&s);
-        }
-        if (gfx.should_close(&s) == 1) { running = 0; }
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as checking = cast(i32, env.argc() > 1 && _is_check(env.argv(1)) == 1);
+    if (ui.program.open(&prog, cast(*u8, 0)) == 0) {
+        io.write_str(2, "caustic-browser: no fonts on this system\n");
+        return 1;
     }
-
-    gfx.close(&s);
+    if (browser.open(&prog) == 0) {
+        io.write_str(2, "caustic-browser: could not open a window\n");
+        ui.program.close(&prog);
+        return 1;
+    }
+    let is i64 as fails with mut = 0;
+    if (checking == 1) { fails = browser.check(); }
+    else { ui.program.run(&prog); }
+    ui.program.close(&prog);
+    browser.free_docs();
+    if (checking == 0) { return 0; }
+    if (fails != 0) { return cast(i32, fails); }
+    io.write_str(1, "browser: all checks pass\n");
     return 0;
 }

@@ -1,0 +1,106 @@
+// paint/display_list.cst — what a page draws, as data.
+//
+// Layout ends here. The list says what to draw and page_view says how, so the
+// engine never touches the toolkit and everything above this line can be tested
+// by comparing lists, with no window and nothing linked.
+//
+// Coordinates are logical pixels from the page's top left. Text is not copied: a
+// command points at bytes its producer keeps alive for as long as the list is
+// drawn.
+
+use "std/mem.cst" as mem;
+
+let is i64 as RECT with imut = 1;
+let is i64 as TEXT with imut = 2;
+
+let is i64 as ERR_ALLOC with imut = 0 - 1;
+let is i64 as INIT_CAP  with imut = 256;
+
+struct Cmd {
+    kind   as i64;
+    x      as f64;
+    y      as f64;
+    w      as f64;    // TEXT: where the lines wrap
+    h      as f64;    // RECT only
+    color  as i64;    // 0xRRGGBB
+    text   as *u8;    // TEXT only
+    len    as i64;
+    size   as f64;
+    weight as i64;
+}
+
+struct List {
+    cmds as *Cmd;
+    n    as i64;
+    cap  as i64;
+}
+
+fn rgb(r as i64, g as i64, b as i64) as i64 { return r * 65536 + g * 256 + b; }
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0 || v == 0 - 1) { return 0; }
+    return 1;
+}
+
+// 0 on success, ERR_ALLOC when there is no memory.
+fn init(l as *List) as i64 {
+    l.n = 0;
+    l.cap = 0;
+    l.cmds = cast(*Cmd, 0);
+    let is *u8 as p = mem.core.mmap_anon(INIT_CAP * sizeof(Cmd));
+    if (_map_ok(p) == 0) { return ERR_ALLOC; }
+    l.cmds = cast(*Cmd, p);
+    l.cap = INIT_CAP;
+    return 0;
+}
+
+fn free(l as *List) as void {
+    if (l.cap > 0) { mem.core.munmap(cast(*u8, l.cmds), l.cap * sizeof(Cmd)); }
+    l.cmds = cast(*Cmd, 0);
+    l.n = 0;
+    l.cap = 0;
+}
+
+fn clear(l as *List) as void { l.n = 0; }
+fn count(l as *List) as i64 { return l.n; }
+fn at(l as *List, i as i64) as *Cmd {
+    return cast(*Cmd, cast(i64, l.cmds) + i * sizeof(Cmd));
+}
+
+// The next free command, or null when the list could not grow. What is already
+// listed stays either way, so a page short of memory draws what it had.
+fn _next(l as *List) as *Cmd {
+    if (l.n == l.cap) {
+        let is i64 as bytes = l.cap * sizeof(Cmd);
+        let is *u8 as p = mem.core.mmap_anon(bytes * 2);
+        if (_map_ok(p) == 0) { return cast(*Cmd, 0); }
+        mem.core.memcpy(p, cast(*u8, l.cmds), bytes);
+        mem.core.munmap(cast(*u8, l.cmds), bytes);
+        l.cmds = cast(*Cmd, p);
+        l.cap = l.cap * 2;
+    }
+    l.n = l.n + 1;
+    return at(l, l.n - 1);
+}
+
+// 1 when listed, 0 when the list could not grow.
+fn rect(l as *List, x as f64, y as f64, w as f64, h as f64, color as i64) as i32 {
+    let is *Cmd as c = _next(l);
+    if (cast(i64, c) == 0) { return 0; }
+    c.kind = RECT;
+    c.x = x; c.y = y; c.w = w; c.h = h;
+    c.color = color;
+    c.text = cast(*u8, 0); c.len = 0; c.size = 0.0; c.weight = 0;
+    return 1;
+}
+
+fn text(l as *List, x as f64, y as f64, w as f64, s as *u8, n as i64, size as f64, weight as i64, color as i64) as i32 {
+    let is *Cmd as c = _next(l);
+    if (cast(i64, c) == 0) { return 0; }
+    c.kind = TEXT;
+    c.x = x; c.y = y; c.w = w; c.h = 0.0;
+    c.color = color;
+    c.text = s; c.len = n; c.size = size; c.weight = weight;
+    return 1;
+}

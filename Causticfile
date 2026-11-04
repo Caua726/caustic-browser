@@ -4,32 +4,37 @@ author "Cauã Alvarenga Neves"
 
 // caustic-browser — build and test surface.
 //
-//   caustic-mk run test        the tokenizer and surface tests, then the window build
+//   caustic-mk run test        the tokenizer and paint tests, then the window, driven
 //   caustic-mk build browser   the window
 //   caustic-mk run clean       build artifacts
 //
-// caustic-media opens the window and hands out the buffer we draw into. Its X11
-// backend links libX11, libXext and libxkbcommon, so `browser` needs them to
-// start. The tests import no window code and link nothing, so they run anywhere.
+// caustic-media's toolkit is the window. Its X11 backend links glibc and libX11,
+// libXext, libXi, libXfixes, libXrandr, libXcursor and libxkbcommon, so `browser`
+// needs them to start. The tokenizer and paint tests link nothing.
 depend "caustic-media" in "https://github.com/Caua726/caustic-media" tag "v0.0.1"
 
 // ── Targets ──────────────────────────────────────────────────────────
 
 target "browser"  { src "src/main.cst"       out "build/browser" }
-target "surftest" { src "tests/surftest.cst" out "build/surftest" }
+target "test_paint" { src "tests/test_paint.cst" out "build/test_paint" }
 target "test_tok" { src "tests/test_tok.cst" out "build/test_tok" }
 
 // ── Scripts ──────────────────────────────────────────────────────────
 
-// The surface test exercises the pixel code without opening a window, so it runs
-// anywhere. `browser` is built and not run, because it opens one.
+// The tokenizer and paint tests open no window and link nothing, so they run
+// anywhere. test-ui opens the real window on a private X server and drives it.
 script "test" {
     "caustic-mk build test_tok"
     "./build/test_tok"
-    "caustic-mk build surftest"
-    "./build/surftest"
+    "caustic-mk build test_paint"
+    "./build/test_paint"
+    "caustic-mk run test-ui"
+    "echo 'test: tokenizer green, paint green, window green'"
+}
+
+script "test-ui" {
     "caustic-mk build browser"
-    "echo 'test: tokenizer green, surface green, window builds'"
+    "env -u WAYLAND_DISPLAY xvfb-run -a ./build/browser --check"
 }
 
 // The tokenizer through BOTH optimizing backends. It is a state machine over a
@@ -46,17 +51,16 @@ script "test-opt" {
     "echo 'test-opt: tokenizer green at -O1 and -O2'"
 }
 
-// Everything test does, plus the tokenizer at all three levels, since that is
-// the whole cost of knowing rather than assuming. `browser` still only builds:
-// a runner has no display server to open it on.
+// What the published toolchain can build: the tokenizer at all three levels and
+// the paint tests. `browser` is left out because the v0.1.11 release cannot compile
+// caustic-media, and a runner has no reason to have the libraries it opens with.
 script "test-ci" {
     "caustic-mk build test_tok"
     "./build/test_tok"
     "caustic-mk run test-opt"
-    "caustic-mk build surftest"
-    "./build/surftest"
-    "caustic-mk build browser"
-    "echo 'test-ci: tokenizer green at -O0/-O1/-O2, surface green, window builds'"
+    "caustic-mk build test_paint"
+    "./build/test_paint"
+    "echo 'test-ci: tokenizer green at -O0/-O1/-O2, paint green (window not built here)'"
 }
 
 script "clean" {

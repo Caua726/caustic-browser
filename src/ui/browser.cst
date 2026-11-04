@@ -1,0 +1,234 @@
+// ui/browser.cst — the window: tabs, each with its toolbar, address and page.
+//
+// The toolbar lives inside the tab rather than above the strip's pages, because
+// the tabs widget holds strip and pages as one, and because what the toolbar shows
+// (the address, whether there is a page to go back to) belongs to that tab anyway.
+
+use "std/io.cst" as io;
+use "caustic-media/ui/ui.cst" as ui;
+use "caustic-media/input/keys.cst" as keys;
+use "../paint/display_list.cst" as dl;
+use "../paint/placeholder.cst" as placeholder;
+use "./page_view.cst" as pv;
+
+let is i64 as MAX_TABS with imut = 32;
+
+let is *u8 as NAME         with imut = "Caustic Browser";
+let is *u8 as NEW_TITLE    with imut = "Nova aba";
+let is *u8 as NO_NAV       with imut = "A navegação ainda não existe";
+let is *u8 as NO_ROOM      with imut = "Não foi possível abrir outra aba";
+
+let is i64 as NEW_TAB   with imut = 1;
+let is i64 as CLOSE_TAB with imut = 2;
+let is i64 as QUIT      with imut = 3;
+
+// One tab: its widgets, and the document it owns.
+struct Doc {
+    entry as i64;
+    view  as i64;
+    list  as dl.List;
+}
+
+struct Browser {
+    a      as *ui.app.App;
+    hs     as *ui.host.Host;
+    t      as *ui.tree.Tree;
+    r      as *ui.router.Router;
+    win    as i64;
+    tabs   as i64;
+    status as i64;
+    menu   as i64;
+    n      as i64;
+    docs   as [MAX_TABS]Doc;
+}
+
+let is Browser as br with mut;
+let is i64 as _fails with mut = 0;
+
+fn _doc(i as i64) as *Doc { return &br.docs[i]; }
+
+fn _say(s as *u8) as void {
+    ui.statusbar.pop(br.t, br.status, 1);
+    ui.statusbar.push(br.t, br.status, 1, s, ui.len(s));
+}
+
+// The tab on the screen, -1 if none is.
+fn _current() as i64 { return ui.tabs.current(br.t, br.tabs); }
+
+// A new tab, made current, with the focus in its address. 1, or 0 when there is
+// no room for it.
+fn new_tab() as i32 {
+    if (br.n >= MAX_TABS) { _say(NO_ROOM); return 0; }
+    let is *ui.tree.Tree as t = br.t;
+    let is *Doc as d = _doc(br.n);
+    if (dl.init(&d.list) != 0) { _say(NO_ROOM); return 0; }
+    placeholder.fill(&d.list);
+
+    let is i64 as page = ui.tab(t, br.tabs, NEW_TITLE);
+    if (page == 0) { dl.free(&d.list); _say(NO_ROOM); return 0; }
+    let is i64 as i = ui.tabs.count(t, br.tabs) - 1;
+    ui.tabs.set_closable(t, br.tabs, i, 1);
+    let is i64 as col = ui.box.create(t, page, ui.box.COLUMN);
+
+    let is i64 as row = ui.box.create(t, col, ui.box.ROW);
+    ui.box.set_spacing(t, row, 6.0);
+    ui.layout.set_margin(t, row, 6.0, 4.0, 6.0, 4.0);
+    let is i64 as nav = ui.toolbar.create(t, row);
+    // Nothing to go back to or reload until there is navigation.
+    ui.tree.set_enabled(t, ui.tool_button(t, nav, "Voltar"), 0);
+    ui.tree.set_enabled(t, ui.tool_button(t, nav, "Avançar"), 0);
+    ui.tree.set_enabled(t, ui.tool_button(t, nav, "Recarregar"), 0);
+    d.entry = ui.entry.create(t, row);
+    ui.layout.set_stretch(t, d.entry, 1.0, 0.0);
+    ui.placeholder(t, d.entry, "Digite um endereço");
+    ui.on(t, d.entry, ui.signal.ACTIVATED, fn_ptr(_address_typed));
+    let is i64 as more = ui.toolbar.create(t, row);
+    ui.on(t, ui.tool_button(t, more, "+"), ui.signal.CLICKED, fn_ptr(_plus_clicked));
+    ui.menubutton.set_menu(t, ui.menubutton(t, row, "Menu"), br.menu);
+
+    d.view = pv.create(t, col, &d.list);
+    ui.layout.set_stretch(t, d.view, 1.0, 1.0);
+
+    br.n = br.n + 1;
+    ui.tabs.set_current(t, br.tabs, i);
+    ui.router.focus(t, br.r, d.entry, 1);
+    return 1;
+}
+
+// The last tab takes the window with it.
+fn close_tab(i as i64) as void {
+    if (i < 0 || i >= br.n) { return; }
+    if (br.n == 1) { ui.app.window_close(br.a, br.win); return; }
+    ui.tabs.remove(br.t, br.tabs, i);
+    dl.free(&_doc(i).list);
+    // Docs keep the tabs' order, so the ones after it move down, and each view
+    // has to be told where its list went.
+    let is i64 as k with mut = i;
+    while (k + 1 < br.n) {
+        br.docs[k] = br.docs[k + 1];
+        pv.set_list(br.t, _doc(k).view, &_doc(k).list);
+        k = k + 1;
+    }
+    br.n = br.n - 1;
+    // The focus went with the tab: without this, typing goes nowhere.
+    _focus_address();
+}
+
+fn _focus_address() as void {
+    let is i64 as i = _current();
+    if (i >= 0 && i < br.n) { ui.router.focus(br.t, br.r, _doc(i).entry, 1); }
+}
+
+fn _act(id as i64) as void {
+    if (id == NEW_TAB) { new_tab(); }
+    if (id == CLOSE_TAB) { close_tab(_current()); }
+    if (id == QUIT) { ui.app.window_close(br.a, br.win); }
+}
+
+fn _address_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _say(NO_NAV); }
+fn _plus_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { new_tab(); }
+fn _menu_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void { _act(*cast(*i64, arg)); }
+fn _tab_closed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { close_tab(*cast(*i64, arg)); }
+fn _key_new(user as *u8) as void { _act(NEW_TAB); }
+fn _key_close(user as *u8) as void { _act(CLOSE_TAB); }
+fn _key_quit(user as *u8) as void { _act(QUIT); }
+fn _key_address(user as *u8) as void { _focus_address(); }
+
+fn _item(s as *u8, id as i64, k as i32) as void {
+    ui.menu.set_accel(br.t, ui.menu_item(br.t, br.menu, s, id), k, keys.MOD_CONTROL);
+}
+
+// The window, with one tab. 1, or 0 when it could not be opened.
+fn open(p as *ui.program.Program) as i32 {
+    br.a = ui.program.app(p);
+    br.hs = ui.program.host(p);
+    br.n = 0;
+    br.win = ui.app.window_open(br.a, 1024.0, 720.0);
+    if (br.win == 0) { return 0; }
+    ui.app.set_title(br.a, br.win, NAME, ui.len(NAME));
+    br.t = ui.app.tree(br.a, br.win);
+    br.r = ui.app.router(br.a, br.win);
+    let is *ui.tree.Tree as t = br.t;
+
+    br.menu = ui.menu.create(t);
+    _item("_Nova aba", NEW_TAB, keys.T);
+    _item("_Fechar aba", CLOSE_TAB, keys.W);
+    ui.menu.add_separator(t, br.menu);
+    _item("_Sair", QUIT, keys.Q);
+    ui.on(t, br.menu, ui.signal.ACTIVATED, fn_ptr(_menu_chosen));
+
+    let is i64 as col = ui.box.create(t, ui.tree.root(t), ui.box.COLUMN);
+    br.tabs = ui.tabs.create(t, col);
+    ui.layout.set_stretch(t, br.tabs, 1.0, 1.0);
+    ui.on(t, br.tabs, ui.signal.CLOSED, fn_ptr(_tab_closed));
+    br.status = ui.statusbar.create(t, col);
+
+    ui.router.add_shortcut(br.r, keys.T, keys.MOD_CONTROL, fn_ptr(_key_new), cast(*u8, 0));
+    ui.router.add_shortcut(br.r, keys.W, keys.MOD_CONTROL, fn_ptr(_key_close), cast(*u8, 0));
+    ui.router.add_shortcut(br.r, keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit), cast(*u8, 0));
+    ui.router.add_shortcut(br.r, keys.L, keys.MOD_CONTROL, fn_ptr(_key_address), cast(*u8, 0));
+
+    return new_tab();
+}
+
+// After the program closed: the views are gone, so the lists can go.
+fn free_docs() as void {
+    let is i64 as i with mut = 0;
+    while (i < br.n) { dl.free(&_doc(i).list); i = i + 1; }
+    br.n = 0;
+}
+
+// --- --check -----------------------------------------------------------------
+
+fn _expect(what as *u8, ok as i32) as void {
+    if (ok == 1) { return; }
+    _fails = _fails + 1;
+    io.write_str(1, "FAIL  ");
+    io.write_str(1, what);
+    io.write_str(1, "\n");
+}
+
+fn _rounds(n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { ui.host.step(br.hs, 20); k = k + 1; }
+}
+
+fn _views_hold_their_lists() as i32 {
+    let is i64 as i with mut = 0;
+    while (i < br.n) {
+        if (cast(i64, pv.list_of(br.t, _doc(i).view)) != cast(i64, &_doc(i).list)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Drives the window through what a person does with tabs. Returns the failures.
+fn check() as i64 {
+    _rounds(10);
+    _expect("the window is on the screen", cast(i32, ui.host.shown(br.hs) == 1));
+    _expect("it opens with one tab", cast(i32, br.n == 1 && ui.tabs.count(br.t, br.tabs) == 1));
+    _expect("the first tab has its page", cast(i32, dl.count(&_doc(0).list) > 0));
+
+    new_tab();
+    new_tab();
+    _rounds(5);
+    _expect("two more tabs", cast(i32, br.n == 3 && ui.tabs.count(br.t, br.tabs) == 3));
+    _expect("a new tab is the current one", cast(i32, _current() == 2));
+    _expect("the focus is in its address", cast(i32, ui.router.focused(br.t, br.r) == _doc(2).entry));
+
+    close_tab(0);
+    _rounds(5);
+    _expect("closing one leaves two", cast(i32, br.n == 2 && ui.tabs.count(br.t, br.tabs) == 2));
+    _expect("the views follow their lists", _views_hold_their_lists());
+    _expect("the focus moves to the tab left on the screen", cast(i32, ui.router.focused(br.t, br.r) == _doc(_current()).entry));
+
+    close_tab(99);
+    _expect("no such tab: nothing closes", cast(i32, br.n == 2));
+
+    close_tab(1);
+    _rounds(5);
+    close_tab(0);
+    _rounds(5);
+    _expect("the last tab takes the window", cast(i32, ui.host.shown(br.hs) == 0));
+    return _fails;
+}

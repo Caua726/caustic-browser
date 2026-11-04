@@ -1,6 +1,6 @@
 # caustic-browser
 
-**A web browser written in [Caustic](https://github.com/Caua726/Caustic), from the pixels up. Milestone 1.**
+**A web browser written in [Caustic](https://github.com/Caua726/Caustic). Milestone 1.**
 
 ![version](https://img.shields.io/badge/version-0.0.2-blue)
 ![status](https://img.shields.io/badge/status-M1%20%C2%B7%20tokeniser-orange)
@@ -8,31 +8,37 @@
 ![dependencies](https://img.shields.io/badge/dependencies-caustic--media-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Read this first.** Two things exist. A window that paints a mock of a
-> browser UI by writing individual pixels into a CPU buffer, and an HTML
-> tokeniser that passes the whole html5lib conformance suite. There is **no tree
-> builder, no CSS, no layout engine, no JavaScript and no networking** — nothing
-> connects the two yet. The name describes the intent, not the contents.
+> **Read this first.** Two things exist. A browser window with tabs, an address
+> bar and a page area showing fixed content, and an HTML tokeniser that passes the
+> whole html5lib conformance suite. There is **no tree builder, no CSS, no layout
+> engine, no JavaScript and no networking** — nothing connects the two yet. The
+> name describes the intent, not the contents.
 
 ## What M0 establishes
 
-The platform seam. [`caustic-media`](https://github.com/Caua726/caustic-media)
-opens the window and hands out a buffer each frame; **the drawing is ours**. There
-is no GPU involved — `clear`, `fill_rect` and `put_pixel` in
-`src/platform/pixels.cst` write bytes into that buffer, and `present` in
-`src/platform/surface.cst` hands it to the compositor.
+The window, on the toolkit of
+[`caustic-media`](https://github.com/Caua726/caustic-media): tabs, each with its own
+toolbar, address and page, the usual shortcuts (`Ctrl+T`, `Ctrl+W`, `Ctrl+L`,
+`Ctrl+Q`) and a status bar. Voltar, Avançar and Recarregar stay disabled, and typing
+an address only says navigation does not exist yet, because it does not.
 
-That matters for what comes next: a browser is a program that decides the colour
-of every pixel it shows. Starting from a rasteriser we own, instead of from a
-drawing API we borrow, means the layout and paint layers have somewhere to land
-that will not have to be rewritten when the toolkit is not enough.
+The page area is the one widget of our own. It plays back a **display list**, and
+that list is the boundary that matters for what comes next: the engine ends there
+and never touches the toolkit, so layout and paint can be tested by comparing lists,
+with no window and nothing linked. Text and shapes on the other side of it come from
+`caustic-media`'s `text/` and `render/`.
 
 ```
-src/platform/surface.cst   the seam: open, begin, present, wait_event, poll, close
-src/platform/pixels.cst    what draws: rgb, put_pixel, fill_rect, clear
-src/main.cst               M0: paint the mock, then sleep until an event asks for another frame
-tests/surftest.cst         the pixel code, checked against a plain buffer
+src/main.cst               starts the program, or drives it with --check
+src/ui/browser.cst         the window: tabs, toolbar, address, status bar, shortcuts
+src/ui/page_view.cst       the page's widget: plays a display list back
+src/paint/display_list.cst what a page draws, as data
+src/paint/placeholder.cst  what a tab shows until there is a page to show
+tests/test_paint.cst       the display list, without a window
 ```
+
+**Known problem:** menu items open blank on X11, here and in `caustic-media`'s own
+`file_browser` example. Choosing one works, and each has a shortcut.
 
 ## What M1 establishes
 
@@ -85,20 +91,23 @@ the tree builder will want anyway.
 ## Not built yet
 
 Everything else, in the order it is likely to be needed: the tree builder, a URL
-parser and HTTP (from [`caustic-net`](https://github.com/Caua726/caustic-net),
-which now does `fetch(url) -> bytes` with TLS), CSS parsing and the cascade, box
-layout, text shaping and font rasterisation, the paint tree, and — much later,
-if ever — a JavaScript engine.
+parser and HTTP (from [`caustic-net`](https://github.com/Caua726/caustic-net), which
+now does `fetch(url) -> bytes` with TLS), CSS parsing and the cascade, box layout,
+and — much later, if ever — a JavaScript engine. Fonts, shaping and image decoding
+come from `caustic-media`.
 
 ## Building it
 
-Requires the [Caustic toolchain](https://github.com/Caua726/Caustic).
-[`caustic-media`](https://github.com/Caua726/caustic-media) is a declared
-dependency, cloned into `.caustic/deps` at its pinned tag on the first build. The
-tests link nothing; the window needs libX11, libXext and libxkbcommon to start.
+Requires a [Caustic toolchain](https://github.com/Caua726/Caustic) built from
+source: `caustic-media` does not compile with the v0.1.11 release.
+[`caustic-media`](https://github.com/Caua726/caustic-media) is a declared dependency,
+cloned into `.caustic/deps` at its pinned tag on the first build. The tokeniser and
+paint tests link nothing. The window needs glibc, libX11, libXext, libXi, libXfixes,
+libXrandr, libXcursor and libxkbcommon to start, and `test-ui` needs `xvfb-run` and
+at least one font.
 
 ```sh
-caustic-mk run test         # the tokeniser suite, the surface test, the window build
+caustic-mk run test         # the tokeniser and paint suites, then the window, driven
 caustic-mk run test-opt     # the tokeniser suite at -O1 and -O2
 caustic-mk build browser && ./build/browser
 ```

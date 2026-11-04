@@ -1,0 +1,19 @@
+// paint/placeholder.cst — what a tab shows until there is a page to show.
+
+use "./display_list.cst" as dl;
+
+let is *u8 as TITLE with imut = "Caustic Browser";
+let is *u8 as BODY  with imut = "Esta aba ainda não carrega páginas. A interface é real; o conteúdo é fixo até existirem rede, árvore, CSS e layout.";
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn fill(l as *dl.List) as void {
+    dl.clear(l);
+    dl.text(l, 32.0, 28.0, 640.0, TITLE, _len(TITLE), 28.0, 700, dl.rgb(32, 40, 48));
+    dl.rect(l, 32.0, 72.0, 96.0, 4.0, dl.rgb(59, 130, 246));
+    dl.text(l, 32.0, 92.0, 640.0, BODY, _len(BODY), 16.0, 400, dl.rgb(58, 66, 76));
+}
