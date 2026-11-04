@@ -1,40 +1,48 @@
 // caustic-browser — M0: open a window and paint OUR pixels into it.
 //
 // Everything you see is written by us into the Surface buffer (put_pixel/
-// fill_rect) — SDL only opens the window and publishes the buffer. No SDL
-// drawing calls, no GPU. This proves the platform seam end to end.
+// fill_rect) — caustic-media only opens the window and publishes the buffer. No
+// GPU. This proves the platform seam end to end.
 
 use "platform/surface.cst" as gfx;
+use "platform/pixels.cst" as px;
+
+// A tiny hand-painted "browser" mock, all our own pixels.
+fn paint(c as *px.Canvas) as void {
+    px.clear(c, px.rgb(245, 245, 247));                      // page background
+    px.fill_rect(c, 0, 0, c.width, 56, px.rgb(32, 40, 48));  // chrome / top bar
+    px.fill_rect(c, 16, 14, c.width - 32, 28, px.rgb(58, 66, 76)); // url bar
+
+    // two content cards with a colored accent stripe on top
+    px.fill_rect(c, 24, 88, 384, 232, px.rgb(255, 255, 255));
+    px.fill_rect(c, 24, 88, 384, 6,   px.rgb(59, 130, 246)); // blue
+    px.fill_rect(c, 440, 88, 384, 232, px.rgb(255, 255, 255));
+    px.fill_rect(c, 440, 88, 384, 6,   px.rgb(239, 68, 68)); // red
+}
 
 fn main() as i32 {
     let is gfx.Surface as s;
     let is i64 as r = gfx.open(&s, "Caustic Browser", 1024, 720);
     if (r != 0) { return 1; }
 
-    // A tiny hand-painted "browser" mock, all our own pixels.
-    gfx.clear(&s, gfx.rgb(245, 245, 247));                      // page background
-    gfx.fill_rect(&s, 0, 0, s.width, 56, gfx.rgb(32, 40, 48));  // chrome / top bar
-    gfx.fill_rect(&s, 16, 14, s.width - 32, 28, gfx.rgb(58, 66, 76)); // url bar
-
-    // two content cards with a colored accent stripe on top
-    gfx.fill_rect(&s, 24, 88, 384, 232, gfx.rgb(255, 255, 255));
-    gfx.fill_rect(&s, 24, 88, 384, 6,   gfx.rgb(59, 130, 246)); // blue
-    gfx.fill_rect(&s, 440, 88, 384, 232, gfx.rgb(255, 255, 255));
-    gfx.fill_rect(&s, 440, 88, 384, 6,   gfx.rgb(239, 68, 68)); // red
-
-    gfx.present(&s);
-
-    // event loop — idle until quit/close (event-driven, not a busy spin)
+    // Draw when the picture is stale and sleep otherwise: an idle window costs
+    // nothing. A frame the platform cannot take yet stays owed until it can.
+    let is i32 as dirty with mut = 1;
     let is i32 as running with mut = 1;
     while (running == 1) {
-        let is i32 as ev with mut = gfx.poll();
-        while (ev != gfx.EV_NONE) {
-            if (ev == gfx.EV_QUIT) { running = 0; }
-            if (ev == gfx.EV_WINDOW_CLOSE) { running = 0; }
-            ev = gfx.poll();
+        if (dirty == 1 && gfx.begin(&s) == 1) {
+            paint(&s.canvas);
+            gfx.present(&s);
+            dirty = 0;
         }
-        gfx.present(&s);
-        gfx.delay(16);
+        gfx.wait_event(&s);
+        let is i32 as ev with mut = gfx.poll(&s);
+        while (ev != gfx.EV_NONE) {
+            if (ev == gfx.EV_CLOSE) { running = 0; }
+            if (ev == gfx.EV_REDRAW) { dirty = 1; }
+            ev = gfx.poll(&s);
+        }
+        if (gfx.should_close(&s) == 1) { running = 0; }
     }
 
     gfx.close(&s);

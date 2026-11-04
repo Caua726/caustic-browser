@@ -4,20 +4,14 @@ author "Cauã Alvarenga Neves"
 
 // caustic-browser — build and test surface.
 //
-//   caustic-mk run test        the surface test, then the window build
+//   caustic-mk run test        the tokenizer and surface tests, then the window build
 //   caustic-mk build browser   the window
 //   caustic-mk run clean       build artifacts
 //
-// caustic-sdl3 used to be both a git submodule and a `depend` on the local
-// directory that submodule checked out into. That is two mechanisms for one
-// dependency and neither of them pinned anything useful: the submodule pinned a
-// commit that `depend` then ignored, and `depend` read whatever happened to be
-// on disk. It also relied on a file — windowsurface.cst — that was never
-// committed to caustic-sdl3 at all, so this could only ever have been built on
-// the one machine that had it.
-//
-// One mechanism now, pinned to a tag, resolved from the published repository.
-depend "caustic-sdl3" in "https://github.com/Caua726/caustic-sdl3" tag "v0.1.0"
+// caustic-media opens the window and hands out the buffer we draw into. Its X11
+// backend links libX11, libXext and libxkbcommon, so `browser` needs them to
+// start. The tests import no window code and link nothing, so they run anywhere.
+depend "caustic-media" in "https://github.com/Caua726/caustic-media" tag "v0.0.1"
 
 // ── Targets ──────────────────────────────────────────────────────────
 
@@ -27,9 +21,8 @@ target "test_tok" { src "tests/test_tok.cst" out "build/test_tok" }
 
 // ── Scripts ──────────────────────────────────────────────────────────
 
-// The surface test exercises the platform seam without opening a window, so it
-// runs anywhere SDL3 is installed. `browser` is built and not run, because it
-// opens one.
+// The surface test exercises the pixel code without opening a window, so it runs
+// anywhere. `browser` is built and not run, because it opens one.
 script "test" {
     "caustic-mk build test_tok"
     "./build/test_tok"
@@ -53,23 +46,17 @@ script "test-opt" {
     "echo 'test-opt: tokenizer green at -O1 and -O2'"
 }
 
-// Build both and run neither.
-//
-// Everything here links SDL3 — the dependency's `system "SDL3"` is collected
-// transitively, so even surftest is dynamically linked against libSDL3.so and
-// will not load without it. Ubuntu's current LTS has no SDL3 package, so a
-// runner cannot have it without building SDL from source, which would say
-// nothing about this repository. Compiling is what CI can honestly check here:
-// that the dependency resolves and both targets build.
-// The tokenizer links nothing and CAN run on a runner, so it does — at all
-// three levels, since that is the whole cost of knowing rather than assuming.
+// Everything test does, plus the tokenizer at all three levels, since that is
+// the whole cost of knowing rather than assuming. `browser` still only builds:
+// a runner has no display server to open it on.
 script "test-ci" {
     "caustic-mk build test_tok"
     "./build/test_tok"
     "caustic-mk run test-opt"
     "caustic-mk build surftest"
+    "./build/surftest"
     "caustic-mk build browser"
-    "echo 'test-ci: tokenizer green at -O0/-O1/-O2; SDL3 targets build (not run — no SDL3 on the runner)'"
+    "echo 'test-ci: tokenizer green at -O0/-O1/-O2, surface green, window builds'"
 }
 
 script "clean" {

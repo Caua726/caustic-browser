@@ -5,7 +5,7 @@
 ![version](https://img.shields.io/badge/version-0.0.2-blue)
 ![status](https://img.shields.io/badge/status-M1%20%C2%B7%20tokeniser-orange)
 ![html5lib](https://img.shields.io/badge/html5lib-7032%2F7032-brightgreen)
-![dependencies](https://img.shields.io/badge/dependencies-caustic--sdl3-brightgreen)
+![dependencies](https://img.shields.io/badge/dependencies-caustic--media-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 > **Read this first.** Two things exist. A window that paints a mock of a
@@ -16,10 +16,11 @@
 
 ## What M0 establishes
 
-The platform seam. SDL3 opens the window and publishes a buffer; **nothing else
-is SDL's**. There are no SDL drawing calls and no GPU involved — `clear`,
-`fill_rect` and `put_pixel` in `src/platform/surface.cst` write bytes into the
-window's own pixel buffer, and `present` hands it to the compositor.
+The platform seam. [`caustic-media`](https://github.com/Caua726/caustic-media)
+opens the window and hands out a buffer each frame; **the drawing is ours**. There
+is no GPU involved — `clear`, `fill_rect` and `put_pixel` in
+`src/platform/pixels.cst` write bytes into that buffer, and `present` in
+`src/platform/surface.cst` hands it to the compositor.
 
 That matters for what comes next: a browser is a program that decides the colour
 of every pixel it shows. Starting from a rasteriser we own, instead of from a
@@ -27,9 +28,10 @@ drawing API we borrow, means the layout and paint layers have somewhere to land
 that will not have to be rewritten when the toolkit is not enough.
 
 ```
-src/platform/surface.cst   the seam: open, clear, put_pixel, fill_rect, present, poll, close
-src/main.cst               M0: paint the mock, then an event-driven idle loop
-tests/surftest.cst         the seam, exercised without opening a window
+src/platform/surface.cst   the seam: open, begin, present, wait_event, poll, close
+src/platform/pixels.cst    what draws: rgb, put_pixel, fill_rect, clear
+src/main.cst               M0: paint the mock, then sleep until an event asks for another frame
+tests/surftest.cst         the pixel code, checked against a plain buffer
 ```
 
 ## What M1 establishes
@@ -90,9 +92,10 @@ if ever — a JavaScript engine.
 
 ## Building it
 
-Requires the [Caustic toolchain](https://github.com/Caua726/Caustic) and SDL3.
-[`caustic-sdl3`](https://github.com/Caua726/caustic-sdl3) is a declared
-dependency, cloned into `.caustic/deps` at its pinned tag on the first build.
+Requires the [Caustic toolchain](https://github.com/Caua726/Caustic).
+[`caustic-media`](https://github.com/Caua726/caustic-media) is a declared
+dependency, cloned into `.caustic/deps` at its pinned tag on the first build. The
+tests link nothing; the window needs libX11, libXext and libxkbcommon to start.
 
 ```sh
 caustic-mk run test         # the tokeniser suite, the surface test, the window build
