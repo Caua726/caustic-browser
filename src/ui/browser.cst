@@ -289,15 +289,9 @@ fn _follow_width() as void {
     chrome.reveal_tab(br.t, _doc(br.cur).tab);
 }
 
-// What the main loop does between steps.
-fn _between_steps() as void {
-    theme.keep(br.a);
-    _follow_width();
-}
-
 // Until the last window closes.
 fn run() as void {
-    while (ui.host.step(br.hs, 0 - 1) == 1) { _between_steps(); }
+    while (ui.host.step(br.hs, 0 - 1) == 1) { _follow_width(); }
 }
 
 // After the program closed: the views are gone, so the lists can go.
@@ -325,7 +319,7 @@ fn _rounds(n as i64) as void {
     let is i64 as k with mut = 0;
     while (k < n) {
         ui.host.step(br.hs, 20);
-        _between_steps();
+        _follow_width();
         k = k + 1;
     }
 }

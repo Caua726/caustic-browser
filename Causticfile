@@ -11,7 +11,7 @@ author "Cauã Alvarenga Neves"
 // caustic-media's toolkit is the window. Its X11 backend links glibc and libX11,
 // libXext, libXi, libXfixes, libXrandr, libXcursor and libxkbcommon, so `browser`
 // needs them to start. The tokenizer and paint tests link nothing.
-depend "caustic-media" in "https://github.com/Caua726/caustic-media" tag "v0.0.1"
+depend "caustic-media" in "https://github.com/Caua726/caustic-media" tag "v0.0.2"
 
 // ── Targets ──────────────────────────────────────────────────────────
 

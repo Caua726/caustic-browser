@@ -41,9 +41,6 @@ src/paint/placeholder.cst  what a tab shows until there is a page to show
 tests/test_paint.cst       the display list, without a window
 ```
 
-**Known problem:** menu items open blank on X11, here and in `caustic-media`'s own
-`file_browser` example. Choosing one works, and each has a shortcut.
-
 ## What M1 establishes
 
 **The HTML tokeniser, WHATWG §13.2.5 — all of it.** 7032 of 7032 cases in the
