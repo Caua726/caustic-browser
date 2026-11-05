@@ -1,0 +1,442 @@
+// ui/chrome.cst — the parts of the window the toolkit has no widget for: the mark,
+// the tabs in the title bar, and buttons that are a drawn icon.
+//
+// Icons are drawn in solid colours, never faded with alpha, because the segments
+// overlap where they join and alpha would show every joint.
+
+use "std/math.cst" as fm;
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/render/draw2d.cst" as draw2d;
+use "caustic-media/render/shapes2d.cst" as shapes;
+use "caustic-media/text/layout/model.cst" as model;
+use "caustic-media/ui/tree.cst" as tree;
+use "caustic-media/ui/widget.cst" as widget;
+use "caustic-media/ui/geom.cst" as geom;
+use "caustic-media/ui/layout.cst" as layout;
+use "caustic-media/ui/event.cst" as event;
+use "caustic-media/ui/painter.cst" as painter;
+use "caustic-media/ui/signal.cst" as signal;
+use "caustic-media/ui/style.cst" as style;
+use "caustic-media/ui/access.cst" as access;
+use "caustic-media/ui/text.cst" as txt;
+use "caustic-media/ui/scroll.cst" as scroll;
+use "caustic-media/input/keys.cst" as keys;
+
+let is i32 as BACK    with imut = 1;
+let is i32 as FORWARD with imut = 2;
+let is i32 as RELOAD  with imut = 3;
+let is i32 as PLUS    with imut = 4;
+let is i32 as MORE    with imut = 5;
+
+let is f64 as TAB_PAD   with imut = 12.0;   // either side of a title; its × sits in this
+let is f64 as TAB_TEXT  with imut = 13.0;
+let is f64 as ICON_SIZE with imut = 30.0;   // what takes the pointer; icons draw at 18
+let is f64 as STROKE    with imut = 1.8;
+let is f64 as LOGO_W    with imut = 46.0;
+let is f64 as WHEEL     with imut = 48.0;   // the strip's travel per notch
+// What the title bar keeps from the tabs: the mark, the +, the window's buttons, and
+// room to take hold of the window and drag it.
+let is f64 as TABS_KEEP_OFF with imut = 300.0;
+let is f64 as TABS_LEAST    with imut = 120.0;
+
+let is txt.Run as _run with mut;
+let is i32 as _ready with mut = 0;
+let is tree.Kind as _logo_kind with mut;
+let is tree.Kind as _tab_kind with mut;
+let is tree.Kind as _tab_area_kind with mut;
+let is tree.Kind as _icon_kind with mut;
+
+struct Tab {
+    title   as *u8;
+    n       as i64;
+    active  as i32;
+    closing as i32;   // held down over the ×, or with the middle button
+    reveal  as i32;   // scroll it into view once it has been laid out
+    _pad0   as i32;
+}
+
+struct Icon {
+    icon     as i32;
+    pressing as i32;
+}
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _run = txt.run();
+    _logo_kind = widget.kind("browser_mark", 0);
+    _logo_kind.measure = fn_ptr(_logo_measure);
+    _logo_kind.paint = fn_ptr(_logo_paint);
+    _tab_area_kind = widget.kind("browser_tab_area", 0);
+    _tab_area_kind.measure = fn_ptr(_tab_area_measure);
+    _tab_area_kind.arrange = fn_ptr(_tab_area_arrange);
+    _tab_kind = widget.kind("browser_tab", sizeof(Tab));
+    _tab_kind.measure = fn_ptr(_tab_measure);
+    _tab_kind.paint = fn_ptr(_tab_paint);
+    _tab_kind.arrange = fn_ptr(_tab_arrange);
+    _tab_kind.event = fn_ptr(_tab_event);
+    _tab_kind.role = access.ROLE_TAB;
+    _tab_kind.access = fn_ptr(_tab_access);
+    _icon_kind = widget.kind("browser_icon", sizeof(Icon));
+    _icon_kind.measure = fn_ptr(_icon_measure);
+    _icon_kind.paint = fn_ptr(_icon_paint);
+    _icon_kind.event = fn_ptr(_icon_event);
+    _icon_kind.role = access.ROLE_BUTTON;
+    _icon_kind.access = fn_ptr(_icon_access);
+    _ready = 1;
+}
+
+// s laid out into _run on one line, in the interface's family. 1 when it could be.
+fn _lay(svc as *txt.Service, th as *style.Theme, s as *u8, n as i64, size as f64, weight as i64) as i32 {
+    let is txt.Style as st = txt.style_of(th.fonts.body);
+    st.family = th.fonts.family;
+    st.size = size;
+    st.weight = weight;
+    let is model.Params as pp = model.params();
+    pp.width = 0.0 - 1.0;
+    return txt.lay_plain(svc, &_run, s, n, &st, &pp);
+}
+
+// --- drawing ------------------------------------------------------------------
+
+fn _seg(c as *draw2d.Canvas, x0 as f64, y0 as f64, x1 as f64, y1 as f64, col as math.color.Color) as void {
+    let is f64 as dx = x1 - x0;
+    let is f64 as dy = y1 - y0;
+    let is f64 as len = fm.sqrt(dx * dx + dy * dy);
+    let is f64 as half = STROKE / 2.0;
+    if (len > 0.0) {
+        let is f64 as nx = 0.0 - dy / len * half;
+        let is f64 as ny = dx / len * half;
+        let is [4]f64 as xs;
+        let is [4]f64 as ys;
+        xs[0] = x0 + nx; ys[0] = y0 + ny;
+        xs[1] = x1 + nx; ys[1] = y1 + ny;
+        xs[2] = x1 - nx; ys[2] = y1 - ny;
+        xs[3] = x0 - nx; ys[3] = y0 - ny;
+        shapes.fill_convex(c, cast(*f64, &xs), cast(*f64, &ys), 4, col);
+    }
+    shapes.fill_circle(c, x0, y0, half, col);
+    shapes.fill_circle(c, x1, y1, half, col);
+}
+
+fn _arrow(c as *draw2d.Canvas, cx as f64, cy as f64, dir as f64, col as math.color.Color) as void {
+    _seg(c, cx - 8.0 * dir, cy, cx + 8.0 * dir, cy, col);
+    _seg(c, cx + 8.0 * dir, cy, cx + 2.5 * dir, cy - 5.5, col);
+    _seg(c, cx + 8.0 * dir, cy, cx + 2.5 * dir, cy + 5.5, col);
+}
+
+// Clockwise from the upper right, most of the way round, ending in an arrowhead.
+fn _reload(c as *draw2d.Canvas, cx as f64, cy as f64, col as math.color.Color) as void {
+    let is f64 as r = 7.5;
+    let is f64 as deg = 3.14159265358979 / 180.0;
+    let is f64 as from = 0.0 - 25.0;
+    let is f64 as sweep = 295.0;
+    let is i64 as steps = 24;
+    let is i64 as i with mut = 0;
+    while (i < steps) {
+        let is f64 as a = (from + sweep * cast(f64, i) / cast(f64, steps)) * deg;
+        let is f64 as b = (from + sweep * cast(f64, i + 1) / cast(f64, steps)) * deg;
+        _seg(c, cx + r * fm.cos(a), cy + r * fm.sin(a), cx + r * fm.cos(b), cy + r * fm.sin(b), col);
+        i = i + 1;
+    }
+    let is f64 as end = (from + sweep) * deg;
+    let is f64 as tipx = cx + r * fm.cos(end);
+    let is f64 as tipy = cy + r * fm.sin(end);
+    _seg(c, tipx, tipy, tipx - 4.5, tipy - 4.0, col);
+    _seg(c, tipx, tipy, tipx - 5.5, tipy + 4.0, col);
+}
+
+fn _draw_icon(c as *draw2d.Canvas, icon as i32, cx as f64, cy as f64, col as math.color.Color) as void {
+    if (icon == BACK) { _arrow(c, cx, cy, 0.0 - 1.0, col); }
+    if (icon == FORWARD) { _arrow(c, cx, cy, 1.0, col); }
+    if (icon == RELOAD) { _reload(c, cx, cy, col); }
+    if (icon == PLUS) {
+        _seg(c, cx - 7.0, cy, cx + 7.0, cy, col);
+        _seg(c, cx, cy - 7.0, cx, cy + 7.0, col);
+    }
+    if (icon == MORE) {
+        shapes.fill_circle(c, cx - 6.0, cy, 1.7, col);
+        shapes.fill_circle(c, cx, cy, 1.7, col);
+        shapes.fill_circle(c, cx + 6.0, cy, 1.7, col);
+    }
+}
+
+// --- the mark -----------------------------------------------------------------
+
+fn logo(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_logo_kind, parent);
+    if (w != 0) { layout.set_stretch(t, w, 0.0, 1.0); }
+    return w;
+}
+
+fn _logo_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.min_w = LOGO_W;
+    out.pref_w = LOGO_W;
+    out.max_w = LOGO_W;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _logo_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) == 0) { return; }
+    if (_lay(svc, p.theme, "C", 1, 22.0, 800) == 1) {
+        txt.draw(svc, p.canvas, &_run, p.rect.x + 22.0 - _run.width / 2.0,
+                 p.rect.y + (p.rect.h - _run.height) / 2.0, math.color.hex(0xFFFFFF));
+    }
+    shapes.fill_rect(p.canvas, p.rect.x + LOGO_W - 1.0, p.rect.y + (p.rect.h - 16.0) / 2.0, 1.0, 16.0,
+                     p.theme.palette.separator);
+}
+
+// --- tabs ---------------------------------------------------------------------
+
+// Where the tabs' scroll area goes. A title bar gives what it holds all it asks for,
+// so a scroll area alone would ask for every tab and run under the window's buttons.
+// This asks for that much only while there is room.
+fn tab_area(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_tab_area_kind, parent);
+    if (w != 0) { layout.set_stretch(t, w, 0.0, 1.0); }
+    return w;
+}
+
+fn _tab_area_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    layout.measure(t, tree.first_child(t, w), c, out);
+    // The root has the window's size before anything is measured.
+    let is f64 as room with mut = layout.rect(t, tree.root(t)).w - TABS_KEEP_OFF;
+    if (room < TABS_LEAST) { room = TABS_LEAST; }
+    if (out.pref_w > room) { out.pref_w = room; }
+    out.min_w = 0.0;
+}
+
+fn _tab_area_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, r.w, r.h);
+    layout.place(t, tree.first_child(t, w), &all);
+}
+
+// A tab as the last child of parent, a row that is the content of a scroll area. It
+// keeps title, which must outlive it. Says CLICKED when chosen and CLOSED when asked
+// to close: both are the program's to do.
+fn tab(t as *tree.Tree, parent as i64, title as *u8, n as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_tab_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Tab as d = cast(*Tab, tree.data(t, w));
+    d.title = title;
+    d.n = n;
+    d.active = 0;
+    d.closing = 0;
+    d.reveal = 0;
+    layout.set_stretch(t, w, 0.0, 1.0);
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+fn _scroller(t as *tree.Tree, w as i64) as i64 { return tree.parent(t, tree.parent(t, w)); }
+
+// Scrolled into view at the next layout, the first time a new tab has a place.
+fn reveal_tab(t as *tree.Tree, w as i64) as void {
+    cast(*Tab, tree.data(t, w)).reveal = 1;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn _tab_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Tab as d = cast(*Tab, data);
+    if (d.reveal == 0) { return; }
+    d.reveal = 0;
+    scroll.scroll_to(t, _scroller(t, w), w, scroll.NEAREST, scroll.NEAREST);
+}
+
+fn _tab_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Tab as d = cast(*Tab, data);
+    if (q.action == access.ASK) {
+        q.name = d.title;
+        q.name_len = d.n;
+        q.actions = access.PRESS;
+        if (d.active == 1) { q.states = q.states | access.SELECTED; }
+        return 1;
+    }
+    if (q.action == access.PRESS) {
+        signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+        return 1;
+    }
+    return 0;
+}
+
+fn set_tab_active(t as *tree.Tree, w as i64, on as i32) as void {
+    cast(*Tab, tree.data(t, w)).active = on;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+fn tab_active(t as *tree.Tree, w as i64) as i32 {
+    return cast(*Tab, tree.data(t, w)).active;
+}
+
+fn _tab_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.max_h = layout.UNBOUNDED;
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) == 0) { return; }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is *Tab as d = cast(*Tab, data);
+    // At the active weight whatever its state, so choosing a tab moves nothing.
+    if (_lay(svc, &th, d.title, d.n, TAB_TEXT, 600) == 0) { return; }
+    out.min_w = _run.width + TAB_PAD * 2.0;
+    out.pref_w = out.min_w;
+    out.max_w = out.min_w;
+}
+
+fn _tab_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) == 0) { return; }
+    let is *Tab as d = cast(*Tab, data);
+    let is i32 as hover = painter.has(p, painter.S_HOVER);
+    let is i64 as weight with mut = 400;
+    if (d.active == 1) { weight = 600; }
+    if (_lay(svc, p.theme, d.title, d.n, TAB_TEXT, weight) == 0) { return; }
+    let is math.color.Color as col with mut = p.theme.palette.fg_dim;
+    if (d.active == 1 || hover == 1) { col = p.theme.palette.fg; }
+    txt.draw(svc, p.canvas, &_run, p.rect.x + TAB_PAD, p.rect.y + (p.rect.h - _run.height) / 2.0, col);
+    if (d.active == 1) {
+        shapes.fill_rounded(p.canvas, p.rect.x + TAB_PAD, p.rect.y + p.rect.h - 6.0, _run.width, 2.0,
+                            1.0, 1.0, 1.0, 1.0, p.theme.palette.accent);
+    }
+    if (hover == 1) {
+        let is f64 as cx = p.rect.x + p.rect.w - TAB_PAD / 2.0;
+        let is f64 as cy = p.rect.y + p.rect.h / 2.0;
+        _seg(p.canvas, cx - 3.0, cy - 3.0, cx + 3.0, cy + 3.0, col);
+        _seg(p.canvas, cx - 3.0, cy + 3.0, cx + 3.0, cy - 3.0, col);
+    }
+}
+
+fn _in_close(t as *tree.Tree, w as i64, e as *event.Event) as i32 {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    return cast(i32, e.local_x >= r.w - TAB_PAD && e.local_x < r.w && e.local_y >= 0.0 && e.local_y < r.h);
+}
+
+fn _plain(e as *event.Event) as i32 {
+    return cast(i32, e.mods == 0 && (e.key == keys.SPACE || e.key == keys.RETURN));
+}
+
+fn _tab_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Tab as d = cast(*Tab, data);
+    // A plain wheel moves the strip, which scrolls sideways and nothing else.
+    if (e.kind == event.SCROLL) {
+        scroll.scroll_by(t, _scroller(t, w), (e.dx + e.dy) * WHEEL, 0.0);
+        return 1;
+    }
+    if (e.kind == event.SHORTCUT_OVERRIDE) { return cast(i64, _plain(e)); }
+    if (e.kind == event.KEY_DOWN && _plain(e) == 1) {
+        signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+        return 1;
+    }
+    if (e.kind == event.POINTER_DOWN) {
+        if (e.button == 2) { d.closing = 2; return 1; }
+        if (e.button != 1) { return 0; }
+        if (_in_close(t, w, e) == 1) { d.closing = 1; return 1; }
+        signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP || e.kind == event.POINTER_CANCEL) {
+        let is i32 as was = d.closing;
+        d.closing = 0;
+        if (was == 0) { return 0; }
+        if (e.kind == event.POINTER_UP && (was == 2 || _in_close(t, w, e) == 1)) {
+            signal.emit(t, w, signal.CLOSED, cast(*u8, 0));
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// --- icon buttons -------------------------------------------------------------
+
+// A button showing icon, as the last child of parent. Says CLICKED.
+fn icon_button(t as *tree.Tree, parent as i64, icon as i32) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_icon_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Icon as d = cast(*Icon, tree.data(t, w));
+    d.icon = icon;
+    d.pressing = 0;
+    layout.set_stretch(t, w, 0.0, 1.0);
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+fn _icon_name(icon as i32) as *u8 {
+    if (icon == BACK) { return "Voltar"; }
+    if (icon == FORWARD) { return "Avançar"; }
+    if (icon == RELOAD) { return "Recarregar"; }
+    if (icon == PLUS) { return "Nova aba"; }
+    return "Menu";
+}
+
+fn _icon_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    if (q.action == access.ASK) {
+        q.name = _icon_name(cast(*Icon, data).icon);
+        q.name_len = 0;
+        while (q.name[q.name_len] != 0) { q.name_len = q.name_len + 1; }
+        q.actions = access.PRESS;
+        return 1;
+    }
+    if (q.action == access.PRESS) {
+        signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+        return 1;
+    }
+    return 0;
+}
+
+fn _icon_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.min_w = ICON_SIZE;
+    out.pref_w = ICON_SIZE;
+    out.max_w = ICON_SIZE;
+    out.min_h = ICON_SIZE;
+    out.pref_h = ICON_SIZE;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _icon_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Icon as d = cast(*Icon, data);
+    let is f64 as cx = p.rect.x + p.rect.w / 2.0;
+    let is f64 as cy = p.rect.y + p.rect.h / 2.0;
+    let is i32 as off = painter.has(p, painter.S_DISABLED);
+    if (off == 0 && (d.pressing == 1 || painter.has(p, painter.S_HOVER) == 1)) {
+        let is f64 as a with mut = 0.08;
+        if (d.pressing == 1) { a = 0.14; }
+        let is f64 as half = ICON_SIZE / 2.0;
+        shapes.fill_rounded(p.canvas, cx - half, cy - half, ICON_SIZE, ICON_SIZE, 9.0, 9.0, 9.0, 9.0,
+                            style.with_alpha(math.color.hex(0xFFFFFF), a));
+    }
+    let is math.color.Color as col with mut = p.theme.palette.fg;
+    if (off == 1) { col = math.color.hex(0x5A616B); }
+    _draw_icon(p.canvas, d.icon, cx, cy, col);
+}
+
+fn _icon_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Icon as d = cast(*Icon, data);
+    if (e.kind == event.SHORTCUT_OVERRIDE) { return cast(i64, _plain(e)); }
+    if (e.kind == event.KEY_DOWN && _plain(e) == 1) {
+        signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+        return 1;
+    }
+    if (e.kind == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        d.pressing = 1;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP || e.kind == event.POINTER_CANCEL) {
+        if (d.pressing == 0) { return 0; }
+        d.pressing = 0;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        let is math.rect.Rect as r = layout.rect(t, w);
+        if (e.kind == event.POINTER_UP && e.local_x >= 0.0 && e.local_y >= 0.0 && e.local_x < r.w && e.local_y < r.h) {
+            signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+        }
+        return 1;
+    }
+    return 0;
+}

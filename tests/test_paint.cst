@@ -22,20 +22,20 @@ fn main() as i32 {
     check("rgb packs 0xRRGGBB", cast(i32, dl.rgb(1, 2, 3) == 66051));
 
     let is *u8 as hello = "hello";
-    dl.rect(&l, 1.0, 2.0, 3.0, 4.0, 5);
-    dl.text(&l, 6.0, 7.0, 8.0, hello, 5, 16.0, 700, 9);
+    dl.rect(&l, 1.0, 2.0, 3.0, 4.0, 2.0, 5);
+    dl.text(&l, 6.0, 7.0, 8.0, hello, 5, 16.0, 700, 22.0, 9);
     check("both are listed", cast(i32, dl.count(&l) == 2));
     let is *dl.Cmd as r = dl.at(&l, 0);
-    check("rect keeps its fields", cast(i32, r.kind == dl.RECT && r.x == 1.0 && r.y == 2.0 && r.w == 3.0 && r.h == 4.0 && r.color == 5));
+    check("rect keeps its fields", cast(i32, r.kind == dl.RECT && r.x == 1.0 && r.y == 2.0 && r.w == 3.0 && r.h == 4.0 && r.radius == 2.0 && r.color == 5));
     let is *dl.Cmd as t = dl.at(&l, 1);
-    check("text keeps its fields", cast(i32, t.kind == dl.TEXT && t.x == 6.0 && t.y == 7.0 && t.w == 8.0 && t.len == 5 && t.size == 16.0 && t.weight == 700 && t.color == 9));
+    check("text keeps its fields", cast(i32, t.kind == dl.TEXT && t.x == 6.0 && t.y == 7.0 && t.w == 8.0 && t.len == 5 && t.size == 16.0 && t.weight == 700 && t.leading == 22.0 && t.color == 9));
     check("text is not copied", cast(i32, cast(i64, t.text) == cast(i64, hello)));
 
     // Past the starting capacity, in order, nothing lost on the way.
     dl.clear(&l);
     let is i64 as i with mut = 0;
     while (i < 1000) {
-        check("grows", dl.rect(&l, 0.0, 0.0, 0.0, 0.0, i));
+        check("grows", dl.rect(&l, 0.0, 0.0, 0.0, 0.0, 0.0, i));
         i = i + 1;
     }
     check("all of them are there", cast(i32, dl.count(&l) == 1000));

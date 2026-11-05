@@ -13,7 +13,7 @@ fn _len(s as *u8) as i64 {
 
 fn fill(l as *dl.List) as void {
     dl.clear(l);
-    dl.text(l, 32.0, 28.0, 640.0, TITLE, _len(TITLE), 28.0, 700, dl.rgb(32, 40, 48));
-    dl.rect(l, 32.0, 72.0, 96.0, 4.0, dl.rgb(59, 130, 246));
-    dl.text(l, 32.0, 92.0, 640.0, BODY, _len(BODY), 16.0, 400, dl.rgb(58, 66, 76));
+    dl.text(l, 32.0, 32.0, 100000.0, TITLE, _len(TITLE), 30.0, 700, 0.0, dl.rgb(32, 38, 46));
+    dl.rect(l, 32.0, 78.0, 104.0, 3.0, 1.5, dl.rgb(52, 120, 246));
+    dl.text(l, 32.0, 101.0, 100000.0, BODY, _len(BODY), 16.0, 400, 22.0, dl.rgb(64, 72, 84));
 }

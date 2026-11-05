@@ -1,22 +1,26 @@
-// ui/browser.cst — the window: tabs, each with its toolbar, address and page.
+// ui/browser.cst — the window: tabs in the title bar and, under them, the page of
+// whichever one is current, with its toolbar and address.
 //
-// The toolbar lives inside the tab rather than above the strip's pages, because
-// the tabs widget holds strip and pages as one, and because what the toolbar shows
-// (the address, whether there is a page to go back to) belongs to that tab anyway.
+// The tabs are our own rather than the toolkit's tabs widget, which holds its strip
+// and its pages as one and so cannot put the strip in the title bar. A stack holds
+// the pages. What the toolbar shows belongs to the tab, so each page has its own.
 
 use "std/io.cst" as io;
 use "caustic-media/ui/ui.cst" as ui;
 use "caustic-media/input/keys.cst" as keys;
+use "caustic-media/window/positioner.cst" as positioner;
 use "../paint/display_list.cst" as dl;
 use "../paint/placeholder.cst" as placeholder;
 use "./page_view.cst" as pv;
+use "./chrome.cst" as chrome;
+use "./theme.cst" as theme;
 
 let is i64 as MAX_TABS with imut = 32;
 
-let is *u8 as NAME         with imut = "Caustic Browser";
-let is *u8 as NEW_TITLE    with imut = "Nova aba";
-let is *u8 as NO_NAV       with imut = "A navegação ainda não existe";
-let is *u8 as NO_ROOM      with imut = "Não foi possível abrir outra aba";
+let is *u8 as NAME      with imut = "Caustic Browser";
+let is *u8 as NEW_TITLE with imut = "Nova aba";
+let is *u8 as NO_NAV    with imut = "A navegação ainda não existe";
+let is *u8 as NO_ROOM   with imut = "Não foi possível abrir outra aba";
 
 let is i64 as NEW_TAB   with imut = 1;
 let is i64 as CLOSE_TAB with imut = 2;
@@ -24,6 +28,8 @@ let is i64 as QUIT      with imut = 3;
 
 // One tab: its widgets, and the document it owns.
 struct Doc {
+    tab   as i64;
+    page  as i64;
     entry as i64;
     view  as i64;
     list  as dl.List;
@@ -35,10 +41,13 @@ struct Browser {
     t      as *ui.tree.Tree;
     r      as *ui.router.Router;
     win    as i64;
-    tabs   as i64;
+    tabs   as i64;    // the scroll area holding the strip
+    strip  as i64;
+    pages  as i64;
     status as i64;
     menu   as i64;
     n      as i64;
+    cur    as i64;
     docs   as [MAX_TABS]Doc;
 }
 
@@ -47,16 +56,45 @@ let is i64 as _fails with mut = 0;
 
 fn _doc(i as i64) as *Doc { return &br.docs[i]; }
 
+// The status bar only exists while it has something to say.
 fn _say(s as *u8) as void {
     ui.statusbar.pop(br.t, br.status, 1);
     ui.statusbar.push(br.t, br.status, 1, s, ui.len(s));
+    ui.tree.set_visible(br.t, br.status, 1);
 }
 
-// The tab on the screen, -1 if none is.
-fn _current() as i64 { return ui.tabs.current(br.t, br.tabs); }
+fn _hush() as void {
+    ui.statusbar.pop(br.t, br.status, 1);
+    ui.tree.set_visible(br.t, br.status, 0);
+}
 
-// A new tab, made current, with the focus in its address. 1, or 0 when there is
-// no room for it.
+fn _index_of_tab(w as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < br.n) {
+        if (_doc(i).tab == w) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Tab i on the screen, with the focus in its address.
+fn select(i as i64) as void {
+    if (i < 0 || i >= br.n) { return; }
+    let is i64 as k with mut = 0;
+    while (k < br.n) {
+        chrome.set_tab_active(br.t, _doc(k).tab, cast(i32, k == i));
+        k = k + 1;
+    }
+    br.cur = i;
+    ui.stack.set_current(br.t, br.pages, _doc(i).page);
+    chrome.reveal_tab(br.t, _doc(i).tab);
+    _hush();
+    // Ready to type, with no outline: it would be permanent, as this is where the
+    // focus lives. Ctrl+L asks for it by keyboard, and that one shows.
+    ui.router.focus(br.t, br.r, _doc(i).entry, 0);
+}
+
+// A new tab, made current. 1, or 0 when there is no room for it.
 fn new_tab() as i32 {
     if (br.n >= MAX_TABS) { _say(NO_ROOM); return 0; }
     let is *ui.tree.Tree as t = br.t;
@@ -64,34 +102,35 @@ fn new_tab() as i32 {
     if (dl.init(&d.list) != 0) { _say(NO_ROOM); return 0; }
     placeholder.fill(&d.list);
 
-    let is i64 as page = ui.tab(t, br.tabs, NEW_TITLE);
-    if (page == 0) { dl.free(&d.list); _say(NO_ROOM); return 0; }
-    let is i64 as i = ui.tabs.count(t, br.tabs) - 1;
-    ui.tabs.set_closable(t, br.tabs, i, 1);
-    let is i64 as col = ui.box.create(t, page, ui.box.COLUMN);
+    d.tab = chrome.tab(t, br.strip, NEW_TITLE, ui.len(NEW_TITLE));
+    if (d.tab == 0) { dl.free(&d.list); _say(NO_ROOM); return 0; }
+    ui.on(t, d.tab, ui.signal.CLICKED, fn_ptr(_tab_chosen));
+    ui.on(t, d.tab, ui.signal.CLOSED, fn_ptr(_tab_closed));
 
-    let is i64 as row = ui.box.create(t, col, ui.box.ROW);
-    ui.box.set_spacing(t, row, 6.0);
-    ui.layout.set_margin(t, row, 6.0, 4.0, 6.0, 4.0);
-    let is i64 as nav = ui.toolbar.create(t, row);
-    // Nothing to go back to or reload until there is navigation.
-    ui.tree.set_enabled(t, ui.tool_button(t, nav, "Voltar"), 0);
-    ui.tree.set_enabled(t, ui.tool_button(t, nav, "Avançar"), 0);
-    ui.tree.set_enabled(t, ui.tool_button(t, nav, "Recarregar"), 0);
+    d.page = ui.box.create(t, br.pages, ui.box.COLUMN);
+    ui.separator.create(t, d.page, 0);
+
+    let is i64 as row = ui.box.create(t, d.page, ui.box.ROW);
+    ui.box.set_spacing(t, row, 4.0);
+    // 42 with the line above: 32 for the address, 4 over it and 5 under.
+    ui.layout.set_margin(t, row, 10.0, 4.0, 8.0, 5.0);
+    // Nothing to go back or forward to until there is navigation.
+    ui.tree.set_enabled(t, chrome.icon_button(t, row, chrome.BACK), 0);
+    ui.tree.set_enabled(t, chrome.icon_button(t, row, chrome.FORWARD), 0);
+    ui.on(t, chrome.icon_button(t, row, chrome.RELOAD), ui.signal.CLICKED, fn_ptr(_reload_clicked));
     d.entry = ui.entry.create(t, row);
     ui.layout.set_stretch(t, d.entry, 1.0, 0.0);
+    ui.layout.set_margin(t, d.entry, 8.0, 0.0, 8.0, 0.0);
+    ui.layout.set_min_size(t, d.entry, 160.0, 0.0);
     ui.placeholder(t, d.entry, "Digite um endereço");
     ui.on(t, d.entry, ui.signal.ACTIVATED, fn_ptr(_address_typed));
-    let is i64 as more = ui.toolbar.create(t, row);
-    ui.on(t, ui.tool_button(t, more, "+"), ui.signal.CLICKED, fn_ptr(_plus_clicked));
-    ui.menubutton.set_menu(t, ui.menubutton(t, row, "Menu"), br.menu);
+    ui.on(t, chrome.icon_button(t, row, chrome.MORE), ui.signal.CLICKED, fn_ptr(_more_clicked));
 
-    d.view = pv.create(t, col, &d.list);
+    d.view = pv.create(t, d.page, &d.list);
     ui.layout.set_stretch(t, d.view, 1.0, 1.0);
 
     br.n = br.n + 1;
-    ui.tabs.set_current(t, br.tabs, i);
-    ui.router.focus(t, br.r, d.entry, 1);
+    select(br.n - 1);
     return 1;
 }
 
@@ -99,7 +138,8 @@ fn new_tab() as i32 {
 fn close_tab(i as i64) as void {
     if (i < 0 || i >= br.n) { return; }
     if (br.n == 1) { ui.app.window_close(br.a, br.win); return; }
-    ui.tabs.remove(br.t, br.tabs, i);
+    ui.tree.destroy(br.t, _doc(i).tab);
+    ui.tree.destroy(br.t, _doc(i).page);
     dl.free(&_doc(i).list);
     // Docs keep the tabs' order, so the ones after it move down, and each view
     // has to be told where its list went.
@@ -110,32 +150,58 @@ fn close_tab(i as i64) as void {
         k = k + 1;
     }
     br.n = br.n - 1;
-    // The focus went with the tab: without this, typing goes nowhere.
-    _focus_address();
+    // The tab on the screen keeps its place if it was not this one; if it was,
+    // the one that took its place, or the new last.
+    let is i64 as next with mut = br.cur;
+    if (i < br.cur) { next = br.cur - 1; }
+    if (next >= br.n) { next = br.n - 1; }
+    select(next);
 }
 
-fn _focus_address() as void {
-    let is i64 as i = _current();
-    if (i >= 0 && i < br.n) { ui.router.focus(br.t, br.r, _doc(i).entry, 1); }
-}
+fn _step_tab(by as i64) as void { select((br.cur + by + br.n) % br.n); }
 
 fn _act(id as i64) as void {
     if (id == NEW_TAB) { new_tab(); }
-    if (id == CLOSE_TAB) { close_tab(_current()); }
+    if (id == CLOSE_TAB) { close_tab(br.cur); }
     if (id == QUIT) { ui.app.window_close(br.a, br.win); }
 }
 
-fn _address_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _say(NO_NAV); }
+fn _tab_chosen(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { select(_index_of_tab(w)); }
+fn _tab_closed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { close_tab(_index_of_tab(w)); }
 fn _plus_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { new_tab(); }
+fn _address_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _say(NO_NAV); }
 fn _menu_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void { _act(*cast(*i64, arg)); }
-fn _tab_closed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { close_tab(*cast(*i64, arg)); }
+
+// There is only the placeholder to load again, and it is the same one.
+fn _reload_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is *Doc as d = _doc(br.cur);
+    placeholder.fill(&d.list);
+    pv.set_list(t, d.view, &d.list);
+    _hush();
+}
+
+// Opens down and to the left, so it stays inside the window at its right edge.
+fn _more_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    ui.menu.popup_from(t, br.r, br.menu, w, ui.layout.window_rect(t, w),
+                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_LEFT, 0);
+}
+
 fn _key_new(user as *u8) as void { _act(NEW_TAB); }
 fn _key_close(user as *u8) as void { _act(CLOSE_TAB); }
 fn _key_quit(user as *u8) as void { _act(QUIT); }
-fn _key_address(user as *u8) as void { _focus_address(); }
+fn _key_address(user as *u8) as void {
+    ui.entry.select(br.t, _doc(br.cur).entry, 0, ui.entry.length(br.t, _doc(br.cur).entry));
+    ui.router.focus(br.t, br.r, _doc(br.cur).entry, 1);
+}
+fn _key_next(user as *u8) as void { _step_tab(1); }
+fn _key_prev(user as *u8) as void { _step_tab(0 - 1); }
 
 fn _item(s as *u8, id as i64, k as i32) as void {
     ui.menu.set_accel(br.t, ui.menu_item(br.t, br.menu, s, id), k, keys.MOD_CONTROL);
+}
+
+fn _shortcut(k as i32, mods as i32, f as ui.router.ShortcutFn) as void {
+    ui.router.add_shortcut(br.r, k, mods, f, cast(*u8, 0));
 }
 
 // The window, with one tab. 1, or 0 when it could not be opened.
@@ -143,7 +209,9 @@ fn open(p as *ui.program.Program) as i32 {
     br.a = ui.program.app(p);
     br.hs = ui.program.host(p);
     br.n = 0;
-    br.win = ui.app.window_open(br.a, 1024.0, 720.0);
+    br.cur = 0;
+    theme.apply(br.a);
+    br.win = ui.app.window_open(br.a, 980.0, 730.0);
     if (br.win == 0) { return 0; }
     ui.app.set_title(br.a, br.win, NAME, ui.len(NAME));
     br.t = ui.app.tree(br.a, br.win);
@@ -157,18 +225,45 @@ fn open(p as *ui.program.Program) as i32 {
     _item("_Sair", QUIT, keys.Q);
     ui.on(t, br.menu, ui.signal.ACTIVATED, fn_ptr(_menu_chosen));
 
-    let is i64 as col = ui.box.create(t, ui.tree.root(t), ui.box.COLUMN);
-    br.tabs = ui.tabs.create(t, col);
-    ui.layout.set_stretch(t, br.tabs, 1.0, 1.0);
-    ui.on(t, br.tabs, ui.signal.CLOSED, fn_ptr(_tab_closed));
-    br.status = ui.statusbar.create(t, col);
+    // Our own frame, so the tabs can share a row with the window's buttons. The
+    // title stays empty there: the window keeps its name for the desktop.
+    let is i64 as deco = ui.decoration.create(t, ui.tree.root(t));
+    ui.app.set_decoration(br.a, br.win, deco);
+    let is i64 as head = ui.decoration.header_of(t, deco);
+    ui.titlebar.set_title(t, head, "", 0);
+    ui.titlebar.set_buttons(t, head, ui.titlebar.BTN_ALL);
+    let is i64 as start = ui.titlebar.start(t, head);
+    chrome.logo(t, start);
+    // Tabs past the room scroll sideways, with no bar: the wheel, or choosing one.
+    let is i64 as area = chrome.tab_area(t, start);
+    br.tabs = ui.scroll.create(t, area);
+    ui.scroll.set_policy(t, br.tabs, ui.scroll.AUTO, ui.scroll.NEVER);
+    ui.scroll.set_bars(t, br.tabs, ui.scroll.OVERLAY);
+    ui.scroll.set_bar_size(t, br.tabs, 0.0);
+    br.strip = ui.box.create(t, br.tabs, ui.box.ROW);
+    ui.on(t, chrome.icon_button(t, start, chrome.PLUS), ui.signal.CLICKED, fn_ptr(_plus_clicked));
 
-    ui.router.add_shortcut(br.r, keys.T, keys.MOD_CONTROL, fn_ptr(_key_new), cast(*u8, 0));
-    ui.router.add_shortcut(br.r, keys.W, keys.MOD_CONTROL, fn_ptr(_key_close), cast(*u8, 0));
-    ui.router.add_shortcut(br.r, keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit), cast(*u8, 0));
-    ui.router.add_shortcut(br.r, keys.L, keys.MOD_CONTROL, fn_ptr(_key_address), cast(*u8, 0));
+    let is i64 as content = ui.decoration.content_of(t, deco);
+    br.pages = ui.stack.create(t, content);
+    ui.layout.set_stretch(t, br.pages, 1.0, 1.0);
+    br.status = ui.statusbar.create(t, content);
+    ui.tree.set_visible(t, br.status, 0);
+
+    _shortcut(keys.T, keys.MOD_CONTROL, fn_ptr(_key_new));
+    _shortcut(keys.W, keys.MOD_CONTROL, fn_ptr(_key_close));
+    _shortcut(keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit));
+    _shortcut(keys.L, keys.MOD_CONTROL, fn_ptr(_key_address));
+    _shortcut(keys.PAGE_DOWN, keys.MOD_CONTROL, fn_ptr(_key_next));
+    _shortcut(keys.PAGE_UP, keys.MOD_CONTROL, fn_ptr(_key_prev));
+    _shortcut(keys.TAB, keys.MOD_CONTROL, fn_ptr(_key_next));
+    _shortcut(keys.TAB, keys.MOD_CONTROL | keys.MOD_SHIFT, fn_ptr(_key_prev));
 
     return new_tab();
+}
+
+// Until the last window closes.
+fn run() as void {
+    while (ui.host.step(br.hs, 0 - 1) == 1) { theme.keep(br.a); }
 }
 
 // After the program closed: the views are gone, so the lists can go.
@@ -190,7 +285,11 @@ fn _expect(what as *u8, ok as i32) as void {
 
 fn _rounds(n as i64) as void {
     let is i64 as k with mut = 0;
-    while (k < n) { ui.host.step(br.hs, 20); k = k + 1; }
+    while (k < n) {
+        ui.host.step(br.hs, 20);
+        theme.keep(br.a);
+        k = k + 1;
+    }
 }
 
 fn _views_hold_their_lists() as i32 {
@@ -202,31 +301,58 @@ fn _views_hold_their_lists() as i32 {
     return 1;
 }
 
+fn _one_active_at(i as i64) as i32 {
+    let is i64 as k with mut = 0;
+    while (k < br.n) {
+        if (chrome.tab_active(br.t, _doc(k).tab) != cast(i32, k == i)) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _focus_in(i as i64) as i32 {
+    return cast(i32, ui.router.focused(br.t, br.r) == _doc(i).entry);
+}
+
 // Drives the window through what a person does with tabs. Returns the failures.
 fn check() as i64 {
     _rounds(10);
     _expect("the window is on the screen", cast(i32, ui.host.shown(br.hs) == 1));
-    _expect("it opens with one tab", cast(i32, br.n == 1 && ui.tabs.count(br.t, br.tabs) == 1));
+    _expect("it opens with one tab", cast(i32, br.n == 1));
+    _expect("our theme outlasts the desktop's", cast(i32, ui.app.theme(br.a).metrics.titlebar_height == 38.0));
     _expect("the first tab has its page", cast(i32, dl.count(&_doc(0).list) > 0));
 
     new_tab();
     new_tab();
     _rounds(5);
-    _expect("two more tabs", cast(i32, br.n == 3 && ui.tabs.count(br.t, br.tabs) == 3));
-    _expect("a new tab is the current one", cast(i32, _current() == 2));
-    _expect("the focus is in its address", cast(i32, ui.router.focused(br.t, br.r) == _doc(2).entry));
+    _expect("two more tabs", cast(i32, br.n == 3));
+    _expect("a new tab is the current one", cast(i32, br.cur == 2 && _one_active_at(2) == 1));
+    _expect("the focus is in its address", _focus_in(2));
+    _expect("its page is the one shown", cast(i32, ui.stack.current(br.t, br.pages) == _doc(2).page));
 
+    select(1);
+    _rounds(3);
+    _expect("choosing a tab shows it", cast(i32, ui.stack.current(br.t, br.pages) == _doc(1).page && _one_active_at(1) == 1));
+    _step_tab(1);
+    _expect("the next tab", cast(i32, br.cur == 2));
+    _step_tab(1);
+    _expect("the next tab wraps round", cast(i32, br.cur == 0));
+
+    select(1);
     close_tab(0);
     _rounds(5);
-    _expect("closing one leaves two", cast(i32, br.n == 2 && ui.tabs.count(br.t, br.tabs) == 2));
+    _expect("closing another leaves the current one on the screen", cast(i32, br.n == 2 && br.cur == 0 && _one_active_at(0) == 1));
     _expect("the views follow their lists", _views_hold_their_lists());
-    _expect("the focus moves to the tab left on the screen", cast(i32, ui.router.focused(br.t, br.r) == _doc(_current()).entry));
+    _expect("the focus stays with it", _focus_in(0));
 
     close_tab(99);
     _expect("no such tab: nothing closes", cast(i32, br.n == 2));
 
-    close_tab(1);
+    close_tab(0);
     _rounds(5);
+    _expect("closing the current one shows what is left", cast(i32, br.n == 1 && br.cur == 0 && _one_active_at(0) == 1));
+    _expect("and the focus goes there", _focus_in(0));
+
     close_tab(0);
     _rounds(5);
     _expect("the last tab takes the window", cast(i32, ui.host.shown(br.hs) == 0));

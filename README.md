@@ -17,20 +17,24 @@
 ## What M0 establishes
 
 The window, on the toolkit of
-[`caustic-media`](https://github.com/Caua726/caustic-media): tabs, each with its own
-toolbar, address and page, the usual shortcuts (`Ctrl+T`, `Ctrl+W`, `Ctrl+L`,
-`Ctrl+Q`) and a status bar. Voltar, Avançar and Recarregar stay disabled, and typing
-an address only says navigation does not exist yet, because it does not.
+[`caustic-media`](https://github.com/Caua726/caustic-media): a dark two-row header,
+tabs as plain text beside the window's own buttons, and a white page. The shortcuts
+are `Ctrl+T`, `Ctrl+W`, `Ctrl+L`, `Ctrl+Q`, and `Ctrl+Tab` or `Ctrl+Page Down` to move
+between tabs. Tabs past the room scroll sideways. Voltar and Avançar stay disabled,
+Recarregar repaints the placeholder, and typing an address only says navigation does
+not exist yet, because it does not.
 
-The page area is the one widget of our own. It plays back a **display list**, and
-that list is the boundary that matters for what comes next: the engine ends there
-and never touches the toolkit, so layout and paint can be tested by comparing lists,
-with no window and nothing linked. Text and shapes on the other side of it come from
+The page area is a widget of our own, and it plays back a **display list**. That
+list is the boundary that matters for what comes next: the engine ends there and never
+touches the toolkit, so layout and paint can be tested by comparing lists, with no
+window and nothing linked. Text and shapes on the other side of it come from
 `caustic-media`'s `text/` and `render/`.
 
 ```
 src/main.cst               starts the program, or drives it with --check
-src/ui/browser.cst         the window: tabs, toolbar, address, status bar, shortcuts
+src/ui/browser.cst         the window: tabs, toolbar, address, shortcuts
+src/ui/chrome.cst          what the toolkit has no widget for: the tabs, drawn icons
+src/ui/theme.cst           the palette and the sizes
 src/ui/page_view.cst       the page's widget: plays a display list back
 src/paint/display_list.cst what a page draws, as data
 src/paint/placeholder.cst  what a tab shows until there is a page to show

@@ -1,0 +1,49 @@
+// ui/theme.cst — the browser's look: dark always, flat, and blue only for what is
+// selected or has the focus.
+
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/ui/ui.cst" as ui;
+
+let is ui.style.Theme as _th with mut;   // the app keeps a pointer to it
+
+fn apply(a as *ui.app.App) as void {
+    _th = ui.style.dark();
+    let is math.color.Color as head = math.color.hex(0x15181D);
+    let is math.color.Color as field = math.color.hex(0x252930);
+    let is math.color.Color as blue = math.color.hex(0x3478F6);
+    _th.palette.window_bg = head;
+    _th.palette.titlebar_bg = head;
+    _th.palette.popover_bg = math.color.hex(0x1C2026);
+    _th.palette.separator = math.color.hex(0x30353D);
+    _th.palette.fg = math.color.hex(0xF1F2F4);
+    _th.palette.fg_dim = math.color.hex(0x9CA3AD);
+    _th.palette.accent = blue;
+    _th.palette.focus = blue;
+    _th.fonts.family = "Inter";       // the system's faces are its fallback
+    _th.fonts.body.size = 13.0;
+    _th.metrics.titlebar_height = 38.0;
+    _th.metrics.control_height = 32.0;
+    _th.metrics.control_pad_x = 14.0;
+    _th.metrics.radius_m = 9.0;
+    // One thin line, on the control's own edge, only when focus moved by keyboard.
+    _th.metrics.focus_width = 1.0;
+    _th.metrics.focus_offset = 0.0;
+    _th.metrics.focus_radius = 9.0;
+    // The address: a filled surface. The ring above is its only outline, because
+    // it has the focus from the start and blue must not be permanent.
+    _th.field.normal.bg = field;
+    _th.field.normal.border = ui.style.with_alpha(field, 0.0);
+    _th.field.checked.bg = field;
+    _th.field.checked.border = ui.style.with_alpha(field, 0.0);
+    _th.metrics.caption_button = 30.0;
+    ui.app.set_theme(a, &_th);
+}
+
+// The host lays the desktop's theme over ours when a window is first shown and
+// whenever the desktop's settings change, and says nothing when it does. Called from
+// the main loop to put ours back; our title bar's height is what tells them apart.
+fn keep(a as *ui.app.App) as void {
+    if (ui.app.theme(a).metrics.titlebar_height != _th.metrics.titlebar_height) {
+        ui.app.set_theme(a, &_th);
+    }
+}

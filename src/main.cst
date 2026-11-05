@@ -35,7 +35,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     }
     let is i64 as fails with mut = 0;
     if (checking == 1) { fails = browser.check(); }
-    else { ui.program.run(&prog); }
+    else { browser.run(); }
     ui.program.close(&prog);
     browser.free_docs();
     if (checking == 0) { return 0; }

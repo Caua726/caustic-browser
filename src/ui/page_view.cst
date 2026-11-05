@@ -66,8 +66,19 @@ fn _text(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd) as void {
     st.family = p.theme.fonts.family;
     st.size = c.size;
     st.weight = c.weight;
+    // The margin on the right mirrors the left, and the text wraps at whichever is
+    // narrower, that or what the command allows.
     let is model.Params as pp = model.params();
     pp.width = c.w;
+    let is f64 as room = p.rect.w - c.x * 2.0;
+    if (room < pp.width) { pp.width = room; }
+    // Line height is a multiple of the font's own, so one line is measured first.
+    if (c.leading > 0.0) {
+        let is model.Params as one = model.params();
+        one.width = 0.0 - 1.0;
+        if (txt.lay_plain(svc, &_run, c.text, c.len, &st, &one) == 0) { return; }
+        if (_run.height > 0.0) { pp.line_height = c.leading / _run.height; }
+    }
     if (txt.lay_plain(svc, &_run, c.text, c.len, &st, &pp) == 0) { return; }
     txt.draw(svc, p.canvas, &_run, p.rect.x + c.x, p.rect.y + c.y, math.color.hex(c.color));
 }
@@ -80,7 +91,8 @@ fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void
     while (i < dl.count(l)) {
         let is *dl.Cmd as c = dl.at(l, i);
         if (c.kind == dl.RECT) {
-            shapes.fill_rect(p.canvas, p.rect.x + c.x, p.rect.y + c.y, c.w, c.h, math.color.hex(c.color));
+            shapes.fill_rounded(p.canvas, p.rect.x + c.x, p.rect.y + c.y, c.w, c.h,
+                                c.radius, c.radius, c.radius, c.radius, math.color.hex(c.color));
         }
         if (c.kind == dl.TEXT && cast(i64, svc) != 0) { _text(svc, p, c); }
         i = i + 1;

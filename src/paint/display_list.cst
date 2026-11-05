@@ -20,13 +20,15 @@ struct Cmd {
     kind   as i64;
     x      as f64;
     y      as f64;
-    w      as f64;    // TEXT: where the lines wrap
+    w      as f64;    // TEXT: the widest it wraps at; the page can narrow it
     h      as f64;    // RECT only
+    radius as f64;    // RECT only: its corners, 0 for square
     color  as i64;    // 0xRRGGBB
     text   as *u8;    // TEXT only
     len    as i64;
     size   as f64;
     weight as i64;
+    leading as f64;   // TEXT only: pixels from line to line, 0 for the font's own
 }
 
 struct List {
@@ -85,22 +87,22 @@ fn _next(l as *List) as *Cmd {
 }
 
 // 1 when listed, 0 when the list could not grow.
-fn rect(l as *List, x as f64, y as f64, w as f64, h as f64, color as i64) as i32 {
+fn rect(l as *List, x as f64, y as f64, w as f64, h as f64, radius as f64, color as i64) as i32 {
     let is *Cmd as c = _next(l);
     if (cast(i64, c) == 0) { return 0; }
     c.kind = RECT;
-    c.x = x; c.y = y; c.w = w; c.h = h;
+    c.x = x; c.y = y; c.w = w; c.h = h; c.radius = radius;
     c.color = color;
-    c.text = cast(*u8, 0); c.len = 0; c.size = 0.0; c.weight = 0;
+    c.text = cast(*u8, 0); c.len = 0; c.size = 0.0; c.weight = 0; c.leading = 0.0;
     return 1;
 }
 
-fn text(l as *List, x as f64, y as f64, w as f64, s as *u8, n as i64, size as f64, weight as i64, color as i64) as i32 {
+fn text(l as *List, x as f64, y as f64, w as f64, s as *u8, n as i64, size as f64, weight as i64, leading as f64, color as i64) as i32 {
     let is *Cmd as c = _next(l);
     if (cast(i64, c) == 0) { return 0; }
     c.kind = TEXT;
-    c.x = x; c.y = y; c.w = w; c.h = 0.0;
+    c.x = x; c.y = y; c.w = w; c.h = 0.0; c.radius = 0.0;
     c.color = color;
-    c.text = s; c.len = n; c.size = size; c.weight = weight;
+    c.text = s; c.len = n; c.size = size; c.weight = weight; c.leading = leading;
     return 1;
 }
