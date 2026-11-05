@@ -130,12 +130,13 @@ let is i64 as P_BORDER_SPACING_V with imut = 120;
 let is i64 as P_CAPTION_SIDE with imut = 121;
 let is i64 as P_CURSOR with imut = 122;
 let is i64 as P_POINTER_EVENTS with imut = 123;
-let is i64 as P_LETTER_SPACING with imut = 124;
-let is i64 as P_WORD_SPACING with imut = 125;
-let is i64 as P_WORD_BREAK with imut = 126;
-let is i64 as P_OVERFLOW_WRAP with imut = 127;
-let is i64 as P_X_DECORATIONS with imut = 128;
-let is i64 as P_COUNT with imut = 129;
+let is i64 as P_SCROLL_BEHAVIOR with imut = 124;
+let is i64 as P_LETTER_SPACING with imut = 125;
+let is i64 as P_WORD_SPACING with imut = 126;
+let is i64 as P_WORD_BREAK with imut = 127;
+let is i64 as P_OVERFLOW_WRAP with imut = 128;
+let is i64 as P_X_DECORATIONS with imut = 129;
+let is i64 as P_COUNT with imut = 130;
 let is i64 as P_INHERITED with imut = 101;
 
 let is i64 as K_BLOCK with imut = 1;
@@ -314,16 +315,17 @@ let is i64 as K_ROW_RESIZE with imut = 173;
 let is i64 as K_ALL_SCROLL with imut = 174;
 let is i64 as K_ZOOM_IN with imut = 175;
 let is i64 as K_ZOOM_OUT with imut = 176;
-let is i64 as K_BREAK_ALL with imut = 177;
-let is i64 as K_KEEP_ALL with imut = 178;
-let is i64 as K_BREAK_WORD with imut = 179;
-let is i64 as K_ANYWHERE with imut = 180;
-let is i64 as K_INHERIT with imut = 181;
-let is i64 as K_INITIAL with imut = 182;
-let is i64 as K_UNSET with imut = 183;
-let is i64 as K_REVERT with imut = 184;
-let is i64 as K_REVERT_LAYER with imut = 185;
-let is i64 as K_NUMBER with imut = 186;
+let is i64 as K_SMOOTH with imut = 177;
+let is i64 as K_BREAK_ALL with imut = 178;
+let is i64 as K_KEEP_ALL with imut = 179;
+let is i64 as K_BREAK_WORD with imut = 180;
+let is i64 as K_ANYWHERE with imut = 181;
+let is i64 as K_INHERIT with imut = 182;
+let is i64 as K_INITIAL with imut = 183;
+let is i64 as K_UNSET with imut = 184;
+let is i64 as K_REVERT with imut = 185;
+let is i64 as K_REVERT_LAYER with imut = 186;
+let is i64 as K_NUMBER with imut = 187;
 
 let is i64 as F_LEN with imut = 1;
 let is i64 as F_PCT with imut = 2;
@@ -339,8 +341,8 @@ struct Values {
     p as [P_COUNT]f64;
 }
 
-let is *u8 as _PROPS with imut = "display position float clear top right bottom left z-index margin-top margin-right margin-bottom margin-left padding-top padding-right padding-bottom padding-left border-top-width border-right-width border-bottom-width border-left-width border-top-style border-right-style border-bottom-style border-left-style border-top-color border-right-color border-bottom-color border-left-color border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius width height min-width max-width min-height max-height box-sizing overflow-x overflow-y opacity background-color background-image background-repeat background-position-x background-position-y background-size-w background-size-h -x-gradient box-shadow flex-direction flex-wrap flex-grow flex-shrink flex-basis justify-content align-items align-self align-content order row-gap column-gap column-count column-width justify-items justify-self grid-template-columns grid-template-rows grid-auto-columns grid-auto-rows grid-auto-flow grid-row-start grid-column-start grid-row-end grid-column-end scroll-padding-top scroll-margin-top transform transform-origin-x transform-origin-y transition-property transition-duration transition-delay transition-timing-function animation-name animation-duration animation-delay animation-iteration-count animation-direction animation-fill-mode animation-timing-function table-layout content text-decoration-line vertical-align outline-width outline-style outline-color outline-offset visibility accent-color fill stroke color font-family font-size font-weight font-style line-height text-align text-indent text-transform white-space list-style-type list-style-position list-style-image border-collapse border-spacing-h border-spacing-v caption-side cursor pointer-events letter-spacing word-spacing word-break overflow-wrap -x-decorations ";
-let is *u8 as _KEYWORDS with imut = "block inline inline-block list-item flow-root none table inline-table table-row table-row-group table-header-group table-footer-group table-column table-column-group table-cell table-caption flex inline-flex grid inline-grid contents static relative absolute fixed sticky left right both auto thin medium thick hidden dotted dashed solid double groove ridge inset outset currentcolor min-content max-content fit-content content-box border-box visible clip scroll transparent repeat repeat-x repeat-y no-repeat space round center top bottom cover contain row row-reverse column column-reverse nowrap wrap wrap-reverse content flex-start flex-end space-between space-around space-evenly start end normal stretch baseline all infinite reverse alternate alternate-reverse forwards backwards underline overline line-through sub super text-top middle text-bottom collapse black family xx-small x-small small large x-large xx-large xxx-large smaller larger bold bolder lighter italic oblique justify -internal-center -webkit-center -moz-center -webkit-left -webkit-right -moz-left -moz-right uppercase lowercase capitalize pre pre-wrap pre-line break-spaces disc circle square decimal decimal-leading-zero lower-alpha upper-alpha lower-latin upper-latin lower-roman upper-roman outside inside separate default context-menu help pointer progress wait cell crosshair text vertical-text alias copy move no-drop not-allowed grab grabbing e-resize n-resize ne-resize nw-resize s-resize se-resize sw-resize w-resize ew-resize ns-resize nesw-resize nwse-resize col-resize row-resize all-scroll zoom-in zoom-out break-all keep-all break-word anywhere inherit initial unset revert revert-layer number ";
+let is *u8 as _PROPS with imut = "display position float clear top right bottom left z-index margin-top margin-right margin-bottom margin-left padding-top padding-right padding-bottom padding-left border-top-width border-right-width border-bottom-width border-left-width border-top-style border-right-style border-bottom-style border-left-style border-top-color border-right-color border-bottom-color border-left-color border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius width height min-width max-width min-height max-height box-sizing overflow-x overflow-y opacity background-color background-image background-repeat background-position-x background-position-y background-size-w background-size-h -x-gradient box-shadow flex-direction flex-wrap flex-grow flex-shrink flex-basis justify-content align-items align-self align-content order row-gap column-gap column-count column-width justify-items justify-self grid-template-columns grid-template-rows grid-auto-columns grid-auto-rows grid-auto-flow grid-row-start grid-column-start grid-row-end grid-column-end scroll-padding-top scroll-margin-top transform transform-origin-x transform-origin-y transition-property transition-duration transition-delay transition-timing-function animation-name animation-duration animation-delay animation-iteration-count animation-direction animation-fill-mode animation-timing-function table-layout content text-decoration-line vertical-align outline-width outline-style outline-color outline-offset visibility accent-color fill stroke color font-family font-size font-weight font-style line-height text-align text-indent text-transform white-space list-style-type list-style-position list-style-image border-collapse border-spacing-h border-spacing-v caption-side cursor pointer-events scroll-behavior letter-spacing word-spacing word-break overflow-wrap -x-decorations ";
+let is *u8 as _KEYWORDS with imut = "block inline inline-block list-item flow-root none table inline-table table-row table-row-group table-header-group table-footer-group table-column table-column-group table-cell table-caption flex inline-flex grid inline-grid contents static relative absolute fixed sticky left right both auto thin medium thick hidden dotted dashed solid double groove ridge inset outset currentcolor min-content max-content fit-content content-box border-box visible clip scroll transparent repeat repeat-x repeat-y no-repeat space round center top bottom cover contain row row-reverse column column-reverse nowrap wrap wrap-reverse content flex-start flex-end space-between space-around space-evenly start end normal stretch baseline all infinite reverse alternate alternate-reverse forwards backwards underline overline line-through sub super text-top middle text-bottom collapse black family xx-small x-small small large x-large xx-large xxx-large smaller larger bold bolder lighter italic oblique justify -internal-center -webkit-center -moz-center -webkit-left -webkit-right -moz-left -moz-right uppercase lowercase capitalize pre pre-wrap pre-line break-spaces disc circle square decimal decimal-leading-zero lower-alpha upper-alpha lower-latin upper-latin lower-roman upper-roman outside inside separate default context-menu help pointer progress wait cell crosshair text vertical-text alias copy move no-drop not-allowed grab grabbing e-resize n-resize ne-resize nw-resize s-resize se-resize sw-resize w-resize ew-resize ns-resize nesw-resize nwse-resize col-resize row-resize all-scroll zoom-in zoom-out smooth break-all keep-all break-word anywhere inherit initial unset revert revert-layer number ";
 
 fn _lower(c as i64) as i64 {
     if (c >= 65 && c <= 90) { return c + 32; }
@@ -566,6 +568,7 @@ fn keywords_of(p as i64) as *u8 {
     if (p == P_CAPTION_SIDE) { return "top bottom "; }
     if (p == P_CURSOR) { return "auto default none context-menu help pointer progress wait cell crosshair text vertical-text alias copy move no-drop not-allowed grab grabbing e-resize n-resize ne-resize nw-resize s-resize se-resize sw-resize w-resize ew-resize ns-resize nesw-resize nwse-resize col-resize row-resize all-scroll zoom-in zoom-out "; }
     if (p == P_POINTER_EVENTS) { return "auto none "; }
+    if (p == P_SCROLL_BEHAVIOR) { return "auto smooth "; }
     if (p == P_LETTER_SPACING) { return "normal "; }
     if (p == P_WORD_SPACING) { return "normal "; }
     if (p == P_WORD_BREAK) { return "normal break-all keep-all break-word "; }
@@ -698,6 +701,7 @@ fn set_initial(v as *Values) as void {
     v.i[P_CAPTION_SIDE] = K_TOP;
     v.i[P_CURSOR] = K_AUTO;
     v.i[P_POINTER_EVENTS] = K_AUTO;
+    v.i[P_SCROLL_BEHAVIOR] = K_AUTO;
     v.i[P_LETTER_SPACING] = K_NORMAL;
     v.i[P_WORD_SPACING] = K_NORMAL;
     v.i[P_WORD_BREAK] = K_NORMAL;

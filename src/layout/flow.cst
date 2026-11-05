@@ -202,7 +202,10 @@ fn _replaced_w(b as *bx.Box) as f64 {
 
 fn _edges_guess(b as *bx.Box) as f64 {
     let is *pr.Values as s = &b.st.v;
-    return _max(s.f[pr.P_PADDING_LEFT], 0.0) + _max(s.f[pr.P_PADDING_RIGHT], 0.0);
+    let is f64 as e with mut = _max(s.f[pr.P_PADDING_LEFT], 0.0) + _max(s.f[pr.P_PADDING_RIGHT], 0.0);
+    if (s.i[pr.P_BORDER_LEFT_STYLE] != pr.K_NONE && s.i[pr.P_BORDER_LEFT_STYLE] != pr.K_HIDDEN) { e = e + s.f[pr.P_BORDER_LEFT_WIDTH]; }
+    if (s.i[pr.P_BORDER_RIGHT_STYLE] != pr.K_NONE && s.i[pr.P_BORDER_RIGHT_STYLE] != pr.K_HIDDEN) { e = e + s.f[pr.P_BORDER_RIGHT_WIDTH]; }
+    return e;
 }
 
 // What a child adds to the width of whatever holds it, in each sense.

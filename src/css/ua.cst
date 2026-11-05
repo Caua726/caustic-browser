@@ -31,8 +31,8 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "ul ul, ul menu, ul dir, menu ul, menu menu, menu dir, dir ul, dir menu, dir dir, ol ul, ol menu, ol dir { list-style-type: circle; }");
     _r(s, "ul ul ul, ul ul menu, ul menu ul, menu ul ul, ol ul ul, ul ol ul, ol ol ul { list-style-type: square; }");
     _r(s, "summary { display: block; }");
-    _r(s, "details > summary::before { content: \"▸ \"; }");
-    _r(s, "details[open] > summary::before { content: \"▾ \"; }");
+    _r(s, "details > summary::before { content: \"▶\"; font-size: 0.7em; margin-right: 0.7em; }");
+    _r(s, "details[open] > summary::before { content: \"▼\"; }");
     _r(s, "h1 { margin: 0.67em 0; font-size: 2em; font-weight: bold; }");
     _r(s, "h2 { margin: 0.83em 0; font-size: 1.5em; font-weight: bold; }");
     _r(s, "h3 { margin: 1em 0; font-size: 1.17em; font-weight: bold; }");
@@ -85,10 +85,14 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "summary { cursor: default; }");
     _r(s, "label { cursor: default; }");
     _r(s, "a:-webkit-any-link:active { color: #ee0000; }");
-    _r(s, "input[type=checkbox], input[type=radio] { width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; cursor: default; }");
+    _r(s, "input[type=checkbox], input[type=radio] { box-sizing: border-box; width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; vertical-align: -2px; border: 1px solid #767676; border-radius: 2px; cursor: default; }");
     _r(s, "input[type=radio] { border-radius: 50%; }");
     _r(s, "input[type=submit], input[type=button], input[type=reset], button, select { border: 1px solid #767676; border-radius: 3px; background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; }");
     _r(s, "select { background-color: white; padding: 2px 5px; text-align: start; }");
+    _r(s, "input:disabled, textarea:disabled, select:disabled { background-color: rgba(239, 239, 239, 0.3); border-color: rgba(118, 118, 118, 0.3); }");
+    _r(s, "input[type=checkbox]:disabled, input[type=radio]:disabled { background-color: transparent; border-color: #cbcbcb; }");
+    _r(s, "input[type=file] { background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; }");
+    _r(s, "progress, meter { vertical-align: -0.2em; }");
     _r(s, "::placeholder { color: #757575; }");
     _r(s, "input[type=range] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; border-radius: 0; background-color: transparent; cursor: default; }");
     _r(s, "input[type=color] { width: 44px; height: 23px; padding: 1px 2px; background-color: #efefef; cursor: default; }");

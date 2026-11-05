@@ -125,6 +125,7 @@ INHERITED = [
      "alias copy move no-drop not-allowed grab grabbing e-resize n-resize ne-resize nw-resize s-resize se-resize "
      "sw-resize w-resize ew-resize ns-resize nesw-resize nwse-resize col-resize row-resize all-scroll zoom-in zoom-out", AUTO),
     ("pointer-events", 0, "auto none", AUTO),
+    ("scroll-behavior", 0, "auto smooth", AUTO),
     ("letter-spacing", LEN, "normal", "normal"),
     ("word-spacing", LEN, "normal", "normal"),
     ("word-break", 0, "normal break-all keep-all break-word", "normal"),

@@ -3,6 +3,7 @@
 // the theme (theme.cst) and their shapes from icons.cst.
 
 use "caustic-media/math/math.cst" as math;
+use "caustic-media/render/draw2d.cst" as draw2d;
 use "caustic-media/render/shapes2d.cst" as shapes;
 use "caustic-media/text/layout/model.cst" as model;
 use "caustic-media/ui/tree.cst" as tree;
@@ -16,6 +17,8 @@ use "caustic-media/ui/style.cst" as style;
 use "caustic-media/ui/access.cst" as access;
 use "caustic-media/ui/text.cst" as txt;
 use "caustic-media/ui/scroll.cst" as scroll;
+use "caustic-media/ui/anim.cst" as anim;
+use "std/math.cst" as fm;
 use "caustic-media/input/keys.cst" as keys;
 use "caustic-media/ui/widgets/titlebar.cst" as titlebar;
 use "./icons.cst" as icons;
@@ -43,18 +46,30 @@ let is tree.Kind as _tab_kind with mut;
 let is tree.Kind as _tab_area_kind with mut;
 let is tree.Kind as _icon_kind with mut;
 
+// How long the interface takes to answer. Nothing here is drawn twice as often as it
+// needs to be: a tween only runs while something is changing.
+let is i64 as HOVER_MS  with imut = 110;
+let is i64 as PRESS_MS  with imut = 70;
+let is i64 as TAB_MS    with imut = 170;
+let is i64 as SPIN_MS   with imut = 520;
+
 struct Tab {
     title   as *u8;
     n       as i64;
     active  as i32;
     closing as i32;   // held down over the ×, or with the middle button
     reveal  as i32;   // scroll it into view once it has been laid out
-    _pad0   as i32;
+    leaving as i32;   // closed, and on its way out
+    grow    as f64;   // how much of its width it has, 0 to 1
+    glow    as f64;   // how much the pointer being over it shows
 }
 
 struct Icon {
     icon     as i32;
     pressing as i32;
+    glow     as f64;  // how much the pointer being over it shows
+    press    as f64;  // and being held down
+    spin     as f64;  // a turn, 0 to 1, when it has been asked for one
 }
 
 fn _init() as void {
@@ -80,6 +95,20 @@ fn _init() as void {
     _icon_kind.role = access.ROLE_BUTTON;
     _icon_kind.access = fn_ptr(_icon_access);
     _ready = 1;
+}
+
+// The tree the tweens' callbacks work on. There is one window.
+let is *tree.Tree as _anim_tree with mut = cast(*tree.Tree, 0);
+
+// A number of a widget's to v, repainting it. Without an animator it is just there.
+fn _to(t as *tree.Tree, w as i64, at as *f64, v as f64, ms as i64) as i64 {
+    let is *anim.Animator as an = anim.of(t);
+    if (cast(i64, an) == 0) {
+        *at = v;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 0;
+    }
+    return anim.number(an, w, at, v, ms, math.curve.EASE_CSS_OUT);
 }
 
 // s laid out into _run on one line, in the interface's family. 1 when it could be.
@@ -190,9 +219,43 @@ fn tab(t as *tree.Tree, parent as i64, title as *u8, n as i64) as i64 {
     d.active = 0;
     d.closing = 0;
     d.reveal = 0;
+    d.leaving = 0;
+    d.grow = 0.0;
+    d.glow = 0.0;
     layout.set_stretch(t, w, 0.0, 1.0);
     tree.set_focusable(t, w, 1);
+    _anim_tree = t;
+    _grow_to(t, w, d, 1.0, 0);
     return w;
+}
+
+fn _tab_step(user as *u8) as void {
+    widget.changed(_anim_tree, cast(i64, user), widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn _tab_gone(user as *u8) as void {
+    tree.destroy(_anim_tree, cast(i64, user));
+}
+
+fn _grow_to(t as *tree.Tree, w as i64, d as *Tab, v as f64, then_gone as i32) as void {
+    let is *anim.Animator as an = anim.of(t);
+    if (cast(i64, an) == 0) {
+        d.grow = v;
+        if (then_gone == 1) { tree.destroy(t, w); }
+        return;
+    }
+    let is i64 as id = anim.number(an, w, &d.grow, v, TAB_MS, math.curve.EASE_CSS_OUT);
+    anim.on_step(an, id, fn_ptr(_tab_step), cast(*u8, w));
+    if (then_gone == 1) { anim.on_done(an, id, fn_ptr(_tab_gone), cast(*u8, w)); }
+}
+
+// Closed: it no longer answers, narrows while the ones after it close up, and is gone.
+fn leave_tab(t as *tree.Tree, w as i64) as void {
+    let is *Tab as d = cast(*Tab, tree.data(t, w));
+    d.leaving = 1;
+    d.closing = 0;
+    tree.set_focusable(t, w, 0);
+    _grow_to(t, w, d, 0.0, 1);
 }
 
 // A new title for a tab. The text is not copied, so it has to outlive the tab.
@@ -253,7 +316,7 @@ fn _tab_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, o
     let is *Tab as d = cast(*Tab, data);
     // At the active weight whatever its state, so choosing a tab moves nothing.
     if (_lay(svc, &th, d.title, d.n, TAB_TEXT, 600) == 0) { return; }
-    out.min_w = _run.width + TAB_PAD * 2.0;
+    out.min_w = (_run.width + TAB_PAD * 2.0) * d.grow;
     out.pref_w = out.min_w;
     out.max_w = out.min_w;
 }
@@ -262,20 +325,32 @@ fn _tab_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as 
     let is *txt.Service as svc = txt.of(t);
     if (cast(i64, svc) == 0) { return; }
     let is *Tab as d = cast(*Tab, data);
-    let is i32 as hover = painter.has(p, painter.S_HOVER);
+    if (p.rect.w <= 0.0) { return; }
     let is i64 as weight with mut = 400;
     if (d.active == 1) { weight = 600; }
     if (_lay(svc, p.theme, d.title, d.n, TAB_TEXT, weight) == 0) { return; }
-    let is math.color.Color as col with mut = p.theme.palette.fg_dim;
-    if (d.active == 1 || hover == 1) { col = p.theme.palette.fg; }
-    txt.draw(svc, p.canvas, &_run, p.rect.x + TAB_PAD, p.rect.y + (p.rect.h - _run.height) / 2.0, col);
+    // Wide as it has got so far, and as clear.
+    draw2d.push_clip(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h);
+    let is math.color.Color as dim = p.theme.palette.fg_dim;
+    let is math.color.Color as fg = p.theme.palette.fg;
+    let is math.color.Color as col with mut = fg;
+    if (d.active == 0) {
+        col.r = dim.r + (fg.r - dim.r) * d.glow;
+        col.g = dim.g + (fg.g - dim.g) * d.glow;
+        col.b = dim.b + (fg.b - dim.b) * d.glow;
+        col.a = dim.a + (fg.a - dim.a) * d.glow;
+    }
+    let is math.color.Color as seen = style.with_alpha(col, col.a * d.grow);
+    txt.draw(svc, p.canvas, &_run, p.rect.x + TAB_PAD, p.rect.y + (p.rect.h - _run.height) / 2.0, seen);
     if (d.active == 1) {
         shapes.fill_rounded(p.canvas, p.rect.x + TAB_PAD, p.rect.y + p.rect.h - 6.0, _run.width, 2.0,
-                            1.0, 1.0, 1.0, 1.0, p.theme.palette.accent);
+                            1.0, 1.0, 1.0, 1.0, style.with_alpha(p.theme.palette.accent, p.theme.palette.accent.a * d.grow));
     }
-    if (hover == 1) {
-        icons.draw(svc, p.canvas, icons.CLOSE, p.rect.x + p.rect.w - TAB_PAD / 2.0, p.rect.y + p.rect.h / 2.0, col);
+    if (d.glow > 0.0) {
+        icons.draw(svc, p.canvas, icons.CLOSE, p.rect.x + p.rect.w - TAB_PAD / 2.0, p.rect.y + p.rect.h / 2.0,
+                   style.with_alpha(col, col.a * d.glow * d.grow));
     }
+    draw2d.pop_clip(p.canvas);
 }
 
 fn _in_close(t as *tree.Tree, w as i64, e as *event.Event) as i32 {
@@ -289,6 +364,9 @@ fn _plain(e as *event.Event) as i32 {
 
 fn _tab_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
     let is *Tab as d = cast(*Tab, data);
+    if (d.leaving == 1) { return 0; }
+    if (e.kind == event.POINTER_ENTER) { _to(t, w, &d.glow, 1.0, HOVER_MS); return 0; }
+    if (e.kind == event.POINTER_LEAVE) { _to(t, w, &d.glow, 0.0, HOVER_MS); return 0; }
     // A plain wheel moves the strip, which scrolls sideways and nothing else.
     if (e.kind == event.SCROLL) {
         scroll.scroll_by(t, _scroller(t, w), (e.dx + e.dy) * WHEEL, 0.0);
@@ -328,9 +406,30 @@ fn icon_button(t as *tree.Tree, parent as i64, icon as i32) as i64 {
     let is *Icon as d = cast(*Icon, tree.data(t, w));
     d.icon = icon;
     d.pressing = 0;
+    d.glow = 0.0;
+    d.press = 0.0;
+    d.spin = 0.0;
     layout.set_stretch(t, w, 0.0, 1.0);
     tree.set_focusable(t, w, 1);
     return w;
+}
+
+fn _spin_over(user as *u8) as void {
+    let is i64 as w = cast(i64, user);
+    if (tree.is_valid(_anim_tree, w) == 0) { return; }
+    cast(*Icon, tree.data(_anim_tree, w)).spin = 0.0;
+    widget.changed(_anim_tree, w, widget.CHANGED_PAINT);
+}
+
+// One turn of its icon, for what has just been asked of it.
+fn spin_icon(t as *tree.Tree, w as i64) as void {
+    let is *anim.Animator as an = anim.of(t);
+    if (cast(i64, an) == 0) { return; }
+    let is *Icon as d = cast(*Icon, tree.data(t, w));
+    d.spin = 0.0;
+    _anim_tree = t;
+    let is i64 as id = anim.number(an, w, &d.spin, 1.0, SPIN_MS, math.curve.EASE_CSS_IN_OUT);
+    anim.on_done(an, id, fn_ptr(_spin_over), cast(*u8, w));
 }
 
 fn _icon_name(icon as i32) as *u8 {
@@ -371,9 +470,8 @@ fn _icon_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as
     let is f64 as cx = p.rect.x + p.rect.w / 2.0;
     let is f64 as cy = p.rect.y + p.rect.h / 2.0;
     let is i32 as off = painter.has(p, painter.S_DISABLED);
-    if (off == 0 && (d.pressing == 1 || painter.has(p, painter.S_HOVER) == 1)) {
-        let is f64 as a with mut = 0.08;
-        if (d.pressing == 1) { a = 0.14; }
+    if (off == 0 && (d.glow > 0.0 || d.press > 0.0)) {
+        let is f64 as a = 0.08 * d.glow + 0.06 * d.press;
         let is f64 as half = ICON_SIZE / 2.0;
         shapes.fill_rounded(p.canvas, cx - half, cy - half, ICON_SIZE, ICON_SIZE, 9.0, 9.0, 9.0, 9.0,
                             style.with_alpha(p.theme.palette.fg, a));
@@ -382,11 +480,21 @@ fn _icon_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as
     if (cast(i64, svc) == 0) { return; }
     let is math.color.Color as col with mut = p.theme.palette.fg;
     if (off == 1) { col = style.with_alpha(col, p.theme.control.disabled_alpha); }
+    let is i32 as turning = cast(i32, d.spin > 0.0 && d.spin < 1.0);
+    if (turning == 1) {
+        let is f64 as a = d.spin * 6.283185307179586;
+        let is f64 as c = fm.cos(a);
+        let is f64 as s = fm.sin(a);
+        draw2d.set_transform(p.canvas, c, s, 0.0 - s, c, cx - c * cx + s * cy, cy - s * cx - c * cy);
+    }
     icons.draw(svc, p.canvas, d.icon, cx, cy, col);
+    if (turning == 1) { draw2d.set_transform(p.canvas, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0); }
 }
 
 fn _icon_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
     let is *Icon as d = cast(*Icon, data);
+    if (e.kind == event.POINTER_ENTER) { _to(t, w, &d.glow, 1.0, HOVER_MS); return 0; }
+    if (e.kind == event.POINTER_LEAVE) { _to(t, w, &d.glow, 0.0, HOVER_MS); return 0; }
     if (e.kind == event.SHORTCUT_OVERRIDE) { return cast(i64, _plain(e)); }
     if (e.kind == event.KEY_DOWN && _plain(e) == 1) {
         signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
@@ -395,13 +503,13 @@ fn _icon_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64
     if (e.kind == event.POINTER_DOWN) {
         if (e.button != 1) { return 0; }
         d.pressing = 1;
-        widget.changed(t, w, widget.CHANGED_PAINT);
+        _to(t, w, &d.press, 1.0, PRESS_MS);
         return 1;
     }
     if (e.kind == event.POINTER_UP || e.kind == event.POINTER_CANCEL) {
         if (d.pressing == 0) { return 0; }
         d.pressing = 0;
-        widget.changed(t, w, widget.CHANGED_PAINT);
+        _to(t, w, &d.press, 0.0, HOVER_MS);
         let is math.rect.Rect as r = layout.rect(t, w);
         if (e.kind == event.POINTER_UP && e.local_x >= 0.0 && e.local_y >= 0.0 && e.local_x < r.w && e.local_y < r.h) {
             signal.emit(t, w, signal.CLICKED, cast(*u8, 0));

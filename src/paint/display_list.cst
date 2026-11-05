@@ -292,3 +292,378 @@ fn unclip(l as *List) as *Cmd {
     if (cast(i64, c) != 0) { c.kind = UNCLIP; }
     return c;
 }
+
+// --- What changed from one list to the next ---
+//
+// Painting is by far the dearest part of a hover, and a hover changes a few boxes. So a
+// list is kept as it was, with what its commands point at reduced to a number because that
+// memory goes when the page is painted again, and the next is compared with it.
+
+struct Snap {
+    cmds as *Cmd;
+    hash as *i64;
+    mats as *f64;     // six for each command, those of a MOVED one
+    n    as i64;
+    cap  as i64;
+}
+
+let is i64 as SAME   with imut = 0;
+let is i64 as PART   with imut = 1;   // only the area given
+let is i64 as ALL    with imut = 2;
+
+fn _mix(h as i64, v as i64) as i64 { return (h ^ v) * 1099511628211; }
+
+fn _mix_f(h as i64, v as f64) as i64 { return _mix(h, cast(i64, v * 1024.0)); }
+
+fn _hash(c as *Cmd) as i64 {
+    let is i64 as h with mut = 7;
+    if ((c.kind == TEXT || c.kind == RUN) && cast(i64, c.text) != 0) {
+        let is i64 as i with mut = 0;
+        while (i < c.len) {
+            h = _mix(h, cast(i64, c.text[i]));
+            i = i + 1;
+        }
+    }
+    if (c.kind == GRADIENT && cast(i64, c.grad) != 0) {
+        let is *GradPaint as g = c.grad;
+        h = _mix(h, g.kind);
+        h = _mix(h, g.repeating);
+        h = _mix_f(h, g.dx);
+        h = _mix_f(h, g.dy);
+        h = _mix_f(h, g.len);
+        h = _mix_f(h, g.cx);
+        h = _mix_f(h, g.cy);
+        h = _mix_f(h, g.rx);
+        h = _mix_f(h, g.ry);
+        h = _mix_f(h, g.from);
+        let is i64 as i with mut = 0;
+        while (i < g.n) {
+            h = _mix_f(h, g.pos[i]);
+            h = _mix(h, g.cols[i]);
+            i = i + 1;
+        }
+    }
+    if (c.kind == MOVED && cast(i64, c.m) != 0) {
+        let is i64 as i with mut = 0;
+        while (i < 6) {
+            h = _mix_f(h, c.m[i]);
+            i = i + 1;
+        }
+    }
+    return h;
+}
+
+// 0 when there is no memory for it, and the next comparison then says ALL.
+fn snap(l as *List, s as *Snap) as i64 {
+    if (l.n > s.cap) {
+        let is i64 as nc with mut = s.cap * 2;
+        if (nc < l.n) { nc = l.n * 2; }
+        if (s.cap > 0) {
+            mem.core.munmap(cast(*u8, s.cmds), s.cap * sizeof(Cmd));
+            mem.core.munmap(cast(*u8, s.hash), s.cap * sizeof(i64));
+            mem.core.munmap(cast(*u8, s.mats), s.cap * 48);
+        }
+        s.cap = 0;
+        s.n = 0 - 1;
+        let is *u8 as a = mem.core.mmap_anon(nc * sizeof(Cmd));
+        if (_map_ok(a) == 0) { return 0; }
+        let is *u8 as b = mem.core.mmap_anon(nc * sizeof(i64));
+        if (_map_ok(b) == 0) {
+            mem.core.munmap(a, nc * sizeof(Cmd));
+            return 0;
+        }
+        let is *u8 as e = mem.core.mmap_anon(nc * 48);
+        if (_map_ok(e) == 0) {
+            mem.core.munmap(a, nc * sizeof(Cmd));
+            mem.core.munmap(b, nc * sizeof(i64));
+            return 0;
+        }
+        s.cmds = cast(*Cmd, a);
+        s.hash = cast(*i64, b);
+        s.mats = cast(*f64, e);
+        s.cap = nc;
+    }
+    let is i64 as i with mut = 0;
+    while (i < l.n) {
+        let is *Cmd as c = cast(*Cmd, cast(i64, l.cmds) + i * sizeof(Cmd));
+        s.cmds[i] = *c;
+        s.hash[i] = _hash(c);
+        if (c.kind == MOVED && cast(i64, c.m) != 0) {
+            let is i64 as k with mut = 0;
+            while (k < 6) {
+                s.mats[i * 6 + k] = c.m[k];
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    s.n = l.n;
+    return 1;
+}
+
+fn _same(a as *Cmd, ha as i64, b as *Cmd) as i64 {
+    if (a.kind != b.kind || a.x != b.x || a.y != b.y || a.w != b.w || a.h != b.h) { return 0; }
+    if (a.radius != b.radius || a.r2 != b.r2 || a.r3 != b.r3 || a.r4 != b.r4) { return 0; }
+    if (a.color != b.color || a.alpha != b.alpha || a.fixed != b.fixed || a.len != b.len) { return 0; }
+    if (a.size != b.size || a.weight != b.weight || a.leading != b.leading || a.italic != b.italic) { return 0; }
+    if (a.deco != b.deco || a.rw != b.rw || a.rh != b.rh || a.ls != b.ls) { return 0; }
+    if (cast(i64, a.img) != cast(i64, b.img)) { return 0; }
+    // A rule can change what is inside a drawing with nothing out here to show for it.
+    if (a.kind == SVG) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        if (a.bw[k] != b.bw[k] || a.bc[k] != b.bc[k]) { return 0; }
+        k = k + 1;
+    }
+    return cast(i64, ha == _hash(b));
+}
+
+fn _structural(c as *Cmd) as i64 {
+    return cast(i64, c.kind == CLIP || c.kind == UNCLIP || c.kind == MOVED || c.kind == UNMOVED);
+}
+
+struct _Area {
+    on as i64;
+    x0 as f64;
+    y0 as f64;
+    x1 as f64;
+    y1 as f64;
+    vx0 as f64;    // the view, in the page: nothing past it needs painting
+    vy0 as f64;
+    vx1 as f64;
+    vy1 as f64;
+    sx as f64;
+    sy as f64;
+}
+
+fn _area_put(a as *_Area, x0 as f64, y0 as f64, x1 as f64, y1 as f64) as void {
+    if (x1 <= a.vx0 || x0 >= a.vx1 || y1 <= a.vy0 || y0 >= a.vy1) { return; }
+    if (a.on == 0) {
+        a.on = 1;
+        a.x0 = x0;
+        a.y0 = y0;
+        a.x1 = x1;
+        a.y1 = y1;
+        return;
+    }
+    if (x0 < a.x0) { a.x0 = x0; }
+    if (y0 < a.y0) { a.y0 = y0; }
+    if (x1 > a.x1) { a.x1 = x1; }
+    if (y1 > a.y1) { a.y1 = y1; }
+}
+
+// How far a command can mark the page, past what it says. 0 when that is not known.
+fn _reach(c as *Cmd, x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as i64 {
+    let is f64 as more with mut = 2.0;
+    let is f64 as w with mut = c.w;
+    let is f64 as h with mut = c.h;
+    let is f64 as x with mut = c.x;
+    let is f64 as y with mut = c.y;
+    if (c.kind == TEXT) { return 0; }
+    if (c.kind == RUN) {
+        // Glyphs lean and hang outside the line they were measured for.
+        w = c.rw;
+        h = c.rh;
+        more = c.size * 0.5 + 2.0;
+    }
+    if (c.kind == SHADOW) { more = c.leading * 1.5 + 2.0; }
+    if (c.kind == STROKE || c.kind == LINE) { more = c.leading + 2.0; }
+    if (c.kind == LINE) {
+        if (w < 0.0) {
+            x = x + w;
+            w = 0.0 - w;
+        }
+        if (h < 0.0) {
+            y = y + h;
+            h = 0.0 - h;
+        }
+    }
+    *x0 = x - more;
+    *y0 = y - more;
+    *x1 = x + w + more;
+    *y1 = y + h + more;
+    return 1;
+}
+
+// A command that differs goes into the area, through what moves it. 0 when that cannot be said.
+fn _area_cmd(a as *_Area, c as *Cmd, m as *f64, moved as i64) as i64 {
+    let is f64 as x0 with mut = 0.0;
+    let is f64 as y0 with mut = 0.0;
+    let is f64 as x1 with mut = 0.0;
+    let is f64 as y1 with mut = 0.0;
+    if (_reach(c, &x0, &y0, &x1, &y1) == 0) { return 0; }
+    if (c.fixed == 1) {
+        if (moved > 0) { return 0; }
+        x0 = x0 + a.sx;
+        x1 = x1 + a.sx;
+        y0 = y0 + a.sy;
+        y1 = y1 + a.sy;
+    }
+    if (moved > 0) {
+        let is f64 as ax = m[0] * x0;
+        let is f64 as bx = m[0] * x1;
+        let is f64 as cx = m[2] * y0;
+        let is f64 as dx = m[2] * y1;
+        let is f64 as ay = m[1] * x0;
+        let is f64 as by = m[1] * x1;
+        let is f64 as cy = m[3] * y0;
+        let is f64 as dy = m[3] * y1;
+        let is f64 as lx with mut = ax;
+        if (bx < lx) { lx = bx; }
+        let is f64 as hx with mut = ax;
+        if (bx > hx) { hx = bx; }
+        let is f64 as ly with mut = ay;
+        if (by < ly) { ly = by; }
+        let is f64 as hy with mut = ay;
+        if (by > hy) { hy = by; }
+        let is f64 as lc with mut = cx;
+        if (dx < lc) { lc = dx; }
+        let is f64 as hc with mut = cx;
+        if (dx > hc) { hc = dx; }
+        let is f64 as ld with mut = cy;
+        if (dy < ld) { ld = dy; }
+        let is f64 as hd with mut = cy;
+        if (dy > hd) { hd = dy; }
+        x0 = lx + lc + m[4] - 1.0;
+        x1 = hx + hc + m[4] + 1.0;
+        y0 = ly + ld + m[5] - 1.0;
+        y1 = hy + hd + m[5] + 1.0;
+    }
+    _area_put(a, x0, y0, x1, y1);
+    return 1;
+}
+
+let is i64 as _MAX_DEPTH with imut = 16;
+let is [96]f64 as _stack with mut;
+
+fn _compose(to as *f64, o as *f64, m as *f64, depth as i64) as void {
+    if (depth == 0) {
+        let is i64 as i with mut = 0;
+        while (i < 6) {
+            to[i] = m[i];
+            i = i + 1;
+        }
+        return;
+    }
+    to[0] = o[0] * m[0] + o[2] * m[1];
+    to[1] = o[1] * m[0] + o[3] * m[1];
+    to[2] = o[0] * m[2] + o[2] * m[3];
+    to[3] = o[1] * m[2] + o[3] * m[3];
+    to[4] = o[0] * m[4] + o[2] * m[5] + o[4];
+    to[5] = o[1] * m[4] + o[3] * m[5] + o[5];
+}
+
+fn _push_moved(c as *Cmd, depth as i64) as void {
+    let is *f64 as o with mut = &_stack[0];
+    if (depth > 0) { o = &_stack[(depth - 1) * 6]; }
+    _compose(&_stack[depth * 6], o, c.m, depth);
+}
+
+// A transform that is all that changed, like something turning for as long as the page is
+// open: what it holds, where it was and where it is now. The index past its UNMOVED, or -1
+// when that takes painting everything.
+fn _moved_group(a as *_Area, s as *Snap, l as *List, i as i64, depth as i64) as i64 {
+    let is *Cmd as c0 = cast(*Cmd, cast(i64, l.cmds) + i * sizeof(Cmd));
+    let is *Cmd as o0 = cast(*Cmd, cast(i64, s.cmds) + i * sizeof(Cmd));
+    if (c0.kind != MOVED || o0.kind != MOVED || cast(i64, c0.m) == 0) { return 0 - 1; }
+    if (c0.x != o0.x || c0.y != o0.y || c0.w != o0.w || c0.h != o0.h || depth + 2 > _MAX_DEPTH) { return 0 - 1; }
+    let is *f64 as up with mut = &_stack[0];
+    if (depth > 0) { up = &_stack[(depth - 1) * 6]; }
+    let is *f64 as was = &_stack[depth * 6];
+    let is *f64 as now = &_stack[(depth + 1) * 6];
+    _compose(was, up, &s.mats[i * 6], depth);
+    _compose(now, up, c0.m, depth);
+    let is i64 as k with mut = i + 1;
+    while (k < l.n) {
+        let is *Cmd as c = cast(*Cmd, cast(i64, l.cmds) + k * sizeof(Cmd));
+        let is *Cmd as o = cast(*Cmd, cast(i64, s.cmds) + k * sizeof(Cmd));
+        if (c.kind == UNMOVED) { return k + 1; }
+        if (c.kind == MOVED) { return 0 - 1; }
+        if (c.kind != UNCLIP) {
+            if (_area_cmd(a, o, was, 1) == 0 || _area_cmd(a, o, now, 1) == 0) { return 0 - 1; }
+            if (_area_cmd(a, c, was, 1) == 0 || _area_cmd(a, c, now, 1) == 0) { return 0 - 1; }
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// What the list painted now shows differently from the one kept: SAME, ALL, or PART with
+// the area in the page. (vx0, vy0)-(vx1, vy1) is the page's view, (sx, sy) its scroll.
+fn changes(s as *Snap, l as *List, sx as f64, sy as f64, vx0 as f64, vy0 as f64, vx1 as f64, vy1 as f64,
+           x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as i64 {
+    if (s.n < 0) { return ALL; }
+    let is _Area as a with mut;
+    a.on = 0;
+    a.x0 = 0.0;
+    a.y0 = 0.0;
+    a.x1 = 0.0;
+    a.y1 = 0.0;
+    a.vx0 = vx0;
+    a.vy0 = vy0;
+    a.vx1 = vx1;
+    a.vy1 = vy1;
+    a.sx = sx;
+    a.sy = sy;
+    let is i64 as depth with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as common with mut = s.n;
+    if (l.n < common) { common = l.n; }
+    // What is the same from the start, keeping up with what moves it.
+    while (i < common) {
+        let is *Cmd as c = cast(*Cmd, cast(i64, l.cmds) + i * sizeof(Cmd));
+        let is *Cmd as o = cast(*Cmd, cast(i64, s.cmds) + i * sizeof(Cmd));
+        if (_same(o, s.hash[i], c) == 0) {
+            if (s.n != l.n) { break; }
+            // Same length: a box that changed, command for command. What changes a clip
+            // changes everything inside it.
+            if (c.kind == MOVED && o.kind == MOVED) {
+                i = _moved_group(&a, s, l, i, depth);
+                if (i < 0) { return ALL; }
+                continue;
+            }
+            if (_structural(c) == 1 || _structural(o) == 1) { return ALL; }
+            let is *f64 as m0 with mut = &_stack[0];
+            if (depth > 0) { m0 = &_stack[(depth - 1) * 6]; }
+            if (_area_cmd(&a, o, m0, depth) == 0 || _area_cmd(&a, c, m0, depth) == 0) { return ALL; }
+        }
+        if (c.kind == MOVED) {
+            if (depth >= _MAX_DEPTH) { return ALL; }
+            _push_moved(c, depth);
+            depth = depth + 1;
+        }
+        if (c.kind == UNMOVED && depth > 0) { depth = depth - 1; }
+        i = i + 1;
+    }
+    if (s.n != l.n) {
+        // Something came or went, like a ::before only under the pointer: what lies
+        // between the same start and the same end.
+        if (depth > 0) { return ALL; }
+        let is i64 as tail with mut = 0;
+        while (tail < common - i) {
+            let is *Cmd as c = cast(*Cmd, cast(i64, l.cmds) + (l.n - 1 - tail) * sizeof(Cmd));
+            let is i64 as oi = s.n - 1 - tail;
+            let is *Cmd as o = cast(*Cmd, cast(i64, s.cmds) + oi * sizeof(Cmd));
+            if (_same(o, s.hash[oi], c) == 0) { break; }
+            tail = tail + 1;
+        }
+        let is i64 as k with mut = i;
+        while (k < s.n - tail) {
+            let is *Cmd as o = cast(*Cmd, cast(i64, s.cmds) + k * sizeof(Cmd));
+            if (_structural(o) == 1 || _area_cmd(&a, o, &_stack[0], 0) == 0) { return ALL; }
+            k = k + 1;
+        }
+        k = i;
+        while (k < l.n - tail) {
+            let is *Cmd as c = cast(*Cmd, cast(i64, l.cmds) + k * sizeof(Cmd));
+            if (_structural(c) == 1 || _area_cmd(&a, c, &_stack[0], 0) == 0) { return ALL; }
+            k = k + 1;
+        }
+    }
+    if (a.on == 0) { return SAME; }
+    *x0 = a.x0;
+    *y0 = a.y0;
+    *x1 = a.x1;
+    *y1 = a.y1;
+    return PART;
+}

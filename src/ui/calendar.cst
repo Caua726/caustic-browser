@@ -1,0 +1,372 @@
+// ui/calendar.cst — a month to choose a day from, for an <input type=date>. It knows dates
+// the way the form keeps them, YYYY-MM-DD, and says ACTIVATED with the one chosen.
+
+use "std/time.cst" as time;
+use "std/mem.cst" as mem;
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/render/shapes2d.cst" as shapes;
+use "caustic-media/text/layout/model.cst" as model;
+use "caustic-media/input/keys.cst" as keys;
+use "caustic-media/ui/tree.cst" as tree;
+use "caustic-media/ui/widget.cst" as widget;
+use "caustic-media/ui/geom.cst" as geom;
+use "caustic-media/ui/event.cst" as event;
+use "caustic-media/ui/painter.cst" as painter;
+use "caustic-media/ui/signal.cst" as signal;
+use "caustic-media/ui/style.cst" as style;
+use "caustic-media/ui/text.cst" as txt;
+use "./icons.cst" as icons;
+
+let is f64 as PAD     with imut = 10.0;
+let is f64 as CELL_W  with imut = 34.0;
+let is f64 as CELL_H  with imut = 30.0;
+let is f64 as HEAD_H  with imut = 36.0;
+let is f64 as DAYS_H  with imut = 22.0;
+let is f64 as ARROW_W with imut = 34.0;
+
+// Where the pointer is, past the days of the month: a number from 1 is a day.
+let is i64 as OVER_NONE with imut = 0;
+let is i64 as OVER_PREV with imut = 0 - 1;
+let is i64 as OVER_NEXT with imut = 0 - 2;
+
+struct Data {
+    year    as i64;    // the month showing
+    month   as i64;    // 1 to 12
+    cursor  as i64;    // the day of it the keys are on, 0 for none yet
+    over    as i64;
+    pressed as i64;
+    chosen  as i64;    // as a single number, year * 10000 + month * 100 + day; 0 for none
+    today   as i64;
+    least   as i64;    // the form's min and max, the same way; 0 for no limit
+    most    as i64;
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+let is txt.Run as _run with mut;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("browser_calendar", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _run = txt.run();
+    _ready = 1;
+}
+
+fn _digits(s as *u8, n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c < 48 || c > 57) { return 0 - 1; }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+// YYYY-MM-DD as one number, or 0 when it is not one.
+fn _parse(s as *u8, n as i64) as i64 {
+    if (cast(i64, s) == 0 || n != 10 || s[4] != 45 || s[7] != 45) { return 0; }
+    let is i64 as y = _digits(s, 4);
+    let is i64 as m = _digits(&s[5], 2);
+    let is i64 as d = _digits(&s[8], 2);
+    if (y < 1 || m < 1 || m > 12 || d < 1 || d > 31) { return 0; }
+    return y * 10000 + m * 100 + d;
+}
+
+fn _days_in(y as i64, m as i64) as i64 {
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+    if (m != 2) { return 31; }
+    if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) { return 29; }
+    return 28;
+}
+
+// The day of the week, from Sunday as 0.
+fn _weekday(y0 as i64, m as i64, d as i64) as i64 {
+    let is i64 as y with mut = y0;
+    if (m < 3) { y = y - 1; }
+    let is [12]i64 as t with mut;
+    t[0] = 0; t[1] = 3; t[2] = 2; t[3] = 5; t[4] = 0; t[5] = 3;
+    t[6] = 5; t[7] = 1; t[8] = 4; t[9] = 6; t[10] = 2; t[11] = 4;
+    return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+}
+
+// Today as one number, from days since 1970 by the proleptic calendar.
+fn _today() as i64 {
+    let is i64 as z = time.unix_time() / 86400 + 719468;
+    let is i64 as era = z / 146097;
+    let is i64 as doe = z - era * 146097;
+    let is i64 as yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let is i64 as doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let is i64 as mp = (5 * doy + 2) / 153;
+    let is i64 as d = doy - (153 * mp + 2) / 5 + 1;
+    let is i64 as m with mut = mp + 3;
+    if (m > 12) { m = m - 12; }
+    let is i64 as y with mut = yoe + era * 400;
+    if (m <= 2) { y = y + 1; }
+    return y * 10000 + m * 100 + d;
+}
+
+// A calendar in parent, showing the month of value (or this one), its limits from min and max.
+fn create(t as *tree.Tree, parent as i64, value as *u8, vn as i64, min as *u8, min_n as i64, max as *u8, max_n as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.chosen = _parse(value, vn);
+    d.today = _today();
+    d.least = _parse(min, min_n);
+    d.most = _parse(max, max_n);
+    let is i64 as at with mut = d.chosen;
+    if (at == 0) { at = d.today; }
+    d.year = at / 10000;
+    d.month = (at / 100) % 100;
+    d.cursor = at % 100;
+    d.over = OVER_NONE;
+    d.pressed = OVER_NONE;
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.min_w = PAD * 2.0 + CELL_W * 7.0;
+    out.pref_w = out.min_w;
+    out.max_w = out.min_w;
+    out.min_h = PAD * 2.0 + HEAD_H + DAYS_H + CELL_H * 6.0;
+    out.pref_h = out.min_h;
+    out.max_h = out.min_h;
+}
+
+fn _can_pick(d as *Data, day as i64) as i64 {
+    let is i64 as v = d.year * 10000 + d.month * 100 + day;
+    if (d.least != 0 && v < d.least) { return 0; }
+    if (d.most != 0 && v > d.most) { return 0; }
+    return 1;
+}
+
+// What of it is at a point of it.
+fn _at(d as *Data, x as f64, y as f64) as i64 {
+    if (y >= PAD && y < PAD + HEAD_H) {
+        if (x >= PAD && x < PAD + ARROW_W) { return OVER_PREV; }
+        if (x >= PAD + CELL_W * 7.0 - ARROW_W && x < PAD + CELL_W * 7.0) { return OVER_NEXT; }
+        return OVER_NONE;
+    }
+    let is f64 as top = PAD + HEAD_H + DAYS_H;
+    if (x < PAD || x >= PAD + CELL_W * 7.0 || y < top || y >= top + CELL_H * 6.0) { return OVER_NONE; }
+    let is i64 as col = cast(i64, (x - PAD) / CELL_W);
+    let is i64 as row = cast(i64, (y - top) / CELL_H);
+    let is i64 as day = row * 7 + col - _weekday(d.year, d.month, 1) + 1;
+    if (day < 1 || day > _days_in(d.year, d.month) || _can_pick(d, day) == 0) { return OVER_NONE; }
+    return day;
+}
+
+fn _turn(t as *tree.Tree, w as i64, d as *Data, by as i64) as void {
+    d.month = d.month + by;
+    if (d.month < 1) {
+        d.month = 12;
+        d.year = d.year - 1;
+    }
+    if (d.month > 12) {
+        d.month = 1;
+        d.year = d.year + 1;
+    }
+    let is i64 as most = _days_in(d.year, d.month);
+    if (d.cursor > most) { d.cursor = most; }
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+fn _pick(t as *tree.Tree, w as i64, d as *Data, day as i64) as void {
+    if (_can_pick(d, day) == 0) { return; }
+    let is [11]u8 as out with mut;
+    let is i64 as y = d.year;
+    out[0] = cast(u8, 48 + (y / 1000) % 10);
+    out[1] = cast(u8, 48 + (y / 100) % 10);
+    out[2] = cast(u8, 48 + (y / 10) % 10);
+    out[3] = cast(u8, 48 + y % 10);
+    out[4] = cast(u8, 45);
+    out[5] = cast(u8, 48 + d.month / 10);
+    out[6] = cast(u8, 48 + d.month % 10);
+    out[7] = cast(u8, 45);
+    out[8] = cast(u8, 48 + day / 10);
+    out[9] = cast(u8, 48 + day % 10);
+    out[10] = cast(u8, 0);
+    signal.emit(t, w, signal.ACTIVATED, cast(*u8, &out));
+}
+
+fn _go_day(t as *tree.Tree, w as i64, d as *Data, by as i64) as void {
+    let is i64 as day with mut = d.cursor + by;
+    if (day < 1) {
+        _turn(t, w, d, 0 - 1);
+        day = _days_in(d.year, d.month) + day;
+    } else if (day > _days_in(d.year, d.month)) {
+        day = day - _days_in(d.year, d.month);
+        _turn(t, w, d, 1);
+    }
+    d.cursor = day;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind == event.POINTER_MOVE || e.kind == event.POINTER_ENTER) {
+        let is i64 as now = _at(d, e.local_x, e.local_y);
+        if (now != d.over) {
+            d.over = now;
+            widget.changed(t, w, widget.CHANGED_PAINT);
+        }
+        return 1;
+    }
+    if (e.kind == event.POINTER_LEAVE) {
+        d.over = OVER_NONE;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 0;
+    }
+    if (e.kind == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        d.pressed = _at(d, e.local_x, e.local_y);
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP) {
+        let is i64 as was = d.pressed;
+        d.pressed = OVER_NONE;
+        if (was == OVER_NONE || was != _at(d, e.local_x, e.local_y)) { return 1; }
+        if (was == OVER_PREV) { _turn(t, w, d, 0 - 1); }
+        else if (was == OVER_NEXT) { _turn(t, w, d, 1); }
+        else { _pick(t, w, d, was); }
+        return 1;
+    }
+    if (e.kind == event.SCROLL) {
+        if (e.dy > 0.0) { _turn(t, w, d, 1); }
+        if (e.dy < 0.0) { _turn(t, w, d, 0 - 1); }
+        return 1;
+    }
+    if (e.kind == event.SHORTCUT_OVERRIDE) {
+        return cast(i64, e.key == keys.LEFT || e.key == keys.RIGHT || e.key == keys.UP || e.key == keys.DOWN ||
+                         e.key == keys.PAGE_UP || e.key == keys.PAGE_DOWN || e.key == keys.RETURN || e.key == keys.SPACE);
+    }
+    if (e.kind == event.KEY_DOWN) {
+        if (e.key == keys.LEFT) { _go_day(t, w, d, 0 - 1); return 1; }
+        if (e.key == keys.RIGHT) { _go_day(t, w, d, 1); return 1; }
+        if (e.key == keys.UP) { _go_day(t, w, d, 0 - 7); return 1; }
+        if (e.key == keys.DOWN) { _go_day(t, w, d, 7); return 1; }
+        if (e.key == keys.PAGE_UP) { _turn(t, w, d, 0 - 1); return 1; }
+        if (e.key == keys.PAGE_DOWN) { _turn(t, w, d, 1); return 1; }
+        if (e.key == keys.RETURN || e.key == keys.SPACE) { _pick(t, w, d, d.cursor); return 1; }
+    }
+    return 0;
+}
+
+fn _month_name(m as i64) as *u8 {
+    if (m == 1) { return "Janeiro"; }
+    if (m == 2) { return "Fevereiro"; }
+    if (m == 3) { return "Março"; }
+    if (m == 4) { return "Abril"; }
+    if (m == 5) { return "Maio"; }
+    if (m == 6) { return "Junho"; }
+    if (m == 7) { return "Julho"; }
+    if (m == 8) { return "Agosto"; }
+    if (m == 9) { return "Setembro"; }
+    if (m == 10) { return "Outubro"; }
+    if (m == 11) { return "Novembro"; }
+    return "Dezembro";
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// s centred on (cx, cy).
+fn _centred(svc as *txt.Service, p as *painter.Painter, s as *u8, n as i64, cx as f64, cy as f64, size as f64, weight as i64, col as math.color.Color) as void {
+    let is txt.Style as st = txt.style_of(p.theme.fonts.body);
+    st.family = p.theme.fonts.family;
+    st.size = size;
+    st.weight = weight;
+    let is model.Params as pp = model.params();
+    pp.width = 0.0 - 1.0;
+    if (txt.lay_plain(svc, &_run, s, n, &st, &pp) == 0) { return; }
+    txt.draw(svc, p.canvas, &_run, cx - _run.width / 2.0, cy - _run.height / 2.0, col);
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) == 0) { return; }
+    let is math.color.Color as fg = p.theme.palette.fg;
+    let is math.color.Color as dim = p.theme.palette.fg_dim;
+    let is f64 as x0 = p.rect.x + PAD;
+    let is f64 as y0 = p.rect.y + PAD;
+    let is f64 as wide = CELL_W * 7.0;
+
+    // The month, and the arrows either side.
+    let is [40]u8 as title with mut;
+    let is *u8 as name = _month_name(d.month);
+    let is i64 as n with mut = _len(name);
+    mem.core.memcpy(cast(*u8, &title), name, n);
+    title[n] = cast(u8, 32);
+    n = n + 1;
+    let is i64 as y = d.year;
+    title[n] = cast(u8, 48 + (y / 1000) % 10);
+    title[n + 1] = cast(u8, 48 + (y / 100) % 10);
+    title[n + 2] = cast(u8, 48 + (y / 10) % 10);
+    title[n + 3] = cast(u8, 48 + y % 10);
+    n = n + 4;
+    _centred(svc, p, cast(*u8, &title), n, x0 + wide / 2.0, y0 + HEAD_H / 2.0, 14.0, 600, fg);
+    if (d.over == OVER_PREV) {
+        shapes.fill_rounded(p.canvas, x0 + 2.0, y0 + 3.0, ARROW_W - 4.0, HEAD_H - 6.0, 8.0, 8.0, 8.0, 8.0, style.with_alpha(fg, 0.1));
+    }
+    if (d.over == OVER_NEXT) {
+        shapes.fill_rounded(p.canvas, x0 + wide - ARROW_W + 2.0, y0 + 3.0, ARROW_W - 4.0, HEAD_H - 6.0, 8.0, 8.0, 8.0, 8.0, style.with_alpha(fg, 0.1));
+    }
+    icons.draw(svc, p.canvas, icons.BACK, x0 + ARROW_W / 2.0, y0 + HEAD_H / 2.0, fg);
+    icons.draw(svc, p.canvas, icons.FORWARD, x0 + wide - ARROW_W / 2.0, y0 + HEAD_H / 2.0, fg);
+
+    // The days of the week, from Sunday as it is written here.
+    let is *u8 as heads = "DSTQQSS";
+    let is i64 as c with mut = 0;
+    while (c < 7) {
+        _centred(svc, p, &heads[c], 1, x0 + CELL_W * (cast(f64, c) + 0.5), y0 + HEAD_H + DAYS_H / 2.0, 11.0, 600, dim);
+        c = c + 1;
+    }
+
+    // The days.
+    let is f64 as top = y0 + HEAD_H + DAYS_H;
+    let is i64 as first = _weekday(d.year, d.month, 1);
+    let is i64 as most = _days_in(d.year, d.month);
+    let is i64 as day with mut = 1;
+    while (day <= most) {
+        let is i64 as at = first + day - 1;
+        let is f64 as cx = x0 + CELL_W * cast(f64, at % 7);
+        let is f64 as cy = top + CELL_H * cast(f64, at / 7);
+        let is i64 as v = d.year * 10000 + d.month * 100 + day;
+        let is i64 as can = _can_pick(d, day);
+        let is math.color.Color as col with mut = fg;
+        if (can == 0) { col = style.with_alpha(fg, p.theme.control.disabled_alpha); }
+        if (v == d.chosen) {
+            shapes.fill_rounded(p.canvas, cx + 2.0, cy + 1.0, CELL_W - 4.0, CELL_H - 2.0, 8.0, 8.0, 8.0, 8.0, p.theme.palette.accent);
+            col = p.theme.palette.accent_fg;
+        } else if (d.over == day) {
+            shapes.fill_rounded(p.canvas, cx + 2.0, cy + 1.0, CELL_W - 4.0, CELL_H - 2.0, 8.0, 8.0, 8.0, 8.0, style.with_alpha(fg, 0.1));
+        } else if (d.cursor == day) {
+            shapes.fill_rounded(p.canvas, cx + 2.0, cy + 1.0, CELL_W - 4.0, CELL_H - 2.0, 8.0, 8.0, 8.0, 8.0, style.with_alpha(fg, 0.05));
+        }
+        if (v == d.today && v != d.chosen) {
+            shapes.stroke_rounded(p.canvas, cx + 2.0, cy + 1.0, CELL_W - 4.0, CELL_H - 2.0, 8.0, 8.0, 8.0, 8.0, 1.0, p.theme.palette.accent);
+        }
+        let is [3]u8 as digits with mut;
+        let is i64 as dn with mut = 0;
+        if (day >= 10) {
+            digits[0] = cast(u8, 48 + day / 10);
+            dn = 1;
+        }
+        digits[dn] = cast(u8, 48 + day % 10);
+        dn = dn + 1;
+        _centred(svc, p, cast(*u8, &digits), dn, cx + CELL_W / 2.0, cy + CELL_H / 2.0, 13.0, 400, col);
+        day = day + 1;
+    }
+}

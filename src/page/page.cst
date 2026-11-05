@@ -722,6 +722,16 @@ fn replace(p as *Page, l as *dl.List) as void {
     paint.paint(&p.c, p.root, l, w, h, &p.tmp_a);
 }
 
+// Whether the root asks to be scrolled gently when a link goes somewhere inside the page.
+fn scrolls_smoothly(p as *Page) as i64 {
+    if (p.root == null) { return 0; }
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as top = _next_element(root, root);
+    let is *style.Style as ts = style.of(top);
+    if (ts == null) { return 0; }
+    return cast(i64, ts.v.i[pr.P_SCROLL_BEHAVIOR] == pr.K_SMOOTH);
+}
+
 // Where the element a fragment names begins, or -1 when nothing here has that name.
 fn anchor_y(p as *Page, frag as *u8, n as i64) as f64 {
     if (p.root == null) { return 0.0 - 1.0; }

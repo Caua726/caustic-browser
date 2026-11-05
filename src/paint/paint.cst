@@ -51,6 +51,12 @@ struct StackItem {
 }
 
 let is i64 as CHECKED with imut = 4278220287;   // #0075ff, what a checked control fills with
+let is i64 as GREYED with imut = 4291019715;    // #c3c3c3, the accent of a control that cannot be used
+let is i64 as TRACK with imut = 4293914607;     // #efefef
+let is i64 as TRACK_EDGE with imut = 11711154;  // #b2b2b2
+let is i64 as METER_GOOD with imut = 4279270416;  // #107c10
+let is i64 as METER_FAIR with imut = 4294949120;  // #ffb900
+let is i64 as METER_POOR with imut = 4292360999;  // #d83b27
 
 fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
 fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
@@ -130,11 +136,12 @@ fn _elem_of(b0 as *bx.Box) as *dom.Node {
     return cast(*dom.Node, 0);
 }
 
-fn _hit_add(p as *Painter, b as *bx.Box, owner as *bx.Box, x as f64, y as f64, w as f64, h as f64, text as i64) as void {
-    if (w <= 0.0 || h <= 0.0) { return; }
-    if (bx.prop(b, pr.P_POINTER_EVENTS) == pr.K_NONE || bx.prop(b, pr.P_VISIBILITY) != pr.K_VISIBLE) { return; }
+// 1 when it went in, as the last of them.
+fn _hit_add(p as *Painter, b as *bx.Box, owner as *bx.Box, x as f64, y as f64, w as f64, h as f64, text as i64) as i64 {
+    if (w <= 0.0 || h <= 0.0) { return 0; }
+    if (bx.prop(b, pr.P_POINTER_EVENTS) == pr.K_NONE || bx.prop(b, pr.P_VISIBILITY) != pr.K_VISIBLE) { return 0; }
     let is *dom.Node as n = _elem_of(b);
-    if (n == null) { return; }
+    if (n == null) { return 0; }
     let is *bx.Ctx as c = p.c;
     if (c.nhits == c.caphits) {
         let is i64 as nc with mut = c.caphits * 2;
@@ -159,6 +166,25 @@ fn _hit_add(p as *Painter, b as *bx.Box, owner as *bx.Box, x as f64, y as f64, w
     e.text = text;
     e.fixed = p.fixed;
     e.inv = p.inv;
+    e.r1 = 0.0;
+    e.r2 = 0.0;
+    e.r3 = 0.0;
+    e.r4 = 0.0;
+    return 1;
+}
+
+// Outside the curve of a corner of radius r, centred (cx, cy), on the far side of it.
+fn _past_corner(dx as f64, dy as f64, r as f64) as i64 {
+    if (r <= 0.0 || dx <= 0.0 || dy <= 0.0) { return 0; }
+    return cast(i64, dx * dx + dy * dy > r * r);
+}
+
+fn _in_corners(e as *bx.HitItem, px as f64, py as f64) as i64 {
+    if (_past_corner(e.x + e.r1 - px, e.y + e.r1 - py, e.r1) == 1) { return 0; }
+    if (_past_corner(px - (e.x + e.w - e.r2), e.y + e.r2 - py, e.r2) == 1) { return 0; }
+    if (_past_corner(px - (e.x + e.w - e.r3), py - (e.y + e.h - e.r3), e.r3) == 1) { return 0; }
+    if (_past_corner(e.x + e.r4 - px, py - (e.y + e.h - e.r4), e.r4) == 1) { return 0; }
+    return 1;
 }
 
 // What was painted last at a point. (x, y) is in the page and (sx, sy) how far it is scrolled.
@@ -180,7 +206,7 @@ fn hit(c as *bx.Ctx, x as f64, y as f64, sx as f64, sy as f64, node as **dom.Nod
             py = (*m)[1] * px0 + (*m)[3] * py0 + (*m)[5];
         }
         if (px >= e.x && py >= e.y && px < e.x + e.w && py < e.y + e.h &&
-            px >= e.cx0 && py >= e.cy0 && px < e.cx1 && py < e.cy1) {
+            px >= e.cx0 && py >= e.cy0 && px < e.cx1 && py < e.cy1 && _in_corners(e, px, py) == 1) {
             *node = e.node;
             *box = e.box;
             *text = e.text;
@@ -557,7 +583,14 @@ fn _box_decorations(p as *Painter, b as *bx.Box, alpha as f64) as void {
     if (_visible(b) == 0) { return; }
     let is f64 as w = bx.border_w(b);
     let is f64 as h = bx.border_h(b);
-    if (b.kind != bx.B_ROW && b.kind != bx.B_ROWGROUP) { _hit_add(p, b, b, b.ax, b.ay, w, h, 0); }
+    if (b.kind != bx.B_ROW && b.kind != bx.B_ROWGROUP && _hit_add(p, b, b, b.ax, b.ay, w, h, 0) == 1 && _has_radius(b) == 1) {
+        let is *bx.HitItem as e = cast(*bx.HitItem, cast(i64, p.c.hits) + (p.c.nhits - 1) * sizeof(bx.HitItem));
+        let is f64 as base = _min(w, h);
+        e.r1 = bx.resolve(b, pr.P_BORDER_TOP_LEFT_RADIUS, base);
+        e.r2 = bx.resolve(b, pr.P_BORDER_TOP_RIGHT_RADIUS, base);
+        e.r3 = bx.resolve(b, pr.P_BORDER_BOTTOM_RIGHT_RADIUS, base);
+        e.r4 = bx.resolve(b, pr.P_BORDER_BOTTOM_LEFT_RADIUS, base);
+    }
     _shadows(p, b, b.ax, b.ay, w, h, alpha);
     _background(p, b, b.ax, b.ay, w, h, alpha);
     _border(p, b, b.ax, b.ay, w, h, alpha);
@@ -658,6 +691,7 @@ fn _replaced(p as *Painter, b as *bx.Box, alpha as f64) as void {
     }
     if (b.control == bx.CTL_RANGE) { _range(p, b, alpha); return; }
     if (b.control == bx.CTL_COLOR) { _color_well(p, b, alpha); return; }
+    if (b.control == bx.CTL_PROGRESS || b.control == bx.CTL_METER) { _gauge(p, b, alpha); return; }
     if (b.control != 0 && b.checked == 1) { _checked(p, b, alpha); }
 }
 
@@ -694,21 +728,44 @@ fn _round(c as *dl.Cmd, r as f64) as void {
 }
 
 // Over the whole control, border and all, as the colour of a checked one covers it.
+fn _shaded(col as i64, k as f64) as i64 {
+    let is i64 as r = cast(i64, cast(f64, (col >> 16) & 255) * (1.0 - k));
+    let is i64 as g = cast(i64, cast(f64, (col >> 8) & 255) * (1.0 - k));
+    let is i64 as bl = cast(i64, cast(f64, col & 255) * (1.0 - k));
+    return (col & 4278190080) | (r << 16) | (g << 8) | bl;
+}
+
+// The accent as the pointer leaves it: darker under it, darker still pressed, grey when
+// the control cannot be used.
+fn _live_accent(b as *bx.Box) as i64 {
+    let is i64 as col = _accent(b);
+    if (b.node == null) { return col; }
+    if (forms.is_disabled(b.node) == 1) { return GREYED; }
+    if ((b.node.flags & dom.FLAG_ACTIVE) != 0) { return _shaded(col, 0.24); }
+    if ((b.node.flags & dom.FLAG_HOVER) != 0) { return _shaded(col, 0.12); }
+    return col;
+}
+
 fn _checked(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is f64 as x = b.ax;
     let is f64 as y = b.ay;
     let is f64 as s = bx.border_w(b);
-    let is i64 as col = _accent(b);
+    let is i64 as col = _live_accent(b);
     if (b.control == bx.CTL_RADIO) {
         _disc(p, x, y, s, col, alpha);
-        _disc(p, x + s * 0.12, y + s * 0.12, s * 0.76, 4294967295, alpha);
-        _disc(p, x + s * 0.25, y + s * 0.25, s * 0.5, col, alpha);
+        _disc(p, x + s * 0.1, y + s * 0.1, s * 0.8, 4294967295, alpha);
+        _disc(p, x + s * 0.24, y + s * 0.24, s * 0.52, col, alpha);
         return;
     }
-    _round(_rect(p, x, y, s, s, col, alpha), 2.0);
-    let is f64 as t = s * 0.15;
-    _line(p, x + s * 0.22, y + s * 0.52, x + s * 0.42, y + s * 0.72, t, 4294967295, alpha);
-    _line(p, x + s * 0.42, y + s * 0.72, x + s * 0.80, y + s * 0.28, t, 4294967295, alpha);
+    _round(_rect(p, x, y, s, s, col, alpha), s * 0.18);
+    // Two strokes square to each other. The short one runs half a width past the corner,
+    // and that is what fills the outside of the bend.
+    let is f64 as t = s * 0.16;
+    let is f64 as jx = x + s * 0.41;
+    let is f64 as jy = y + s * 0.72;
+    let is f64 as past = t * 0.5 * 0.7071;
+    _line(p, x + s * 0.2, y + s * 0.51, jx + past, jy + past, t, 4294967295, alpha);
+    _line(p, jx, jy, x + s * 0.8, y + s * 0.33, t, 4294967295, alpha);
 }
 
 fn _range(p as *Painter, b as *bx.Box, alpha as f64) as void {
@@ -724,15 +781,40 @@ fn _range(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is f64 as bar = 8.0;
     let is f64 as cy = y + b.h / 2.0;
     let is f64 as cx = x + thumb / 2.0 + frac * (b.w - thumb);
-    let is i64 as col = _accent(b);
-    _round(_rect(p, x, cy - bar / 2.0, b.w, bar, 4294112231, alpha), bar / 2.0);
-    let is *dl.Cmd as e = dl.stroke(p.l, x, cy - bar / 2.0, b.w, bar, 1.0, 11711154, alpha);
-    if (e != null) {
-        e.fixed = p.fixed;
-        _round(e, bar / 2.0);
-    }
+    let is i64 as col = _live_accent(b);
+    _track(p, x, cy - bar / 2.0, b.w, bar, alpha);
     _round(_rect(p, x, cy - bar / 2.0, cx - x, bar, col, alpha), bar / 2.0);
     _disc(p, cx - thumb / 2.0, cy - thumb / 2.0, thumb, col, alpha);
+}
+
+// The grey channel a range, a progress bar and a meter run in.
+fn _track(p as *Painter, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    _round(_rect(p, x, y, w, h, TRACK, alpha), h / 2.0);
+    let is *dl.Cmd as e = dl.stroke(p.l, x, y, w, h, 1.0, TRACK_EDGE, alpha);
+    if (e != null) {
+        e.fixed = p.fixed;
+        _round(e, h / 2.0);
+    }
+}
+
+fn _gauge(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (b.node == null || b.w <= 0.0 || b.h <= 0.0) { return; }
+    let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is f64 as bar = _min(8.0, b.h);
+    let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP] + (b.h - bar) / 2.0;
+    let is i64 as is_meter = cast(i64, b.control == bx.CTL_METER);
+    let is f64 as frac with mut = forms.gauge_frac(b.node, is_meter);
+    let is i64 as col with mut = _accent(b);
+    if (is_meter == 1) {
+        let is i64 as grade = forms.meter_grade(b.node);
+        col = METER_GOOD;
+        if (grade == 1) { col = METER_FAIR; }
+        if (grade == 2) { col = METER_POOR; }
+    }
+    // No value to show: a stretch of the bar, to say it is waiting.
+    if (frac < 0.0) { frac = 0.2; }
+    _track(p, x, y, b.w, bar, alpha);
+    if (frac > 0.0) { _round(_rect(p, x, y, _max(bar, b.w * frac), bar, col, alpha), bar / 2.0); }
 }
 
 fn _hex_digit(c as i64) as i64 {
@@ -747,6 +829,7 @@ fn _color_well(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
     let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
     let is i64 as col with mut = 4278190080;
+    let is f64 as alpha2 with mut = alpha;
     let is *dom.Attr as a = dom.find_attr(b.node, "value", 5);
     if (a != null && a.value_len == 7 && a.value[0] == 35) {
         let is i64 as k with mut = 1;
@@ -757,11 +840,18 @@ fn _color_well(p as *Painter, b as *bx.Box, alpha as f64) as void {
         }
         col = 4278190080 | rgb;
     }
-    _rect(p, x, y, b.w, b.h, col, alpha);
-    _rect(p, x, y, b.w, 1.0, 4286019447, alpha);
-    _rect(p, x, y + b.h - 1.0, b.w, 1.0, 4286019447, alpha);
-    _rect(p, x, y, 1.0, b.h, 4286019447, alpha);
-    _rect(p, x + b.w - 1.0, y, 1.0, b.h, 4286019447, alpha);
+    if (forms.is_disabled(b.node) == 1) { alpha2 = alpha * 0.45; }
+    // On whole pixels, or the edge smears over two.
+    let is f64 as sx = cast(f64, cast(i64, x + 0.5));
+    let is f64 as sy = cast(f64, cast(i64, y + 0.5));
+    let is f64 as sw = cast(f64, cast(i64, b.w + 0.5));
+    let is f64 as sh = cast(f64, cast(i64, b.h + 0.5));
+    _round(_rect(p, sx, sy, sw, sh, col, alpha2), 2.0);
+    let is *dl.Cmd as e = dl.stroke(p.l, sx, sy, sw, sh, 1.0, 0, 0.32 * alpha2);
+    if (e != null) {
+        e.fixed = p.fixed;
+        _round(e, 2.0);
+    }
 }
 
 fn _select_arrow(p as *Painter, b as *bx.Box, alpha as f64) as void {

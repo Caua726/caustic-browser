@@ -633,7 +633,7 @@ fn _textarea(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     b.inline_ctx = 1;
     let is f64 as em = st.v.f[pr.P_FONT_SIZE];
     b.iw = cast(f64, _attr_int(n, "cols", 4, 20)) * em * 0.6;
-    b.ih = cast(f64, _attr_int(n, "rows", 4, 2)) * em * 1.2;
+    b.ih = cast(f64, _attr_int(n, "rows", 4, 2)) * m.line_height(st);
     return b;
 }
 
@@ -958,9 +958,20 @@ fn _box_of(c as *bx.Ctx, n as *dom.Node, st as *style.Style, ordinal as i64) as 
         if (n.tag == tg.SELECT) { return _select(c, n, st); }
         if (n.tag == tg.TEXTAREA) { return _textarea(c, n, st); }
         if (_tag_is(n, "canvas") == 1 || _tag_is(n, "video") == 1 || _tag_is(n, "iframe") == 1 ||
-            _tag_is(n, "embed") == 1 || _tag_is(n, "object") == 1 || _tag_is(n, "audio") == 1 ||
-            _tag_is(n, "meter") == 1 || _tag_is(n, "progress") == 1) {
+            _tag_is(n, "embed") == 1 || _tag_is(n, "object") == 1 || _tag_is(n, "audio") == 1) {
             return _other_replaced(c, n, st);
+        }
+        if (_tag_is(n, "progress") == 1 || _tag_is(n, "meter") == 1) {
+            let is *bx.Box as g = _replaced_shell(c, n, st);
+            let is f64 as em = st.v.f[pr.P_FONT_SIZE];
+            g.control = bx.CTL_METER;
+            g.iw = em * 5.0;
+            if (_tag_is(n, "progress") == 1) {
+                g.control = bx.CTL_PROGRESS;
+                g.iw = em * 10.0;
+            }
+            g.ih = em;
+            return g;
         }
     }
     let is *bx.Box as b = _box_shell(c, n, st, d);

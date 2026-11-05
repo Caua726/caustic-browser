@@ -30,6 +30,8 @@ use "../paint/display_list.cst" as dl;
 use "../paint/placeholder.cst" as placeholder;
 use "./page_view.cst" as pv;
 use "./chrome.cst" as chrome;
+use "./calendar.cst" as calendar;
+use "./colorpick.cst" as colorpick;
 use "./icons.cst" as icons;
 use "./theme.cst" as theme;
 
@@ -65,6 +67,7 @@ struct Doc {
     view  as i64;
     back  as i64;
     forward as i64;
+    reload  as i64;
     list  as dl.List;
     hooks as pv.Hooks;
     pg    as *pg.Page;   // null until the tab first goes somewhere
@@ -205,7 +208,8 @@ fn new_tab() as i32 {
     ui.tree.set_enabled(t, d.forward, 0);
     ui.on(t, d.back, ui.signal.CLICKED, fn_ptr(_back_clicked));
     ui.on(t, d.forward, ui.signal.CLICKED, fn_ptr(_forward_clicked));
-    ui.on(t, chrome.icon_button(t, row, chrome.RELOAD), ui.signal.CLICKED, fn_ptr(_reload_clicked));
+    d.reload = chrome.icon_button(t, row, chrome.RELOAD);
+    ui.on(t, d.reload, ui.signal.CLICKED, fn_ptr(_reload_clicked));
     d.entry = ui.entry.create(t, row);
     ui.layout.set_stretch(t, d.entry, 1.0, 0.0);
     ui.layout.set_margin(t, d.entry, 8.0, 0.0, 8.0, 0.0);
@@ -230,7 +234,8 @@ fn close_tab(i as i64) as void {
     if (br.n == 1) { ui.app.window_close(br.a, br.win); return; }
     if (_ed_doc == _doc(i)) { _drop_editor(); }
     if (_sel_doc == _doc(i)) { _sel_doc = cast(*Doc, 0); }
-    ui.tree.destroy(br.t, _doc(i).tab);
+    if (_cal_doc == _doc(i)) { _cal_doc = cast(*Doc, 0); }
+    chrome.leave_tab(br.t, _doc(i).tab);
     ui.tree.destroy(br.t, _doc(i).page);
     _forget_page(_doc(i));
     dl.free(&_doc(i).list);
@@ -275,6 +280,7 @@ fn _forward_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as vo
 // The same page again, from the network, or the placeholder if the tab has been nowhere.
 fn _reload() as void {
     let is *Doc as d = _doc(br.cur);
+    chrome.spin_icon(br.t, d.reload);
     if (d.hist_n == 0) {
         placeholder.fill(&d.list);
         pv.set_list(br.t, d.view, &d.list);
@@ -663,6 +669,17 @@ fn _scroll_to_fragment(d as *Doc, u as *u8) as i64 {
     return 1;
 }
 
+// The same inside the page already showing, which gets there the way the page asks.
+fn _go_to_fragment(d as *Doc, u as *u8) as i64 {
+    let is *u8 as f = _fragment_of(u);
+    if (cast(i64, f) == 0) { return 0; }
+    let is f64 as y = pg.anchor_y(d.pg, f, url.len_of(f));
+    if (y < 0.0) { return 0; }
+    if (pg.scrolls_smoothly(d.pg) == 1) { pv.glide_to(br.t, d.view, 0.0, y); }
+    else { pv.scroll_to(br.t, d.view, 0.0, y); }
+    return 1;
+}
+
 // The load that was asked for, if any.
 fn _service() as void {
     if (_pend_slot < 0) { return; }
@@ -671,6 +688,7 @@ fn _service() as void {
     if (d.used == 0) { return; }
     _hush();
     if (_ed_doc == d) { _close_editor(); }
+    if (_cal_doc == d) { _cal_doc = cast(*Doc, 0); }
     let is i64 as push = _pend_push;
     let is f64 as y0 = _pend_y;
     let is [MAX_URL]u8 as u with mut;
@@ -679,7 +697,7 @@ fn _service() as void {
     if (_is_same_document(d, cast(*u8, &u)) == 1) {
         if (push == 1) { _push_history(d, cast(*u8, &u)); }
         _copy_cut(cast(*u8, &d.pg.url), cast(*u8, &u), pg.MAX_URL);
-        if (_scroll_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
+        if (_go_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
         ui.entry.set_text(br.t, d.entry, cast(*u8, &u), url.len_of(cast(*u8, &u)));
         _nav_buttons(d);
         return;
@@ -732,9 +750,13 @@ fn _follow_view() as void {
     _lay_out(d);
 }
 
+// What the page last showed, to tell what a change of look really changed.
+let is dl.Snap as _shown with mut;
+
 fn _restyle(d as *Doc) as void {
+    dl.snap(&d.list, &_shown);
     pg.refresh(d.pg, &d.list);
-    pv.set_list(br.t, d.view, &d.list);
+    pv.set_list_changed(br.t, d.view, &d.list, &_shown);
     pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
     _place_editor(d);
     _keep_moving(d);
@@ -753,13 +775,14 @@ fn _motion_due(user as *u8) as void {
         let is *Doc as d = _doc(br.cur);
         if (_has_page(d) == 1 && pg.moving(d.pg) == 1) {
             still = 1;
+            dl.snap(&d.list, &_shown);
             if (pg.tick(d.pg, &d.list, pv.scroll_y(br.t, d.view)) == 1) {
                 let is f64 as x0 with mut = 0.0;
                 let is f64 as y0 with mut = 0.0;
                 let is f64 as x1 with mut = 0.0;
                 let is f64 as y1 with mut = 0.0;
                 if (pg.moved_area(d.pg, &x0, &y0, &x1, &y1) == 1) { pv.set_list_part(br.t, d.view, &d.list, x0, y0, x1, y1); }
-                else { pv.set_list(br.t, d.view, &d.list); }
+                else { pv.set_list_changed(br.t, d.view, &d.list, &_shown); }
             }
         }
     }
@@ -915,6 +938,8 @@ fn _entered(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _ed
 
 // A field of the page ready for typing, with the caret at a byte, or all of it selected
 // for a negative one.
+let is [512]u8 as _ed_family with mut;
+
 fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
     let is *ui.tree.Tree as t = br.t;
     _close_editor();
@@ -956,6 +981,7 @@ fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
         if (readonly == 1) { ui.textview.set_editable(t, ed, 0); }
     } else {
         ed = ui.entry.create(t, holder);
+        ui.entry.set_frame(t, ed, 0);
         let is *dom.Attr as ty = dom.find_attr(n, "type", 4);
         if (ty != null && _same_word(ty.value, ty.value_len, "password") == 1) { ui.entry.set_password(t, ed, 1); }
         ui.entry.set_text(t, ed, v, vn);
@@ -964,17 +990,34 @@ fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
         if (ph != null) { ui.entry.set_placeholder(t, ed, ph.value, ph.value_len); }
         ui.on(t, ed, ui.signal.ACTIVATED, fn_ptr(_entered));
     }
-    // It should read as the page's field: the page's colours and size, and no frame.
+    // It should read as the page's field: the page's colours, font and size, and no frame.
+    // The holder hides the text under it, with the box's corners, which a widget taller
+    // than the box could not.
     _ed_over = ui.style.overrides();
     let is i64 as bg = st.v.i[pr.P_BACKGROUND_COLOR];
-    if (((bg >> 24) & 255) == 255) { ui.style.override_color(&_ed_over, ui.style.ROLE_VIEW_BG, _argb(bg)); }
-    else { ui.style.override_color(&_ed_over, ui.style.ROLE_VIEW_BG, math.color.hex(16777215)); }
-    ui.style.override_color(&_ed_over, ui.style.ROLE_FG, _argb(st.v.i[pr.P_COLOR]));
+    let is math.color.Color as under with mut = math.color.hex(16777215);
+    if (((bg >> 24) & 255) == 255) { under = _argb(bg); }
+    let is f64 as corner = bx.resolve(b, pr.P_BORDER_TOP_LEFT_RADIUS, bx.border_h(b)) - b.b[bx.LEFT];
+    let is f64 as inner with mut = 0.0;
+    if (corner > 0.0) { inner = corner; }
+    pv.set_field_look(t, d.view, under, inner);
     let is math.color.Color as none with mut = math.color.hex(0);
     none.a = 0.0;
+    ui.style.override_color(&_ed_over, ui.style.ROLE_VIEW_BG, none);
+    ui.style.override_color(&_ed_over, ui.style.ROLE_FG, _argb(st.v.i[pr.P_COLOR]));
     ui.style.override_color(&_ed_over, ui.style.ROLE_BORDER, none);
     _ed_over.radius = 0.0;
     _ed_over.text_scale = st.v.f[pr.P_FONT_SIZE] / th.fonts.body.size;
+    // Copied: a style's words go with the next restyle, and typing brings one on.
+    let is *u8 as fam = cast(*u8, st.v.i[pr.P_FONT_FAMILY]);
+    let is i64 as fam_n with mut = 0;
+    while (fam_n < 511 && fam[fam_n] != 0) {
+        _ed_family[fam_n] = fam[fam_n];
+        fam_n = fam_n + 1;
+    }
+    _ed_family[fam_n] = cast(u8, 0);
+    if (fam[fam_n] == 0) { _ed_over.family = cast(*u8, &_ed_family); }
+    _ed_over.weight = cast(i64, st.v.f[pr.P_FONT_WEIGHT]);
     ui.tree.set_overrides(t, ed, &_ed_over);
     _ed_widget = ed;
     _ed_node = n;
@@ -1063,6 +1106,7 @@ fn _open_select(d as *Doc, n as *dom.Node, by_keys as i64) as void {
     if (b == null) { return; }
     if (_sel_menu != 0) { ui.tree.destroy(t, _sel_menu); }
     let is i64 as m = ui.menu.create(t);
+    _page_popup_look(t, m);
     _sel_menu = m;
     _sel_doc = d;
     _sel_node = n;
@@ -1109,6 +1153,133 @@ fn _open_select(d as *Doc, n as *dom.Node, by_keys as i64) as void {
     ui.menu.popup_from(t, br.r, m, d.view, math.rect.rect(ax, ay, bx.border_w(b), bx.border_h(b)),
                        positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT, cast(i32, by_keys));
     if (by_keys == 1 && current != 0) { ui.router.focus(t, br.r, current, 1); }
+}
+
+// --- The calendar of an <input type=date> ---
+//
+// Its icon opens it, and the rest of the field is still there to be typed in.
+
+// What opens from a control belongs to the page, not to the browser around it, and a page
+// is light unless it has said otherwise.
+let is ui.style.Overrides as _pop_over with mut;
+let is i64 as _pop_over_ready with mut = 0;
+
+fn _page_popup_look(t as *ui.tree.Tree, w as i64) as void {
+    if (_pop_over_ready == 0) {
+        _pop_over = ui.style.overrides();
+        ui.style.override_color(&_pop_over, ui.style.ROLE_WINDOW_BG, math.color.hex(16777215));
+        ui.style.override_color(&_pop_over, ui.style.ROLE_VIEW_BG, math.color.hex(16777215));
+        ui.style.override_color(&_pop_over, ui.style.ROLE_POPOVER_BG, math.color.hex(16777215));
+        ui.style.override_color(&_pop_over, ui.style.ROLE_FG, math.color.hex(1712678));
+        ui.style.override_color(&_pop_over, ui.style.ROLE_FG_DIM, math.color.hex(6253429));
+        ui.style.override_color(&_pop_over, ui.style.ROLE_BORDER, math.color.hex(14013663));
+        _pop_over_ready = 1;
+    }
+    ui.tree.set_overrides(t, w, &_pop_over);
+}
+
+let is i64 as _color_popup with mut = 0;
+let is *Doc as _color_doc with mut = cast(*Doc, 0);
+let is *dom.Node as _color_node with mut = cast(*dom.Node, 0);
+
+fn _color_changed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    if (_color_doc == cast(*Doc, 0) || _has_page(_color_doc) == 0 || _color_node == null) { return; }
+    forms.set_value(&_color_doc.pg.doc, _color_node, arg, 7);
+    _color_doc.pg.dirty = 1;
+}
+
+fn _color_settled(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    _color_changed(t, w, arg, user);
+    ui.popup.close(t, _color_popup);
+}
+
+fn _open_color(d as *Doc, n as *dom.Node) as void {
+    let is *ui.tree.Tree as t = br.t;
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    if (b == null) { return; }
+    if (_color_popup != 0) { ui.tree.destroy(t, _color_popup); }
+    _color_popup = ui.popup.create(t);
+    if (_color_popup == 0) { return; }
+    _page_popup_look(t, _color_popup);
+    _color_doc = d;
+    _color_node = n;
+    let is i64 as vn with mut = 0;
+    let is *u8 as v = forms.value_of(&d.pg.doc, n, &vn);
+    let is i64 as c = colorpick.create(t, _color_popup, v, vn);
+    if (c == 0) { return; }
+    ui.on(t, c, ui.signal.CHANGED, fn_ptr(_color_changed));
+    ui.on(t, c, ui.signal.ACTIVATED, fn_ptr(_color_settled));
+    let is math.rect.Rect as vr = ui.layout.window_rect(t, d.view);
+    let is f64 as ax with mut = vr.x + b.ax;
+    let is f64 as ay with mut = vr.y + b.ay;
+    if (_is_fixed(b) == 0) {
+        ax = ax - pv.scroll_x(t, d.view);
+        ay = ay - pv.scroll_y(t, d.view);
+    }
+    ui.popup.open_from(t, br.r, _color_popup, d.view, math.rect.rect(ax, ay, bx.border_w(b), bx.border_h(b)),
+                       positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT, ui.popup.FOCUS_FIRST);
+    ui.router.focus(t, br.r, c, 0);
+}
+
+let is i64 as _cal_popup with mut = 0;
+let is *Doc as _cal_doc with mut = cast(*Doc, 0);
+let is *dom.Node as _cal_node with mut = cast(*dom.Node, 0);
+
+fn _on_date_icon(d as *Doc, n as *dom.Node, p as *pv.Pointer) as i64 {
+    if (forms.is_date(n) == 0 || forms.is_disabled(n) == 1) { return 0; }
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    if (b == null) { return 0; }
+    return cast(i64, p.x + p.sx >= b.ax + bx.border_w(b) - 34.0);
+}
+
+fn _cal_chosen(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    if (_cal_doc != cast(*Doc, 0) && _has_page(_cal_doc) == 1 && _cal_node != null) {
+        forms.set_value(&_cal_doc.pg.doc, _cal_node, arg, 10);
+        _cal_doc.pg.dirty = 1;
+    }
+    ui.popup.close(t, _cal_popup);
+}
+
+fn _open_calendar(d as *Doc, n as *dom.Node) as void {
+    let is *ui.tree.Tree as t = br.t;
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    if (b == null) { return; }
+    if (_cal_popup != 0) { ui.tree.destroy(t, _cal_popup); }
+    _cal_popup = ui.popup.create(t);
+    if (_cal_popup == 0) { return; }
+    _page_popup_look(t, _cal_popup);
+    _cal_doc = d;
+    _cal_node = n;
+    let is i64 as vn with mut = 0;
+    let is *u8 as v = forms.value_of(&d.pg.doc, n, &vn);
+    let is *dom.Attr as lo = dom.find_attr(n, "min", 3);
+    let is *dom.Attr as hi = dom.find_attr(n, "max", 3);
+    let is *u8 as lo_s with mut = cast(*u8, 0);
+    let is i64 as lo_n with mut = 0;
+    if (lo != null) {
+        lo_s = lo.value;
+        lo_n = lo.value_len;
+    }
+    let is *u8 as hi_s with mut = cast(*u8, 0);
+    let is i64 as hi_n with mut = 0;
+    if (hi != null) {
+        hi_s = hi.value;
+        hi_n = hi.value_len;
+    }
+    let is i64 as c = calendar.create(t, _cal_popup, v, vn, lo_s, lo_n, hi_s, hi_n);
+    if (c == 0) { return; }
+    ui.on(t, c, ui.signal.ACTIVATED, fn_ptr(_cal_chosen));
+    let is math.rect.Rect as vr = ui.layout.window_rect(t, d.view);
+    let is f64 as ax with mut = vr.x + b.ax;
+    let is f64 as ay with mut = vr.y + b.ay;
+    if (_is_fixed(b) == 0) {
+        ax = ax - pv.scroll_x(t, d.view);
+        ay = ay - pv.scroll_y(t, d.view);
+    }
+    ui.popup.open_from(t, br.r, _cal_popup, d.view, math.rect.rect(ax, ay, bx.border_w(b), bx.border_h(b)),
+                       positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT, ui.popup.FOCUS_FIRST);
+    // The keys work from the start. Opened with the pointer, it has no outline to show it.
+    ui.router.focus(t, br.r, c, 0);
 }
 
 // Up and down on a <select> with the focus: the next option that can be chosen.
@@ -1199,6 +1370,7 @@ fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
                 forms.toggle(doc, x);
                 d.pg.dirty = 1;
             }
+            if (k == forms.COLOR) { _open_color(d, x); }
             if (k == forms.SUBMIT) {
                 let is *dom.Node as form = forms.form_of(doc, x);
                 if (form != null) { _submit(d, form, x); }
@@ -1216,7 +1388,7 @@ fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
             let is *dom.Node as target = forms.label_target(doc, x);
             if (target == null || forms.is_disabled(target) == 1) { return; }
             let is i64 as tk = forms.kind_of(target);
-            if (tk == forms.TEXT || tk == forms.AREA || tk == forms.SELECT || tk == forms.RANGE || tk == forms.COLOR) {
+            if (tk == forms.TEXT || tk == forms.AREA || tk == forms.SELECT || tk == forms.RANGE) {
                 _focus_element(d, target, 0);
                 return;
             }
@@ -1322,6 +1494,12 @@ fn _page_pressed(user as *u8, p as *pv.Pointer) as i64 {
     _hit_of(d, p, &h);
     pg.set_active(d.pg, h.node);
     let is *dom.Node as f = _focus_target(h.node);
+    if (f != null && _on_date_icon(d, f, p) == 1) {
+        _close_editor();
+        pg.set_focus(d.pg, f, 0);
+        _open_calendar(d, f);
+        return 1;
+    }
     if (f != null && _is_typed_in(f) == 1) {
         if (f == _ed_node) { return 1; }
         pg.set_focus(d.pg, f, 1);
@@ -1401,8 +1579,9 @@ fn _page_wheel(user as *u8, p as *pv.Pointer) as i64 {
     let is layout.Hit as h with mut;
     _hit_of(d, p, &h);
     if (h.box == null || layout.scroll_boxes(h.box, p.dx, p.dy) == 0) { return 0; }
+    dl.snap(&d.list, &_shown);
     pg.replace(d.pg, &d.list);
-    pv.set_list(br.t, d.view, &d.list);
+    pv.set_list_changed(br.t, d.view, &d.list, &_shown);
     pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
     _place_editor(d);
     return 1;

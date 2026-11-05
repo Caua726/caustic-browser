@@ -1,0 +1,285 @@
+// ui/colorpick.cst — a colour to choose, for an <input type=color>. A square of saturation
+// and brightness, a strip of hues under it, and what they come to. It knows colours the
+// way the form keeps them, #rrggbb, says CHANGED with each one on the way and ACTIVATED
+// with the one settled on.
+
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/render/shapes2d.cst" as shapes;
+use "caustic-media/text/layout/model.cst" as model;
+use "caustic-media/input/keys.cst" as keys;
+use "caustic-media/ui/tree.cst" as tree;
+use "caustic-media/ui/widget.cst" as widget;
+use "caustic-media/ui/geom.cst" as geom;
+use "caustic-media/ui/event.cst" as event;
+use "caustic-media/ui/painter.cst" as painter;
+use "caustic-media/ui/signal.cst" as signal;
+use "caustic-media/ui/style.cst" as style;
+use "caustic-media/ui/text.cst" as txt;
+
+let is f64 as PAD      with imut = 12.0;
+let is f64 as SQUARE_W with imut = 216.0;
+let is f64 as SQUARE_H with imut = 136.0;
+let is f64 as GAP      with imut = 12.0;
+let is f64 as STRIP_H  with imut = 12.0;
+let is f64 as WELL     with imut = 28.0;
+
+// A column of the square at a time: its colour only ever runs down them.
+let is i64 as COLUMNS with imut = 54;
+
+let is i64 as ZONE_NONE   with imut = 0;
+let is i64 as ZONE_SQUARE with imut = 1;
+let is i64 as ZONE_STRIP  with imut = 2;
+
+struct Data {
+    hue  as f64;    // 0 to 1, around the wheel
+    sat  as f64;    // 0 to 1
+    val  as f64;    // 0 to 1
+    held as i64;    // the part the pointer went down on
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+let is txt.Run as _run with mut;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("browser_colorpick", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _run = txt.run();
+    _ready = 1;
+}
+
+fn _clamp01(v as f64) as f64 {
+    if (v < 0.0) { return 0.0; }
+    if (v > 1.0) { return 1.0; }
+    return v;
+}
+
+fn _hex_digit(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+// #rrggbb as one number, or black when it is not one, which is what a form takes it for.
+fn _parse(s as *u8, n as i64) as i64 {
+    if (n != 7 || s[0] != 35) { return 0; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 1;
+    while (i < 7) {
+        let is i64 as x = _hex_digit(cast(i64, s[i]));
+        if (x < 0) { return 0; }
+        v = v * 16 + x;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _from_rgb(d as *Data, rgb as i64) as void {
+    let is f64 as r = cast(f64, (rgb >> 16) & 255) / 255.0;
+    let is f64 as g = cast(f64, (rgb >> 8) & 255) / 255.0;
+    let is f64 as b = cast(f64, rgb & 255) / 255.0;
+    let is f64 as hi with mut = r;
+    if (g > hi) { hi = g; }
+    if (b > hi) { hi = b; }
+    let is f64 as lo with mut = r;
+    if (g < lo) { lo = g; }
+    if (b < lo) { lo = b; }
+    let is f64 as span = hi - lo;
+    d.val = hi;
+    d.sat = 0.0;
+    d.hue = 0.0;
+    if (hi <= 0.0 || span <= 0.0) { return; }
+    d.sat = span / hi;
+    let is f64 as h with mut = 0.0;
+    if (hi == r) { h = (g - b) / span; }
+    else if (hi == g) { h = 2.0 + (b - r) / span; }
+    else { h = 4.0 + (r - g) / span; }
+    h = h / 6.0;
+    if (h < 0.0) { h = h + 1.0; }
+    d.hue = h;
+}
+
+// Red, green and blue from 0 to 255, as one number.
+fn _rgb_of(h0 as f64, s as f64, v as f64) as i64 {
+    let is f64 as h = _clamp01(h0) * 6.0;
+    let is i64 as side = cast(i64, h);
+    let is f64 as f = h - cast(f64, side);
+    let is f64 as p = v * (1.0 - s);
+    let is f64 as q = v * (1.0 - s * f);
+    let is f64 as u = v * (1.0 - s * (1.0 - f));
+    let is f64 as r with mut = v;
+    let is f64 as g with mut = u;
+    let is f64 as b with mut = p;
+    if (side == 1) { r = q; g = v; b = p; }
+    if (side == 2) { r = p; g = v; b = u; }
+    if (side == 3) { r = p; g = q; b = v; }
+    if (side == 4) { r = u; g = p; b = v; }
+    if (side >= 5) { r = v; g = p; b = q; }
+    let is i64 as ri = cast(i64, r * 255.0 + 0.5);
+    let is i64 as gi = cast(i64, g * 255.0 + 0.5);
+    let is i64 as bi = cast(i64, b * 255.0 + 0.5);
+    return (ri << 16) | (gi << 8) | bi;
+}
+
+fn _hex_of(rgb as i64, out as *u8) as void {
+    let is *u8 as digits = "0123456789abcdef";
+    out[0] = cast(u8, 35);
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        out[i + 1] = digits[(rgb >> (20 - i * 4)) & 15];
+        i = i + 1;
+    }
+    out[7] = cast(u8, 0);
+}
+
+fn create(t as *tree.Tree, parent as i64, value as *u8, vn as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    _from_rgb(d, _parse(value, vn));
+    d.held = ZONE_NONE;
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.min_w = PAD * 2.0 + SQUARE_W;
+    out.pref_w = out.min_w;
+    out.max_w = out.min_w;
+    out.min_h = PAD * 2.0 + SQUARE_H + GAP + STRIP_H + GAP + WELL;
+    out.pref_h = out.min_h;
+    out.max_h = out.min_h;
+}
+
+fn _emit(t as *tree.Tree, w as i64, d as *Data, sig as i32) as void {
+    let is [8]u8 as out with mut;
+    _hex_of(_rgb_of(d.hue, d.sat, d.val), cast(*u8, &out));
+    signal.emit(t, w, sig, cast(*u8, &out));
+}
+
+fn _zone_at(x as f64, y as f64) as i64 {
+    if (x < PAD - 4.0 || x > PAD + SQUARE_W + 4.0) { return ZONE_NONE; }
+    if (y >= PAD - 4.0 && y <= PAD + SQUARE_H + 4.0) { return ZONE_SQUARE; }
+    let is f64 as top = PAD + SQUARE_H + GAP;
+    if (y >= top - 4.0 && y <= top + STRIP_H + 4.0) { return ZONE_STRIP; }
+    return ZONE_NONE;
+}
+
+// Where the pointer is on the part it holds, which it may well have left by now.
+fn _follow(t as *tree.Tree, w as i64, d as *Data, x as f64, y as f64) as void {
+    let is f64 as across = _clamp01((x - PAD) / SQUARE_W);
+    if (d.held == ZONE_SQUARE) {
+        d.sat = across;
+        d.val = 1.0 - _clamp01((y - PAD) / SQUARE_H);
+    } else if (d.held == ZONE_STRIP) {
+        // The last step of the strip is red again, and it is the same red as the first.
+        d.hue = across * 0.9999;
+    } else {
+        return;
+    }
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    _emit(t, w, d, signal.CHANGED);
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        d.held = _zone_at(e.local_x, e.local_y);
+        _follow(t, w, d, e.local_x, e.local_y);
+        return 1;
+    }
+    if (e.kind == event.POINTER_MOVE) {
+        if (d.held != ZONE_NONE) { _follow(t, w, d, e.local_x, e.local_y); }
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP) {
+        d.held = ZONE_NONE;
+        return 1;
+    }
+    if (e.kind == event.SHORTCUT_OVERRIDE) {
+        return cast(i64, e.key == keys.LEFT || e.key == keys.RIGHT || e.key == keys.UP || e.key == keys.DOWN ||
+                         e.key == keys.RETURN || e.key == keys.SPACE);
+    }
+    if (e.kind == event.KEY_DOWN) {
+        let is f64 as by = 0.02;
+        let is i64 as moved with mut = 1;
+        if ((e.mods & keys.MOD_SHIFT) != 0 && (e.key == keys.LEFT || e.key == keys.RIGHT)) {
+            if (e.key == keys.LEFT) { d.hue = _clamp01(d.hue - by); }
+            else { d.hue = _clamp01(d.hue + by) * 0.9999; }
+        }
+        else if (e.key == keys.LEFT) { d.sat = _clamp01(d.sat - by); }
+        else if (e.key == keys.RIGHT) { d.sat = _clamp01(d.sat + by); }
+        else if (e.key == keys.UP) { d.val = _clamp01(d.val + by); }
+        else if (e.key == keys.DOWN) { d.val = _clamp01(d.val - by); }
+        else { moved = 0; }
+        if (moved == 1) {
+            widget.changed(t, w, widget.CHANGED_PAINT);
+            _emit(t, w, d, signal.CHANGED);
+            return 1;
+        }
+        if (e.key == keys.RETURN || e.key == keys.SPACE) {
+            _emit(t, w, d, signal.ACTIVATED);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn _ring(p as *painter.Painter, cx as f64, cy as f64, r as f64) as void {
+    let is math.color.Color as dark = math.color.rgba(0.0, 0.0, 0.0, 0.45);
+    let is math.color.Color as white = math.color.hex(16777215);
+    shapes.stroke_rounded(p.canvas, cx - r - 1.0, cy - r - 1.0, r * 2.0 + 2.0, r * 2.0 + 2.0, r + 1.0, r + 1.0, r + 1.0, r + 1.0, 1.0, dark);
+    shapes.stroke_rounded(p.canvas, cx - r, cy - r, r * 2.0, r * 2.0, r, r, r, r, 2.0, white);
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is f64 as x0 = p.rect.x + PAD;
+    let is f64 as y0 = p.rect.y + PAD;
+
+    // The square: each column runs from its colour at full brightness down to black.
+    let is f64 as col_w = SQUARE_W / cast(f64, COLUMNS);
+    let is i64 as i with mut = 0;
+    while (i < COLUMNS) {
+        let is f64 as s = cast(f64, i) / cast(f64, COLUMNS - 1);
+        let is math.color.Color as top = math.color.hex(_rgb_of(d.hue, s, 1.0));
+        shapes.fill_rounded_gradient(p.canvas, x0 + cast(f64, i) * col_w, y0, col_w + 0.5, SQUARE_H, 0.0, 0.0, 0.0, 0.0, top, math.color.hex(0));
+        i = i + 1;
+    }
+    _ring(p, x0 + d.sat * SQUARE_W, y0 + (1.0 - d.val) * SQUARE_H, 6.0);
+
+    // The strip, a pixel of hue at a time.
+    let is f64 as sy = y0 + SQUARE_H + GAP;
+    i = 0;
+    let is i64 as most = cast(i64, SQUARE_W);
+    while (i < most) {
+        let is f64 as h = cast(f64, i) / cast(f64, most);
+        shapes.fill_rect(p.canvas, x0 + cast(f64, i), sy, 1.5, STRIP_H, math.color.hex(_rgb_of(h, 1.0, 1.0)));
+        i = i + 1;
+    }
+    _ring(p, x0 + d.hue * SQUARE_W, sy + STRIP_H / 2.0, 7.0);
+
+    // What they come to, as a colour and as the words for it.
+    let is f64 as wy = sy + STRIP_H + GAP;
+    let is i64 as rgb = _rgb_of(d.hue, d.sat, d.val);
+    shapes.fill_rounded(p.canvas, x0, wy, WELL, WELL, 6.0, 6.0, 6.0, 6.0, math.color.hex(rgb));
+    shapes.stroke_rounded(p.canvas, x0, wy, WELL, WELL, 6.0, 6.0, 6.0, 6.0, 1.0, style.with_alpha(p.theme.palette.fg, 0.2));
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) == 0) { return; }
+    let is [8]u8 as words with mut;
+    _hex_of(rgb, cast(*u8, &words));
+    let is txt.Style as st = txt.style_of(p.theme.fonts.body);
+    st.family = p.theme.fonts.family;
+    st.size = 13.0;
+    let is model.Params as pp = model.params();
+    pp.width = 0.0 - 1.0;
+    if (txt.lay_plain(svc, &_run, cast(*u8, &words), 7, &st, &pp) == 0) { return; }
+    txt.draw(svc, p.canvas, &_run, x0 + WELL + 10.0, wy + (WELL - _run.height) / 2.0, p.theme.palette.fg);
+}

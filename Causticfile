@@ -12,13 +12,13 @@ author "Cauã Alvarenga Neves"
 // window. Its X11 backend links glibc and libX11,
 // libXext, libXi, libXfixes, libXrandr, libXcursor and libxkbcommon, so `browser`
 // needs them to start. The tokenizer and paint tests link nothing.
-depend "caustic-media" in "https://github.com/Caua726/caustic-media" tag "v0.0.5"
+depend "caustic-media" in "https://github.com/Caua726/caustic-media" tag "v0.0.7"
 // DNS, TLS, HTTP and cookies. Unpinned because its only tag predates client/fetch.cst.
 depend "caustic-net" in "https://github.com/Caua726/caustic-net"
 
-// A quarter less CPU to open a page than unoptimized. -O2 ran out of memory for the
-// intermediate code within 8 GB on a program this size.
-flags "-O1"
+// Frames take a third to a half of what they do at -O1, and a compile takes twice as
+// long. znver3 is this machine's CPU, so the binary needs AVX2 to start.
+flags "-O2 --cpu=znver3 -j 4"
 
 // ── Targets ──────────────────────────────────────────────────────────
 
