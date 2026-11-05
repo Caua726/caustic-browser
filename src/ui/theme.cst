@@ -36,6 +36,7 @@ fn apply(a as *ui.app.App) as void {
     _th.field.checked.bg = field;
     _th.field.checked.border = ui.style.with_alpha(field, 0.0);
     _th.metrics.caption_button = 30.0;
+    _th.control.disabled_alpha = 0.35;
     ui.app.set_theme(a, &_th);
 }
 

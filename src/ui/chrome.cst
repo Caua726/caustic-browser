@@ -1,12 +1,8 @@
 // ui/chrome.cst — the parts of the window the toolkit has no widget for: the mark,
-// the tabs in the title bar, and buttons that are a drawn icon.
-//
-// Icons are drawn in solid colours, never faded with alpha, because the segments
-// overlap where they join and alpha would show every joint.
+// the tabs in the title bar, and buttons that show an icon. Their colours come from
+// the theme (theme.cst) and their shapes from icons.cst.
 
-use "std/math.cst" as fm;
 use "caustic-media/math/math.cst" as math;
-use "caustic-media/render/draw2d.cst" as draw2d;
 use "caustic-media/render/shapes2d.cst" as shapes;
 use "caustic-media/text/layout/model.cst" as model;
 use "caustic-media/ui/tree.cst" as tree;
@@ -21,23 +17,24 @@ use "caustic-media/ui/access.cst" as access;
 use "caustic-media/ui/text.cst" as txt;
 use "caustic-media/ui/scroll.cst" as scroll;
 use "caustic-media/input/keys.cst" as keys;
+use "caustic-media/ui/widgets/titlebar.cst" as titlebar;
+use "./icons.cst" as icons;
 
-let is i32 as BACK    with imut = 1;
-let is i32 as FORWARD with imut = 2;
-let is i32 as RELOAD  with imut = 3;
-let is i32 as PLUS    with imut = 4;
-let is i32 as MORE    with imut = 5;
+let is i32 as BACK    with imut = icons.BACK;
+let is i32 as FORWARD with imut = icons.FORWARD;
+let is i32 as RELOAD  with imut = icons.RELOAD;
+let is i32 as PLUS    with imut = icons.PLUS;
+let is i32 as MORE    with imut = icons.MORE;
 
 let is f64 as TAB_PAD   with imut = 12.0;   // either side of a title; its × sits in this
 let is f64 as TAB_TEXT  with imut = 13.0;
 let is f64 as ICON_SIZE with imut = 30.0;   // what takes the pointer; icons draw at 18
-let is f64 as STROKE    with imut = 1.8;
 let is f64 as LOGO_W    with imut = 46.0;
 let is f64 as WHEEL     with imut = 48.0;   // the strip's travel per notch
-// What the title bar keeps from the tabs: the mark, the +, the window's buttons, and
-// room to take hold of the window and drag it.
-let is f64 as TABS_KEEP_OFF with imut = 300.0;
-let is f64 as TABS_LEAST    with imut = 120.0;
+let is f64 as DRAG_ROOM  with imut = 48.0;  // kept free to take hold of the window
+let is f64 as TABS_LEAST with imut = 120.0;
+// The title bar's own gap beside each of its buttons (its _GAP), which it does not say.
+let is f64 as BUTTON_GAP with imut = 6.0;
 
 let is txt.Run as _run with mut;
 let is i32 as _ready with mut = 0;
@@ -96,70 +93,6 @@ fn _lay(svc as *txt.Service, th as *style.Theme, s as *u8, n as i64, size as f64
     return txt.lay_plain(svc, &_run, s, n, &st, &pp);
 }
 
-// --- drawing ------------------------------------------------------------------
-
-fn _seg(c as *draw2d.Canvas, x0 as f64, y0 as f64, x1 as f64, y1 as f64, col as math.color.Color) as void {
-    let is f64 as dx = x1 - x0;
-    let is f64 as dy = y1 - y0;
-    let is f64 as len = fm.sqrt(dx * dx + dy * dy);
-    let is f64 as half = STROKE / 2.0;
-    if (len > 0.0) {
-        let is f64 as nx = 0.0 - dy / len * half;
-        let is f64 as ny = dx / len * half;
-        let is [4]f64 as xs;
-        let is [4]f64 as ys;
-        xs[0] = x0 + nx; ys[0] = y0 + ny;
-        xs[1] = x1 + nx; ys[1] = y1 + ny;
-        xs[2] = x1 - nx; ys[2] = y1 - ny;
-        xs[3] = x0 - nx; ys[3] = y0 - ny;
-        shapes.fill_convex(c, cast(*f64, &xs), cast(*f64, &ys), 4, col);
-    }
-    shapes.fill_circle(c, x0, y0, half, col);
-    shapes.fill_circle(c, x1, y1, half, col);
-}
-
-fn _arrow(c as *draw2d.Canvas, cx as f64, cy as f64, dir as f64, col as math.color.Color) as void {
-    _seg(c, cx - 8.0 * dir, cy, cx + 8.0 * dir, cy, col);
-    _seg(c, cx + 8.0 * dir, cy, cx + 2.5 * dir, cy - 5.5, col);
-    _seg(c, cx + 8.0 * dir, cy, cx + 2.5 * dir, cy + 5.5, col);
-}
-
-// Clockwise from the upper right, most of the way round, ending in an arrowhead.
-fn _reload(c as *draw2d.Canvas, cx as f64, cy as f64, col as math.color.Color) as void {
-    let is f64 as r = 7.5;
-    let is f64 as deg = 3.14159265358979 / 180.0;
-    let is f64 as from = 0.0 - 25.0;
-    let is f64 as sweep = 295.0;
-    let is i64 as steps = 24;
-    let is i64 as i with mut = 0;
-    while (i < steps) {
-        let is f64 as a = (from + sweep * cast(f64, i) / cast(f64, steps)) * deg;
-        let is f64 as b = (from + sweep * cast(f64, i + 1) / cast(f64, steps)) * deg;
-        _seg(c, cx + r * fm.cos(a), cy + r * fm.sin(a), cx + r * fm.cos(b), cy + r * fm.sin(b), col);
-        i = i + 1;
-    }
-    let is f64 as end = (from + sweep) * deg;
-    let is f64 as tipx = cx + r * fm.cos(end);
-    let is f64 as tipy = cy + r * fm.sin(end);
-    _seg(c, tipx, tipy, tipx - 4.5, tipy - 4.0, col);
-    _seg(c, tipx, tipy, tipx - 5.5, tipy + 4.0, col);
-}
-
-fn _draw_icon(c as *draw2d.Canvas, icon as i32, cx as f64, cy as f64, col as math.color.Color) as void {
-    if (icon == BACK) { _arrow(c, cx, cy, 0.0 - 1.0, col); }
-    if (icon == FORWARD) { _arrow(c, cx, cy, 1.0, col); }
-    if (icon == RELOAD) { _reload(c, cx, cy, col); }
-    if (icon == PLUS) {
-        _seg(c, cx - 7.0, cy, cx + 7.0, cy, col);
-        _seg(c, cx, cy - 7.0, cx, cy + 7.0, col);
-    }
-    if (icon == MORE) {
-        shapes.fill_circle(c, cx - 6.0, cy, 1.7, col);
-        shapes.fill_circle(c, cx, cy, 1.7, col);
-        shapes.fill_circle(c, cx + 6.0, cy, 1.7, col);
-    }
-}
-
 // --- the mark -----------------------------------------------------------------
 
 fn logo(t as *tree.Tree, parent as i64) as i64 {
@@ -182,7 +115,7 @@ fn _logo_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as
     if (cast(i64, svc) == 0) { return; }
     if (_lay(svc, p.theme, "C", 1, 22.0, 800) == 1) {
         txt.draw(svc, p.canvas, &_run, p.rect.x + 22.0 - _run.width / 2.0,
-                 p.rect.y + (p.rect.h - _run.height) / 2.0, math.color.hex(0xFFFFFF));
+                 p.rect.y + (p.rect.h - _run.height) / 2.0, p.theme.palette.fg);
     }
     shapes.fill_rect(p.canvas, p.rect.x + LOGO_W - 1.0, p.rect.y + (p.rect.h - 16.0) / 2.0, 1.0, 16.0,
                      p.theme.palette.separator);
@@ -200,10 +133,40 @@ fn tab_area(t as *tree.Tree, parent as i64) as i64 {
     return w;
 }
 
+// What else shares the title bar's line with the tabs, measured: the rest of the
+// start row, the window's buttons, the bar's padding, and room to drag the window.
+fn _rest_of_title_bar(t as *tree.Tree, area as i64) as f64 {
+    let is i64 as start = tree.parent(t, area);
+    let is i64 as head = tree.parent(t, start);
+    let is style.Theme as th;
+    widget.theme(t, area, &th);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    let is f64 as used with mut = th.metrics.space_m * 3.0 + DRAG_ROOM;
+    let is i64 as ch with mut = tree.first_child(t, start);
+    while (ch != 0) {
+        if (ch != area) {
+            layout.measure(t, ch, &free, &s);
+            used = used + s.pref_w;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    let is i32 as which with mut = titlebar.MINIMIZE;
+    while (which <= titlebar.CLOSE) {
+        let is i64 as b = titlebar.button(t, head, which);
+        if (b != 0) {
+            layout.measure(t, b, &free, &s);
+            used = used + s.pref_w + BUTTON_GAP;
+        }
+        which = which + 1;
+    }
+    return used;
+}
+
 fn _tab_area_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
     layout.measure(t, tree.first_child(t, w), c, out);
     // The root has the window's size before anything is measured.
-    let is f64 as room with mut = layout.rect(t, tree.root(t)).w - TABS_KEEP_OFF;
+    let is f64 as room with mut = layout.rect(t, tree.root(t)).w - _rest_of_title_bar(t, w);
     if (room < TABS_LEAST) { room = TABS_LEAST; }
     if (out.pref_w > room) { out.pref_w = room; }
     out.min_w = 0.0;
@@ -303,10 +266,7 @@ fn _tab_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as 
                             1.0, 1.0, 1.0, 1.0, p.theme.palette.accent);
     }
     if (hover == 1) {
-        let is f64 as cx = p.rect.x + p.rect.w - TAB_PAD / 2.0;
-        let is f64 as cy = p.rect.y + p.rect.h / 2.0;
-        _seg(p.canvas, cx - 3.0, cy - 3.0, cx + 3.0, cy + 3.0, col);
-        _seg(p.canvas, cx - 3.0, cy + 3.0, cx + 3.0, cy - 3.0, col);
+        icons.draw(svc, p.canvas, icons.CLOSE, p.rect.x + p.rect.w - TAB_PAD / 2.0, p.rect.y + p.rect.h / 2.0, col);
     }
 }
 
@@ -408,11 +368,13 @@ fn _icon_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as
         if (d.pressing == 1) { a = 0.14; }
         let is f64 as half = ICON_SIZE / 2.0;
         shapes.fill_rounded(p.canvas, cx - half, cy - half, ICON_SIZE, ICON_SIZE, 9.0, 9.0, 9.0, 9.0,
-                            style.with_alpha(math.color.hex(0xFFFFFF), a));
+                            style.with_alpha(p.theme.palette.fg, a));
     }
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) == 0) { return; }
     let is math.color.Color as col with mut = p.theme.palette.fg;
-    if (off == 1) { col = math.color.hex(0x5A616B); }
-    _draw_icon(p.canvas, d.icon, cx, cy, col);
+    if (off == 1) { col = style.with_alpha(col, p.theme.control.disabled_alpha); }
+    icons.draw(svc, p.canvas, d.icon, cx, cy, col);
 }
 
 fn _icon_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {

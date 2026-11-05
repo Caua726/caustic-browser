@@ -5,6 +5,11 @@ use "./display_list.cst" as dl;
 let is *u8 as TITLE with imut = "Caustic Browser";
 let is *u8 as BODY  with imut = "Esta aba ainda não carrega páginas. A interface é real; o conteúdo é fixo até existirem rede, árvore, CSS e layout.";
 
+// A page's colours are the page's, whatever the browser's theme is.
+let is i64 as INK    with imut = 0x20262E;
+let is i64 as ACCENT with imut = 0x3478F6;
+let is i64 as TEXT   with imut = 0x404854;
+
 fn _len(s as *u8) as i64 {
     let is i64 as n with mut = 0;
     while (s[n] != 0) { n = n + 1; }
@@ -13,7 +18,7 @@ fn _len(s as *u8) as i64 {
 
 fn fill(l as *dl.List) as void {
     dl.clear(l);
-    dl.text(l, 32.0, 32.0, 100000.0, TITLE, _len(TITLE), 30.0, 700, 0.0, dl.rgb(32, 38, 46));
-    dl.rect(l, 32.0, 78.0, 104.0, 3.0, 1.5, dl.rgb(52, 120, 246));
-    dl.text(l, 32.0, 101.0, 100000.0, BODY, _len(BODY), 16.0, 400, 22.0, dl.rgb(64, 72, 84));
+    dl.text(l, 32.0, 32.0, 100000.0, TITLE, _len(TITLE), 30.0, 700, 0.0, INK);
+    dl.rect(l, 32.0, 78.0, 104.0, 3.0, 1.5, ACCENT);
+    dl.text(l, 32.0, 101.0, 100000.0, BODY, _len(BODY), 16.0, 400, 22.0, TEXT);
 }

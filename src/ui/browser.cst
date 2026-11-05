@@ -13,6 +13,7 @@ use "../paint/display_list.cst" as dl;
 use "../paint/placeholder.cst" as placeholder;
 use "./page_view.cst" as pv;
 use "./chrome.cst" as chrome;
+use "./icons.cst" as icons;
 use "./theme.cst" as theme;
 
 let is i64 as MAX_TABS with imut = 32;
@@ -26,8 +27,10 @@ let is i64 as NEW_TAB   with imut = 1;
 let is i64 as CLOSE_TAB with imut = 2;
 let is i64 as QUIT      with imut = 3;
 
-// One tab: its widgets, and the document it owns.
+// One tab: its widgets, and the document it owns. A Doc stays in its slot for as long
+// as the tab lives, so a view can keep pointing at its list; `order` is what moves.
 struct Doc {
+    used  as i64;
     tab   as i64;
     page  as i64;
     entry as i64;
@@ -48,13 +51,21 @@ struct Browser {
     menu   as i64;
     n      as i64;
     cur    as i64;
+    width  as f64;    // the window's, as of the last look
     docs   as [MAX_TABS]Doc;
+    order  as [MAX_TABS]i64;   // the slot of each tab, left to right
 }
 
 let is Browser as br with mut;
 let is i64 as _fails with mut = 0;
 
-fn _doc(i as i64) as *Doc { return &br.docs[i]; }
+fn _doc(i as i64) as *Doc { return &br.docs[br.order[i]]; }
+
+fn _free_slot() as i64 {
+    let is i64 as k with mut = 0;
+    while (br.docs[k].used == 1) { k = k + 1; }
+    return k;
+}
 
 // The status bar only exists while it has something to say.
 fn _say(s as *u8) as void {
@@ -98,7 +109,8 @@ fn select(i as i64) as void {
 fn new_tab() as i32 {
     if (br.n >= MAX_TABS) { _say(NO_ROOM); return 0; }
     let is *ui.tree.Tree as t = br.t;
-    let is *Doc as d = _doc(br.n);
+    let is i64 as slot = _free_slot();
+    let is *Doc as d = &br.docs[slot];
     if (dl.init(&d.list) != 0) { _say(NO_ROOM); return 0; }
     placeholder.fill(&d.list);
 
@@ -129,6 +141,8 @@ fn new_tab() as i32 {
     d.view = pv.create(t, d.page, &d.list);
     ui.layout.set_stretch(t, d.view, 1.0, 1.0);
 
+    d.used = 1;
+    br.order[br.n] = slot;
     br.n = br.n + 1;
     select(br.n - 1);
     return 1;
@@ -141,12 +155,10 @@ fn close_tab(i as i64) as void {
     ui.tree.destroy(br.t, _doc(i).tab);
     ui.tree.destroy(br.t, _doc(i).page);
     dl.free(&_doc(i).list);
-    // Docs keep the tabs' order, so the ones after it move down, and each view
-    // has to be told where its list went.
+    _doc(i).used = 0;
     let is i64 as k with mut = i;
     while (k + 1 < br.n) {
-        br.docs[k] = br.docs[k + 1];
-        pv.set_list(br.t, _doc(k).view, &_doc(k).list);
+        br.order[k] = br.order[k + 1];
         k = k + 1;
     }
     br.n = br.n - 1;
@@ -210,6 +222,9 @@ fn open(p as *ui.program.Program) as i32 {
     br.hs = ui.program.host(p);
     br.n = 0;
     br.cur = 0;
+    br.width = 0.0;
+    let is i64 as slot with mut = 0;
+    while (slot < MAX_TABS) { br.docs[slot].used = 0; slot = slot + 1; }
     theme.apply(br.a);
     br.win = ui.app.window_open(br.a, 980.0, 730.0);
     if (br.win == 0) { return 0; }
@@ -233,6 +248,7 @@ fn open(p as *ui.program.Program) as i32 {
     ui.titlebar.set_title(t, head, "", 0);
     ui.titlebar.set_buttons(t, head, ui.titlebar.BTN_ALL);
     let is i64 as start = ui.titlebar.start(t, head);
+    ui.box.set_spacing(t, start, 0.0);
     chrome.logo(t, start);
     // Tabs past the room scroll sideways, with no bar: the wheel, or choosing one.
     let is i64 as area = chrome.tab_area(t, start);
@@ -261,15 +277,37 @@ fn open(p as *ui.program.Program) as i32 {
     return new_tab();
 }
 
+// Layout keeps a widget's measure until the widget changes, and a new window size
+// does not count, so the tabs' room would stay what it was. Revealing the current tab
+// measures that again, and keeps the tab in view in whatever room is left.
+fn _follow_width() as void {
+    // The last tab closes the window and leaves its Doc behind, with a closed tree.
+    if (br.n == 0 || ui.app.window_valid(br.a, br.win) == 0) { return; }
+    let is f64 as w = ui.layout.rect(br.t, ui.tree.root(br.t)).w;
+    if (w == br.width) { return; }
+    br.width = w;
+    chrome.reveal_tab(br.t, _doc(br.cur).tab);
+}
+
+// What the main loop does between steps.
+fn _between_steps() as void {
+    theme.keep(br.a);
+    _follow_width();
+}
+
 // Until the last window closes.
 fn run() as void {
-    while (ui.host.step(br.hs, 0 - 1) == 1) { theme.keep(br.a); }
+    while (ui.host.step(br.hs, 0 - 1) == 1) { _between_steps(); }
 }
 
 // After the program closed: the views are gone, so the lists can go.
 fn free_docs() as void {
     let is i64 as i with mut = 0;
-    while (i < br.n) { dl.free(&_doc(i).list); i = i + 1; }
+    while (i < br.n) {
+        dl.free(&_doc(i).list);
+        _doc(i).used = 0;
+        i = i + 1;
+    }
     br.n = 0;
 }
 
@@ -287,7 +325,7 @@ fn _rounds(n as i64) as void {
     let is i64 as k with mut = 0;
     while (k < n) {
         ui.host.step(br.hs, 20);
-        theme.keep(br.a);
+        _between_steps();
         k = k + 1;
     }
 }
@@ -319,6 +357,7 @@ fn check() as i64 {
     _rounds(10);
     _expect("the window is on the screen", cast(i32, ui.host.shown(br.hs) == 1));
     _expect("it opens with one tab", cast(i32, br.n == 1));
+    _expect("every icon is a path", icons.all_parse());
     _expect("our theme outlasts the desktop's", cast(i32, ui.app.theme(br.a).metrics.titlebar_height == 38.0));
     _expect("the first tab has its page", cast(i32, dl.count(&_doc(0).list) > 0));
 
@@ -342,7 +381,13 @@ fn check() as i64 {
     close_tab(0);
     _rounds(5);
     _expect("closing another leaves the current one on the screen", cast(i32, br.n == 2 && br.cur == 0 && _one_active_at(0) == 1));
-    _expect("the views follow their lists", _views_hold_their_lists());
+    _expect("the views keep their lists", _views_hold_their_lists());
+    new_tab();
+    _rounds(3);
+    _expect("a closed tab's slot is used again", cast(i32, br.order[br.n - 1] == 0));
+    close_tab(br.n - 1);
+    select(0);
+    _rounds(3);
     _expect("the focus stays with it", _focus_in(0));
 
     close_tab(99);

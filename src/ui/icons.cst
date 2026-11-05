@@ -1,0 +1,69 @@
+// ui/icons.cst — the browser's own icons, as data.
+//
+// Each is a path on an 18 by 18 grid, in the language of caustic-media's
+// ui/icons.cst: M x y, L x y, Q, C c1x c1y c2x c2y x y and Z, absolute like SVG's
+// upper-case commands, and O cx cy r for a circle. A new one is a new id and a new
+// string, which can come from any vector editor once its strokes are converted to
+// outlines.
+//
+// They are filled even-odd, so where two outlines overlap is a HOLE. A stroked shape
+// has to be one outline of its whole silhouette, not strokes laid over each other.
+// The strokes here are 1.8 wide. RELOAD is an arc of radius 7.5 around the centre,
+// from -20 degrees clockwise to 285, with an arrowhead's two arms 5.2 long.
+
+use "caustic-media/render/draw2d.cst" as draw2d;
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/text/outline/path.cst" as path;
+use "caustic-media/text/raster/raster.cst" as raster;
+use "caustic-media/ui/icons.cst" as toolkit;
+use "caustic-media/ui/text.cst" as txt;
+
+let is i32 as BACK    with imut = 1;
+let is i32 as FORWARD with imut = 2;
+let is i32 as RELOAD  with imut = 3;
+let is i32 as PLUS    with imut = 4;
+let is i32 as MORE    with imut = 5;
+let is i32 as CLOSE   with imut = 6;
+let is i32 as LAST    with imut = 6;
+
+let is f64 as SIZE with imut = 18.0;
+
+fn source(id as i32) as *u8 {
+    if (id == BACK) { return "M1.73 9 L7.36 3.36 L8.64 4.64 L5.18 8.1 L15.5 8.1 L15.5 9.9 L5.18 9.9 L8.64 13.36 L7.36 14.64 Z"; }
+    if (id == FORWARD) { return "M16.27 9 L10.64 3.36 L9.36 4.64 L12.82 8.1 L2.5 8.1 L2.5 9.9 L12.82 9.9 L9.36 13.36 L10.64 14.64 Z"; }
+    if (id == RELOAD) { return "M16.89 6.13 C18.15 9.59 17.01 13.48 14.07 15.7 C11.12 17.92 7.08 17.97 4.09 15.81 C1.09 13.65 -0.14 9.8 1.04 6.31 C2.23 2.81 5.55 0.5 9.24 0.6 L7.56 -2.3 L9.12 -3.2 L12.17 2.08 L6.89 5.13 L5.99 3.58 L7.85 2.5 C5.12 2.98 2.98 5.12 2.5 7.86 C2.02 10.59 3.3 13.33 5.7 14.72 C8.1 16.1 11.12 15.84 13.24 14.06 C15.37 12.27 16.15 9.35 15.2 6.74 Z"; }
+    if (id == PLUS) { return "M8.1 2 L9.9 2 L9.9 8.1 L16 8.1 L16 9.9 L9.9 9.9 L9.9 16 L8.1 16 L8.1 9.9 L2 9.9 L2 8.1 L8.1 8.1 Z"; }
+    if (id == MORE) { return "O 3 9 1.7 O 9 9 1.7 O 15 9 1.7"; }
+    if (id == CLOSE) { return "M4.86 6.14 L6.14 4.86 L9 7.73 L11.86 4.86 L13.14 6.14 L10.27 9 L13.14 11.86 L11.86 13.14 L9 10.27 L6.14 13.14 L4.86 11.86 L7.73 9 Z"; }
+    return cast(*u8, 0);
+}
+
+let is path.Path as _p with mut;
+let is i32 as _ready with mut = 0;
+
+fn _path() as *path.Path {
+    if (_ready == 0) {
+        _p = path.open(512);
+        _ready = 1;
+    }
+    return &_p;
+}
+
+// Whether every icon's string is a path: a typo in one shows here, not as a gap in
+// the toolbar.
+fn all_parse() as i32 {
+    let is i32 as id with mut = 1;
+    while (id <= LAST) {
+        if (toolkit.parse(source(id), _path()) == 0) { return 0; }
+        id = id + 1;
+    }
+    return 1;
+}
+
+// Icon id centred on (cx, cy), in col. 1, or 0 for no room this frame.
+fn draw(svc as *txt.Service, c as *draw2d.Canvas, id as i32, cx as f64, cy as f64, col as math.color.Color) as i32 {
+    let is *path.Path as p = _path();
+    if (toolkit.parse(source(id), p) == 0) { return 0; }
+    let is raster.flatten.Transform as t = raster.transform(1.0, 0.0, 0.0, 1.0, cx - SIZE / 2.0, cy - SIZE / 2.0);
+    return txt.fill_path(svc, c, p, &t, raster.EVENODD, col);
+}
