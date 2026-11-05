@@ -595,7 +595,10 @@ fn _box_decorations(p as *Painter, b as *bx.Box, alpha as f64) as void {
     _background(p, b, b.ax, b.ay, w, h, alpha);
     _border(p, b, b.ax, b.ay, w, h, alpha);
     if (b.control == bx.CTL_SELECT) { _select_arrow(p, b, alpha); }
-    if (b.control == bx.CTL_DATE) { _date_icon(p, b, alpha); }
+    if (b.control == bx.CTL_DATE) {
+        _date_icon(p, b, alpha);
+        _date_part_mark(p, b, alpha);
+    }
     _outline(p, b, b.ax, b.ay, w, h, alpha);
 }
 
@@ -860,6 +863,23 @@ fn _select_arrow(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is i64 as col = b.st.v.i[pr.P_COLOR];
     _line(p, cx - 4.0, cy - 2.0, cx, cy + 2.0, 1.5, col, alpha);
     _line(p, cx, cy + 2.0, cx + 4.0, cy - 2.0, 1.5, col, alpha);
+}
+
+// Behind the part of a date the keys are on.
+fn _date_part_mark(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (b.node == null || b.node != forms.date_node || (b.node.flags & dom.FLAG_FOCUS) == 0) { return; }
+    let is [11]u8 as text with mut;
+    forms.date_text(b.node, cast(*u8, &text));
+    let is *u8 as family = cast(*u8, b.st.v.i[pr.P_FONT_FAMILY]);
+    let is f64 as em = b.st.v.f[pr.P_FONT_SIZE];
+    let is i64 as weight = cast(i64, b.st.v.f[pr.P_FONT_WEIGHT]);
+    let is i64 as at = forms.date_part_start(forms.date_part);
+    let is f64 as x0 = m.text_width(cast(*u8, &text), at, family, em, weight, 0);
+    let is f64 as x1 = m.text_width(cast(*u8, &text), at + forms.date_part_len(forms.date_part), family, em, weight, 0);
+    let is f64 as h = em * 1.4;
+    let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is f64 as y = b.ay + bx.border_h(b) / 2.0 - h / 2.0;
+    _round(_rect(p, x + x0 - 1.0, y, x1 - x0 + 2.0, h, _accent(b), alpha * 0.25), 3.0);
 }
 
 fn _date_icon(p as *Painter, b as *bx.Box, alpha as f64) as void {

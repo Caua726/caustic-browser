@@ -528,10 +528,8 @@ fn _input(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     if (t != null && decl.eq(t.value, t.value_len, "date") == 1) {
         b.control = bx.CTL_DATE;
         let is *u8 as shown = arena.alloc(c.a, 11);
-        let is i64 as sn with mut = 0;
-        if (val != null) { sn = forms.date_shown(val.value, val.value_len, shown); }
-        if (sn > 0) { _control_label(c, b, st, shown, sn, 0); }
-        else { _control_label(c, b, st, "dd/mm/aaaa", 10, 0); }
+        forms.date_text(n, shown);
+        _control_label(c, b, st, shown, 10, 0);
         b.iw = st.v.f[pr.P_FONT_SIZE] * 8.0;
         return b;
     }

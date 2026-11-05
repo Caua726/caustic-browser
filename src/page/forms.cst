@@ -252,6 +252,7 @@ fn set_value(d as *dom.Document, n as *dom.Node, s as *u8, len as i64) as void {
     }
     _keep_original(d, n, "value", 5, "-x-default", 10);
     dom.set_attr(d, n, "value", 5, s, len);
+    if (dom.find_attr(n, "-x-date", 7) != null) { dom.remove_attr(n, "-x-date", 7); }
 }
 
 // A checkbox flips. A radio button comes on, and the rest of its group goes off.
@@ -390,6 +391,7 @@ fn reset(d as *dom.Document, form as *dom.Node) as void {
             }
         }
         if ((k == TEXT || k == RANGE || k == COLOR) && form_of(d, x) == form) { _restore(d, x, "value", 5, "-x-default", 10); }
+        if (k == TEXT && form_of(d, x) == form && dom.find_attr(x, "-x-date", 7) != null) { dom.remove_attr(x, "-x-date", 7); }
         if ((k == CHECK || k == RADIO) && form_of(d, x) == form) { _restore(d, x, "checked", 7, "-x-checked", 10); }
         if (k == SELECT && form_of(d, x) == form) {
             let is *dom.Node as o with mut = next_option(x, cast(*dom.Node, 0));
@@ -731,4 +733,135 @@ fn date_typed(s as *u8, n as i64, out as *u8) as i64 {
     out[7] = cast(u8, 45);
     mem.core.memcpy(&out[8], s, 2);
     return 10;
+}
+
+// --- A date, typed a part at a time ---
+//
+// dd/mm/aaaa, always ten characters, with its slashes where they are. A date only partly
+// typed is no value yet, so it is kept beside the value, in -x-date, until it is one.
+
+let is *dom.Node as date_node with mut = cast(*dom.Node, 0);    // the field the parts below are of
+let is i64 as date_part with mut = 0;                           // 0 the day, 1 the month, 2 the year
+let is i64 as _date_digits with mut = 0;                        // typed into that part so far
+
+fn date_part_start(part as i64) as i64 { return part * 3; }
+fn date_part_len(part as i64) as i64 {
+    if (part == 2) { return 4; }
+    return 2;
+}
+
+fn date_locked(n as *dom.Node) as i64 {
+    return cast(i64, is_disabled(n) == 1 || dom.find_attr(n, "readonly", 8) != null);
+}
+
+// What the field shows, ten characters into out.
+fn date_text(n as *dom.Node, out as *u8) as void {
+    let is *dom.Attr as draft = dom.find_attr(n, "-x-date", 7);
+    if (draft != null && draft.value_len == 10) {
+        mem.core.memcpy(out, draft.value, 10);
+        return;
+    }
+    let is *dom.Attr as val = dom.find_attr(n, "value", 5);
+    if (val != null && date_shown(val.value, val.value_len, out) == 10) { return; }
+    mem.core.memcpy(out, "dd/mm/aaaa", 10);
+}
+
+// The text back into the form: a value if it is a date, a draft while it is not.
+fn _date_put(d as *dom.Document, n as *dom.Node, text as *u8) as void {
+    let is [11]u8 as iso with mut;
+    let is i64 as m = date_typed(text, 10, cast(*u8, &iso));
+    set_value(d, n, cast(*u8, &iso), m);
+    if (m == 0 && mem.core.memcmp(text, "dd/mm/aaaa", 10) != 0) { dom.add_attr(d, n, dom.ATTR_PLAIN, "-x-date", 7, text, 10); }
+}
+
+fn date_begin(n as *dom.Node) as void {
+    date_node = n;
+    date_part = 0;
+    _date_digits = 0;
+}
+
+fn date_move(by as i64) as void {
+    date_part = date_part + by;
+    if (date_part < 0) { date_part = 0; }
+    if (date_part > 2) { date_part = 2; }
+    _date_digits = 0;
+}
+
+// A digit into the part it is on, which it leaves once no other digit could follow.
+fn date_digit(d as *dom.Document, n as *dom.Node, digit as i64) as void {
+    let is [11]u8 as text with mut;
+    date_text(n, cast(*u8, &text));
+    let is i64 as at = date_part_start(date_part);
+    let is i64 as len = date_part_len(date_part);
+    let is i64 as i with mut = 0;
+    while (i < len - 1) {
+        text[at + i] = text[at + i + 1];
+        if (_date_digits == 0) { text[at + i] = cast(u8, 48); }
+        i = i + 1;
+    }
+    text[at + len - 1] = cast(u8, 48 + digit);
+    _date_digits = _date_digits + 1;
+    _date_put(d, n, cast(*u8, &text));
+    if (_date_digits == len) {
+        if (date_part < 2) { date_move(1); }
+        else { _date_digits = 0; }
+        return;
+    }
+    if (_date_digits == 1 && ((date_part == 0 && digit > 3) || (date_part == 1 && digit > 1))) { date_move(1); }
+}
+
+// Up or down by one, around the part's range. An empty part starts from an end of it,
+// and an empty year from this one.
+fn date_step(d as *dom.Document, n as *dom.Node, by as i64, this_year as i64) as void {
+    let is [11]u8 as text with mut;
+    date_text(n, cast(*u8, &text));
+    let is i64 as at = date_part_start(date_part);
+    let is i64 as len = date_part_len(date_part);
+    let is i64 as was = _digits(&text[at], len);
+    let is i64 as v with mut = was + by;
+    if (date_part == 2) {
+        if (was < 0) { v = this_year; }
+        if (v < 1) { v = 1; }
+        if (v > 9999) { v = 9999; }
+    } else {
+        let is i64 as most with mut = 12;
+        if (date_part == 0) {
+            most = 31;
+            let is i64 as month = _digits(&text[3], 2);
+            if (month == 4 || month == 6 || month == 9 || month == 11) { most = 30; }
+            if (month == 2) {
+                let is i64 as y = _digits(&text[6], 4);
+                most = 29;
+                if (y > 0 && (y % 4 != 0 || (y % 100 == 0 && y % 400 != 0))) { most = 28; }
+            }
+        }
+        if (was < 0) {
+            v = 1;
+            if (by < 0) { v = most; }
+        }
+        if (v < 1) { v = most; }
+        if (v > most) { v = 1; }
+    }
+    let is i64 as i with mut = len - 1;
+    while (i >= 0) {
+        text[at + i] = cast(u8, 48 + v % 10);
+        v = v / 10;
+        i = i - 1;
+    }
+    _date_digits = 0;
+    _date_put(d, n, cast(*u8, &text));
+}
+
+fn date_clear(d as *dom.Document, n as *dom.Node) as void {
+    let is [11]u8 as text with mut;
+    date_text(n, cast(*u8, &text));
+    let is i64 as at = date_part_start(date_part);
+    let is *u8 as blank = "dd/mm/aaaa";
+    let is i64 as i with mut = 0;
+    while (i < date_part_len(date_part)) {
+        text[at + i] = blank[at + i];
+        i = i + 1;
+    }
+    _date_digits = 0;
+    _date_put(d, n, cast(*u8, &text));
 }

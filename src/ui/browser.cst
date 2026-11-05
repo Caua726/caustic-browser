@@ -834,13 +834,7 @@ fn _close_editor() as void {
     if (_ed_widget == 0) { return; }
     let is i64 as n with mut = 0;
     let is *u8 as s = _ed_text(&n);
-    if (forms.is_date(_ed_node) == 1) {
-        // What is not a date leaves it empty, as a real date picker would never hold it.
-        let is [11]u8 as iso with mut;
-        forms.set_value(&_ed_doc.pg.doc, _ed_node, cast(*u8, &iso), forms.date_typed(s, n, cast(*u8, &iso)));
-    } else {
-        forms.set_value(&_ed_doc.pg.doc, _ed_node, s, n);
-    }
+    forms.set_value(&_ed_doc.pg.doc, _ed_node, s, n);
     _ed_doc.pg.dirty = 1;
     _drop_editor();
 }
@@ -966,12 +960,6 @@ fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
     if (holder == 0) { return; }
     let is i64 as vn with mut = 0;
     let is *u8 as v with mut = forms.value_of(&d.pg.doc, n, &vn);
-    // A date is typed as it is read, whatever it is kept as.
-    let is [11]u8 as shown with mut;
-    if (forms.is_date(n) == 1) {
-        vn = forms.date_shown(v, vn, cast(*u8, &shown));
-        v = cast(*u8, &shown);
-    }
     let is i64 as readonly = cast(i64, dom.find_attr(n, "readonly", 8) != null);
     let is i64 as ed with mut = 0;
     if (area == 1) {
@@ -1106,7 +1094,6 @@ fn _open_select(d as *Doc, n as *dom.Node, by_keys as i64) as void {
     if (b == null) { return; }
     if (_sel_menu != 0) { ui.tree.destroy(t, _sel_menu); }
     let is i64 as m = ui.menu.create(t);
-    _page_popup_look(t, m);
     _sel_menu = m;
     _sel_doc = d;
     _sel_node = n;
@@ -1159,25 +1146,6 @@ fn _open_select(d as *Doc, n as *dom.Node, by_keys as i64) as void {
 //
 // Its icon opens it, and the rest of the field is still there to be typed in.
 
-// What opens from a control belongs to the page, not to the browser around it, and a page
-// is light unless it has said otherwise.
-let is ui.style.Overrides as _pop_over with mut;
-let is i64 as _pop_over_ready with mut = 0;
-
-fn _page_popup_look(t as *ui.tree.Tree, w as i64) as void {
-    if (_pop_over_ready == 0) {
-        _pop_over = ui.style.overrides();
-        ui.style.override_color(&_pop_over, ui.style.ROLE_WINDOW_BG, math.color.hex(16777215));
-        ui.style.override_color(&_pop_over, ui.style.ROLE_VIEW_BG, math.color.hex(16777215));
-        ui.style.override_color(&_pop_over, ui.style.ROLE_POPOVER_BG, math.color.hex(16777215));
-        ui.style.override_color(&_pop_over, ui.style.ROLE_FG, math.color.hex(1712678));
-        ui.style.override_color(&_pop_over, ui.style.ROLE_FG_DIM, math.color.hex(6253429));
-        ui.style.override_color(&_pop_over, ui.style.ROLE_BORDER, math.color.hex(14013663));
-        _pop_over_ready = 1;
-    }
-    ui.tree.set_overrides(t, w, &_pop_over);
-}
-
 let is i64 as _color_popup with mut = 0;
 let is *Doc as _color_doc with mut = cast(*Doc, 0);
 let is *dom.Node as _color_node with mut = cast(*dom.Node, 0);
@@ -1200,7 +1168,6 @@ fn _open_color(d as *Doc, n as *dom.Node) as void {
     if (_color_popup != 0) { ui.tree.destroy(t, _color_popup); }
     _color_popup = ui.popup.create(t);
     if (_color_popup == 0) { return; }
-    _page_popup_look(t, _color_popup);
     _color_doc = d;
     _color_node = n;
     let is i64 as vn with mut = 0;
@@ -1225,19 +1192,24 @@ let is i64 as _cal_popup with mut = 0;
 let is *Doc as _cal_doc with mut = cast(*Doc, 0);
 let is *dom.Node as _cal_node with mut = cast(*dom.Node, 0);
 
-fn _on_date_icon(d as *Doc, n as *dom.Node, p as *pv.Pointer) as i64 {
-    if (forms.is_date(n) == 0 || forms.is_disabled(n) == 1) { return 0; }
-    let is *bx.Box as b = layout.box_of(d.pg.root, n);
-    if (b == null) { return 0; }
-    return cast(i64, p.x + p.sx >= b.ax + bx.border_w(b) - 34.0);
-}
-
 fn _cal_chosen(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
     if (_cal_doc != cast(*Doc, 0) && _has_page(_cal_doc) == 1 && _cal_node != null) {
         forms.set_value(&_cal_doc.pg.doc, _cal_node, arg, 10);
         _cal_doc.pg.dirty = 1;
     }
     ui.popup.close(t, _cal_popup);
+}
+
+// A digit typed with the calendar open: it goes, and the digit goes to the field.
+fn _cal_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is *Doc as d = _cal_doc;
+    let is *dom.Node as n = _cal_node;
+    let is i64 as digit = cast(i64, arg[0]);
+    ui.popup.close(t, _cal_popup);
+    if (d == cast(*Doc, 0) || _has_page(d) == 0 || n == null) { return; }
+    ui.router.focus(t, br.r, d.view, 0);
+    forms.date_digit(&d.pg.doc, n, digit);
+    d.pg.dirty = 1;
 }
 
 fn _open_calendar(d as *Doc, n as *dom.Node) as void {
@@ -1247,7 +1219,6 @@ fn _open_calendar(d as *Doc, n as *dom.Node) as void {
     if (_cal_popup != 0) { ui.tree.destroy(t, _cal_popup); }
     _cal_popup = ui.popup.create(t);
     if (_cal_popup == 0) { return; }
-    _page_popup_look(t, _cal_popup);
     _cal_doc = d;
     _cal_node = n;
     let is i64 as vn with mut = 0;
@@ -1269,6 +1240,7 @@ fn _open_calendar(d as *Doc, n as *dom.Node) as void {
     let is i64 as c = calendar.create(t, _cal_popup, v, vn, lo_s, lo_n, hi_s, hi_n);
     if (c == 0) { return; }
     ui.on(t, c, ui.signal.ACTIVATED, fn_ptr(_cal_chosen));
+    ui.on(t, c, ui.signal.USER, fn_ptr(_cal_typed));
     let is math.rect.Rect as vr = ui.layout.window_rect(t, d.view);
     let is f64 as ax with mut = vr.x + b.ax;
     let is f64 as ay with mut = vr.y + b.ay;
@@ -1321,6 +1293,7 @@ fn _reveal(d as *Doc, b as *bx.Box) as void {
 
 fn _is_typed_in(n as *dom.Node) as i64 {
     let is i64 as k = forms.kind_of(n);
+    if (forms.is_date(n) == 1) { return 0; }
     return cast(i64, k == forms.TEXT || k == forms.AREA);
 }
 
@@ -1331,6 +1304,7 @@ fn _focus_element(d as *Doc, n as *dom.Node, select_all as i64) as void {
     pg.set_focus(d.pg, n, 1);
     let is *bx.Box as b = layout.box_of(d.pg.root, n);
     if (b != null) { _reveal(d, b); }
+    if (forms.is_date(n) == 1) { forms.date_begin(n); }
     if (_is_typed_in(n) == 1) {
         let is i64 as vn with mut = 0;
         forms.value_of(&d.pg.doc, n, &vn);
@@ -1494,10 +1468,14 @@ fn _page_pressed(user as *u8, p as *pv.Pointer) as i64 {
     _hit_of(d, p, &h);
     pg.set_active(d.pg, h.node);
     let is *dom.Node as f = _focus_target(h.node);
-    if (f != null && _on_date_icon(d, f, p) == 1) {
+    if (f != null && forms.is_date(f) == 1) {
         _close_editor();
         pg.set_focus(d.pg, f, 0);
-        _open_calendar(d, f);
+        ui.router.focus(br.t, br.r, d.view, 0);
+        if (forms.date_locked(f) == 0) {
+            forms.date_begin(f);
+            _open_calendar(d, f);
+        }
         return 1;
     }
     if (f != null && _is_typed_in(f) == 1) {
@@ -1587,6 +1565,32 @@ fn _page_wheel(user as *u8, p as *pv.Pointer) as i64 {
     return 1;
 }
 
+// A key on a date field: digits fill the part it is on, the arrows go between parts and
+// change them. Enter sends the form, as it does from any field.
+fn _date_key(d as *Doc, n as *dom.Node, k as i32, mods as i64) as i64 {
+    if ((mods & cast(i64, keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER)) != 0) { return 0; }
+    let is *dom.Document as doc = &d.pg.doc;
+    if (forms.date_node != n) { forms.date_begin(n); }
+    if (k >= keys.NUM_0 && k <= keys.NUM_9) { forms.date_digit(doc, n, cast(i64, k - keys.NUM_0)); }
+    else if (k == keys.LEFT) { forms.date_move(0 - 1); }
+    else if (k == keys.RIGHT) { forms.date_move(1); }
+    else if (k == keys.UP) { forms.date_step(doc, n, 1, calendar.this_year()); }
+    else if (k == keys.DOWN) { forms.date_step(doc, n, 0 - 1, calendar.this_year()); }
+    else if (k == keys.BACKSPACE || k == keys.DELETE) { forms.date_clear(doc, n); }
+    else if (k == keys.SPACE) {
+        _open_calendar(d, n);
+        return 1;
+    }
+    else if (k == keys.RETURN) {
+        let is *dom.Node as form = forms.form_of(doc, n);
+        if (form != null) { _submit(d, form, forms.default_button(doc, form)); }
+        return 1;
+    }
+    else { return 0; }
+    d.pg.dirty = 1;
+    return 1;
+}
+
 fn _page_key(user as *u8, p as *pv.Pointer) as i64 {
     let is *Doc as d = cast(*Doc, user);
     if (_has_page(d) == 0) { return 0; }
@@ -1605,6 +1609,7 @@ fn _page_key(user as *u8, p as *pv.Pointer) as i64 {
     }
     let is *dom.Node as f = pg.focused(d.pg);
     if (f == null) { return 0; }
+    if (forms.is_date(f) == 1 && forms.date_locked(f) == 0) { return _date_key(d, f, k, p.mods); }
     let is i64 as fk = forms.kind_of(f);
     if (fk == forms.RANGE) {
         let is i64 as moved with mut = 0;

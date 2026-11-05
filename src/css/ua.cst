@@ -91,6 +91,7 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "select { background-color: white; padding: 2px 5px; text-align: start; }");
     _r(s, "input:disabled, textarea:disabled, select:disabled { background-color: rgba(239, 239, 239, 0.3); border-color: rgba(118, 118, 118, 0.3); }");
     _r(s, "input[type=checkbox]:disabled, input[type=radio]:disabled { background-color: transparent; border-color: #cbcbcb; }");
+    _r(s, "input[type=date] { cursor: default; }");
     _r(s, "input[type=file] { background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; }");
     _r(s, "progress, meter { vertical-align: -0.2em; }");
     _r(s, "::placeholder { color: #757575; }");

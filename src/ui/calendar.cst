@@ -111,6 +111,8 @@ fn _today() as i64 {
 }
 
 // A calendar in parent, showing the month of value (or this one), its limits from min and max.
+fn this_year() as i64 { return _today() / 10000; }
+
 fn create(t as *tree.Tree, parent as i64, value as *u8, vn as i64, min as *u8, min_n as i64, max as *u8, max_n as i64) as i64 {
     _init();
     let is i64 as w = tree.create(t, &_kind, parent);
@@ -244,11 +246,18 @@ fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
         if (e.dy < 0.0) { _turn(t, w, d, 0 - 1); }
         return 1;
     }
+    if (e.kind == event.SHORTCUT_OVERRIDE && e.key >= keys.NUM_0 && e.key <= keys.NUM_9) { return 1; }
     if (e.kind == event.SHORTCUT_OVERRIDE) {
         return cast(i64, e.key == keys.LEFT || e.key == keys.RIGHT || e.key == keys.UP || e.key == keys.DOWN ||
                          e.key == keys.PAGE_UP || e.key == keys.PAGE_DOWN || e.key == keys.RETURN || e.key == keys.SPACE);
     }
     if (e.kind == event.KEY_DOWN) {
+        // A digit is the date being typed, not a day to go to: USER, with the digit.
+        if (e.key >= keys.NUM_0 && e.key <= keys.NUM_9) {
+            let is u8 as digit = cast(u8, e.key - keys.NUM_0);
+            signal.emit(t, w, signal.USER, &digit);
+            return 1;
+        }
         if (e.key == keys.LEFT) { _go_day(t, w, d, 0 - 1); return 1; }
         if (e.key == keys.RIGHT) { _go_day(t, w, d, 1); return 1; }
         if (e.key == keys.UP) { _go_day(t, w, d, 0 - 7); return 1; }
