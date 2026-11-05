@@ -1,0 +1,458 @@
+// css/tokens.cst — the CSS Syntax tokenizer, section 4 of css-syntax-3.
+//
+// All of a stylesheet becomes one array before any of it is parsed, because the
+// parser looks ahead, backs up, and keeps slices of tokens for the values that hold
+// var() and cannot be understood until an element is being styled.
+//
+// Every name and string is a copy with its escapes resolved, terminated with a zero,
+// so nothing after this file ever has to know that CSS has escapes.
+
+use "../base/arena.cst" as arena;
+use "std/mem.cst" as mem;
+
+let is i64 as T_EOF       with imut = 0;
+let is i64 as T_IDENT     with imut = 1;
+let is i64 as T_FUNCTION  with imut = 2;
+let is i64 as T_AT        with imut = 3;
+let is i64 as T_HASH      with imut = 4;
+let is i64 as T_STRING    with imut = 5;
+let is i64 as T_BAD       with imut = 6;   // a bad string or a bad url: never valid anywhere
+let is i64 as T_URL       with imut = 7;
+let is i64 as T_DELIM     with imut = 8;
+let is i64 as T_NUMBER    with imut = 9;
+let is i64 as T_PERCENT   with imut = 10;
+let is i64 as T_DIMENSION with imut = 11;
+let is i64 as T_WS        with imut = 12;
+let is i64 as T_CDO       with imut = 13;
+let is i64 as T_CDC       with imut = 14;
+let is i64 as T_COLON     with imut = 15;
+let is i64 as T_SEMI      with imut = 16;
+let is i64 as T_COMMA     with imut = 17;
+let is i64 as T_LBRACKET  with imut = 18;
+let is i64 as T_RBRACKET  with imut = 19;
+let is i64 as T_LPAREN    with imut = 20;
+let is i64 as T_RPAREN    with imut = 21;
+let is i64 as T_LBRACE    with imut = 22;
+let is i64 as T_RBRACE    with imut = 23;
+
+struct Token {
+    kind   as i64;
+    s      as *u8;   // IDENT, FUNCTION, AT, HASH, STRING, URL; DIMENSION: its unit
+    n      as i64;
+    num    as f64;   // NUMBER, PERCENT, DIMENSION
+    delim  as i64;   // DELIM: the byte
+    flag   as i64;   // HASH: 1 for one that could be an id. NUMBER: 1 for an integer
+}
+
+struct List {
+    t   as *Token;
+    n   as i64;
+    cap as i64;
+}
+
+struct _Lex {
+    a   as *arena.Arena;
+    s   as *u8;
+    n   as i64;
+    i   as i64;
+    buf as *u8;     // as long as the source: nothing decoded can be longer
+    b   as i64;
+    out as *List;
+}
+
+fn _at(x as *_Lex, k as i64) as i64 {
+    if (x.i + k >= x.n) { return 0 - 1; }
+    return cast(i64, x.s[x.i + k]);
+}
+
+fn _is_nl(c as i64) as i64 {
+    if (c == 10 || c == 13 || c == 12) { return 1; }
+    return 0;
+}
+fn _is_ws(c as i64) as i64 {
+    if (c == 32 || c == 9 || _is_nl(c) == 1) { return 1; }
+    return 0;
+}
+fn _is_digit(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+fn _hex(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+fn _is_name_start(c as i64) as i64 {
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128) { return 1; }
+    return 0;
+}
+fn _is_name(c as i64) as i64 {
+    if (_is_name_start(c) == 1 || _is_digit(c) == 1 || c == 45) { return 1; }
+    return 0;
+}
+fn _valid_escape(a as i64, b as i64) as i64 {
+    if (a != 92 || _is_nl(b) == 1 || b < 0) { return 0; }
+    return 1;
+}
+fn _starts_ident(a as i64, b as i64, c as i64) as i64 {
+    if (a == 45) {
+        if (_is_name_start(b) == 1 || b == 45 || _valid_escape(b, c) == 1) { return 1; }
+        return 0;
+    }
+    if (_is_name_start(a) == 1) { return 1; }
+    return _valid_escape(a, b);
+}
+fn _starts_number(a as i64, b as i64, c as i64) as i64 {
+    if (a == 43 || a == 45) {
+        if (_is_digit(b) == 1 || (b == 46 && _is_digit(c) == 1)) { return 1; }
+        return 0;
+    }
+    if (a == 46) { return _is_digit(b); }
+    return _is_digit(a);
+}
+
+fn _put(x as *_Lex, c as i64) as void {
+    x.buf[x.b] = cast(u8, c);
+    x.b = x.b + 1;
+}
+
+fn _put_cp(x as *_Lex, c as i64) as void {
+    if (c < 128) { _put(x, c); return; }
+    if (c < 2048) {
+        _put(x, 192 + (c >> 6));
+        _put(x, 128 + (c & 63));
+        return;
+    }
+    if (c < 65536) {
+        _put(x, 224 + (c >> 12));
+        _put(x, 128 + ((c >> 6) & 63));
+        _put(x, 128 + (c & 63));
+        return;
+    }
+    _put(x, 240 + (c >> 18));
+    _put(x, 128 + ((c >> 12) & 63));
+    _put(x, 128 + ((c >> 6) & 63));
+    _put(x, 128 + (c & 63));
+}
+
+// The backslash has been passed. Six hex digits take at most four bytes, and every
+// other escape one byte for one, so the output never outruns the source.
+fn _escape(x as *_Lex) as void {
+    let is i64 as c = _at(x, 0);
+    if (c < 0) { _put_cp(x, 65533); return; }
+    if (_hex(c) < 0) {
+        _put(x, c);
+        x.i = x.i + 1;
+        return;
+    }
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 6 && _hex(_at(x, 0)) >= 0) {
+        v = v * 16 + _hex(_at(x, 0));
+        x.i = x.i + 1;
+        k = k + 1;
+    }
+    if (_is_ws(_at(x, 0)) == 1) { x.i = x.i + 1; }
+    if (v == 0 || v > 1114111 || (v >= 55296 && v <= 57343)) { v = 65533; }
+    _put_cp(x, v);
+}
+
+fn _push(x as *_Lex, kind as i64) as *Token {
+    let is *List as l = x.out;
+    if (l.n == l.cap) {
+        let is i64 as cap with mut = l.cap * 2;
+        if (cap == 0) { cap = 1024; }
+        let is *Token as t = cast(*Token, arena.alloc(x.a, cap * sizeof(Token)));
+        if (l.n > 0) { mem.core.memcpy(cast(*u8, t), cast(*u8, l.t), l.n * sizeof(Token)); }
+        l.t = t;
+        l.cap = cap;
+    }
+    let is *Token as t = &l.t[l.n];
+    l.n = l.n + 1;
+    t.kind = kind;
+    t.s = cast(*u8, 0);
+    t.n = 0;
+    t.num = 0.0;
+    t.delim = 0;
+    t.flag = 0;
+    return t;
+}
+
+fn _name(x as *_Lex) as void {
+    x.b = 0;
+    while (1 == 1) {
+        let is i64 as c = _at(x, 0);
+        if (_is_name(c) == 1) {
+            _put(x, c);
+            x.i = x.i + 1;
+            continue;
+        }
+        if (_valid_escape(c, _at(x, 1)) == 1) {
+            x.i = x.i + 1;
+            _escape(x);
+            continue;
+        }
+        return;
+    }
+}
+
+fn _keep(x as *_Lex, t as *Token) as void {
+    t.s = arena.copy(x.a, x.buf, x.b);
+    t.n = x.b;
+}
+
+fn _string(x as *_Lex, q as i64) as void {
+    x.i = x.i + 1;
+    x.b = 0;
+    while (1 == 1) {
+        let is i64 as c = _at(x, 0);
+        if (c < 0 || c == q) {
+            if (c == q) { x.i = x.i + 1; }
+            _keep(x, _push(x, T_STRING));
+            return;
+        }
+        if (_is_nl(c) == 1) {
+            _push(x, T_BAD);
+            return;
+        }
+        x.i = x.i + 1;
+        if (c != 92) { _put(x, c); continue; }
+        let is i64 as d = _at(x, 0);
+        if (d < 0) { continue; }
+        if (_is_nl(d) == 1) {
+            if (d == 13 && _at(x, 1) == 10) { x.i = x.i + 1; }
+            x.i = x.i + 1;
+            continue;
+        }
+        _escape(x);
+    }
+}
+
+fn _pow10(e as i64) as f64 {
+    let is f64 as r with mut = 1.0;
+    let is i64 as k with mut = 0;
+    let is i64 as m with mut = e;
+    if (m < 0) { m = 0 - m; }
+    if (m > 308) { m = 308; }
+    while (k < m) { r = r * 10.0; k = k + 1; }
+    if (e < 0) { return 1.0 / r; }
+    return r;
+}
+
+fn _number(x as *_Lex, t as *Token) as void {
+    let is f64 as sign with mut = 1.0;
+    let is i64 as c with mut = _at(x, 0);
+    if (c == 43 || c == 45) {
+        if (c == 45) { sign = 0.0 - 1.0; }
+        x.i = x.i + 1;
+    }
+    let is f64 as v with mut = 0.0;
+    while (_is_digit(_at(x, 0)) == 1) {
+        v = v * 10.0 + cast(f64, _at(x, 0) - 48);
+        x.i = x.i + 1;
+    }
+    let is i64 as integer with mut = 1;
+    if (_at(x, 0) == 46 && _is_digit(_at(x, 1)) == 1) {
+        integer = 0;
+        x.i = x.i + 1;
+        let is f64 as place with mut = 0.1;
+        while (_is_digit(_at(x, 0)) == 1) {
+            v = v + cast(f64, _at(x, 0) - 48) * place;
+            place = place * 0.1;
+            x.i = x.i + 1;
+        }
+    }
+    c = _at(x, 0);
+    if (c == 101 || c == 69) {
+        let is i64 as d = _at(x, 1);
+        let is i64 as skip with mut = 0;
+        if (_is_digit(d) == 1) { skip = 1; }
+        if ((d == 43 || d == 45) && _is_digit(_at(x, 2)) == 1) { skip = 2; }
+        if (skip > 0) {
+            integer = 0;
+            x.i = x.i + skip;
+            let is i64 as e with mut = 0;
+            while (_is_digit(_at(x, 0)) == 1) {
+                if (e < 10000) { e = e * 10 + (_at(x, 0) - 48); }
+                x.i = x.i + 1;
+            }
+            if (d == 45) { e = 0 - e; }
+            v = v * _pow10(e);
+        }
+    }
+    t.num = v * sign;
+    t.flag = integer;
+}
+
+fn _numeric(x as *_Lex) as void {
+    let is Token as tmp with mut;
+    _number(x, &tmp);
+    let is i64 as a = _at(x, 0);
+    if (_starts_ident(a, _at(x, 1), _at(x, 2)) == 1) {
+        _name(x);
+        let is *Token as t = _push(x, T_DIMENSION);
+        _keep(x, t);
+        t.num = tmp.num;
+        t.flag = tmp.flag;
+        return;
+    }
+    if (a == 37) {
+        x.i = x.i + 1;
+        let is *Token as t = _push(x, T_PERCENT);
+        t.num = tmp.num;
+        return;
+    }
+    let is *Token as t = _push(x, T_NUMBER);
+    t.num = tmp.num;
+    t.flag = tmp.flag;
+}
+
+fn _bad_url(x as *_Lex) as void {
+    while (1 == 1) {
+        let is i64 as c = _at(x, 0);
+        if (c < 0) { break; }
+        x.i = x.i + 1;
+        if (c == 41) { break; }
+        if (_valid_escape(c, _at(x, 0)) == 1) { _escape(x); }
+    }
+    _push(x, T_BAD);
+}
+
+fn _url(x as *_Lex) as void {
+    x.b = 0;
+    while (_is_ws(_at(x, 0)) == 1) { x.i = x.i + 1; }
+    while (1 == 1) {
+        let is i64 as c = _at(x, 0);
+        if (c < 0) { break; }
+        x.i = x.i + 1;
+        if (c == 41) { break; }
+        if (_is_ws(c) == 1) {
+            while (_is_ws(_at(x, 0)) == 1) { x.i = x.i + 1; }
+            if (_at(x, 0) == 41) { x.i = x.i + 1; break; }
+            if (_at(x, 0) < 0) { break; }
+            _bad_url(x);
+            return;
+        }
+        if (c == 34 || c == 39 || c == 40) { _bad_url(x); return; }
+        if (c == 92) {
+            if (_valid_escape(c, _at(x, 0)) == 0) { _bad_url(x); return; }
+            _escape(x);
+            continue;
+        }
+        _put(x, c);
+    }
+    _keep(x, _push(x, T_URL));
+}
+
+fn _ident_like(x as *_Lex) as void {
+    _name(x);
+    if (_at(x, 0) != 40) {
+        _keep(x, _push(x, T_IDENT));
+        return;
+    }
+    x.i = x.i + 1;
+    let is i64 as is_url = _name_is_url(x);
+    if (is_url == 1) {
+        let is i64 as k with mut = 0;
+        while (_is_ws(_at(x, k)) == 1) { k = k + 1; }
+        let is i64 as q = _at(x, k);
+        if (q != 34 && q != 39) {
+            _url(x);
+            return;
+        }
+    }
+    _keep(x, _push(x, T_FUNCTION));
+}
+
+fn _name_is_url(x as *_Lex) as i64 {
+    if (x.b != 3) { return 0; }
+    if ((x.buf[0] | 32) == 117 && (x.buf[1] | 32) == 114 && (x.buf[2] | 32) == 108) { return 1; }
+    return 0;
+}
+
+fn _one(x as *_Lex, kind as i64) as void {
+    x.i = x.i + 1;
+    _push(x, kind);
+}
+
+fn _delim(x as *_Lex, c as i64) as void {
+    x.i = x.i + 1;
+    _push(x, T_DELIM).delim = c;
+}
+
+// All of src, into l. It keeps pointers into nothing but the arena.
+fn tokenize(a as *arena.Arena, src as *u8, len as i64, l as *List) as void {
+    let is _Lex as lx with mut;
+    let is *_Lex as x = &lx;
+    x.a = a;
+    x.s = src;
+    x.n = len;
+    x.i = 0;
+    x.buf = arena.alloc(a, len + 16);
+    x.b = 0;
+    x.out = l;
+    l.t = cast(*Token, 0);
+    l.n = 0;
+    l.cap = 0;
+    while (x.i < x.n) {
+        let is i64 as c = _at(x, 0);
+        let is i64 as c1 = _at(x, 1);
+        let is i64 as c2 = _at(x, 2);
+        if (c == 47 && c1 == 42) {
+            x.i = x.i + 2;
+            while (x.i < x.n && !(_at(x, 0) == 42 && _at(x, 1) == 47)) { x.i = x.i + 1; }
+            x.i = x.i + 2;
+            continue;
+        }
+        if (_is_ws(c) == 1) {
+            while (_is_ws(_at(x, 0)) == 1) { x.i = x.i + 1; }
+            _push(x, T_WS);
+            continue;
+        }
+        if (c == 34 || c == 39) { _string(x, c); continue; }
+        if (c == 35) {
+            if (_is_name(c1) == 1 || _valid_escape(c1, c2) == 1) {
+                let is i64 as could = _starts_ident(c1, c2, _at(x, 3));
+                x.i = x.i + 1;
+                _name(x);
+                let is *Token as t = _push(x, T_HASH);
+                _keep(x, t);
+                t.flag = could;
+                continue;
+            }
+            _delim(x, c);
+            continue;
+        }
+        if (c == 40) { _one(x, T_LPAREN); continue; }
+        if (c == 41) { _one(x, T_RPAREN); continue; }
+        if (c == 91) { _one(x, T_LBRACKET); continue; }
+        if (c == 93) { _one(x, T_RBRACKET); continue; }
+        if (c == 123) { _one(x, T_LBRACE); continue; }
+        if (c == 125) { _one(x, T_RBRACE); continue; }
+        if (c == 44) { _one(x, T_COMMA); continue; }
+        if (c == 58) { _one(x, T_COLON); continue; }
+        if (c == 59) { _one(x, T_SEMI); continue; }
+        if (_starts_number(c, c1, c2) == 1) { _numeric(x); continue; }
+        if (c == 45 && c1 == 45 && c2 == 62) {
+            x.i = x.i + 3;
+            _push(x, T_CDC);
+            continue;
+        }
+        if (_starts_ident(c, c1, c2) == 1) { _ident_like(x); continue; }
+        if (c == 60 && c1 == 33 && c2 == 45 && _at(x, 3) == 45) {
+            x.i = x.i + 4;
+            _push(x, T_CDO);
+            continue;
+        }
+        if (c == 64 && _starts_ident(c1, c2, _at(x, 3)) == 1) {
+            x.i = x.i + 1;
+            _name(x);
+            _keep(x, _push(x, T_AT));
+            continue;
+        }
+        _delim(x, c);
+    }
+    _push(x, T_EOF);
+    l.n = l.n - 1;
+}

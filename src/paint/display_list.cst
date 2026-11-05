@@ -12,9 +12,53 @@ use "std/mem.cst" as mem;
 
 let is i64 as RECT with imut = 1;
 let is i64 as TEXT with imut = 2;
+let is i64 as RUN with imut = 3;     // one line of text, placed by layout: never wraps
+let is i64 as IMAGE with imut = 4;
+let is i64 as CLIP with imut = 5;    // x, y, w, h, until the UNCLIP that matches it
+let is i64 as UNCLIP with imut = 6;
+let is i64 as STROKE with imut = 7;  // the edge of a rounded box: leading is its width
+let is i64 as LINE with imut = 8;    // from (x, y) by (w, h): leading is its width
+let is i64 as SHADOW with imut = 9;  // the soft shadow of a rounded box: leading is its blur
+let is i64 as GRADIENT with imut = 10;
+let is i64 as RING with imut = 11;   // a rounded edge whose sides differ
+let is i64 as SVG with imut = 12;
+let is i64 as MOVED with imut = 13;   // m until the UNMOVED that matches: x, y, w, h its box
+let is i64 as UNMOVED with imut = 14;
+
+let is i64 as DECO_UNDERLINE with imut = 1;
+let is i64 as DECO_OVERLINE  with imut = 2;
+let is i64 as DECO_STRIKE    with imut = 4;
 
 let is i64 as ERR_ALLOC with imut = 0 - 1;
 let is i64 as INIT_CAP  with imut = 256;
+
+// Pixels a page shows, decoded once and drawn from wherever it is used. The view makes
+// the texture the first time it draws one, because only it has a device. tex is 0 until
+// then.
+struct Image {
+    pixels as *u8;    // RGBA, row after row, width * 4 bytes each
+    width  as i64;
+    height as i64;
+    tex    as i64;
+}
+
+// A gradient worked out for its box: every length is pixels by now, and each stop a place
+// from 0 to 1 along it, with the first stop's place possibly below 0 or the last's above 1.
+struct GradPaint {
+    kind      as i64;      // css/values.cst's GRAD_*
+    repeating as i64;
+    dx        as f64;      // linear: the unit direction, and how long the line is
+    dy        as f64;
+    len       as f64;
+    cx        as f64;      // radial and conic: the centre
+    cy        as f64;
+    rx        as f64;      // radial
+    ry        as f64;
+    from      as f64;      // conic: where 0 is, as a part of a turn clockwise from up
+    pos       as *f64;
+    cols      as *i64;     // 0xAARRGGBB
+    n         as i64;
+}
 
 struct Cmd {
     kind   as i64;
@@ -29,6 +73,23 @@ struct Cmd {
     size   as f64;
     weight as i64;
     leading as f64;   // TEXT only: pixels from line to line, 0 for the font's own
+    alpha  as f64;    // of color, 1 for solid
+    r2     as f64;    // RECT, STROKE: the other three corners, clockwise from radius
+    r3     as f64;
+    r4     as f64;
+    family as *u8;    // RUN only: as CSS writes it, null for the interface's
+    italic as i64;    // RUN only
+    deco   as i64;    // RUN only: DECO_* bits
+    fixed  as i64;    // does not move when the page scrolls
+    img    as *Image; // IMAGE only
+    rw     as f64;    // RUN only: how wide layout measured it
+    rh     as f64;    // RUN only: and how tall
+    ls     as f64;    // RUN only: letter-spacing, added after every character
+    grad   as *GradPaint;   // GRADIENT only
+    node   as *u8;    // SVG only: its element
+    bw     as [4]f64; // RING only: top, right, bottom, left
+    bc     as [4]i64; // RING only: 0xAARRGGBB
+    m      as *f64;   // MOVED only: six numbers
 }
 
 struct List {
@@ -94,6 +155,7 @@ fn rect(l as *List, x as f64, y as f64, w as f64, h as f64, radius as f64, color
     c.x = x; c.y = y; c.w = w; c.h = h; c.radius = radius;
     c.color = color;
     c.text = cast(*u8, 0); c.len = 0; c.size = 0.0; c.weight = 0; c.leading = 0.0;
+    _plain(c);
     return 1;
 }
 
@@ -104,5 +166,129 @@ fn text(l as *List, x as f64, y as f64, w as f64, s as *u8, n as i64, size as f6
     c.x = x; c.y = y; c.w = w; c.h = 0.0; c.radius = 0.0;
     c.color = color;
     c.text = s; c.len = n; c.size = size; c.weight = weight; c.leading = leading;
+    _plain(c);
     return 1;
+}
+
+fn _plain(c as *Cmd) as void {
+    c.alpha = 1.0;
+    c.r2 = c.radius;
+    c.r3 = c.radius;
+    c.r4 = c.radius;
+    c.family = cast(*u8, 0);
+    c.italic = 0;
+    c.deco = 0;
+    c.fixed = 0;
+    c.img = cast(*Image, 0);
+    c.rw = 0.0;
+    c.rh = 0.0;
+}
+
+// The commands layout's painter writes. Each returns the command, or null when the list
+// could not grow, so a caller can set the rest of what it means.
+fn box(l as *List, x as f64, y as f64, w as f64, h as f64, color as i64, alpha as f64) as *Cmd {
+    if (rect(l, x, y, w, h, 0.0, color) == 0) { return cast(*Cmd, 0); }
+    let is *Cmd as c = at(l, l.n - 1);
+    c.alpha = alpha;
+    return c;
+}
+
+fn stroke(l as *List, x as f64, y as f64, w as f64, h as f64, width as f64, color as i64, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, color, alpha);
+    if (cast(i64, c) != 0) {
+        c.kind = STROKE;
+        c.leading = width;
+    }
+    return c;
+}
+
+fn run(l as *List, x as f64, y as f64, s as *u8, n as i64, family as *u8, size as f64, weight as i64, italic as i64,
+       deco as i64, color as i64, alpha as f64) as *Cmd {
+    if (text(l, x, y, 0.0 - 1.0, s, n, size, weight, 0.0, color) == 0) { return cast(*Cmd, 0); }
+    let is *Cmd as c = at(l, l.n - 1);
+    c.kind = RUN;
+    c.family = family;
+    c.italic = italic;
+    c.deco = deco;
+    c.alpha = alpha;
+    return c;
+}
+
+fn image(l as *List, x as f64, y as f64, w as f64, h as f64, img as *Image, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, 16777215, alpha);
+    if (cast(i64, c) != 0) {
+        c.kind = IMAGE;
+        c.img = img;
+    }
+    return c;
+}
+
+fn line(l as *List, x0 as f64, y0 as f64, x1 as f64, y1 as f64, width as f64, color as i64, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x0, y0, x1 - x0, y1 - y0, color, alpha);
+    if (cast(i64, c) != 0) {
+        c.kind = LINE;
+        c.leading = width;
+    }
+    return c;
+}
+
+fn shadow(l as *List, x as f64, y as f64, w as f64, h as f64, radius as f64, blur as f64, color as i64, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, color, alpha);
+    if (cast(i64, c) != 0) {
+        c.kind = SHADOW;
+        c.radius = radius;
+        c.leading = blur;
+    }
+    return c;
+}
+
+fn gradient(l as *List, x as f64, y as f64, w as f64, h as f64, g as *GradPaint, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, 16777215, alpha);
+    if (cast(i64, c) != 0) {
+        c.kind = GRADIENT;
+        c.grad = g;
+    }
+    return c;
+}
+
+fn ring(l as *List, x as f64, y as f64, w as f64, h as f64, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, 16777215, alpha);
+    if (cast(i64, c) != 0) { c.kind = RING; }
+    return c;
+}
+
+fn svg(l as *List, x as f64, y as f64, w as f64, h as f64, node as *u8, color as i64, alpha as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, color, alpha);
+    if (cast(i64, c) != 0) {
+        c.kind = SVG;
+        c.node = node;
+    }
+    return c;
+}
+
+fn clip(l as *List, x as f64, y as f64, w as f64, h as f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, 0, 1.0);
+    if (cast(i64, c) != 0) { c.kind = CLIP; }
+    return c;
+}
+
+fn moved(l as *List, x as f64, y as f64, w as f64, h as f64, m as *f64) as *Cmd {
+    let is *Cmd as c = box(l, x, y, w, h, 0, 1.0);
+    if (cast(i64, c) != 0) {
+        c.kind = MOVED;
+        c.m = m;
+    }
+    return c;
+}
+
+fn unmoved(l as *List) as *Cmd {
+    let is *Cmd as c = box(l, 0.0, 0.0, 0.0, 0.0, 0, 1.0);
+    if (cast(i64, c) != 0) { c.kind = UNMOVED; }
+    return c;
+}
+
+fn unclip(l as *List) as *Cmd {
+    let is *Cmd as c = box(l, 0.0, 0.0, 0.0, 0.0, 0, 1.0);
+    if (cast(i64, c) != 0) { c.kind = UNCLIP; }
+    return c;
 }

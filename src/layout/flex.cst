@@ -1,0 +1,546 @@
+// layout/flex.cst — flexbox, the CSS Flexible Box algorithm with its less common corners
+// taken at face value.
+//
+// Items go in lines along the main axis, each line's free space is shared out by grow
+// and shrink, and only then does anything get laid out, because in a row an item's height
+// depends on the width it ends up with.
+//
+// baseline alignment is treated as start, and wrap-reverse as wrap, reversed.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "./box.cst" as bx;
+use "./flow.cst" as flow;
+
+struct Fline {
+    first as *bx.Box;
+    n     as i64;
+    cross as f64;
+    next  as *Fline;
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _is_row(b as *bx.Box) as i64 {
+    let is i64 as d = bx.prop(b, pr.P_FLEX_DIRECTION);
+    if (d == pr.K_ROW || d == pr.K_ROW_REVERSE) { return 1; }
+    return 0;
+}
+
+fn _is_reverse(b as *bx.Box) as i64 {
+    let is i64 as d = bx.prop(b, pr.P_FLEX_DIRECTION);
+    if (d == pr.K_ROW_REVERSE || d == pr.K_COLUMN_REVERSE) { return 1; }
+    return 0;
+}
+
+// In-flow children linked in order-property order. Stable: ties keep the source's order.
+fn _sorted_items(b as *bx.Box) as *bx.Box {
+    let is *bx.Box as head with mut = cast(*bx.Box, 0);
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (bx.is_out_of_flow(x) == 0) {
+            x.next_item = cast(*bx.Box, 0);
+            let is f64 as o = x.st.v.f[pr.P_ORDER];
+            if (head == null || head.st.v.f[pr.P_ORDER] > o) {
+                x.next_item = head;
+                head = x;
+            } else {
+                let is *bx.Box as p with mut = head;
+                while (p.next_item != null && p.next_item.st.v.f[pr.P_ORDER] <= o) { p = p.next_item; }
+                x.next_item = p.next_item;
+                p.next_item = x;
+            }
+        }
+        x = x.next;
+    }
+    return head;
+}
+
+fn _widths(c as *bx.Ctx, b as *bx.Box) as void {
+    let is i64 as row = _is_row(b);
+    let is f64 as lo with mut = 0.0;
+    let is f64 as hi with mut = 0.0;
+    let is f64 as gap = bx.resolve(b, pr.P_COLUMN_GAP, 0.0 - 1.0);
+    let is i64 as nowrap = cast(i64, bx.prop(b, pr.P_FLEX_WRAP) == pr.K_NOWRAP);
+    let is i64 as k with mut = 0;
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (bx.is_out_of_flow(x) == 0) {
+            let is f64 as a = flow.outer_min(c, x);
+            let is f64 as d = flow.outer_max(c, x);
+            if (row == 1) {
+                if (nowrap == 1) { lo = lo + a; }
+                else { lo = _max(lo, a); }
+                hi = hi + d;
+                if (k > 0) {
+                    hi = hi + gap;
+                    if (nowrap == 1) { lo = lo + gap; }
+                }
+            } else {
+                lo = _max(lo, a);
+                hi = _max(hi, d);
+            }
+            k = k + 1;
+        }
+        x = x.next;
+    }
+    b.min_cw = lo;
+    b.max_cw = _max(hi, lo);
+}
+
+// The item at this content width, returning how tall it came out. It is a context of its
+// own, so laying it out again later for a different width costs only the time.
+fn _lay_at_width(c as *bx.Ctx, it as *bx.Box, w as f64, ch as f64) as f64 {
+    it.w = flow.clamp_w(it, w, 0.0 - 1.0);
+    if (it.kind == bx.B_REPLACED) { return it.h; }
+    flow.contents(c, it, ch);
+    return it.h;
+}
+
+fn _main_edges(it as *bx.Box, row as i64) as f64 {
+    if (row == 1) { return it.m[bx.LEFT] + bx.edges_w(it) + it.m[bx.RIGHT]; }
+    return it.m[bx.TOP] + bx.edges_h(it) + it.m[bx.BOTTOM];
+}
+
+// The size an item would like along the main axis before anything flexes.
+fn _basis(c as *bx.Ctx, b as *bx.Box, it as *bx.Box, row as i64, main as f64) as void {
+    let is *pr.Values as s = &it.st.v;
+    let is f64 as v with mut = 0.0 - 1.0;
+    let is i64 as bk = s.i[pr.P_FLEX_BASIS];
+    if (bk == 0 && (s.p[pr.P_FLEX_BASIS] == 0.0 || main >= 0.0)) {
+        v = bx.resolve(it, pr.P_FLEX_BASIS, main);
+        if (bx.prop(it, pr.P_BOX_SIZING) == pr.K_BORDER_BOX) {
+            if (row == 1) { v = _max(v - bx.edges_w(it), 0.0); }
+            else { v = _max(v - bx.edges_h(it), 0.0); }
+        }
+    } else if (bk == pr.K_AUTO) {
+        if (row == 1) {
+            let is f64 as w with mut = 0.0;
+            if (flow.specified_w(it, main, &w) == 1) { v = w; }
+        } else {
+            v = flow.specified_h(it, main);
+        }
+    }
+    if (v < 0.0) {
+        if (it.kind == bx.B_REPLACED) {
+            flow.replaced_size(it, b.w, b.def_h);
+            if (row == 1) { v = it.w; }
+            else { v = it.h; }
+        } else if (row == 1) {
+            flow.intrinsic(c, it);
+            v = it.max_cw;
+        } else {
+            // Content height needs a width first, which for a column is the cross size.
+            let is f64 as w with mut = 0.0;
+            if (flow.specified_w(it, b.w, &w) == 0) {
+                w = _max(b.w - it.m[bx.LEFT] - it.m[bx.RIGHT] - bx.edges_w(it), 0.0);
+                if (_stretches(b, it) == 0) {
+                    flow.intrinsic(c, it);
+                    w = _min(w, it.max_cw);
+                }
+            }
+            it.def_h = 0.0 - 1.0;
+            v = _lay_at_width(c, it, w, 0.0 - 1.0);
+        }
+    }
+    it.base = v;
+    it.hypo = _clamp_main(it, v, row, main);
+}
+
+fn _clamp_main(it as *bx.Box, v as f64, row as i64, main as f64) as f64 {
+    if (row == 1) { return _floor_auto(it, flow.clamp_w(it, v, main), row); }
+    return _floor_auto(it, flow.clamp_h(it, v, main), row);
+}
+
+// min-width: auto, for flex items: not narrower than their longest word, unless they
+// could scroll instead. What a page's min-width: 0 is there to turn off.
+fn _floor_auto(it as *bx.Box, v as f64, row as i64) as f64 {
+    if (row == 0) { return v; }
+    if (it.st.v.i[pr.P_MIN_WIDTH] != pr.K_AUTO) { return v; }
+    if (it.st.v.i[pr.P_OVERFLOW_X] != pr.K_VISIBLE) { return v; }
+    if (it.min_cw > v) { return it.min_cw; }
+    return v;
+}
+
+fn _align_of(b as *bx.Box, it as *bx.Box) as i64 {
+    let is i64 as k with mut = bx.prop(it, pr.P_ALIGN_SELF);
+    if (k == pr.K_AUTO) { k = bx.prop(b, pr.P_ALIGN_ITEMS); }
+    if (k == pr.K_NORMAL) { return pr.K_STRETCH; }
+    if (k == pr.K_START || k == pr.K_BASELINE) { return pr.K_FLEX_START; }
+    if (k == pr.K_END) { return pr.K_FLEX_END; }
+    return k;
+}
+
+fn _stretches(b as *bx.Box, it as *bx.Box) as i64 {
+    if (_align_of(b, it) != pr.K_STRETCH) { return 0; }
+    let is i64 as side_auto with mut = 0;
+    if (_is_row(b) == 1) {
+        if (it.st.v.i[pr.P_MARGIN_TOP] == pr.K_AUTO || it.st.v.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO) { side_auto = 1; }
+    } else {
+        if (it.st.v.i[pr.P_MARGIN_LEFT] == pr.K_AUTO || it.st.v.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO) { side_auto = 1; }
+    }
+    if (side_auto == 1) { return 0; }
+    return 1;
+}
+
+// Grow or shrink one line's items to fit, freezing any that hit a limit, as the spec's
+// "resolve the flexible lengths" asks.
+fn _flex_line(l as *Fline, main as f64, gap as f64, row as i64) as void {
+    let is f64 as used with mut = gap * cast(f64, l.n - 1);
+    let is f64 as hypo_sum with mut = used;
+    let is *bx.Box as it with mut = l.first;
+    let is i64 as k with mut = 0;
+    while (k < l.n) {
+        it.frozen = 0;
+        it.main = it.hypo;
+        hypo_sum = hypo_sum + it.hypo + _main_edges(it, row);
+        it = it.next_item;
+        k = k + 1;
+    }
+    if (main < 0.0) { return; }
+    let is i64 as grow = cast(i64, hypo_sum < main);
+    let is i64 as rounds with mut = 0;
+    while (rounds < 8) {
+        let is f64 as free with mut = main - gap * cast(f64, l.n - 1);
+        let is f64 as weight with mut = 0.0;
+        it = l.first;
+        k = 0;
+        while (k < l.n) {
+            free = free - _main_edges(it, row);
+            if (it.frozen == 1) {
+                free = free - it.main;
+            } else {
+                free = free - it.base;
+                if (grow == 1) { weight = weight + it.st.v.f[pr.P_FLEX_GROW]; }
+                else { weight = weight + it.st.v.f[pr.P_FLEX_SHRINK] * it.base; }
+            }
+            it = it.next_item;
+            k = k + 1;
+        }
+        if (weight <= 0.0) { return; }
+        // Grow factors that add up to less than one only take that share of the room.
+        if (grow == 1 && weight < 1.0) { free = free * weight; }
+        let is i64 as violated with mut = 0;
+        it = l.first;
+        k = 0;
+        while (k < l.n) {
+            if (it.frozen == 0) {
+                let is f64 as v with mut = it.base;
+                if (grow == 1) {
+                    v = it.base + free * it.st.v.f[pr.P_FLEX_GROW] / weight;
+                    if (it.st.v.f[pr.P_FLEX_GROW] == 0.0) { v = it.hypo; }
+                } else {
+                    v = it.base + free * it.st.v.f[pr.P_FLEX_SHRINK] * it.base / weight;
+                }
+                let is f64 as clamped = _clamp_main(it, v, row, main);
+                it.main = clamped;
+                if (clamped != v || (grow == 1 && it.st.v.f[pr.P_FLEX_GROW] == 0.0) ||
+                    (grow == 0 && it.st.v.f[pr.P_FLEX_SHRINK] == 0.0)) {
+                    it.frozen = 1;
+                    violated = 1;
+                }
+            }
+            it = it.next_item;
+            k = k + 1;
+        }
+        if (violated == 0) { return; }
+        rounds = rounds + 1;
+    }
+}
+
+fn _layout(c as *bx.Ctx, b as *bx.Box) as void {
+    _lay_out_items(c, b);
+    flow.items_baseline(b);
+}
+
+fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
+    let is i64 as row = _is_row(b);
+    let is i64 as reverse = _is_reverse(b);
+    let is i64 as wrap = cast(i64, bx.prop(b, pr.P_FLEX_WRAP) != pr.K_NOWRAP);
+    let is i64 as wrap_rev = cast(i64, bx.prop(b, pr.P_FLEX_WRAP) == pr.K_WRAP_REVERSE);
+    let is f64 as main_size with mut = b.w;
+    let is f64 as cross_size with mut = b.def_h;
+    if (row == 0) {
+        main_size = b.def_h;
+        cross_size = b.w;
+    }
+    let is f64 as main_gap with mut = 0.0;
+    let is f64 as cross_gap with mut = 0.0;
+    if (row == 1) {
+        main_gap = bx.resolve(b, pr.P_COLUMN_GAP, b.w);
+        cross_gap = bx.resolve(b, pr.P_ROW_GAP, b.def_h);
+    } else {
+        main_gap = bx.resolve(b, pr.P_ROW_GAP, b.def_h);
+        cross_gap = bx.resolve(b, pr.P_COLUMN_GAP, b.w);
+    }
+
+    // Everything's preferred size.
+    let is *bx.Box as items = _sorted_items(b);
+    let is *bx.Box as it with mut = items;
+    while (it != null) {
+        flow.edges(it, b.w);
+        it.def_h = 0.0 - 1.0;
+        flow.intrinsic(c, it);
+        _basis(c, b, it, row, main_size);
+        it = it.next_item;
+    }
+
+    // Lines.
+    let is *Fline as lines with mut = cast(*Fline, 0);
+    let is *Fline as last with mut = cast(*Fline, 0);
+    it = items;
+    while (it != null) {
+        let is *Fline as l = cast(*Fline, arena.alloc(c.a, sizeof(Fline)));
+        l.first = it;
+        let is f64 as sum with mut = 0.0;
+        while (it != null) {
+            let is f64 as size = it.hypo + _main_edges(it, row);
+            if (wrap == 1 && l.n > 0 && main_size >= 0.0 && sum + main_gap + size > main_size) { break; }
+            if (l.n > 0) { sum = sum + main_gap; }
+            sum = sum + size;
+            l.n = l.n + 1;
+            it = it.next_item;
+        }
+        if (lines == null) { lines = l; }
+        else { last.next = l; }
+        last = l;
+    }
+
+    // Main sizes, then each item at the size that gives it, to learn its cross size.
+    let is f64 as cross_total with mut = 0.0;
+    let is i64 as nlines with mut = 0;
+    let is f64 as biggest_main with mut = 0.0;
+    let is *Fline as l with mut = lines;
+    while (l != null) {
+        _flex_line(l, main_size, main_gap, row);
+        let is f64 as line_main with mut = main_gap * cast(f64, l.n - 1);
+        it = l.first;
+        let is i64 as k with mut = 0;
+        while (k < l.n) {
+            if (row == 1) {
+                it.w = it.main;
+                if (it.kind == bx.B_REPLACED) {
+                    flow.replaced_size(it, b.w, b.def_h);
+                    it.w = it.main;
+                } else {
+                    it.def_h = flow.specified_h(it, b.def_h);
+                    flow.contents(c, it, b.def_h);
+                }
+                l.cross = _max(l.cross, it.m[bx.TOP] + bx.border_h(it) + it.m[bx.BOTTOM]);
+            } else {
+                // A column's items already have their width from the basis, unless
+                // they stretch, and stretching is decided below once lines are known.
+                let is f64 as w with mut = 0.0;
+                if (flow.specified_w(it, b.w, &w) == 0) {
+                    w = _max(b.w - it.m[bx.LEFT] - it.m[bx.RIGHT] - bx.edges_w(it), 0.0);
+                    if (_stretches(b, it) == 0) { w = _min(w, it.max_cw); }
+                }
+                it.def_h = it.main;
+                it.h = it.main;
+                if (it.kind != bx.B_REPLACED) {
+                    it.w = flow.clamp_w(it, w, b.w);
+                    flow.contents(c, it, it.main);
+                }
+                l.cross = _max(l.cross, it.m[bx.LEFT] + bx.border_w(it) + it.m[bx.RIGHT]);
+            }
+            line_main = line_main + it.main + _main_edges(it, row);
+            it = it.next_item;
+            k = k + 1;
+        }
+        biggest_main = _max(biggest_main, line_main);
+        cross_total = cross_total + l.cross;
+        if (nlines > 0) { cross_total = cross_total + cross_gap; }
+        nlines = nlines + 1;
+        l = l.next;
+    }
+
+    let is f64 as used_main with mut = main_size;
+    if (used_main < 0.0) { used_main = biggest_main; }
+    let is f64 as used_cross with mut = cross_size;
+    if (used_cross < 0.0) { used_cross = cross_total; }
+
+    // A single line with a known cross size takes all of it.
+    if (wrap == 0 && lines != null && cross_size >= 0.0) { lines.cross = cross_size; cross_total = cross_size; }
+
+    // Lines along the cross axis.
+    let is f64 as cross_free = used_cross - cross_total;
+    let is f64 as cross_at with mut = 0.0;
+    let is f64 as between with mut = cross_gap;
+    let is i64 as ac = bx.prop(b, pr.P_ALIGN_CONTENT);
+    if (wrap == 1 && nlines > 0) {
+        if (ac == pr.K_FLEX_END || ac == pr.K_END) { cross_at = cross_free; }
+        if (ac == pr.K_CENTER) { cross_at = cross_free / 2.0; }
+        if (ac == pr.K_SPACE_BETWEEN && nlines > 1 && cross_free > 0.0) { between = cross_gap + cross_free / cast(f64, nlines - 1); }
+        if (ac == pr.K_SPACE_AROUND && cross_free > 0.0) {
+            between = cross_gap + cross_free / cast(f64, nlines);
+            cross_at = cross_free / cast(f64, nlines) / 2.0;
+        }
+        if (ac == pr.K_SPACE_EVENLY && cross_free > 0.0) {
+            between = cross_gap + cross_free / cast(f64, nlines + 1);
+            cross_at = cross_free / cast(f64, nlines + 1);
+        }
+        if ((ac == pr.K_NORMAL || ac == pr.K_STRETCH) && cross_free > 0.0) {
+            let is f64 as share = cross_free / cast(f64, nlines);
+            l = lines;
+            while (l != null) {
+                l.cross = l.cross + share;
+                l = l.next;
+            }
+        }
+    }
+
+    let is i64 as jc = bx.prop(b, pr.P_JUSTIFY_CONTENT);
+    l = lines;
+    while (l != null) {
+        let is f64 as free with mut = used_main - main_gap * cast(f64, l.n - 1);
+        let is i64 as autos with mut = 0;
+        it = l.first;
+        let is i64 as k with mut = 0;
+        while (k < l.n) {
+            free = free - it.main - _main_edges(it, row);
+            if (row == 1) {
+                if (it.st.v.i[pr.P_MARGIN_LEFT] == pr.K_AUTO) { autos = autos + 1; }
+                if (it.st.v.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO) { autos = autos + 1; }
+            } else {
+                if (it.st.v.i[pr.P_MARGIN_TOP] == pr.K_AUTO) { autos = autos + 1; }
+                if (it.st.v.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO) { autos = autos + 1; }
+            }
+            it = it.next_item;
+            k = k + 1;
+        }
+        let is f64 as start with mut = 0.0;
+        let is f64 as step with mut = main_gap;
+        let is f64 as auto_share with mut = 0.0;
+        if (autos > 0 && free > 0.0) {
+            auto_share = free / cast(f64, autos);
+        } else {
+            let is i64 as flip = reverse;
+            if (jc == pr.K_FLEX_END || jc == pr.K_END) { if (flip == 0) { start = free; } }
+            else if (jc == pr.K_FLEX_START || jc == pr.K_START || jc == pr.K_NORMAL) { if (flip == 1) { start = free; } }
+            else if (jc == pr.K_RIGHT) { start = free; }
+            else if (jc == pr.K_CENTER) { start = free / 2.0; }
+            else if (free > 0.0) {
+                if (jc == pr.K_SPACE_BETWEEN && l.n > 1) { step = main_gap + free / cast(f64, l.n - 1); }
+                if (jc == pr.K_SPACE_AROUND) {
+                    step = main_gap + free / cast(f64, l.n);
+                    start = free / cast(f64, l.n) / 2.0;
+                }
+                if (jc == pr.K_SPACE_EVENLY) {
+                    step = main_gap + free / cast(f64, l.n + 1);
+                    start = step - main_gap;
+                }
+            } else if (flip == 1) {
+                start = free;
+            }
+        }
+        // A reversed line starts from the far end, and so walks the items backwards.
+        let is f64 as pos with mut = start;
+        it = l.first;
+        k = 0;
+        while (k < l.n) {
+            let is f64 as ms with mut = 0.0;
+            let is f64 as me with mut = 0.0;
+            let is f64 as cs with mut = 0.0;
+            let is f64 as ce with mut = 0.0;
+            let is i64 as a_start with mut = 0;
+            let is i64 as a_end with mut = 0;
+            let is i64 as c_astart with mut = 0;
+            let is i64 as c_aend with mut = 0;
+            let is f64 as main_edge with mut = 0.0;
+            let is f64 as cross_edge with mut = 0.0;
+            if (row == 1) {
+                ms = it.m[bx.LEFT];
+                me = it.m[bx.RIGHT];
+                cs = it.m[bx.TOP];
+                ce = it.m[bx.BOTTOM];
+                a_start = cast(i64, it.st.v.i[pr.P_MARGIN_LEFT] == pr.K_AUTO);
+                a_end = cast(i64, it.st.v.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO);
+                c_astart = cast(i64, it.st.v.i[pr.P_MARGIN_TOP] == pr.K_AUTO);
+                c_aend = cast(i64, it.st.v.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO);
+                main_edge = bx.edges_w(it);
+                cross_edge = bx.edges_h(it);
+            } else {
+                ms = it.m[bx.TOP];
+                me = it.m[bx.BOTTOM];
+                cs = it.m[bx.LEFT];
+                ce = it.m[bx.RIGHT];
+                a_start = cast(i64, it.st.v.i[pr.P_MARGIN_TOP] == pr.K_AUTO);
+                a_end = cast(i64, it.st.v.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO);
+                c_astart = cast(i64, it.st.v.i[pr.P_MARGIN_LEFT] == pr.K_AUTO);
+                c_aend = cast(i64, it.st.v.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO);
+                main_edge = bx.edges_h(it);
+                cross_edge = bx.edges_w(it);
+            }
+            if (a_start == 1) { ms = ms + auto_share; }
+            if (a_end == 1) { me = me + auto_share; }
+
+            // Stretching changes a size, and in a row a size something inside might use.
+            let is f64 as item_cross with mut = 0.0;
+            let is i64 as stretches = _stretches(b, it);
+            if (row == 1) {
+                if (stretches == 1 && bx.is_definite(it, pr.P_HEIGHT, b.def_h) == 0 && it.kind != bx.B_REPLACED) {
+                    let is f64 as target = flow.clamp_h(it, _max(l.cross - cs - ce - cross_edge, 0.0), b.def_h);
+                    if (target != it.h) {
+                        it.h = target;
+                        if (it.kind == bx.B_FLEX || it.kind == bx.B_GRID || it.kind == bx.B_TABLE) {
+                            it.def_h = target;
+                            flow.contents(c, it, target);
+                        }
+                    }
+                }
+                item_cross = it.h + cross_edge;
+            } else {
+                item_cross = it.w + cross_edge;
+            }
+            let is f64 as cross_free_here = l.cross - cs - ce - item_cross;
+            let is f64 as cp with mut = cs;
+            if (c_astart == 1 || c_aend == 1) {
+                if (c_astart == 1 && c_aend == 1) { cp = cs + _max(cross_free_here, 0.0) / 2.0; }
+                else if (c_astart == 1) { cp = cs + _max(cross_free_here, 0.0); }
+            } else {
+                let is i64 as al = _align_of(b, it);
+                if (al == pr.K_FLEX_END) { cp = cs + cross_free_here; }
+                if (al == pr.K_CENTER) { cp = cs + cross_free_here / 2.0; }
+            }
+            let is f64 as line_cross with mut = cross_at;
+            if (wrap_rev == 1) { line_cross = used_cross - cross_at - l.cross; }
+
+            let is f64 as size = it.main + main_edge;
+            let is f64 as mp with mut = pos + ms;
+            if (reverse == 1) { mp = used_main - pos - me - size; }
+            if (row == 1) {
+                it.x = mp;
+                it.y = line_cross + cp;
+            } else {
+                it.y = mp;
+                it.x = line_cross + cp;
+            }
+            pos = pos + ms + size + me + step;
+            it = it.next_item;
+            k = k + 1;
+        }
+        cross_at = cross_at + l.cross + between;
+        l = l.next;
+    }
+
+    if (row == 1) {
+        b.h = used_cross;
+    } else {
+        b.h = used_main;
+    }
+    // Positioned children keep to where the flex container starts.
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.is_abs == 1) {
+            x.sx = 0.0;
+            x.sy = 0.0;
+        }
+        x = x.next;
+    }
+}
+
+fn install() as void {
+    bx.flex_layout = fn_ptr(_layout);
+    bx.flex_widths = fn_ptr(_widths);
+}

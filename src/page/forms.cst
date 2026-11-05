@@ -1,0 +1,693 @@
+// page/forms.cst — what form controls are, and what using them does to the document.
+//
+// There are no scripts, so nothing can tell a control's attribute from its current value,
+// and the attribute is where the value lives. Checking a box adds `checked`, typing
+// changes `value`, and styling and layout read the result like anything else. The first
+// change keeps the original under a name no page uses, which is what a reset goes back to.
+
+use "../css/decl.cst" as decl;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "../loader/url.cst" as url;
+use "std/mem.cst" as mem;
+
+let is i64 as RANGE  with imut = 20;
+let is i64 as COLOR  with imut = 21;
+let is i64 as NONE   with imut = 0;
+let is i64 as TEXT   with imut = 1;
+let is i64 as AREA   with imut = 2;
+let is i64 as CHECK  with imut = 3;
+let is i64 as RADIO  with imut = 4;
+let is i64 as SUBMIT with imut = 5;
+let is i64 as RESET  with imut = 6;
+let is i64 as BUTTON with imut = 7;
+let is i64 as SELECT with imut = 8;
+
+// What submit_url says when the form wants what this browser cannot send.
+let is i64 as NEEDS_POST with imut = 0 - 2;
+
+fn _attr_is(n as *dom.Node, name as *u8, nlen as i64, val as *u8) as i64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null) { return 0; }
+    return decl.eq(a.value, a.value_len, val);
+}
+
+fn kind_of(n as *dom.Node) as i64 {
+    if (n.kind != dom.ELEMENT || n.ns != dom.NS_HTML) { return NONE; }
+    if (n.tag == tg.TEXTAREA) { return AREA; }
+    if (n.tag == tg.SELECT) { return SELECT; }
+    if (n.tag == tg.BUTTON) {
+        if (_attr_is(n, "type", 4, "reset") == 1) { return RESET; }
+        if (_attr_is(n, "type", 4, "button") == 1) { return BUTTON; }
+        return SUBMIT;
+    }
+    if (n.tag != tg.INPUT) { return NONE; }
+    if (_attr_is(n, "type", 4, "hidden") == 1) { return NONE; }
+    if (_attr_is(n, "type", 4, "checkbox") == 1) { return CHECK; }
+    if (_attr_is(n, "type", 4, "radio") == 1) { return RADIO; }
+    if (_attr_is(n, "type", 4, "range") == 1) { return RANGE; }
+    if (_attr_is(n, "type", 4, "color") == 1) { return COLOR; }
+    if (_attr_is(n, "type", 4, "submit") == 1 || _attr_is(n, "type", 4, "image") == 1) { return SUBMIT; }
+    if (_attr_is(n, "type", 4, "reset") == 1) { return RESET; }
+    if (_attr_is(n, "type", 4, "button") == 1 || _attr_is(n, "type", 4, "file") == 1) { return BUTTON; }
+    return TEXT;
+}
+
+fn is_disabled(n as *dom.Node) as i64 {
+    if (dom.find_attr(n, "disabled", 8) != null) { return 1; }
+    return 0;
+}
+
+fn is_link(n as *dom.Node) as i64 {
+    if (n.kind == dom.ELEMENT && n.ns == dom.NS_HTML && (n.tag == tg.A || n.tag == tg.AREA) &&
+        dom.find_attr(n, "href", 4) != null) { return 1; }
+    return 0;
+}
+
+fn is_summary(n as *dom.Node) as i64 {
+    if (n.kind == dom.ELEMENT && n.ns == dom.NS_HTML && n.tag == tg.SUMMARY) { return 1; }
+    return 0;
+}
+
+fn is_label(n as *dom.Node) as i64 {
+    if (n.kind == dom.ELEMENT && n.name_len == 5 && decl.eq(n.name, 5, "label") == 1) { return 1; }
+    return 0;
+}
+
+fn is_focusable(n as *dom.Node) as i64 {
+    if (n.kind != dom.ELEMENT) { return 0; }
+    if (is_link(n) == 1 || is_summary(n) == 1) { return 1; }
+    if (kind_of(n) != NONE) { return 1 - is_disabled(n); }
+    let is *dom.Attr as a = dom.find_attr(n, "tabindex", 8);
+    if (a != null && a.value_len > 0 && a.value[0] != 45) { return 1; }
+    return 0;
+}
+
+// The next element after n in document order under root, or null. A loop over links, so a
+// deep page costs no stack.
+fn next_element(root as *dom.Node, n as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = n;
+    while (1 == 1) {
+        if (x.first != null) {
+            x = x.first;
+        } else {
+            while (x != root && x.next == null) { x = x.parent; }
+            if (x == root) { return cast(*dom.Node, 0); }
+            x = x.next;
+        }
+        if (x.kind == dom.ELEMENT) { return x; }
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _shown(n as *dom.Node) as i64 {
+    let is *style.Style as st = style.of(n);
+    if (st == null) { return 0; }
+    if (st.v.i[pr.P_DISPLAY] == pr.K_NONE || st.v.i[pr.P_VISIBILITY] != pr.K_VISIBLE) { return 0; }
+    return 1;
+}
+
+// What Tab goes to from `from`: in document order, or backwards. Null past either end.
+fn next_focusable(d as *dom.Document, from as *dom.Node, backwards as i64) as *dom.Node {
+    let is *dom.Node as root = d.node;
+    let is *dom.Node as x with mut = next_element(root, root);
+    let is *dom.Node as last with mut = cast(*dom.Node, 0);
+    let is i64 as passed with mut = cast(i64, from == null);
+    while (x != null) {
+        if (x == from) {
+            if (backwards == 1) { return last; }
+            passed = 1;
+        } else if (is_focusable(x) == 1 && _shown(x) == 1) {
+            if (backwards == 1) { last = x; }
+            else if (passed == 1) { return x; }
+        }
+        x = next_element(root, x);
+    }
+    if (backwards == 1 && from == null) { return last; }
+    return cast(*dom.Node, 0);
+}
+
+fn by_id(d as *dom.Document, s as *u8, n as i64) as *dom.Node {
+    let is *dom.Node as root = d.node;
+    let is *dom.Node as x with mut = next_element(root, root);
+    while (x != null) {
+        let is *dom.Attr as a = dom.find_attr(x, "id", 2);
+        if (a != null && a.value_len == n && mem.memcmp(a.value, s, n) == 0) { return x; }
+        x = next_element(root, x);
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn form_of(d as *dom.Document, n as *dom.Node) as *dom.Node {
+    let is *dom.Attr as a = dom.find_attr(n, "form", 4);
+    if (a != null) { return by_id(d, a.value, a.value_len); }
+    let is *dom.Node as x with mut = n.parent;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && x.ns == dom.NS_HTML && x.tag == tg.FORM) { return x; }
+        x = x.parent;
+    }
+    return cast(*dom.Node, 0);
+}
+
+// What clicking a label really clicks.
+fn label_target(d as *dom.Document, label as *dom.Node) as *dom.Node {
+    let is *dom.Attr as a = dom.find_attr(label, "for", 3);
+    if (a != null) { return by_id(d, a.value, a.value_len); }
+    let is *dom.Node as x with mut = next_element(label, label);
+    while (x != null) {
+        if (kind_of(x) != NONE) { return x; }
+        x = next_element(label, x);
+    }
+    return cast(*dom.Node, 0);
+}
+
+// --- Values ---
+
+fn _keep_original(d as *dom.Document, n as *dom.Node, name as *u8, nlen as i64, mark as *u8, mlen as i64) as void {
+    if (dom.find_attr(n, mark, mlen) != null) { return; }
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    // "-" for it had none, and "=" ahead of what it had.
+    if (a == null) {
+        dom.add_attr(d, n, dom.ATTR_PLAIN, mark, mlen, "-", 1);
+        return;
+    }
+    let is *u8 as kept = dom.alloc(d, a.value_len + 1);
+    kept[0] = cast(u8, 61);
+    if (a.value_len > 0) { mem.core.memcpy(&kept[1], a.value, a.value_len); }
+    dom.add_attr(d, n, dom.ATTR_PLAIN, mark, mlen, kept, a.value_len + 1);
+}
+
+fn _restore(d as *dom.Document, n as *dom.Node, name as *u8, nlen as i64, mark as *u8, mlen as i64) as void {
+    let is *dom.Attr as m = dom.find_attr(n, mark, mlen);
+    if (m == null) { return; }
+    if (m.value_len == 1 && m.value[0] == 45) { dom.remove_attr(n, name, nlen); }
+    else { dom.set_attr(d, n, name, nlen, &m.value[1], m.value_len - 1); }
+    dom.remove_attr(n, mark, mlen);
+}
+
+// All of an element's own text in one piece, which a textarea almost always already is.
+fn text_of(d as *dom.Document, n as *dom.Node, out_n as *i64) as *u8 {
+    let is i64 as cap with mut = 1;
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT) { cap = cap + x.text_len; }
+        else if (x.kind == dom.ELEMENT) {
+            let is i64 as inner with mut = 0;
+            text_of(d, x, &inner);
+            cap = cap + inner;
+        }
+        x = x.next;
+    }
+    let is *u8 as out = dom.alloc(d, cap);
+    let is i64 as w with mut = 0;
+    x = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT) {
+            if (x.text_len > 0) { mem.core.memcpy(&out[w], x.text, x.text_len); }
+            w = w + x.text_len;
+        } else if (x.kind == dom.ELEMENT) {
+            let is i64 as inner with mut = 0;
+            let is *u8 as t = text_of(d, x, &inner);
+            if (inner > 0) { mem.core.memcpy(&out[w], t, inner); }
+            w = w + inner;
+        }
+        x = x.next;
+    }
+    *out_n = w;
+    return out;
+}
+
+fn value_of(d as *dom.Document, n as *dom.Node, out_n as *i64) as *u8 {
+    if (kind_of(n) == AREA) { return text_of(d, n, out_n); }
+    let is *dom.Attr as a = dom.find_attr(n, "value", 5);
+    if (a == null) {
+        *out_n = 0;
+        return "";
+    }
+    *out_n = a.value_len;
+    return a.value;
+}
+
+fn _set_area_text(d as *dom.Document, n as *dom.Node, s as *u8, len as i64) as void {
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        let is *dom.Node as next = x.next;
+        dom.remove(x);
+        x = next;
+    }
+    if (len > 0) { dom.append(n, dom.text(d, s, len)); }
+}
+
+fn set_value(d as *dom.Document, n as *dom.Node, s as *u8, len as i64) as void {
+    if (kind_of(n) == AREA) {
+        if (dom.find_attr(n, "-x-default", 10) == null) {
+            let is i64 as old_n with mut = 0;
+            let is *u8 as old = text_of(d, n, &old_n);
+            dom.add_attr(d, n, dom.ATTR_PLAIN, "-x-default", 10, old, old_n);
+        }
+        _set_area_text(d, n, s, len);
+        return;
+    }
+    _keep_original(d, n, "value", 5, "-x-default", 10);
+    dom.set_attr(d, n, "value", 5, s, len);
+}
+
+// A checkbox flips. A radio button comes on, and the rest of its group goes off.
+fn toggle(d as *dom.Document, n as *dom.Node) as void {
+    let is i64 as k = kind_of(n);
+    if (k == CHECK) {
+        _keep_original(d, n, "checked", 7, "-x-checked", 10);
+        if (dom.find_attr(n, "checked", 7) != null) { dom.remove_attr(n, "checked", 7); }
+        else { dom.add_attr(d, n, dom.ATTR_PLAIN, "checked", 7, "", 0); }
+        return;
+    }
+    if (k != RADIO) { return; }
+    let is *dom.Attr as name = dom.find_attr(n, "name", 4);
+    if (name != null) {
+        let is *dom.Node as form = form_of(d, n);
+        let is *dom.Node as root = d.node;
+        let is *dom.Node as x with mut = next_element(root, root);
+        while (x != null) {
+            if (x != n && kind_of(x) == RADIO) {
+                let is *dom.Attr as other = dom.find_attr(x, "name", 4);
+                if (other != null && other.value_len == name.value_len &&
+                    mem.memcmp(other.value, name.value, name.value_len) == 0 && form_of(d, x) == form) {
+                    _keep_original(d, x, "checked", 7, "-x-checked", 10);
+                    dom.remove_attr(x, "checked", 7);
+                }
+            }
+            x = next_element(root, x);
+        }
+    }
+    _keep_original(d, n, "checked", 7, "-x-checked", 10);
+    if (dom.find_attr(n, "checked", 7) == null) { dom.add_attr(d, n, dom.ATTR_PLAIN, "checked", 7, "", 0); }
+}
+
+// --- Options ---
+
+fn next_option(select as *dom.Node, after as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = after;
+    if (x == null) { x = select; }
+    x = next_element(select, x);
+    while (x != null) {
+        if (x.ns == dom.NS_HTML && x.tag == tg.OPTION) { return x; }
+        x = next_element(select, x);
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn nth_option(select as *dom.Node, i as i64) as *dom.Node {
+    let is *dom.Node as o with mut = next_option(select, cast(*dom.Node, 0));
+    let is i64 as k with mut = 0;
+    while (o != null && k < i) {
+        o = next_option(select, o);
+        k = k + 1;
+    }
+    return o;
+}
+
+fn choose_option(d as *dom.Document, select as *dom.Node, chosen as *dom.Node) as void {
+    let is *dom.Node as o with mut = next_option(select, cast(*dom.Node, 0));
+    while (o != null) {
+        _keep_original(d, o, "selected", 8, "-x-selected", 11);
+        dom.remove_attr(o, "selected", 8);
+        o = next_option(select, o);
+    }
+    dom.add_attr(d, chosen, dom.ATTR_PLAIN, "selected", 8, "", 0);
+}
+
+fn _is_space(c as i64) as i64 {
+    if (c == 32 || c == 9 || c == 10 || c == 12 || c == 13) { return 1; }
+    return 0;
+}
+
+// An option as it reads: its label, or its text with the source's line breaks gone.
+fn option_text(d as *dom.Document, o as *dom.Node, out_n as *i64) as *u8 {
+    let is *dom.Attr as l = dom.find_attr(o, "label", 5);
+    if (l != null && l.value_len > 0) {
+        *out_n = l.value_len;
+        return l.value;
+    }
+    let is i64 as n with mut = 0;
+    let is *u8 as s = text_of(d, o, &n);
+    let is i64 as w with mut = 0;
+    let is i64 as gap with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        i = i + 1;
+        if (_is_space(c) == 1) {
+            gap = 1;
+            continue;
+        }
+        if (gap == 1 && w > 0) {
+            s[w] = cast(u8, 32);
+            w = w + 1;
+        }
+        gap = 0;
+        s[w] = cast(u8, c);
+        w = w + 1;
+    }
+    *out_n = w;
+    return s;
+}
+
+fn _option_value(d as *dom.Document, o as *dom.Node, out_n as *i64) as *u8 {
+    let is *dom.Attr as v = dom.find_attr(o, "value", 5);
+    if (v != null) {
+        *out_n = v.value_len;
+        return v.value;
+    }
+    return option_text(d, o, out_n);
+}
+
+fn selected_option(select as *dom.Node) as *dom.Node {
+    let is *dom.Node as first = next_option(select, cast(*dom.Node, 0));
+    let is *dom.Node as o with mut = first;
+    let is *dom.Node as chosen with mut = cast(*dom.Node, 0);
+    while (o != null) {
+        if (dom.find_attr(o, "selected", 8) != null) { chosen = o; }
+        o = next_option(select, o);
+    }
+    if (chosen != null) { return chosen; }
+    return first;
+}
+
+// --- The form as a whole ---
+
+fn reset(d as *dom.Document, form as *dom.Node) as void {
+    let is *dom.Node as root = d.node;
+    let is *dom.Node as x with mut = next_element(root, root);
+    while (x != null) {
+        let is i64 as k = kind_of(x);
+        if (k == AREA && form_of(d, x) == form) {
+            let is *dom.Attr as m = dom.find_attr(x, "-x-default", 10);
+            if (m != null) {
+                _set_area_text(d, x, m.value, m.value_len);
+                dom.remove_attr(x, "-x-default", 10);
+            }
+        }
+        if ((k == TEXT || k == RANGE || k == COLOR) && form_of(d, x) == form) { _restore(d, x, "value", 5, "-x-default", 10); }
+        if ((k == CHECK || k == RADIO) && form_of(d, x) == form) { _restore(d, x, "checked", 7, "-x-checked", 10); }
+        if (k == SELECT && form_of(d, x) == form) {
+            let is *dom.Node as o with mut = next_option(x, cast(*dom.Node, 0));
+            while (o != null) {
+                _restore(d, o, "selected", 8, "-x-selected", 11);
+                o = next_option(x, o);
+            }
+        }
+        x = next_element(root, x);
+    }
+}
+
+fn _encode(out as *u8, w0 as i64, cap as i64, s as *u8, n as i64) as i64 {
+    let is *u8 as hex = "0123456789ABCDEF";
+    let is i64 as w with mut = w0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        i = i + 1;
+        if (w < 0 || w + 3 >= cap) { return 0 - 1; }
+        let is i64 as plain = cast(i64, (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                                    c == 42 || c == 45 || c == 46 || c == 95);
+        if (plain == 1) {
+            out[w] = cast(u8, c);
+            w = w + 1;
+        } else if (c == 32) {
+            out[w] = cast(u8, 43);
+            w = w + 1;
+        } else {
+            out[w] = cast(u8, 37);
+            out[w + 1] = hex[c >> 4];
+            out[w + 2] = hex[c & 15];
+            w = w + 3;
+        }
+    }
+    return w;
+}
+
+fn _field(out as *u8, w0 as i64, cap as i64, name as *dom.Attr, val as *u8, n as i64, first as *i64) as i64 {
+    let is i64 as w with mut = w0;
+    if (w < 0 || w + 2 >= cap) { return 0 - 1; }
+    if (*first == 0) {
+        out[w] = cast(u8, 38);
+        w = w + 1;
+    }
+    *first = 0;
+    w = _encode(out, w, cap, name.value, name.value_len);
+    if (w < 0 || w + 2 >= cap) { return 0 - 1; }
+    out[w] = cast(u8, 61);
+    return _encode(out, w + 1, cap, val, n);
+}
+
+// The URL submitting a form goes to, in out: its length, -1 when it will not fit, or
+// NEEDS_POST for the method the network library cannot send a body with.
+fn submit_url(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, base as *u8, out as *u8, cap as i64) as i64 {
+    if (_attr_is(form, "method", 6, "post") == 1) { return NEEDS_POST; }
+    let is *dom.Attr as action = dom.find_attr(form, "action", 6);
+    let is i64 as w with mut = 0;
+    if (action != null && action.value_len > 0) { w = url.resolve(base, action.value, action.value_len, out, cap); }
+    else { w = url.resolve(base, "", 0, out, cap); }
+    if (w < 0) { return w; }
+    // Whatever query or fragment it had, the form's own takes its place.
+    let is i64 as k with mut = 0;
+    while (k < w && out[k] != 63 && out[k] != 35) { k = k + 1; }
+    w = k;
+    if (w + 2 >= cap) { return 0 - 1; }
+    out[w] = cast(u8, 63);
+    w = w + 1;
+    let is i64 as first with mut = 1;
+    let is *dom.Node as root = d.node;
+    let is *dom.Node as x with mut = next_element(root, root);
+    while (x != null && w >= 0) {
+        let is *dom.Attr as name = dom.find_attr(x, "name", 4);
+        let is i64 as k2 = kind_of(x);
+        let is i64 as hidden = cast(i64, x.ns == dom.NS_HTML && x.tag == tg.INPUT && _attr_is(x, "type", 4, "hidden") == 1);
+        if (name != null && name.value_len > 0 && (k2 != NONE || hidden == 1) && is_disabled(x) == 0 && form_of(d, x) == form) {
+            let is i64 as n with mut = 0;
+            if (hidden == 1 || k2 == TEXT || k2 == AREA) {
+                let is *u8 as v = value_of(d, x, &n);
+                w = _field(out, w, cap, name, v, n, &first);
+            } else if (k2 == RANGE) {
+                let is [32]u8 as num with mut;
+                let is i64 as len = _fmt_num(range_value(x), cast(*u8, &num));
+                w = _field(out, w, cap, name, cast(*u8, &num), len, &first);
+            } else if (k2 == COLOR) {
+                let is *dom.Attr as v = dom.find_attr(x, "value", 5);
+                if (v != null) { w = _field(out, w, cap, name, v.value, v.value_len, &first); }
+                else { w = _field(out, w, cap, name, "#000000", 7, &first); }
+            } else if (k2 == CHECK || k2 == RADIO) {
+                if (dom.find_attr(x, "checked", 7) != null) {
+                    let is *dom.Attr as v = dom.find_attr(x, "value", 5);
+                    if (v != null) { w = _field(out, w, cap, name, v.value, v.value_len, &first); }
+                    else { w = _field(out, w, cap, name, "on", 2, &first); }
+                }
+            } else if (k2 == SELECT) {
+                let is *dom.Node as o = selected_option(x);
+                if (o != null) {
+                    let is *u8 as v = _option_value(d, o, &n);
+                    w = _field(out, w, cap, name, v, n, &first);
+                }
+            } else if (k2 == SUBMIT && x == submitter) {
+                let is *u8 as v = value_of(d, x, &n);
+                w = _field(out, w, cap, name, v, n, &first);
+            }
+        }
+        x = next_element(root, x);
+    }
+    if (w < 0 || w >= cap) { return 0 - 1; }
+    out[w] = cast(u8, 0);
+    return w;
+}
+
+// The first submit button of a form, which pressing Enter in one of its fields presses.
+fn default_button(d as *dom.Document, form as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = next_element(form, form);
+    while (x != null) {
+        if (kind_of(x) == SUBMIT && is_disabled(x) == 0) { return x; }
+        x = next_element(form, x);
+    }
+    return cast(*dom.Node, 0);
+}
+
+// --- A slider ---
+
+fn _num_attr(n as *dom.Node, name as *u8, nlen as i64, dflt as f64) as f64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null || a.value_len == 0) { return dflt; }
+    let is *u8 as s = a.value;
+    let is i64 as i with mut = 0;
+    let is f64 as sign with mut = 1.0;
+    if (s[0] == 45) {
+        sign = 0.0 - 1.0;
+        i = 1;
+    }
+    let is f64 as v with mut = 0.0;
+    let is i64 as digits with mut = 0;
+    while (i < a.value_len && s[i] >= 48 && s[i] <= 57) {
+        v = v * 10.0 + cast(f64, cast(i64, s[i]) - 48);
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if (i < a.value_len && s[i] == 46) {
+        i = i + 1;
+        let is f64 as place with mut = 0.1;
+        while (i < a.value_len && s[i] >= 48 && s[i] <= 57) {
+            v = v + cast(f64, cast(i64, s[i]) - 48) * place;
+            place = place * 0.1;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if (digits == 0) { return dflt; }
+    return v * sign;
+}
+
+fn range_min(n as *dom.Node) as f64 { return _num_attr(n, "min", 3, 0.0); }
+
+fn range_max(n as *dom.Node) as f64 {
+    let is f64 as lo = range_min(n);
+    let is f64 as hi = _num_attr(n, "max", 3, 100.0);
+    if (hi < lo) { return lo; }
+    return hi;
+}
+
+fn _range_step(n as *dom.Node) as f64 {
+    let is f64 as st = _num_attr(n, "step", 4, 1.0);
+    if (st <= 0.0) { return 1.0; }
+    return st;
+}
+
+fn _range_clamp(n as *dom.Node, v as f64) as f64 {
+    let is f64 as lo = range_min(n);
+    let is f64 as hi = range_max(n);
+    let is f64 as st = _range_step(n);
+    // To the nearest step from the bottom, and a step past the top is the last that fits.
+    let is f64 as steps = cast(f64, cast(i64, (v - lo) / st + 0.5));
+    let is f64 as out with mut = lo + steps * st;
+    if (v <= lo) { out = lo; }
+    while (out > hi) { out = out - st; }
+    if (out < lo) { out = lo; }
+    return out;
+}
+
+// With no value it sits halfway, as the standard says.
+fn range_value(n as *dom.Node) as f64 {
+    let is f64 as lo = range_min(n);
+    let is f64 as hi = range_max(n);
+    return _range_clamp(n, _num_attr(n, "value", 5, lo + (hi - lo) / 2.0));
+}
+
+// A whole number, or one with what it needs of three decimals.
+fn _fmt_num(v0 as f64, out as *u8) as i64 {
+    let is i64 as w with mut = 0;
+    let is f64 as v with mut = v0;
+    if (v < 0.0) {
+        out[w] = cast(u8, 45);
+        w = w + 1;
+        v = 0.0 - v;
+    }
+    let is i64 as scaled = cast(i64, v * 1000.0 + 0.5);
+    let is i64 as whole = scaled / 1000;
+    let is i64 as frac with mut = scaled % 1000;
+    let is [24]u8 as rev with mut;
+    let is i64 as k with mut = 0;
+    let is i64 as q with mut = whole;
+    if (q == 0) {
+        rev[0] = cast(u8, 48);
+        k = 1;
+    }
+    while (q > 0 && k < 24) {
+        rev[k] = cast(u8, 48 + q % 10);
+        q = q / 10;
+        k = k + 1;
+    }
+    while (k > 0) {
+        k = k - 1;
+        out[w] = rev[k];
+        w = w + 1;
+    }
+    if (frac > 0) {
+        out[w] = cast(u8, 46);
+        w = w + 1;
+        let is i64 as place with mut = 100;
+        while (place > 0 && frac > 0) {
+            out[w] = cast(u8, 48 + frac / place);
+            frac = frac % place;
+            place = place / 10;
+            w = w + 1;
+        }
+    }
+    return w;
+}
+
+// Moves a slider. 1 when that changed it.
+fn range_set(d as *dom.Document, n as *dom.Node, v as f64) as i64 {
+    let is f64 as now = range_value(n);
+    let is f64 as to = _range_clamp(n, v);
+    if (to == now && dom.find_attr(n, "value", 5) != null) { return 0; }
+    let is [32]u8 as num with mut;
+    let is i64 as len = _fmt_num(to, cast(*u8, &num));
+    set_value(d, n, cast(*u8, &num), len);
+    return 1;
+}
+
+fn range_step(d as *dom.Document, n as *dom.Node, by as i64) as i64 {
+    return range_set(d, n, range_value(n) + cast(f64, by) * _range_step(n));
+}
+
+// --- A date ---
+//
+// The value is always yyyy-mm-dd. What a person reads and types is dd/mm/yyyy.
+
+fn is_date(n as *dom.Node) as i64 {
+    if (n.kind != dom.ELEMENT || n.ns != dom.NS_HTML || n.tag != tg.INPUT) { return 0; }
+    return _attr_is(n, "type", 4, "date");
+}
+
+fn _digits(s as *u8, n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (s[i] < 48 || s[i] > 57) { return 0 - 1; }
+        v = v * 10 + cast(i64, s[i]) - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+// The value as it is shown, into out (11 bytes): its length, or 0 when it is not a date.
+fn date_shown(s as *u8, n as i64, out as *u8) as i64 {
+    if (n != 10 || s[4] != 45 || s[7] != 45) { return 0; }
+    if (_digits(s, 4) < 0 || _digits(&s[5], 2) < 0 || _digits(&s[8], 2) < 0) { return 0; }
+    mem.core.memcpy(out, &s[8], 2);
+    out[2] = cast(u8, 47);
+    mem.core.memcpy(&out[3], &s[5], 2);
+    out[5] = cast(u8, 47);
+    mem.core.memcpy(&out[6], s, 4);
+    return 10;
+}
+
+// What was typed as the value, into out (11 bytes): its length, or 0 when it is no date.
+fn date_typed(s as *u8, n as i64, out as *u8) as i64 {
+    if (n != 10 || (s[2] != 47 && s[2] != 45 && s[2] != 46) || (s[5] != 47 && s[5] != 45 && s[5] != 46)) { return 0; }
+    let is i64 as day = _digits(s, 2);
+    let is i64 as month = _digits(&s[3], 2);
+    let is i64 as year = _digits(&s[6], 4);
+    if (day < 1 || month < 1 || month > 12 || year < 1) { return 0; }
+    let is i64 as most with mut = 31;
+    if (month == 4 || month == 6 || month == 9 || month == 11) { most = 30; }
+    if (month == 2) {
+        most = 28;
+        if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) { most = 29; }
+    }
+    if (day > most) { return 0; }
+    mem.core.memcpy(out, &s[6], 4);
+    out[4] = cast(u8, 45);
+    mem.core.memcpy(&out[5], &s[3], 2);
+    out[7] = cast(u8, 45);
+    mem.core.memcpy(&out[8], s, 2);
+    return 10;
+}

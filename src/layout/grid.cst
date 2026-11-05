@@ -1,0 +1,893 @@
+// layout/grid.cst — CSS Grid: items into cells, then tracks sized from what is in them.
+//
+// Columns first, because a height needs a width; then each item laid out at the width of
+// its cells to learn how tall it is, then the rows. Named lines and grid-template-areas
+// are not read, subgrid is not either, and `dense` packs as sparse does.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "../css/values.cst" as v;
+use "./box.cst" as bx;
+use "./flow.cst" as flow;
+use "std/mem.cst" as mem;
+
+let is i64 as MAX_LINES with imut = 4096;
+
+let is i64 as FIT_NONE with imut = 0;    // the room is known, or else as the content wants
+let is i64 as FIT_MIN  with imut = 1;    // as narrow as it can go
+let is i64 as FIT_MAX  with imut = 2;    // as wide as its content likes
+
+// A track while it is being sized.
+struct _T {
+    base as f64;
+    grow as f64;    // how far it may still go; negative for no limit yet
+    lo   as i64;    // TRACK_*
+    hi   as i64;
+    fr   as f64;
+    at   as f64;    // where it starts, once the sizes are in
+    held as i64;    // a flexible track out of the sharing, in this round
+}
+
+struct _Grid {
+    items as *bx.Box;
+    cols  as *_T;
+    ncols as i64;
+    rows  as *_T;
+    nrows as i64;
+    n_exp_cols as i64;
+    n_exp_rows as i64;
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _list_of(b as *bx.Box, p as i64) as *v.TrackList {
+    if (b.st.v.i[p] == pr.K_NONE || b.st.v.i[p] == pr.K_AUTO) { return cast(*v.TrackList, 0); }
+    return cast(*v.TrackList, b.st.v.i[p]);
+}
+
+fn _len_px(c as *bx.Ctx, b as *bx.Box, l as *v.Len, avail as f64) as f64 {
+    let is f64 as px = style.px_of(c.e, l, b.st.v.f[pr.P_FONT_SIZE]);
+    if (avail < 0.0) { return px; }
+    return px + l.pct * avail / 100.0;
+}
+
+fn _size_kind(s as *v.TrackSize, avail as f64) as i64 {
+    // A percentage of a size nobody knows yet is as good as auto.
+    if (s.kind == v.TRACK_LEN && s.len.pct != 0.0 && avail < 0.0) { return v.TRACK_AUTO; }
+    return s.kind;
+}
+
+fn _set_track(c as *bx.Ctx, b as *bx.Box, t as *_T, x as *v.Track, avail as f64) as void {
+    t.lo = _size_kind(&x.lo, avail);
+    t.hi = _size_kind(&x.hi, avail);
+    t.fr = x.hi.fr;
+    t.base = 0.0;
+    t.grow = 0.0 - 1.0;
+    t.at = 0.0;
+    t.held = 0;
+    if (t.lo == v.TRACK_LEN) { t.base = _max(_len_px(c, b, &x.lo.len, avail), 0.0); }
+    if (t.hi == v.TRACK_LEN) { t.grow = _max(_len_px(c, b, &x.hi.len, avail), t.base); }
+}
+
+fn _auto_track(c as *bx.Ctx, b as *bx.Box, t as *_T, p as i64, avail as f64) as void {
+    let is *v.TrackList as l = _list_of(b, p);
+    if (l == null) {
+        t.lo = v.TRACK_AUTO;
+        t.hi = v.TRACK_AUTO;
+        t.fr = 0.0;
+        t.base = 0.0;
+        t.grow = 0.0 - 1.0;
+        t.at = 0.0;
+        t.held = 0;
+        return;
+    }
+    _set_track(c, b, t, &l.t[0], avail);
+}
+
+// How many times auto-fill and auto-fit go in. Their tracks need a size that says itself,
+// and without room to fill there is one.
+fn _repeats(c as *bx.Ctx, b as *bx.Box, l as *v.TrackList, avail as f64, gap as f64) as i64 {
+    if (avail < 0.0) { return 1; }
+    let is f64 as fixed with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < l.n) {
+        if (k < l.rep_at || k >= l.rep_at + l.rep_n) {
+            if (l.t[k].lo.kind == v.TRACK_LEN) { fixed = fixed + _len_px(c, b, &l.t[k].lo.len, avail); }
+            fixed = fixed + gap;
+        }
+        k = k + 1;
+    }
+    let is f64 as one with mut = 0.0;
+    k = 0;
+    while (k < l.rep_n) {
+        let is *v.Track as x = &l.t[l.rep_at + k];
+        let is f64 as sz with mut = 0.0;
+        if (x.lo.kind == v.TRACK_LEN) { sz = _len_px(c, b, &x.lo.len, avail); }
+        if (x.hi.kind == v.TRACK_LEN) { sz = _max(sz, _len_px(c, b, &x.hi.len, avail)); }
+        one = one + sz + gap;
+        k = k + 1;
+    }
+    if (one <= 0.0) { return 1; }
+    let is i64 as n = cast(i64, (avail - fixed + gap) / one);
+    if (n < 1) { return 1; }
+    if (n > 1024) { return 1024; }
+    return n;
+}
+
+// The explicit tracks of a list, with what repeats written out. How many went in.
+fn _explicit_count(c as *bx.Ctx, b as *bx.Box, p as i64, avail as f64, gap as f64) as i64 {
+    let is *v.TrackList as l = _list_of(b, p);
+    if (l == null) { return 0; }
+    if (l.rep == v.REPEAT_NONE) { return l.n; }
+    return l.n - l.rep_n + l.rep_n * _repeats(c, b, l, avail, gap);
+}
+
+fn _explicit_at(c as *bx.Ctx, b as *bx.Box, p as i64, i as i64, avail as f64, gap as f64) as *v.Track {
+    let is *v.TrackList as l = _list_of(b, p);
+    if (l.rep == v.REPEAT_NONE) { return &l.t[i]; }
+    if (i < l.rep_at) { return &l.t[i]; }
+    let is i64 as times = _repeats(c, b, l, avail, gap);
+    let is i64 as into = i - l.rep_at;
+    if (into < l.rep_n * times) { return &l.t[l.rep_at + into % l.rep_n]; }
+    return &l.t[i - l.rep_n * times + l.rep_n];
+}
+
+fn _new_tracks(c as *bx.Ctx, b as *bx.Box, n as i64, explicit_p as i64, n_exp as i64, auto_p as i64, avail as f64, gap as f64) as *_T {
+    let is i64 as cnt with mut = n;
+    if (cnt < 1) { cnt = 1; }
+    let is *_T as t = cast(*_T, arena.alloc(c.a, cnt * sizeof(_T)));
+    mem.memzero(cast(*u8, t), cnt * sizeof(_T));
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (k < n_exp) { _set_track(c, b, &t[k], _explicit_at(c, b, explicit_p, k, avail, gap), avail); }
+        else { _auto_track(c, b, &t[k], auto_p, avail); }
+        k = k + 1;
+    }
+    return t;
+}
+
+// --- Items into cells ---
+
+// One axis of an item: its start and how many tracks, with start -1 for not said.
+fn _line_of(b as *bx.Box, it as *bx.Box, start_p as i64, end_p as i64, n_exp as i64, at as *i64, span as *i64) as void {
+    let is *pr.Values as s = &it.st.v;
+    *at = 0 - 1;
+    *span = 1;
+    let is i64 as has_a = cast(i64, s.i[start_p] == pr.K_NUMBER);
+    let is i64 as has_e = cast(i64, s.i[end_p] == pr.K_NUMBER);
+    let is f64 as a = s.f[start_p];
+    let is f64 as e = s.f[end_p];
+    let is i64 as a_span = cast(i64, has_a == 1 && a >= v.GRID_SPAN);
+    let is i64 as e_span = cast(i64, has_e == 1 && e >= v.GRID_SPAN);
+    if (a_span == 1) { *span = cast(i64, a - v.GRID_SPAN); }
+    if (e_span == 1) { *span = cast(i64, e - v.GRID_SPAN); }
+    let is i64 as line_a with mut = 0;
+    let is i64 as line_e with mut = 0;
+    if (has_a == 1 && a_span == 0) {
+        line_a = cast(i64, a);
+        if (line_a < 0) { line_a = n_exp + 2 + line_a; }
+        if (line_a < 1) { line_a = 1; }
+    }
+    if (has_e == 1 && e_span == 0) {
+        line_e = cast(i64, e);
+        if (line_e < 0) { line_e = n_exp + 2 + line_e; }
+        if (line_e < 1) { line_e = 1; }
+    }
+    if (line_a > 0 && line_e > 0) {
+        if (line_e < line_a) {
+            let is i64 as tmp = line_a;
+            line_a = line_e;
+            line_e = tmp;
+        }
+        if (line_e == line_a) { line_e = line_a + 1; }
+        *at = line_a - 1;
+        *span = line_e - line_a;
+    } else if (line_a > 0) {
+        *at = line_a - 1;
+    } else if (line_e > 0) {
+        *at = line_e - 1 - *span;
+        if (*at < 0) { *at = 0; }
+    }
+    if (*span < 1) { *span = 1; }
+    if (*span > MAX_LINES) { *span = MAX_LINES; }
+    if (*at >= MAX_LINES) { *at = MAX_LINES - 1; }
+}
+
+fn _taken(cells as *u8, major as i64, minor as i64, minors as i64) as i64 {
+    return cast(i64, cells[major * minors + minor]);
+}
+
+// Placing packs along the minor axis, the columns unless grid-auto-flow says otherwise, and
+// the major axis grows as it needs to. The grid is held as a bitmap that doubles.
+struct _Cells {
+    c      as *bx.Ctx;
+    bits   as *u8;
+    minors as i64;
+    majors as i64;    // room for this many
+    used   as i64;    // how many hold something
+}
+
+fn _cells_room(g as *_Cells, majors as i64) as void {
+    if (majors <= g.majors) { return; }
+    let is i64 as cap with mut = g.majors * 2;
+    if (cap < 16) { cap = 16; }
+    while (cap < majors) { cap = cap * 2; }
+    let is *u8 as nb = arena.alloc(g.c.a, cap * g.minors);
+    mem.memzero(nb, cap * g.minors);
+    if (g.majors > 0) { mem.core.memcpy(nb, g.bits, g.majors * g.minors); }
+    g.bits = nb;
+    g.majors = cap;
+}
+
+fn _fits(g as *_Cells, major as i64, minor as i64, maj_span as i64, min_span as i64) as i64 {
+    if (minor + min_span > g.minors) { return 0; }
+    _cells_room(g, major + maj_span);
+    let is i64 as a with mut = 0;
+    while (a < maj_span) {
+        let is i64 as k with mut = 0;
+        while (k < min_span) {
+            if (_taken(g.bits, major + a, minor + k, g.minors) != 0) { return 0; }
+            k = k + 1;
+        }
+        a = a + 1;
+    }
+    return 1;
+}
+
+fn _take(g as *_Cells, major as i64, minor as i64, maj_span as i64, min_span as i64) as void {
+    _cells_room(g, major + maj_span);
+    let is i64 as a with mut = 0;
+    while (a < maj_span) {
+        let is i64 as k with mut = 0;
+        while (k < min_span) {
+            g.bits[(major + a) * g.minors + minor + k] = cast(u8, 1);
+            k = k + 1;
+        }
+        a = a + 1;
+    }
+    if (major + maj_span > g.used) { g.used = major + maj_span; }
+}
+
+// In-flow children linked in the order property's order, stable.
+fn _sorted(b as *bx.Box) as *bx.Box {
+    let is *bx.Box as head with mut = cast(*bx.Box, 0);
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (bx.is_out_of_flow(x) == 0) {
+            x.next_item = cast(*bx.Box, 0);
+            let is f64 as o = x.st.v.f[pr.P_ORDER];
+            if (head == null || head.st.v.f[pr.P_ORDER] > o) {
+                x.next_item = head;
+                head = x;
+            } else {
+                let is *bx.Box as p with mut = head;
+                while (p.next_item != null && p.next_item.st.v.f[pr.P_ORDER] <= o) { p = p.next_item; }
+                x.next_item = p.next_item;
+                p.next_item = x;
+            }
+        }
+        x = x.next;
+    }
+    return head;
+}
+
+fn _place_items(c as *bx.Ctx, b as *bx.Box, gr as *_Grid, avail as f64, col_gap as f64) as void {
+    gr.items = _sorted(b);
+    let is f64 as row_gap = bx.resolve(b, pr.P_ROW_GAP, b.def_h);
+    gr.n_exp_cols = _explicit_count(c, b, pr.P_GRID_TEMPLATE_COLUMNS, avail, col_gap);
+    gr.n_exp_rows = _explicit_count(c, b, pr.P_GRID_TEMPLATE_ROWS, b.def_h, row_gap);
+    let is i64 as by_col = cast(i64, bx.prop(b, pr.P_GRID_AUTO_FLOW) == pr.K_COLUMN);
+
+    // Each item's lines, and how wide the minor axis has to be.
+    let is i64 as minors with mut = gr.n_exp_cols;
+    if (by_col == 1) { minors = gr.n_exp_rows; }
+    let is *bx.Box as it with mut = gr.items;
+    while (it != null) {
+        let is i64 as ca with mut = 0;
+        let is i64 as cs with mut = 1;
+        let is i64 as ra with mut = 0;
+        let is i64 as rs with mut = 1;
+        _line_of(b, it, pr.P_GRID_COLUMN_START, pr.P_GRID_COLUMN_END, gr.n_exp_cols, &ca, &cs);
+        _line_of(b, it, pr.P_GRID_ROW_START, pr.P_GRID_ROW_END, gr.n_exp_rows, &ra, &rs);
+        it.col = ca;
+        it.colspan = cs;
+        it.row = ra;
+        it.rowspan = rs;
+        let is i64 as need with mut = cs;
+        if (ca >= 0) { need = ca + cs; }
+        if (by_col == 1) {
+            need = rs;
+            if (ra >= 0) { need = ra + rs; }
+        }
+        if (need > minors) { minors = need; }
+        it = it.next_item;
+    }
+    if (minors < 1) { minors = 1; }
+    if (minors > MAX_LINES) { minors = MAX_LINES; }
+
+    let is _Cells as g with mut;
+    g.c = c;
+    g.bits = cast(*u8, 0);
+    g.minors = minors;
+    g.majors = 0;
+    g.used = 0;
+    _cells_room(&g, 16);
+
+    // Those with a place on both axes go first, then those with a row, then the rest by
+    // a cursor that only moves forward.
+    it = gr.items;
+    while (it != null) {
+        let is i64 as maj with mut = it.row;
+        let is i64 as mnr with mut = it.col;
+        let is i64 as majs with mut = it.rowspan;
+        let is i64 as mnrs with mut = it.colspan;
+        if (by_col == 1) { maj = it.col; mnr = it.row; majs = it.colspan; mnrs = it.rowspan; }
+        if (mnrs > minors) { mnrs = minors; }
+        if (mnr + mnrs > minors) { mnr = minors - mnrs; }
+        if (maj >= 0 && mnr >= 0) { _take(&g, maj, mnr, majs, mnrs); }
+        else if (maj >= 0) {
+            let is i64 as k with mut = 0;
+            while (k + mnrs <= minors && _fits(&g, maj, k, majs, mnrs) == 0) { k = k + 1; }
+            if (k + mnrs > minors) { k = 0; }
+            _take(&g, maj, k, majs, mnrs);
+            if (by_col == 1) { it.row = k; it.rowspan = mnrs; }
+            else { it.col = k; it.colspan = mnrs; }
+        }
+        it = it.next_item;
+    }
+    let is i64 as cur_maj with mut = 0;
+    let is i64 as cur_mnr with mut = 0;
+    it = gr.items;
+    while (it != null) {
+        let is i64 as maj with mut = it.row;
+        let is i64 as mnr with mut = it.col;
+        let is i64 as majs with mut = it.rowspan;
+        let is i64 as mnrs with mut = it.colspan;
+        if (by_col == 1) { maj = it.col; mnr = it.row; majs = it.colspan; mnrs = it.rowspan; }
+        if (mnrs > minors) { mnrs = minors; }
+        if (maj < 0) {
+            if (mnr >= 0) {
+                // Its minor line is fixed: forward along the major axis until it fits.
+                if (mnr + mnrs > minors) { mnr = minors - mnrs; }
+                if (mnr < cur_mnr) { cur_maj = cur_maj + 1; }
+                while (_fits(&g, cur_maj, mnr, majs, mnrs) == 0) { cur_maj = cur_maj + 1; }
+                cur_mnr = mnr;
+                maj = cur_maj;
+            } else {
+                while (_fits(&g, cur_maj, cur_mnr, majs, mnrs) == 0) {
+                    cur_mnr = cur_mnr + 1;
+                    if (cur_mnr + mnrs > minors) {
+                        cur_mnr = 0;
+                        cur_maj = cur_maj + 1;
+                    }
+                }
+                mnr = cur_mnr;
+                maj = cur_maj;
+            }
+            _take(&g, maj, mnr, majs, mnrs);
+            if (by_col == 1) {
+                it.col = maj;
+                it.row = mnr;
+                it.rowspan = mnrs;
+            } else {
+                it.row = maj;
+                it.col = mnr;
+                it.colspan = mnrs;
+            }
+        }
+        it = it.next_item;
+    }
+
+    gr.ncols = minors;
+    gr.nrows = g.used;
+    if (by_col == 1) {
+        gr.ncols = g.used;
+        gr.nrows = minors;
+    }
+    if (gr.ncols < gr.n_exp_cols) { gr.ncols = gr.n_exp_cols; }
+    if (gr.nrows < gr.n_exp_rows) { gr.nrows = gr.n_exp_rows; }
+    gr.cols = _new_tracks(c, b, gr.ncols, pr.P_GRID_TEMPLATE_COLUMNS, gr.n_exp_cols, pr.P_GRID_AUTO_COLUMNS, avail, col_gap);
+    gr.rows = _new_tracks(c, b, gr.nrows, pr.P_GRID_TEMPLATE_ROWS, gr.n_exp_rows, pr.P_GRID_AUTO_ROWS, b.def_h, row_gap);
+}
+
+// --- Sizing tracks ---
+
+fn _is_intrinsic_lo(t as *_T) as i64 {
+    return cast(i64, t.lo == v.TRACK_AUTO || t.lo == v.TRACK_MIN || t.lo == v.TRACK_MAX);
+}
+
+fn _is_intrinsic_hi(t as *_T) as i64 {
+    return cast(i64, t.hi == v.TRACK_AUTO || t.hi == v.TRACK_MIN || t.hi == v.TRACK_MAX);
+}
+
+fn _span_at(it as *bx.Box, is_col as i64, at as *i64, span as *i64) as void {
+    if (is_col == 1) {
+        *at = it.col;
+        *span = it.colspan;
+    } else {
+        *at = it.row;
+        *span = it.rowspan;
+    }
+}
+
+// From what is in them: it.base is what an item needs at least and it.hypo what it would
+// like, with its margins.
+fn _from_items(items as *bx.Box, t as *_T, gap as f64, is_col as i64) as void {
+    let is i64 as most with mut = 1;
+    let is *bx.Box as it with mut = items;
+    while (it != null) {
+        let is i64 as at with mut = 0;
+        let is i64 as span with mut = 1;
+        _span_at(it, is_col, &at, &span);
+        if (span > most) { most = span; }
+        if (span == 1) {
+            let is *_T as x = &t[at];
+            if (x.lo == v.TRACK_AUTO || x.lo == v.TRACK_MIN) { x.base = _max(x.base, it.base); }
+            if (x.lo == v.TRACK_MAX) { x.base = _max(x.base, it.hypo); }
+            if (x.hi == v.TRACK_AUTO || x.hi == v.TRACK_MAX) { x.grow = _max(x.grow, it.hypo); }
+            if (x.hi == v.TRACK_MIN) { x.grow = _max(x.grow, it.base); }
+        }
+        it = it.next_item;
+    }
+    // Wider items after: what they need beyond their tracks goes evenly across those of
+    // them that can take it. Only flexible tracks can if any of them is flexible.
+    let is i64 as s with mut = 2;
+    while (s <= most) {
+        it = items;
+        while (it != null) {
+            let is i64 as at with mut = 0;
+            let is i64 as span with mut = 1;
+            _span_at(it, is_col, &at, &span);
+            if (span == s) {
+                let is f64 as have with mut = gap * cast(f64, span - 1);
+                let is f64 as wish with mut = have;
+                let is i64 as open with mut = 0;
+                let is i64 as flex with mut = 0;
+                let is i64 as k with mut = 0;
+                while (k < span) {
+                    let is *_T as x = &t[at + k];
+                    have = have + x.base;
+                    wish = wish + _max(x.base, x.grow);
+                    if (x.hi == v.TRACK_FR) { flex = 1; }
+                    if (_is_intrinsic_lo(x) == 1) { open = open + 1; }
+                    k = k + 1;
+                }
+                if (flex == 1) {
+                    open = 0;
+                    k = 0;
+                    while (k < span) {
+                        if (t[at + k].hi == v.TRACK_FR && _is_intrinsic_lo(&t[at + k]) == 1) { open = open + 1; }
+                        k = k + 1;
+                    }
+                }
+                let is f64 as extra = it.base - have;
+                if (open > 0 && extra > 0.0) {
+                    let is f64 as share = extra / cast(f64, open);
+                    k = 0;
+                    while (k < span) {
+                        let is *_T as x = &t[at + k];
+                        if (_is_intrinsic_lo(x) == 1 && (flex == 0 || x.hi == v.TRACK_FR)) { x.base = x.base + share; }
+                        k = k + 1;
+                    }
+                }
+                if (flex == 0) {
+                    let is i64 as wants with mut = 0;
+                    k = 0;
+                    while (k < span) {
+                        if (_is_intrinsic_hi(&t[at + k]) == 1) { wants = wants + 1; }
+                        k = k + 1;
+                    }
+                    let is f64 as more = it.hypo - wish;
+                    if (wants > 0 && more > 0.0) {
+                        let is f64 as share = more / cast(f64, wants);
+                        k = 0;
+                        while (k < span) {
+                            let is *_T as x = &t[at + k];
+                            if (_is_intrinsic_hi(x) == 1) { x.grow = _max(x.base, x.grow) + share; }
+                            k = k + 1;
+                        }
+                    }
+                }
+            }
+            it = it.next_item;
+        }
+        s = s + 1;
+    }
+}
+
+fn _settle_limits(t as *_T, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (t[k].hi != v.TRACK_FR && t[k].grow < t[k].base) { t[k].grow = t[k].base; }
+        k = k + 1;
+    }
+}
+
+fn _sum_bases(t as *_T, n as i64, gap as f64) as f64 {
+    let is f64 as sum with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        sum = sum + t[k].base;
+        k = k + 1;
+    }
+    if (n > 1) { sum = sum + gap * cast(f64, n - 1); }
+    return sum;
+}
+
+// Shares out free room among tracks with a limit above their size.
+fn _maximize(t as *_T, n as i64, avail as f64, gap as f64) as void {
+    let is i64 as rounds with mut = 0;
+    while (rounds < n + 1) {
+        let is f64 as free = avail - _sum_bases(t, n, gap);
+        if (free <= 0.01) { return; }
+        let is i64 as open with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < n) {
+            if (t[k].hi != v.TRACK_FR && t[k].grow > t[k].base) { open = open + 1; }
+            k = k + 1;
+        }
+        if (open == 0) { return; }
+        let is f64 as share = free / cast(f64, open);
+        k = 0;
+        while (k < n) {
+            if (t[k].hi != v.TRACK_FR && t[k].grow > t[k].base) { t[k].base = _min(t[k].base + share, t[k].grow); }
+            k = k + 1;
+        }
+        rounds = rounds + 1;
+    }
+}
+
+fn _has_flex(t as *_T, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (t[k].hi == v.TRACK_FR) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The size of one fr with this much room for the flexible tracks and what else is there.
+fn _fr_in(t as *_T, n as i64, room as f64, gap as f64) as f64 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        t[k].held = 0;
+        k = k + 1;
+    }
+    let is i64 as rounds with mut = 0;
+    let is f64 as size with mut = 0.0;
+    while (rounds <= n) {
+        let is f64 as left with mut = room;
+        if (n > 1) { left = left - gap * cast(f64, n - 1); }
+        let is f64 as frs with mut = 0.0;
+        k = 0;
+        while (k < n) {
+            if (t[k].hi == v.TRACK_FR && t[k].held == 0) { frs = frs + t[k].fr; }
+            else { left = left - t[k].base; }
+            k = k + 1;
+        }
+        if (frs < 1.0) { frs = 1.0; }
+        size = _max(left, 0.0) / frs;
+        let is i64 as held with mut = 0;
+        k = 0;
+        while (k < n) {
+            if (t[k].hi == v.TRACK_FR && t[k].held == 0 && size * t[k].fr < t[k].base) {
+                t[k].held = 1;
+                held = 1;
+            }
+            k = k + 1;
+        }
+        if (held == 0) { return size; }
+        rounds = rounds + 1;
+    }
+    return size;
+}
+
+// With no room to go by, one fr is whatever gives every flexible track what is in it.
+fn _fr_of_content(items as *bx.Box, t as *_T, n as i64, gap as f64, is_col as i64) as f64 {
+    let is f64 as size with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (t[k].hi == v.TRACK_FR && t[k].fr > 0.0) {
+            let is f64 as d with mut = t[k].fr;
+            if (d < 1.0) { d = 1.0; }
+            size = _max(size, t[k].base / d);
+        }
+        k = k + 1;
+    }
+    let is *bx.Box as it with mut = items;
+    while (it != null) {
+        let is i64 as at with mut = 0;
+        let is i64 as span with mut = 1;
+        _span_at(it, is_col, &at, &span);
+        let is f64 as left with mut = it.hypo - gap * cast(f64, span - 1);
+        let is f64 as frs with mut = 0.0;
+        k = 0;
+        while (k < span) {
+            if (t[at + k].hi == v.TRACK_FR) { frs = frs + t[at + k].fr; }
+            else { left = left - t[at + k].base; }
+            k = k + 1;
+        }
+        if (frs > 0.0) {
+            if (frs < 1.0) { frs = 1.0; }
+            size = _max(size, left / frs);
+        }
+        it = it.next_item;
+    }
+    return size;
+}
+
+fn _apply_fr(t as *_T, n as i64, size as f64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (t[k].hi == v.TRACK_FR) { t[k].base = _max(t[k].base, size * t[k].fr); }
+        k = k + 1;
+    }
+}
+
+fn _size_tracks(items as *bx.Box, t as *_T, n as i64, avail as f64, gap as f64, is_col as i64, mode as i64) as void {
+    _from_items(items, t, gap, is_col);
+    _settle_limits(t, n);
+    // Room nobody has measured is as good as endless: everything takes what it would like.
+    if (mode == FIT_MAX || (mode == FIT_NONE && avail < 0.0)) {
+        let is i64 as k with mut = 0;
+        while (k < n) {
+            if (t[k].hi != v.TRACK_FR) { t[k].base = t[k].grow; }
+            k = k + 1;
+        }
+    } else if (avail >= 0.0) {
+        _maximize(t, n, avail, gap);
+    }
+    if (_has_flex(t, n) == 0) { return; }
+    if (mode == FIT_MIN) { return; }
+    if (avail >= 0.0 && mode == FIT_NONE) { _apply_fr(t, n, _fr_in(t, n, avail, gap)); }
+    else { _apply_fr(t, n, _fr_of_content(items, t, n, gap, is_col)); }
+}
+
+// Room left over goes to auto tracks, unless the page chose to place the tracks instead.
+fn _stretch_auto(t as *_T, n as i64, room as f64, gap as f64, align as i64) as void {
+    if (align != pr.K_NORMAL && align != pr.K_STRETCH) { return; }
+    let is f64 as free = room - _sum_bases(t, n, gap);
+    if (free <= 0.0) { return; }
+    let is i64 as autos with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (t[k].hi == v.TRACK_AUTO) { autos = autos + 1; }
+        k = k + 1;
+    }
+    if (autos == 0) { return; }
+    let is f64 as share = free / cast(f64, autos);
+    k = 0;
+    while (k < n) {
+        if (t[k].hi == v.TRACK_AUTO) { t[k].base = t[k].base + share; }
+        k = k + 1;
+    }
+}
+
+// Where each track starts, for justify-content or align-content.
+fn _lay_out_tracks(t as *_T, n as i64, room as f64, gap as f64, align as i64) as void {
+    let is f64 as free = room - _sum_bases(t, n, gap);
+    let is f64 as at with mut = 0.0;
+    let is f64 as step with mut = gap;
+    if (align == pr.K_END || align == pr.K_FLEX_END || align == pr.K_RIGHT) { at = free; }
+    if (align == pr.K_CENTER) { at = free / 2.0; }
+    if (free > 0.0 && n > 0) {
+        if (align == pr.K_SPACE_BETWEEN && n > 1) { step = gap + free / cast(f64, n - 1); }
+        if (align == pr.K_SPACE_AROUND) {
+            step = gap + free / cast(f64, n);
+            at = free / cast(f64, n) / 2.0;
+        }
+        if (align == pr.K_SPACE_EVENLY) {
+            step = gap + free / cast(f64, n + 1);
+            at = free / cast(f64, n + 1);
+        }
+    }
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        t[k].at = at;
+        at = at + t[k].base + step;
+        k = k + 1;
+    }
+}
+
+// What an item adds to its columns: what it must have, and what it would like. A box that
+// scrolls, and one with a min-width of its own, need no room for their content.
+fn _col_contributions(c as *bx.Ctx, it as *bx.Box) as void {
+    let is f64 as big = flow.outer_max(c, it);
+    let is f64 as small with mut = flow.outer_min(c, it);
+    let is f64 as w with mut = 0.0;
+    if (it.kind != bx.B_REPLACED && flow.specified_w(it, 0.0 - 1.0, &w) == 0) {
+        let is *pr.Values as s = &it.st.v;
+        if (s.i[pr.P_OVERFLOW_X] != pr.K_VISIBLE && s.i[pr.P_MIN_WIDTH] == pr.K_AUTO) { small = small - it.min_cw; }
+        else if (s.i[pr.P_MIN_WIDTH] == 0 && s.p[pr.P_MIN_WIDTH] == 0.0) { small = small - it.min_cw + s.f[pr.P_MIN_WIDTH]; }
+    }
+    if (small < 0.0) { small = 0.0; }
+    it.base = small;
+    it.hypo = _max(big, small);
+}
+
+fn _widths(c as *bx.Ctx, b as *bx.Box) as void {
+    let is f64 as gap = bx.resolve(b, pr.P_COLUMN_GAP, 0.0 - 1.0);
+    let is _Grid as g with mut;
+    let is f64 as no_w = 0.0 - 1.0;
+    _place_items(c, b, &g, no_w, gap);
+    let is *bx.Box as it with mut = g.items;
+    while (it != null) {
+        _col_contributions(c, it);
+        it = it.next_item;
+    }
+    _size_tracks(g.items, g.cols, g.ncols, no_w, gap, 1, FIT_MIN);
+    b.min_cw = _sum_bases(g.cols, g.ncols, gap);
+    let is _Grid as h with mut;
+    _place_items(c, b, &h, no_w, gap);
+    it = h.items;
+    while (it != null) {
+        _col_contributions(c, it);
+        it = it.next_item;
+    }
+    _size_tracks(h.items, h.cols, h.ncols, no_w, gap, 1, FIT_MAX);
+    b.max_cw = _max(_sum_bases(h.cols, h.ncols, gap), b.min_cw);
+}
+
+// --- Laying it out ---
+
+fn _span_size(t as *_T, at as i64, span as i64, gap as f64) as f64 {
+    let is f64 as sum with mut = gap * cast(f64, span - 1);
+    let is i64 as k with mut = 0;
+    while (k < span) {
+        sum = sum + t[at + k].base;
+        k = k + 1;
+    }
+    return sum;
+}
+
+fn _self_x(b as *bx.Box, it as *bx.Box) as i64 {
+    let is i64 as k with mut = bx.prop(it, pr.P_JUSTIFY_SELF);
+    if (k == pr.K_AUTO) { k = bx.prop(b, pr.P_JUSTIFY_ITEMS); }
+    return k;
+}
+
+fn _self_y(b as *bx.Box, it as *bx.Box) as i64 {
+    let is i64 as k with mut = bx.prop(it, pr.P_ALIGN_SELF);
+    if (k == pr.K_AUTO) { k = bx.prop(b, pr.P_ALIGN_ITEMS); }
+    return k;
+}
+
+fn _fills(it as *bx.Box, k as i64) as i64 {
+    if (k == pr.K_STRETCH) { return 1; }
+    // normal is stretch, except that what has a size of its own keeps it.
+    if (k == pr.K_NORMAL && it.kind != bx.B_REPLACED) { return 1; }
+    return 0;
+}
+
+fn _start_of(k as i64, free as f64) as f64 {
+    if (k == pr.K_CENTER) { return free / 2.0; }
+    if (k == pr.K_END || k == pr.K_FLEX_END || k == pr.K_RIGHT) { return free; }
+    return 0.0;
+}
+
+// At the width of its columns, to learn how tall it is.
+fn _lay_item(c as *bx.Ctx, b as *bx.Box, it as *bx.Box, area_w as f64) as void {
+    flow.edges(it, area_w);
+    let is f64 as room = area_w - it.m[bx.LEFT] - it.m[bx.RIGHT] - bx.edges_w(it);
+    if (it.kind == bx.B_REPLACED) {
+        flow.replaced_size(it, area_w, 0.0 - 1.0);
+        return;
+    }
+    let is f64 as w with mut = 0.0;
+    if (flow.specified_w(it, area_w, &w) == 0) {
+        let is *pr.Values as s = &it.st.v;
+        let is i64 as side_auto = cast(i64, s.i[pr.P_MARGIN_LEFT] == pr.K_AUTO || s.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO);
+        if (_fills(it, _self_x(b, it)) == 1 && side_auto == 0) {
+            w = _max(room, 0.0);
+        } else {
+            flow.intrinsic(c, it);
+            w = _min(_max(it.min_cw, room), it.max_cw);
+        }
+    }
+    it.w = flow.clamp_w(it, w, area_w);
+    it.def_h = flow.specified_h(it, 0.0 - 1.0);
+    flow.contents(c, it, 0.0 - 1.0);
+}
+
+fn _layout(c as *bx.Ctx, b as *bx.Box) as void {
+    _lay_out_items(c, b);
+    flow.items_baseline(b);
+}
+
+fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
+    let is f64 as col_gap = bx.resolve(b, pr.P_COLUMN_GAP, b.w);
+    let is f64 as row_gap = bx.resolve(b, pr.P_ROW_GAP, b.def_h);
+    let is _Grid as g with mut;
+    _place_items(c, b, &g, b.w, col_gap);
+
+    let is *bx.Box as it with mut = g.items;
+    while (it != null) {
+        _col_contributions(c, it);
+        it = it.next_item;
+    }
+    _size_tracks(g.items, g.cols, g.ncols, b.w, col_gap, 1, FIT_NONE);
+    _stretch_auto(g.cols, g.ncols, b.w, col_gap, bx.prop(b, pr.P_JUSTIFY_CONTENT));
+    _lay_out_tracks(g.cols, g.ncols, b.w, col_gap, bx.prop(b, pr.P_JUSTIFY_CONTENT));
+
+    // Rows from how tall everything is at those widths.
+    it = g.items;
+    while (it != null) {
+        let is f64 as area_w = _span_size(g.cols, it.col, it.colspan, col_gap);
+        _lay_item(c, b, it, area_w);
+        let is f64 as tall = it.m[bx.TOP] + bx.border_h(it) + it.m[bx.BOTTOM];
+        it.hypo = tall;
+        it.base = tall;
+        // One that scrolls can be as short as its row makes it.
+        if (it.st.v.i[pr.P_OVERFLOW_Y] != pr.K_VISIBLE && it.st.v.i[pr.P_MIN_HEIGHT] == pr.K_AUTO) {
+            it.base = it.m[bx.TOP] + bx.edges_h(it) + it.m[bx.BOTTOM];
+        }
+        it = it.next_item;
+    }
+    _size_tracks(g.items, g.rows, g.nrows, b.def_h, row_gap, 0, FIT_NONE);
+    let is f64 as total with mut = _sum_bases(g.rows, g.nrows, row_gap);
+    let is f64 as room with mut = b.def_h;
+    if (room < 0.0) {
+        // Without a height, min-height is the only room there is to fill.
+        room = flow.clamp_h(b, total, 0.0 - 1.0);
+        if (room > total && _has_flex(g.rows, g.nrows) == 1) {
+            _apply_fr(g.rows, g.nrows, _fr_in(g.rows, g.nrows, room, row_gap));
+        }
+    }
+    _stretch_auto(g.rows, g.nrows, room, row_gap, bx.prop(b, pr.P_ALIGN_CONTENT));
+    total = _sum_bases(g.rows, g.nrows, row_gap);
+    if (b.def_h < 0.0) { room = _max(room, total); }
+    _lay_out_tracks(g.rows, g.nrows, room, row_gap, bx.prop(b, pr.P_ALIGN_CONTENT));
+
+    // Everything in its cells.
+    it = g.items;
+    while (it != null) {
+        let is f64 as area_w = _span_size(g.cols, it.col, it.colspan, col_gap);
+        let is f64 as area_h = _span_size(g.rows, it.row, it.rowspan, row_gap);
+        let is *pr.Values as s = &it.st.v;
+        let is i64 as ky = _self_y(b, it);
+        if (it.kind == bx.B_REPLACED) {
+            flow.replaced_size(it, area_w, area_h);
+        } else {
+            let is f64 as target with mut = flow.specified_h(it, area_h);
+            let is i64 as top_bot_auto = cast(i64, s.i[pr.P_MARGIN_TOP] == pr.K_AUTO || s.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO);
+            if (target < 0.0 && _fills(it, ky) == 1 && top_bot_auto == 0) {
+                target = flow.clamp_h(it, _max(area_h - it.m[bx.TOP] - it.m[bx.BOTTOM] - bx.edges_h(it), 0.0), area_h);
+            }
+            if (target >= 0.0 && target != it.h) {
+                it.def_h = target;
+                flow.contents(c, it, area_h);
+            }
+        }
+        let is f64 as free_x = area_w - it.m[bx.LEFT] - bx.border_w(it) - it.m[bx.RIGHT];
+        let is f64 as free_y = area_h - it.m[bx.TOP] - bx.border_h(it) - it.m[bx.BOTTOM];
+        let is f64 as dx with mut = _start_of(_self_x(b, it), free_x);
+        let is f64 as dy with mut = _start_of(ky, free_y);
+        if (s.i[pr.P_MARGIN_LEFT] == pr.K_AUTO && s.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO) { dx = free_x / 2.0; }
+        else if (s.i[pr.P_MARGIN_LEFT] == pr.K_AUTO) { dx = free_x; }
+        else if (s.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO) { dx = 0.0; }
+        if (s.i[pr.P_MARGIN_TOP] == pr.K_AUTO && s.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO) { dy = free_y / 2.0; }
+        else if (s.i[pr.P_MARGIN_TOP] == pr.K_AUTO) { dy = free_y; }
+        else if (s.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO) { dy = 0.0; }
+        it.x = g.cols[it.col].at + dx + it.m[bx.LEFT];
+        it.y = g.rows[it.row].at + dy + it.m[bx.TOP];
+        it = it.next_item;
+    }
+
+    b.h = total;
+    // What is positioned keeps to where the grid starts, its cells being no containing block here.
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.is_abs == 1) {
+            x.sx = 0.0;
+            x.sy = 0.0;
+        }
+        x = x.next;
+    }
+}
+
+fn install() as void {
+    bx.grid_layout = fn_ptr(_layout);
+    bx.grid_widths = fn_ptr(_widths);
+}

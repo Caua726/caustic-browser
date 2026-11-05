@@ -1,0 +1,70 @@
+// loader/file.cst — a whole file in memory.
+//
+// Read until it ends rather than asking the size first, so a pipe or /dev/stdin
+// works the same as a file on disk.
+
+use "std/mem.cst" as mem;
+use "std/io.cst" as io;
+
+let is i64 as ERR_OPEN  with imut = 0 - 1;
+let is i64 as ERR_READ  with imut = 0 - 2;
+let is i64 as ERR_ALLOC with imut = 0 - 3;
+
+let is i64 as INIT_CAP with imut = 65536;
+
+struct File {
+    data as *u8;
+    len  as i64;
+    cap  as i64;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0 || v == 0 - 1) { return 0; }
+    return 1;
+}
+
+// 0 on success. On anything else there is nothing to free.
+fn read(path as *u8, f as *File) as i64 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return ERR_OPEN; }
+    f.len = 0;
+    f.cap = INIT_CAP;
+    f.data = mem.core.mmap_anon(f.cap);
+    if (_map_ok(f.data) == 0) {
+        io._close_fd(fd);
+        return ERR_ALLOC;
+    }
+    while (1 == 1) {
+        if (f.len == f.cap) {
+            let is *u8 as p = mem.core.mmap_anon(f.cap * 2);
+            if (_map_ok(p) == 0) {
+                mem.core.munmap(f.data, f.cap);
+                io._close_fd(fd);
+                return ERR_ALLOC;
+            }
+            mem.core.memcpy(p, f.data, f.len);
+            mem.core.munmap(f.data, f.cap);
+            f.data = p;
+            f.cap = f.cap * 2;
+        }
+        let is i64 as got = io._read_fd(fd, cast(*u8, cast(i64, f.data) + f.len), f.cap - f.len);
+        if (got == 0 - 4) { continue; }   // EINTR: nothing was read
+        if (got < 0) {
+            mem.core.munmap(f.data, f.cap);
+            io._close_fd(fd);
+            return ERR_READ;
+        }
+        if (got == 0) { break; }
+        f.len = f.len + got;
+    }
+    io._close_fd(fd);
+    return 0;
+}
+
+fn free(f as *File) as void {
+    mem.core.munmap(f.data, f.cap);
+    f.data = cast(*u8, 0);
+    f.len = 0;
+    f.cap = 0;
+}

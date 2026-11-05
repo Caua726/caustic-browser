@@ -1,0 +1,991 @@
+// layout/build.cst — the box tree, from the styled DOM.
+//
+// Most of this file is CSS 2's anonymous boxes. CSS says a block has either blocks or
+// lines in it, and a table has only rows and a row only cells, and pages do not, so the
+// missing boxes are made here and nothing after this has to allow for them.
+//
+// One simplification: an inline box with a block inside it becomes a block itself,
+// instead of being split around the block as CSS asks. It looks the same unless the
+// inline has a border or a background, and it is what makes <a><div> work.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "../css/decl.cst" as decl;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "../loader/url.cst" as url;
+use "../paint/display_list.cst" as dl;
+use "./box.cst" as bx;
+use "./measure.cst" as m;
+use "../page/forms.cst" as forms;
+use "std/mem.cst" as mem;
+
+fn _is_ws(c as i64) as i64 {
+    if (c == 32 || c == 9 || c == 10 || c == 12 || c == 13) { return 1; }
+    return 0;
+}
+
+// --- Text ---
+
+fn _lower_byte(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+fn _upper_byte(c as i64) as i64 {
+    if (c >= 97 && c <= 122) { return c - 32; }
+    return c;
+}
+
+// Text as it will be set: whitespace handled as white-space says, and case changed.
+// Only ASCII and Latin-1 change case; the rest of Unicode would need its tables here.
+fn _set_text(c as *bx.Ctx, b as *bx.Box, s as *u8, n as i64) as void {
+    let is i64 as ws = bx.prop(b, pr.P_WHITE_SPACE);
+    let is i64 as keep_spaces = cast(i64, ws == pr.K_PRE || ws == pr.K_PRE_WRAP || ws == pr.K_BREAK_SPACES);
+    let is i64 as keep_lines = cast(i64, keep_spaces == 1 || ws == pr.K_PRE_LINE);
+    let is i64 as cap with mut = n + 1;
+    if (keep_spaces == 1) { cap = n * 8 + 1; }
+    let is *u8 as out = arena.alloc(c.a, cap);
+    let is i64 as w with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as col with mut = 0;
+    let is i64 as was_space with mut = 0;
+    while (i < n) {
+        let is i64 as x = cast(i64, s[i]);
+        i = i + 1;
+        if (x == 13) {
+            if (i < n && s[i] == 10) { continue; }
+            if (keep_lines == 1) {
+                out[w] = cast(u8, 10);
+                w = w + 1;
+                col = 0;
+                was_space = 1;
+                continue;
+            }
+        }
+        if (keep_lines == 1 && (x == 10 || x == 12)) {
+            // A line break takes the spaces before it with it when they collapse.
+            if (keep_spaces == 0) {
+                while (w > 0 && out[w - 1] == 32) { w = w - 1; }
+            }
+            out[w] = cast(u8, 10);
+            w = w + 1;
+            col = 0;
+            was_space = 1;
+            continue;
+        }
+        if (keep_spaces == 1 && x == 9) {
+            let is i64 as stop = 8 - col % 8;
+            let is i64 as k with mut = 0;
+            while (k < stop) {
+                out[w] = cast(u8, 32);
+                w = w + 1;
+                k = k + 1;
+            }
+            col = col + stop;
+            continue;
+        }
+        if (keep_spaces == 0 && _is_ws(x) == 1) {
+            if (was_space == 0) {
+                out[w] = cast(u8, 32);
+                w = w + 1;
+                was_space = 1;
+            }
+            continue;
+        }
+        out[w] = cast(u8, x);
+        w = w + 1;
+        col = col + 1;
+        was_space = 0;
+    }
+    let is i64 as tr = bx.prop(b, pr.P_TEXT_TRANSFORM);
+    if (tr != pr.K_NONE) {
+        let is i64 as start_word with mut = 1;
+        let is i64 as k with mut = 0;
+        while (k < w) {
+            let is i64 as x = cast(i64, out[k]);
+            if (x == 195 && k + 1 < w) {
+                let is i64 as y = cast(i64, out[k + 1]);
+                // Latin-1 letters, except the two that are not cased pairs.
+                if ((tr == pr.K_UPPERCASE || (tr == pr.K_CAPITALIZE && start_word == 1)) && y >= 160 && y <= 190 && y != 183) { out[k + 1] = cast(u8, y - 32); }
+                if (tr == pr.K_LOWERCASE && y >= 128 && y <= 158 && y != 151) { out[k + 1] = cast(u8, y + 32); }
+                start_word = 0;
+                k = k + 2;
+                continue;
+            }
+            if (tr == pr.K_UPPERCASE) { out[k] = cast(u8, _upper_byte(x)); }
+            if (tr == pr.K_LOWERCASE) { out[k] = cast(u8, _lower_byte(x)); }
+            if (tr == pr.K_CAPITALIZE && start_word == 1) { out[k] = cast(u8, _upper_byte(x)); }
+            start_word = cast(i64, _is_ws(x) == 1);
+            k = k + 1;
+        }
+    }
+    out[w] = cast(u8, 0);
+    b.text = out;
+    b.tlen = w;
+}
+
+fn _add_text(c as *bx.Ctx, parent as *bx.Box, st as *style.Style, s as *u8, n as i64) as *bx.Box {
+    let is *bx.Box as b = bx.alloc_box(c, bx.B_TEXT, cast(*dom.Node, 0), st);
+    _set_text(c, b, s, n);
+    bx.append(parent, b);
+    return b;
+}
+
+fn _blank(b as *bx.Box) as i64 {
+    if (b.kind != bx.B_TEXT) { return 0; }
+    let is i64 as ws = bx.prop(b, pr.P_WHITE_SPACE);
+    if (ws == pr.K_PRE || ws == pr.K_PRE_WRAP || ws == pr.K_BREAK_SPACES) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < b.tlen) {
+        let is i64 as x = cast(i64, b.text[i]);
+        if (x != 32 && !(ws == pr.K_NORMAL && x == 10)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// --- Generated content ---
+
+// The content property's text, with attr() filled in from the element.
+fn _content_text(c as *bx.Ctx, n as *dom.Node, s as *u8, out_n as *i64) as *u8 {
+    let is i64 as cap with mut = 1;
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        if (s[i] == 1) {
+            let is i64 as st = i + 1;
+            while (s[i] != 2 && s[i] != 0) { i = i + 1; }
+            let is *dom.Attr as a = dom.find_attr(n, &s[st], i - st);
+            if (a != null) { cap = cap + a.value_len; }
+        } else {
+            cap = cap + 1;
+        }
+        if (s[i] != 0) { i = i + 1; }
+    }
+    let is *u8 as out = arena.alloc(c.a, cap);
+    let is i64 as w with mut = 0;
+    i = 0;
+    while (s[i] != 0) {
+        if (s[i] == 1) {
+            let is i64 as st = i + 1;
+            while (s[i] != 2 && s[i] != 0) { i = i + 1; }
+            let is *dom.Attr as a = dom.find_attr(n, &s[st], i - st);
+            if (a != null) {
+                mem.core.memcpy(&out[w], a.value, a.value_len);
+                w = w + a.value_len;
+            }
+        } else {
+            out[w] = s[i];
+            w = w + 1;
+        }
+        if (s[i] != 0) { i = i + 1; }
+    }
+    out[w] = cast(u8, 0);
+    *out_n = w;
+    return out;
+}
+
+fn _pseudo(c as *bx.Ctx, parent as *bx.Box, n as *dom.Node, st as *style.Style) as void {
+    if (st == null) { return; }
+    let is i64 as k = st.v.i[pr.P_DISPLAY];
+    let is *bx.Box as b = _box_shell(c, n, st, k);
+    b.node = cast(*dom.Node, 0);
+    let is i64 as len with mut = 0;
+    let is *u8 as txt = _content_text(c, n, cast(*u8, st.v.i[pr.P_CONTENT]), &len);
+    if (len > 0) { _add_text(c, b, st, txt, len); }
+    _normalize(c, b);
+    bx.append(parent, b);
+}
+
+// --- Elements ---
+
+fn _attr_int(n as *dom.Node, name as *u8, nlen as i64, dflt as i64) as i64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null) { return dflt; }
+    let is i64 as i with mut = 0;
+    let is i64 as sign with mut = 1;
+    while (i < a.value_len && _is_ws(cast(i64, a.value[i])) == 1) { i = i + 1; }
+    if (i < a.value_len && a.value[i] == 45) { sign = 0 - 1; i = i + 1; }
+    let is i64 as v with mut = 0;
+    let is i64 as digits with mut = 0;
+    while (i < a.value_len && a.value[i] >= 48 && a.value[i] <= 57) {
+        if (v < 100000000) { v = v * 10 + cast(i64, a.value[i]) - 48; }
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if (digits == 0) { return dflt; }
+    return sign * v;
+}
+
+fn _tag_is(n as *dom.Node, name as *u8) as i64 { return decl.eq(n.name, n.name_len, name); }
+
+fn _attr_is(n as *dom.Node, name as *u8, nlen as i64, val as *u8) as i64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null) { return 0; }
+    return decl.eq(a.value, a.value_len, val);
+}
+
+// The box that goes with a display value, empty, with its flags set.
+fn _box_shell(c as *bx.Ctx, n as *dom.Node, st as *style.Style, d as i64) as *bx.Box {
+    let is i64 as kind with mut = bx.B_BLOCK;
+    if (d == pr.K_INLINE) { kind = bx.B_INLINE; }
+    if (d == pr.K_FLEX || d == pr.K_INLINE_FLEX) { kind = bx.B_FLEX; }
+    if (d == pr.K_GRID || d == pr.K_INLINE_GRID) { kind = bx.B_GRID; }
+    if (d == pr.K_TABLE || d == pr.K_INLINE_TABLE) { kind = bx.B_TABLE; }
+    if (d == pr.K_TABLE_ROW_GROUP || d == pr.K_TABLE_HEADER_GROUP || d == pr.K_TABLE_FOOTER_GROUP) { kind = bx.B_ROWGROUP; }
+    if (d == pr.K_TABLE_ROW) { kind = bx.B_ROW; }
+    if (d == pr.K_TABLE_CELL) { kind = bx.B_CELL; }
+    if (d == pr.K_TABLE_CAPTION) { kind = bx.B_CAPTION; }
+    if (d == pr.K_TABLE_COLUMN || d == pr.K_TABLE_COLUMN_GROUP) { kind = bx.B_COL; }
+    let is *bx.Box as b = bx.alloc_box(c, kind, n, st);
+    if (d == pr.K_INLINE_BLOCK || d == pr.K_INLINE_FLEX || d == pr.K_INLINE_TABLE || d == pr.K_INLINE_GRID) { b.atomic = 1; }
+    if (st.v.i[pr.P_FLOAT] != pr.K_NONE) { b.is_float = 1; }
+    let is i64 as pos = st.v.i[pr.P_POSITION];
+    if (pos == pr.K_ABSOLUTE || pos == pr.K_FIXED) { b.is_abs = 1; }
+    if (pos == pr.K_FIXED) { b.is_fixed = 1; }
+    return b;
+}
+
+fn _roman(c as *bx.Ctx, v0 as i64, upper as i64, out_n as *i64) as *u8 {
+    let is *u8 as out = arena.alloc(c.a, 32);
+    let is i64 as w with mut = 0;
+    let is i64 as v with mut = v0;
+    if (v <= 0 || v >= 4000) { return _decimal(c, v0, out_n); }
+    let is *u8 as syms = "m cm d cd c xc l xl x ix v iv i ";
+    let is [13]i64 as vals with mut;
+    vals[0] = 1000; vals[1] = 900; vals[2] = 500; vals[3] = 400; vals[4] = 100; vals[5] = 90;
+    vals[6] = 50; vals[7] = 40; vals[8] = 10; vals[9] = 9; vals[10] = 5; vals[11] = 4; vals[12] = 1;
+    let is i64 as at with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 13) {
+        while (v >= vals[k]) {
+            let is i64 as j with mut = at;
+            while (syms[j] != 32) {
+                out[w] = syms[j];
+                w = w + 1;
+                j = j + 1;
+            }
+            v = v - vals[k];
+        }
+        while (syms[at] != 32) { at = at + 1; }
+        at = at + 1;
+        k = k + 1;
+    }
+    if (upper == 1) {
+        k = 0;
+        while (k < w) {
+            out[k] = cast(u8, _upper_byte(cast(i64, out[k])));
+            k = k + 1;
+        }
+    }
+    out[w] = cast(u8, 0);
+    *out_n = w;
+    return out;
+}
+
+fn _decimal(c as *bx.Ctx, v0 as i64, out_n as *i64) as *u8 {
+    let is *u8 as out = arena.alloc(c.a, 32);
+    let is i64 as v with mut = v0;
+    let is i64 as neg = cast(i64, v < 0);
+    if (neg == 1) { v = 0 - v; }
+    let is [24]u8 as tmp with mut;
+    let is i64 as t with mut = 0;
+    if (v == 0) {
+        tmp[0] = cast(u8, 48);
+        t = 1;
+    }
+    while (v > 0) {
+        tmp[t] = cast(u8, 48 + v % 10);
+        v = v / 10;
+        t = t + 1;
+    }
+    let is i64 as w with mut = 0;
+    if (neg == 1) {
+        out[0] = cast(u8, 45);
+        w = 1;
+    }
+    while (t > 0) {
+        t = t - 1;
+        out[w] = tmp[t];
+        w = w + 1;
+    }
+    out[w] = cast(u8, 0);
+    *out_n = w;
+    return out;
+}
+
+fn _alpha(c as *bx.Ctx, v0 as i64, upper as i64, out_n as *i64) as *u8 {
+    if (v0 <= 0) { return _decimal(c, v0, out_n); }
+    let is [16]u8 as tmp with mut;
+    let is i64 as t with mut = 0;
+    let is i64 as v with mut = v0;
+    while (v > 0 && t < 16) {
+        v = v - 1;
+        let is i64 as base with mut = 97;
+        if (upper == 1) { base = 65; }
+        tmp[t] = cast(u8, base + v % 26);
+        v = v / 26;
+        t = t + 1;
+    }
+    let is *u8 as out = arena.alloc(c.a, 20);
+    let is i64 as w with mut = 0;
+    while (t > 0) {
+        t = t - 1;
+        out[w] = tmp[t];
+        w = w + 1;
+    }
+    *out_n = w;
+    return out;
+}
+
+// The marker of a list item with this number: a shape, or text with its full stop.
+fn _make_marker(c as *bx.Ctx, b as *bx.Box, ordinal as i64) as void {
+    let is i64 as k = bx.prop(b, pr.P_LIST_STYLE_TYPE);
+    if (bx.prop(b, pr.P_LIST_STYLE_IMAGE) != pr.K_NONE) {
+        let is *u8 as u = cast(*u8, bx.prop(b, pr.P_LIST_STYLE_IMAGE));
+        if (cast(i64, c.images) != 0) {
+            b.mimg = call(c.images, c.user, u, url.len_of(u));
+            if (b.mimg != null) {
+                b.marker = bx.MARK_IMAGE;
+                return;
+            }
+        }
+    }
+    if (k == pr.K_NONE) { return; }
+    if (k == pr.K_DISC) { b.marker = bx.MARK_DISC; }
+    else if (k == pr.K_CIRCLE) { b.marker = bx.MARK_CIRCLE; }
+    else if (k == pr.K_SQUARE) { b.marker = bx.MARK_SQUARE; }
+    else {
+        let is i64 as n with mut = 0;
+        let is *u8 as s with mut = cast(*u8, 0);
+        if (k == pr.K_LOWER_ROMAN) { s = _roman(c, ordinal, 0, &n); }
+        else if (k == pr.K_UPPER_ROMAN) { s = _roman(c, ordinal, 1, &n); }
+        else if (k == pr.K_LOWER_ALPHA || k == pr.K_LOWER_LATIN) { s = _alpha(c, ordinal, 0, &n); }
+        else if (k == pr.K_UPPER_ALPHA || k == pr.K_UPPER_LATIN) { s = _alpha(c, ordinal, 1, &n); }
+        else if (k == pr.K_DECIMAL_LEADING_ZERO && ordinal >= 0 && ordinal < 10) {
+            let is i64 as m with mut = 0;
+            let is *u8 as d = _decimal(c, ordinal, &m);
+            s = arena.alloc(c.a, m + 2);
+            s[0] = cast(u8, 48);
+            mem.core.memcpy(&s[1], d, m);
+            n = m + 1;
+        } else {
+            s = _decimal(c, ordinal, &n);
+        }
+        // The full stop and a space, with room left when the number was written.
+        let is *u8 as t = arena.alloc(c.a, n + 3);
+        mem.core.memcpy(t, s, n);
+        t[n] = cast(u8, 46);
+        t[n + 1] = cast(u8, 32);
+        b.mtext = t;
+        b.mlen = n + 1;
+        b.marker = bx.MARK_TEXT;
+    }
+    // Inside the box the marker is simply its first text.
+    if (bx.prop(b, pr.P_LIST_STYLE_POSITION) == pr.K_INSIDE) {
+        let is *u8 as s with mut = b.mtext;
+        let is i64 as n with mut = b.mlen + 1;
+        if (b.marker != bx.MARK_TEXT) {
+            s = "• ";
+            n = 4;
+        }
+        b.marker = bx.MARK_NONE;
+        let is *bx.Box as t = bx.alloc_box(c, bx.B_TEXT, cast(*dom.Node, 0), b.st);
+        t.text = s;
+        t.tlen = n;
+        bx.append(b, t);
+    }
+}
+
+// How many items a list has, for a reversed one that counts down to one.
+fn _count_items(n as *dom.Node) as i64 {
+    let is i64 as k with mut = 0;
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && x.style != null && style.of(x).v.i[pr.P_DISPLAY] == pr.K_LIST_ITEM) { k = k + 1; }
+        x = x.next;
+    }
+    return k;
+}
+
+// The children of element n, as boxes under parent. Text in it is set in st.
+fn _children(c as *bx.Ctx, parent as *bx.Box, n as *dom.Node, st as *style.Style) as void {
+    let is i64 as step with mut = 1;
+    let is i64 as ordinal with mut = 1;
+    if (n.kind == dom.ELEMENT && n.tag == tg.OL) {
+        if (dom.find_attr(n, "reversed", 8) != null) {
+            step = 0 - 1;
+            ordinal = _count_items(n);
+        }
+        ordinal = _attr_int(n, "start", 5, ordinal);
+    }
+    if (st != null) { _pseudo(c, parent, n, st.before); }
+    // Selectors can hide a closed <details>'s elements, and only this can hide its text.
+    let is i64 as closed = cast(i64, n.kind == dom.ELEMENT && n.tag == tg.DETAILS && dom.find_attr(n, "open", 4) == null);
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT && st != null && closed == 0) {
+            if (x.text_len > 0) { _add_text(c, parent, st, x.text, x.text_len); }
+        }
+        if (x.kind == dom.ELEMENT && x.style != null) {
+            let is *style.Style as cs = style.of(x);
+            let is i64 as d = cs.v.i[pr.P_DISPLAY];
+            if (d == pr.K_CONTENTS) {
+                _children(c, parent, x, cs);
+            } else if (d != pr.K_NONE) {
+                if (d == pr.K_LIST_ITEM) {
+                    if (x.tag == tg.LI) { ordinal = _attr_int(x, "value", 5, ordinal); }
+                }
+                let is *bx.Box as b = _box_of(c, x, cs, ordinal);
+                if (d == pr.K_LIST_ITEM) { ordinal = ordinal + step; }
+                if (b != null) { bx.append(parent, b); }
+            }
+        }
+        x = x.next;
+    }
+    if (st != null) { _pseudo(c, parent, n, st.after); }
+}
+
+// --- Replaced elements and form controls ---
+
+fn _replaced_shell(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *bx.Box as b = _box_shell(c, n, st, st.v.i[pr.P_DISPLAY]);
+    b.kind = bx.B_REPLACED;
+    if (st.v.i[pr.P_DISPLAY] == pr.K_INLINE) { b.atomic = 1; }
+    return b;
+}
+
+fn _element_text(c as *bx.Ctx, n as *dom.Node, out_n as *i64) as *u8 {
+    let is i64 as cap with mut = 1;
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT) { cap = cap + x.text_len; }
+        x = x.next;
+    }
+    let is *u8 as out = arena.alloc(c.a, cap);
+    let is i64 as w with mut = 0;
+    x = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT) {
+            mem.core.memcpy(&out[w], x.text, x.text_len);
+            w = w + x.text_len;
+        }
+        x = x.next;
+    }
+    *out_n = w;
+    return out;
+}
+
+fn _control_block(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *bx.Box as b = _box_shell(c, n, st, st.v.i[pr.P_DISPLAY]);
+    if (b.kind == bx.B_INLINE) {
+        b.kind = bx.B_BLOCK;
+        b.atomic = 1;
+    }
+    return b;
+}
+
+// A line of text for a control to show. The no-break space keeps an empty one as tall
+// as a full one.
+fn _control_label(c as *bx.Ctx, b as *bx.Box, st as *style.Style, s as *u8, n as i64, dim as i64) as void {
+    let is *style.Style as ts = style.anonymous(c.a, st, pr.K_INLINE);
+    ts.v.i[pr.P_WHITE_SPACE] = pr.K_PRE;
+    if (dim == 1) {
+        ts.v.i[pr.P_COLOR] = 4285887861;
+        if (st.placeholder != null) { ts.v.i[pr.P_COLOR] = st.placeholder.v.i[pr.P_COLOR]; }
+    }
+    if (n == 0) { _add_text(c, b, ts, " ", 2); }
+    else { _add_text(c, b, ts, s, n); }
+    b.inline_ctx = 1;
+}
+
+fn _input(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *dom.Attr as t = dom.find_attr(n, "type", 4);
+    if (t != null && (decl.eq(t.value, t.value_len, "checkbox") == 1 || decl.eq(t.value, t.value_len, "radio") == 1)) {
+        let is *bx.Box as b = _replaced_shell(c, n, st);
+        b.control = 1;
+        if (decl.eq(t.value, t.value_len, "radio") == 1) { b.control = 2; }
+        b.checked = cast(i64, dom.find_attr(n, "checked", 7) != null);
+        return b;
+    }
+    if (t != null && decl.eq(t.value, t.value_len, "range") == 1) {
+        let is *bx.Box as b = _replaced_shell(c, n, st);
+        b.control = bx.CTL_RANGE;
+        b.iw = 129.0;
+        b.ih = 16.0;
+        return b;
+    }
+    if (t != null && decl.eq(t.value, t.value_len, "color") == 1) {
+        let is *bx.Box as b = _replaced_shell(c, n, st);
+        b.control = bx.CTL_COLOR;
+        b.iw = 44.0;
+        b.ih = 23.0;
+        return b;
+    }
+    let is *bx.Box as b = _control_block(c, n, st);
+    b.vcenter = 1;
+    let is *dom.Attr as val = dom.find_attr(n, "value", 5);
+    if (t != null && decl.eq(t.value, t.value_len, "date") == 1) {
+        b.control = bx.CTL_DATE;
+        let is *u8 as shown = arena.alloc(c.a, 11);
+        let is i64 as sn with mut = 0;
+        if (val != null) { sn = forms.date_shown(val.value, val.value_len, shown); }
+        if (sn > 0) { _control_label(c, b, st, shown, sn, 0); }
+        else { _control_label(c, b, st, "dd/mm/aaaa", 10, 0); }
+        b.iw = st.v.f[pr.P_FONT_SIZE] * 8.0;
+        return b;
+    }
+    if (t != null && decl.eq(t.value, t.value_len, "file") == 1) {
+        _control_label(c, b, st, "Escolher arquivo", 16, 0);
+        return b;
+    }
+    if (t != null && decl.eq(t.value, t.value_len, "password") == 1 && val != null && val.value_len > 0) {
+        // A dot a character, and not a byte: U+2022 for each one that starts a character.
+        let is i64 as chars with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < val.value_len) {
+            if ((cast(i64, val.value[k]) & 192) != 128) { chars = chars + 1; }
+            k = k + 1;
+        }
+        let is *u8 as dots = arena.alloc(c.a, chars * 3 + 1);
+        k = 0;
+        while (k < chars) {
+            dots[k * 3] = cast(u8, 226);
+            dots[k * 3 + 1] = cast(u8, 128);
+            dots[k * 3 + 2] = cast(u8, 162);
+            k = k + 1;
+        }
+        _control_label(c, b, st, dots, chars * 3, 0);
+        b.iw = cast(f64, _attr_int(n, "size", 4, 20)) * st.v.f[pr.P_FONT_SIZE] * 0.5;
+        return b;
+    }
+    if (t != null && (decl.eq(t.value, t.value_len, "submit") == 1 || decl.eq(t.value, t.value_len, "button") == 1 || decl.eq(t.value, t.value_len, "reset") == 1)) {
+        if (val != null) { _control_label(c, b, st, val.value, val.value_len, 0); }
+        else if (decl.eq(t.value, t.value_len, "reset") == 1) { _control_label(c, b, st, "Limpar", 6, 0); }
+        else if (decl.eq(t.value, t.value_len, "submit") == 1) { _control_label(c, b, st, "Enviar", 6, 0); }
+        else { _control_label(c, b, st, "", 0, 0); }
+        return b;
+    }
+    if (val != null && val.value_len > 0) {
+        _control_label(c, b, st, val.value, val.value_len, 0);
+    } else {
+        let is *dom.Attr as ph = dom.find_attr(n, "placeholder", 11);
+        if (ph != null) { _control_label(c, b, st, ph.value, ph.value_len, 1); }
+        else { _control_label(c, b, st, "", 0, 0); }
+    }
+    // As wide as its size attribute asks, about 7 pixels a character at the control's font.
+    b.iw = cast(f64, _attr_int(n, "size", 4, 20)) * st.v.f[pr.P_FONT_SIZE] * 0.5;
+    return b;
+}
+
+fn _select(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *bx.Box as b = _control_block(c, n, st);
+    b.control = bx.CTL_SELECT;
+    b.vcenter = 1;
+    let is f64 as widest with mut = 0.0;
+    let is *dom.Node as chosen with mut = cast(*dom.Node, 0);
+    let is *dom.Node as first with mut = cast(*dom.Node, 0);
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT) {
+            let is *dom.Node as o with mut = x;
+            if (x.tag == tg.OPTGROUP) { o = x.first; }
+            while (o != null) {
+                if (o.kind == dom.ELEMENT && o.tag == tg.OPTION) {
+                    if (first == null) { first = o; }
+                    if (dom.find_attr(o, "selected", 8) != null) { chosen = o; }
+                    // As wide as the widest of them, whichever is showing.
+                    let is i64 as ln with mut = 0;
+                    let is *u8 as lt with mut = _element_text(c, o, &ln);
+                    while (ln > 0 && _is_ws(cast(i64, lt[0])) == 1) { lt = &lt[1]; ln = ln - 1; }
+                    while (ln > 0 && _is_ws(cast(i64, lt[ln - 1])) == 1) { ln = ln - 1; }
+                    let is f64 as lw = m.width(st, lt, ln);
+                    if (lw > widest) { widest = lw; }
+                }
+                if (x.tag == tg.OPTGROUP) { o = o.next; }
+                else { o = cast(*dom.Node, 0); }
+            }
+        }
+        x = x.next;
+    }
+    if (chosen == null) { chosen = first; }
+    let is i64 as len with mut = 0;
+    let is *u8 as label with mut = cast(*u8, 0);
+    if (chosen != null) { label = _element_text(c, chosen, &len); }
+    // Trim what a line break in the source left around the option's name.
+    while (len > 0 && _is_ws(cast(i64, label[0])) == 1) { label = &label[1]; len = len - 1; }
+    while (len > 0 && _is_ws(cast(i64, label[len - 1])) == 1) { len = len - 1; }
+    _control_label(c, b, st, label, len, 0);
+    // Room for the arrow, which paint draws at the far end.
+    b.iw = widest + 22.0;
+    return b;
+}
+
+fn _textarea(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *bx.Box as b = _control_block(c, n, st);
+    let is i64 as len with mut = 0;
+    let is *u8 as t = _element_text(c, n, &len);
+    if (len > 0) { _add_text(c, b, st, t, len); }
+    else {
+        let is *dom.Attr as ph = dom.find_attr(n, "placeholder", 11);
+        if (ph != null) { _control_label(c, b, st, ph.value, ph.value_len, 1); }
+    }
+    b.inline_ctx = 1;
+    let is f64 as em = st.v.f[pr.P_FONT_SIZE];
+    b.iw = cast(f64, _attr_int(n, "cols", 4, 20)) * em * 0.6;
+    b.ih = cast(f64, _attr_int(n, "rows", 4, 2)) * em * 1.2;
+    return b;
+}
+
+fn _image_box(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *dom.Attr as src = dom.find_attr(n, "src", 3);
+    let is *dl.Image as im with mut = cast(*dl.Image, 0);
+    if (src != null && src.value_len > 0 && cast(i64, c.images) != 0) {
+        let is i64 as cap = src.value_len + url.len_of(c.base) + 16;
+        let is *u8 as abs = arena.alloc(c.a, cap);
+        let is i64 as m = url.resolve(c.base, src.value, src.value_len, abs, cap);
+        if (m >= 0) { im = call(c.images, c.user, abs, m); }
+    }
+    if (im == null) {
+        // A missing image is its alt text, in a line with what is around it.
+        let is *dom.Attr as alt = dom.find_attr(n, "alt", 3);
+        let is i64 as sized = cast(i64, st.v.i[pr.P_WIDTH] == 0 && st.v.i[pr.P_HEIGHT] == 0);
+        if (alt != null && alt.value_len > 0 && sized == 0) {
+            let is *bx.Box as b = bx.alloc_box(c, bx.B_INLINE, n, st);
+            _add_text(c, b, st, alt.value, alt.value_len);
+            return b;
+        }
+        let is *bx.Box as b = _replaced_shell(c, n, st);
+        return b;
+    }
+    let is *bx.Box as b = _replaced_shell(c, n, st);
+    b.img = im;
+    b.iw = cast(f64, im.width);
+    b.ih = cast(f64, im.height);
+    return b;
+}
+
+// A number at the start of s; 0 when there is none. How far it read goes into used.
+fn _number(s as *u8, n as i64, used as *i64) as f64 {
+    let is i64 as i with mut = 0;
+    while (i < n && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 44)) { i = i + 1; }
+    let is f64 as sign with mut = 1.0;
+    if (i < n && s[i] == 45) {
+        sign = 0.0 - 1.0;
+        i = i + 1;
+    }
+    let is f64 as v with mut = 0.0;
+    while (i < n && s[i] >= 48 && s[i] <= 57) {
+        v = v * 10.0 + cast(f64, cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    if (i < n && s[i] == 46) {
+        i = i + 1;
+        let is f64 as place with mut = 0.1;
+        while (i < n && s[i] >= 48 && s[i] <= 57) {
+            v = v + cast(f64, cast(i64, s[i]) - 48) * place;
+            place = place * 0.1;
+            i = i + 1;
+        }
+    }
+    *used = i;
+    return v * sign;
+}
+
+// width or height as an <svg> writes it. A percentage is of the box it is in, which is
+// what having no size at all ends up meaning, so it counts as none.
+fn _svg_length(n as *dom.Node, name as *u8, nlen as i64) as f64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null || a.value_len == 0 || a.value[a.value_len - 1] == 37) { return 0.0; }
+    let is i64 as used with mut = 0;
+    return _number(a.value, a.value_len, &used);
+}
+
+// An <svg>'s contents are not drawn, but its size has to be right or everything after it
+// lands in the wrong place. Its viewBox gives the proportions when width and height do not.
+fn _svg_box(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *bx.Box as b = _replaced_shell(c, n, st);
+    let is f64 as w = _svg_length(n, "width", 5);
+    let is f64 as h = _svg_length(n, "height", 6);
+    let is f64 as ratio with mut = 0.0;
+    let is *dom.Attr as vb = dom.find_attr(n, "viewBox", 7);
+    if (vb != null) {
+        let is i64 as at with mut = 0;
+        let is i64 as used with mut = 0;
+        let is i64 as k with mut = 0;
+        let is [4]f64 as nums with mut;
+        while (k < 4) {
+            nums[k] = _number(&vb.value[at], vb.value_len - at, &used);
+            at = at + used;
+            k = k + 1;
+        }
+        if (nums[2] > 0.0 && nums[3] > 0.0) { ratio = nums[2] / nums[3]; }
+    }
+    b.iw = w;
+    b.ih = h;
+    if (ratio > 0.0) {
+        b.ratio = ratio;
+        if (w > 0.0 && h == 0.0) { b.ih = w / ratio; }
+        if (h > 0.0 && w == 0.0) { b.iw = h * ratio; }
+        return b;
+    }
+    if (w == 0.0) { b.iw = 300.0; }
+    if (h == 0.0) { b.ih = 150.0; }
+    return b;
+}
+
+fn _other_replaced(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
+    let is *bx.Box as b = _replaced_shell(c, n, st);
+    b.iw = cast(f64, _attr_int(n, "width", 5, 300));
+    b.ih = cast(f64, _attr_int(n, "height", 6, 150));
+    return b;
+}
+
+// --- Tables ---
+
+fn _is_internal(b as *bx.Box) as i64 {
+    let is i64 as k = b.kind;
+    if (k == bx.B_ROWGROUP || k == bx.B_ROW || k == bx.B_CELL || k == bx.B_CAPTION || k == bx.B_COL) { return 1; }
+    return 0;
+}
+
+// Between the parts of a table, whitespace is nothing. Anything else is put in the
+// anonymous box that would have held it.
+fn _wrap_list(c as *bx.Ctx, owner as *bx.Box, want as i64, wrap_kind as i64) as void {
+    let is *bx.Box as x with mut = bx.take_children(owner);
+    let is *bx.Box as anon with mut = cast(*bx.Box, 0);
+    while (x != null) {
+        let is *bx.Box as next = x.next;
+        x.next = cast(*bx.Box, 0);
+        let is i64 as fits with mut = cast(i64, x.kind == want);
+        if (owner.kind == bx.B_TABLE) {
+            fits = cast(i64, x.kind == bx.B_ROWGROUP || x.kind == bx.B_CAPTION || x.kind == bx.B_COL);
+        }
+        if (fits == 1) {
+            anon = cast(*bx.Box, 0);
+            bx.append(owner, x);
+        } else if (_blank(x) == 1 && anon == null) {
+            // dropped
+        } else {
+            if (anon == null) {
+                anon = bx.alloc_box(c, wrap_kind, cast(*dom.Node, 0), style.anonymous(c.a, owner.st, _display_of(wrap_kind)));
+                anon.anon = 1;
+                bx.append(owner, anon);
+            }
+            bx.append(anon, x);
+        }
+        x = next;
+    }
+}
+
+fn _display_of(kind as i64) as i64 {
+    if (kind == bx.B_ROWGROUP) { return pr.K_TABLE_ROW_GROUP; }
+    if (kind == bx.B_ROW) { return pr.K_TABLE_ROW; }
+    if (kind == bx.B_CELL) { return pr.K_TABLE_CELL; }
+    return pr.K_BLOCK;
+}
+
+fn _fix_table(c as *bx.Ctx, t as *bx.Box) as void {
+    // Rows straight under the table and anything else go in anonymous groups. A row
+    // that arrives alone is what the wrapper below will then see inside its group.
+    _wrap_list(c, t, bx.B_ROWGROUP, bx.B_ROWGROUP);
+    let is *bx.Box as g with mut = t.first;
+    while (g != null) {
+        if (g.kind == bx.B_ROWGROUP) {
+            _wrap_list(c, g, bx.B_ROW, bx.B_ROW);
+            let is *bx.Box as r with mut = g.first;
+            while (r != null) {
+                _wrap_list(c, r, bx.B_CELL, bx.B_CELL);
+                let is *bx.Box as cell with mut = r.first;
+                while (cell != null) {
+                    if (cell.anon == 1) { _normalize(c, cell); }
+                    if (cell.node != null) {
+                        cell.colspan = _attr_int(cell.node, "colspan", 7, 1);
+                        cell.rowspan = _attr_int(cell.node, "rowspan", 7, 1);
+                        if (cell.colspan < 1) { cell.colspan = 1; }
+                        if (cell.colspan > 1000) { cell.colspan = 1000; }
+                        if (cell.rowspan < 0) { cell.rowspan = 1; }
+                        if (cell.rowspan > 65534) { cell.rowspan = 65534; }
+                    }
+                    cell = cell.next;
+                }
+                r = r.next;
+            }
+        }
+        g = g.next;
+    }
+}
+
+// Table parts with no table around them get an anonymous one, runs of them together.
+fn _wrap_orphans(c as *bx.Ctx, b as *bx.Box) as void {
+    let is i64 as any with mut = 0;
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (_is_internal(x) == 1) { any = 1; }
+        x = x.next;
+    }
+    if (any == 0) { return; }
+    x = bx.take_children(b);
+    let is *bx.Box as anon with mut = cast(*bx.Box, 0);
+    while (x != null) {
+        let is *bx.Box as next = x.next;
+        x.next = cast(*bx.Box, 0);
+        if (_is_internal(x) == 1) {
+            if (anon == null) {
+                anon = bx.alloc_box(c, bx.B_TABLE, cast(*dom.Node, 0), style.anonymous(c.a, b.st, pr.K_TABLE));
+                anon.anon = 1;
+                bx.append(b, anon);
+            }
+            bx.append(anon, x);
+        } else if (_blank(x) == 1 && anon != null) {
+            // whitespace between parts of the same table
+        } else {
+            if (anon != null) { _fix_table(c, anon); }
+            anon = cast(*bx.Box, 0);
+            bx.append(b, x);
+        }
+        x = next;
+    }
+    if (anon != null) { _fix_table(c, anon); }
+}
+
+// --- Keeping lines and blocks apart ---
+
+// Whether a child among block siblings has to be a block.
+fn _any_block_child(b as *bx.Box) as i64 {
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (bx.is_block_level(x) == 1) { return 1; }
+        x = x.next;
+    }
+    return 0;
+}
+
+fn _wrap_inlines(c as *bx.Ctx, b as *bx.Box) as void {
+    let is *bx.Box as x with mut = bx.take_children(b);
+    let is *bx.Box as anon with mut = cast(*bx.Box, 0);
+    while (x != null) {
+        let is *bx.Box as next = x.next;
+        x.next = cast(*bx.Box, 0);
+        if (bx.is_inline_level(x) == 1) {
+            if (anon == null) {
+                if (_blank(x) == 0) {
+                    anon = bx.alloc_box(c, bx.B_BLOCK, cast(*dom.Node, 0), style.anonymous(c.a, b.st, pr.K_BLOCK));
+                    anon.anon = 1;
+                    anon.inline_ctx = 1;
+                    bx.append(b, anon);
+                    bx.append(anon, x);
+                }
+            } else {
+                bx.append(anon, x);
+            }
+        } else if (bx.is_out_of_flow(x) == 1 && anon != null) {
+            bx.append(anon, x);
+        } else {
+            anon = cast(*bx.Box, 0);
+            bx.append(b, x);
+        }
+        x = next;
+    }
+}
+
+// A box's children are in place: settle whether it holds lines or blocks.
+fn _normalize(c as *bx.Ctx, b as *bx.Box) as void {
+    if (b.kind == bx.B_TEXT || b.kind == bx.B_BR || b.kind == bx.B_REPLACED) { return; }
+    if (b.kind == bx.B_TABLE) { _fix_table(c, b); return; }
+    if (b.kind == bx.B_ROWGROUP || b.kind == bx.B_ROW || b.kind == bx.B_COL) { return; }
+    _wrap_orphans(c, b);
+    if (b.kind == bx.B_INLINE) {
+        if (_any_block_child(b) == 0) { return; }
+        b.kind = bx.B_BLOCK;
+    }
+    if (b.kind == bx.B_FLEX || b.kind == bx.B_GRID) {
+        _flex_items(c, b);
+        return;
+    }
+    if (_any_block_child(b) == 1) { _wrap_inlines(c, b); return; }
+    b.inline_ctx = 1;
+}
+
+// Every child of a flex or grid container is a block, whatever it was, and a run of text is one
+// block of its own.
+fn _flex_items(c as *bx.Ctx, b as *bx.Box) as void {
+    let is *bx.Box as x with mut = bx.take_children(b);
+    let is *bx.Box as anon with mut = cast(*bx.Box, 0);
+    while (x != null) {
+        let is *bx.Box as next = x.next;
+        x.next = cast(*bx.Box, 0);
+        if (x.kind == bx.B_TEXT || x.kind == bx.B_BR) {
+            if (anon != null || _blank(x) == 0) {
+                if (anon == null) {
+                    anon = bx.alloc_box(c, bx.B_BLOCK, cast(*dom.Node, 0), style.anonymous(c.a, b.st, pr.K_BLOCK));
+                    anon.anon = 1;
+                    anon.inline_ctx = 1;
+                    anon.flex_item = 1;
+                    bx.append(b, anon);
+                }
+                bx.append(anon, x);
+            }
+        } else {
+            anon = cast(*bx.Box, 0);
+            if (bx.is_out_of_flow(x) == 0) {
+                x.flex_item = 1;
+                x.atomic = 0;
+                if (x.kind == bx.B_INLINE) {
+                    x.kind = bx.B_BLOCK;
+                    _normalize(c, x);
+                }
+            } else {
+                x.is_float = 0;
+            }
+            bx.append(b, x);
+        }
+        x = next;
+    }
+}
+
+// The box for an element, with everything under it.
+fn _box_of(c as *bx.Ctx, n as *dom.Node, st as *style.Style, ordinal as i64) as *bx.Box {
+    let is i64 as d = st.v.i[pr.P_DISPLAY];
+    if (n.ns == dom.NS_SVG) { return _svg_box(c, n, st); }
+    if (n.ns == dom.NS_HTML) {
+        if (n.tag == tg.IMG) { return _image_box(c, n, st); }
+        if (n.tag == tg.BR) {
+            let is *bx.Box as b = bx.alloc_box(c, bx.B_BR, n, st);
+            return b;
+        }
+        if (n.tag == tg.INPUT) { return _input(c, n, st); }
+        if (n.tag == tg.SELECT) { return _select(c, n, st); }
+        if (n.tag == tg.TEXTAREA) { return _textarea(c, n, st); }
+        if (_tag_is(n, "canvas") == 1 || _tag_is(n, "video") == 1 || _tag_is(n, "iframe") == 1 ||
+            _tag_is(n, "embed") == 1 || _tag_is(n, "object") == 1 || _tag_is(n, "audio") == 1 ||
+            _tag_is(n, "meter") == 1 || _tag_is(n, "progress") == 1) {
+            return _other_replaced(c, n, st);
+        }
+    }
+    let is *bx.Box as b = _box_shell(c, n, st, d);
+    if (d == pr.K_LIST_ITEM) { _make_marker(c, b, ordinal); }
+    _children(c, b, n, st);
+    _normalize(c, b);
+    return b;
+}
+
+// The whole tree, under a box that stands for the window.
+fn build(c as *bx.Ctx, d as *dom.Document) as *bx.Box {
+    let is *style.Style as st = style.anonymous(c.a, cast(*style.Style, 0), pr.K_BLOCK);
+    let is *bx.Box as root = bx.alloc_box(c, bx.B_BLOCK, cast(*dom.Node, 0), st);
+    root.anon = 1;
+    let is *dom.Node as x with mut = d.node.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && x.style != null) {
+            let is *style.Style as cs = style.of(x);
+            if (cs.v.i[pr.P_DISPLAY] != pr.K_NONE) {
+                let is *bx.Box as b = _box_of(c, x, cs, 1);
+                if (b != null) { bx.append(root, b); }
+            }
+        }
+        x = x.next;
+    }
+    _normalize(c, root);
+    return root;
+}

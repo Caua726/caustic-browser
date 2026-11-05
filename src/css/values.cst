@@ -1,0 +1,262 @@
+// css/values.cst — what a declaration holds once its tokens are understood.
+
+use "./tokens.cst" as tok;
+
+let is i64 as V_NONE   with imut = 0;
+let is i64 as V_KW     with imut = 1;    // kw
+let is i64 as V_LEN    with imut = 2;    // len
+let is i64 as V_NUM    with imut = 3;    // num
+let is i64 as V_COLOR  with imut = 4;    // color
+let is i64 as V_STR    with imut = 5;    // s, n: a string of a font list, or content
+let is i64 as V_URL    with imut = 6;    // s, n: already absolute
+let is i64 as V_GLOBAL with imut = 7;    // kw: inherit, initial, unset
+let is i64 as V_DATA   with imut = 8;    // s: a structure of its own, below, that decl.cst made
+
+let is i64 as COLOR_CURRENT with imut = 0 - 1;
+
+// A length as a sum, because calc() can mix units that only an element can resolve.
+struct Len {
+    px  as f64;
+    pct as f64;
+    em  as f64;
+    rem as f64;
+    vw  as f64;
+    vh  as f64;
+    pick as *Pick;    // and this many of a min(), max() or clamp()
+    pick_k as f64;
+}
+
+let is i64 as PICK_MIN   with imut = 0;
+let is i64 as PICK_MAX   with imut = 1;
+let is i64 as PICK_CLAMP with imut = 2;
+
+// Which argument wins can depend on what only an element knows, so all of them are kept.
+struct Pick {
+    kind as i64;
+    n    as i64;
+    args as *Len;
+}
+
+// One side of a grid track, or a whole one. A plain 100px is the same on both sides.
+let is i64 as TRACK_LEN with imut = 0;
+let is i64 as TRACK_FR  with imut = 1;
+let is i64 as TRACK_AUTO with imut = 2;
+let is i64 as TRACK_MIN with imut = 3;   // min-content
+let is i64 as TRACK_MAX with imut = 4;   // max-content
+
+struct TrackSize {
+    kind as i64;
+    fr   as f64;
+    len  as Len;
+}
+
+struct Track {
+    lo as TrackSize;
+    hi as TrackSize;
+}
+
+let is i64 as REPEAT_NONE with imut = 0;
+let is i64 as REPEAT_FILL with imut = 1;
+let is i64 as REPEAT_FIT  with imut = 2;
+
+// What grid-template-columns and its kin came to. A number of repeats that is known is
+// already written out; auto-fill and auto-fit wait for the width, so rep_n tracks from
+// rep_at are the part that repeats.
+struct TrackList {
+    t      as *Track;
+    n      as i64;
+    rep    as i64;
+    rep_at as i64;
+    rep_n  as i64;
+}
+
+// grid-row-start and its kin hold a line number, or this plus how many tracks to span.
+let is f64 as GRID_SPAN with imut = 1000000.0;
+
+struct Shadow {
+    x      as Len;
+    y      as Len;
+    blur   as Len;
+    spread as Len;
+    color  as i64;    // 0xAARRGGBB, or COLOR_CURRENT
+    inset  as i64;
+    next   as *Shadow;
+}
+
+let is i64 as GRAD_LINEAR with imut = 1;
+let is i64 as GRAD_RADIAL with imut = 2;
+let is i64 as GRAD_CONIC  with imut = 3;
+
+let is i64 as EXTENT_FARTHEST_CORNER with imut = 0;
+let is i64 as EXTENT_FARTHEST_SIDE   with imut = 1;
+let is i64 as EXTENT_CLOSEST_CORNER  with imut = 2;
+let is i64 as EXTENT_CLOSEST_SIDE    with imut = 3;
+let is i64 as EXTENT_SIZE            with imut = 4;
+
+struct GradStop {
+    color   as i64;   // 0xAARRGGBB, or COLOR_CURRENT
+    has_pos as i64;
+    pos     as Len;
+}
+
+// One background layer that is an image with no file. Corner and side keywords are already
+// an angle or a percentage by the time they get here; `next` is the layer below.
+struct Gradient {
+    kind      as i64;
+    repeating as i64;
+    corner    as i64;   // linear, to a corner: which, as 1 + bit 0 right + bit 1 bottom; the box decides the angle
+    angle     as f64;   // linear: degrees, clockwise from up. conic: where it starts
+    circle    as i64;
+    extent    as i64;
+    rx        as Len;   // EXTENT_SIZE
+    ry        as Len;
+    at_x      as Len;
+    at_y      as Len;
+    stops     as *GradStop;
+    nstops    as i64;
+    next      as *Gradient;
+}
+
+struct Value {
+    kind  as i64;
+    kw    as i64;
+    num   as f64;
+    color as i64;     // 0xAARRGGBB, or COLOR_CURRENT
+    s     as *u8;
+    n     as i64;
+    len   as Len;
+}
+
+// Not a longhand: the value holds var() and has to wait for an element, or it
+// names a custom property.
+let is i64 as D_CUSTOM  with imut = 0 - 1;
+let is i64 as D_PENDING with imut = 0 - 2;
+
+struct Decl {
+    prop      as i64;    // P_*, D_CUSTOM or D_PENDING
+    important as i64;
+    val       as Value;
+    name      as *u8;    // D_CUSTOM, D_PENDING
+    name_n    as i64;
+    toks      as *tok.Token;
+    ntoks     as i64;
+}
+
+struct DeclList {
+    d   as *Decl;
+    n   as i64;
+    cap as i64;
+}
+
+// One function of a transform. Angles are in radians.
+let is i64 as TOP_TRANSLATE with imut = 1;   // x, y
+let is i64 as TOP_SCALE     with imut = 2;   // a, b
+let is i64 as TOP_ROTATE    with imut = 3;   // a
+let is i64 as TOP_SKEW      with imut = 4;   // a, b
+let is i64 as TOP_MATRIX    with imut = 5;   // a to f
+
+struct TOp {
+    kind as i64;
+    a as f64;
+    b as f64;
+    c as f64;
+    d as f64;
+    e as f64;
+    f as f64;
+    x as Len;
+    y as Len;
+}
+
+struct Transform {
+    n   as i64;
+    ops as *TOp;
+}
+
+let is i64 as EASE_LINEAR with imut = 0;
+let is i64 as EASE_BEZIER with imut = 1;
+let is i64 as EASE_STEPS  with imut = 2;
+
+struct Ease {
+    kind as i64;
+    x1 as f64;
+    y1 as f64;
+    x2 as f64;
+    y2 as f64;
+    steps as i64;
+    start as i64;     // a step at the start of each interval, not the end
+}
+
+// What transition-property may name besides a longhand.
+let is i64 as TP_NONE  with imut = 0 - 1;
+let is i64 as TP_ALL   with imut = 0 - 2;
+let is i64 as TP_BG    with imut = 0 - 3;
+let is i64 as TP_BORDER_COLOR  with imut = 0 - 4;
+let is i64 as TP_BORDER_RADIUS with imut = 0 - 5;
+let is i64 as TP_UNKNOWN with imut = 0 - 6;
+
+struct PropList {
+    n as i64;
+    p as *i64;
+}
+
+struct Times {
+    n as i64;
+    t as *f64;
+}
+
+struct Eases {
+    n as i64;
+    e as *Ease;
+}
+
+struct Name {
+    s as *u8;
+    n as i64;
+}
+
+fn _bezier(a as f64, b as f64, t as f64) as f64 {
+    let is f64 as u = 1.0 - t;
+    return 3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t;
+}
+
+// How far along it is at a fraction t of the time.
+fn ease_at(e as *Ease, t as f64) as f64 {
+    if (e == null || e.kind == EASE_LINEAR) { return t; }
+    if (e.kind == EASE_STEPS) {
+        let is f64 as n = cast(f64, e.steps);
+        let is i64 as k with mut = cast(i64, t * n);
+        if (e.start == 1) { k = k + 1; }
+        let is f64 as out = cast(f64, k) / n;
+        if (out > 1.0) { return 1.0; }
+        return out;
+    }
+    // x(u) = t by bisection: slower than it need be, and it runs a few times a frame.
+    let is f64 as lo with mut = 0.0;
+    let is f64 as hi with mut = 1.0;
+    let is i64 as i with mut = 0;
+    while (i < 24) {
+        let is f64 as mid = (lo + hi) / 2.0;
+        if (_bezier(e.x1, e.x2, mid) < t) { lo = mid; }
+        else { hi = mid; }
+        i = i + 1;
+    }
+    return _bezier(e.y1, e.y2, (lo + hi) / 2.0);
+}
+
+// What a min(), max() or clamp() of these comes to.
+fn pick_of(kind as i64, vals as *f64, n as i64) as f64 {
+    if (kind == PICK_CLAMP) {
+        let is f64 as out with mut = vals[1];
+        if (out > vals[2]) { out = vals[2]; }
+        if (out < vals[0]) { out = vals[0]; }
+        return out;
+    }
+    let is f64 as out with mut = vals[0];
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        if (kind == PICK_MIN && vals[i] < out) { out = vals[i]; }
+        if (kind == PICK_MAX && vals[i] > out) { out = vals[i]; }
+        i = i + 1;
+    }
+    return out;
+}

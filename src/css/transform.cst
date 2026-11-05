@@ -1,0 +1,187 @@
+// css/transform.cst: what a transform's functions come to as a matrix, and what lies
+// between two of them.
+//
+// A matrix is six numbers, a b c d e f: x' = ax + cy + e, y' = bx + dy + f.
+
+use "std/math.cst" as fm;
+use "../base/arena.cst" as arena;
+use "./style.cst" as style;
+use "./values.cst" as v;
+
+fn identity(m as *f64) as void {
+    m[0] = 1.0; m[1] = 0.0;
+    m[2] = 0.0; m[3] = 1.0;
+    m[4] = 0.0; m[5] = 0.0;
+}
+
+// a after b: what b does happens first. out may be either.
+fn mul(a as *f64, b as *f64, out as *f64) as void {
+    let is f64 as m0 = a[0] * b[0] + a[2] * b[1];
+    let is f64 as m1 = a[1] * b[0] + a[3] * b[1];
+    let is f64 as m2 = a[0] * b[2] + a[2] * b[3];
+    let is f64 as m3 = a[1] * b[2] + a[3] * b[3];
+    let is f64 as m4 = a[0] * b[4] + a[2] * b[5] + a[4];
+    let is f64 as m5 = a[1] * b[4] + a[3] * b[5] + a[5];
+    out[0] = m0;
+    out[1] = m1;
+    out[2] = m2;
+    out[3] = m3;
+    out[4] = m4;
+    out[5] = m5;
+}
+
+// The inverse: 1, or 0 when it has none, which a scale of nothing does not.
+fn invert(m as *f64, out as *f64) as i64 {
+    let is f64 as det = m[0] * m[3] - m[1] * m[2];
+    if (det > 0.0 - 0.0000000001 && det < 0.0000000001) { return 0; }
+    let is f64 as a = m[3] / det;
+    let is f64 as b = 0.0 - m[1] / det;
+    let is f64 as c = 0.0 - m[2] / det;
+    let is f64 as d = m[0] / det;
+    let is f64 as e = 0.0 - (a * m[4] + c * m[5]);
+    let is f64 as f = 0.0 - (b * m[4] + d * m[5]);
+    out[0] = a;
+    out[1] = b;
+    out[2] = c;
+    out[3] = d;
+    out[4] = e;
+    out[5] = f;
+    return 1;
+}
+
+fn _op(e as *style.Engine, o as *v.TOp, w as f64, h as f64, em as f64, m as *f64) as void {
+    identity(m);
+    if (o.kind == v.TOP_TRANSLATE) {
+        m[4] = style.full_of(e, &o.x, em, w);
+        m[5] = style.full_of(e, &o.y, em, h);
+    } else if (o.kind == v.TOP_SCALE) {
+        m[0] = o.a;
+        m[3] = o.b;
+    } else if (o.kind == v.TOP_ROTATE) {
+        let is f64 as cs = fm.cos(o.a);
+        let is f64 as sn = fm.sin(o.a);
+        m[0] = cs;
+        m[1] = sn;
+        m[2] = 0.0 - sn;
+        m[3] = cs;
+    } else if (o.kind == v.TOP_SKEW) {
+        m[2] = fm.tan(o.a);
+        m[1] = fm.tan(o.b);
+    } else if (o.kind == v.TOP_MATRIX) {
+        m[0] = o.a;
+        m[1] = o.b;
+        m[2] = o.c;
+        m[3] = o.d;
+        m[4] = o.e;
+        m[5] = o.f;
+    }
+}
+
+// What it does to a box w by h, about its own top left corner.
+fn matrix_of(e as *style.Engine, t as *v.Transform, w as f64, h as f64, em as f64, out as *f64) as void {
+    identity(out);
+    if (t == null) { return; }
+    let is [6]f64 as one with mut;
+    let is i64 as i with mut = 0;
+    while (i < t.n) {
+        _op(e, &t.ops[i], w, h, em, cast(*f64, &one));
+        mul(out, cast(*f64, &one), out);
+        i = i + 1;
+    }
+}
+
+fn _mix(a as f64, b as f64, u as f64) as f64 { return a + (b - a) * u; }
+
+fn _mix_len(a as *v.Len, b as *v.Len, u as f64, out as *v.Len) as void {
+    out.px = _mix(a.px, b.px, u);
+    out.pct = _mix(a.pct, b.pct, u);
+    out.em = _mix(a.em, b.em, u);
+    out.rem = _mix(a.rem, b.rem, u);
+    out.vw = _mix(a.vw, b.vw, u);
+    out.vh = _mix(a.vh, b.vh, u);
+    out.pick = cast(*v.Pick, 0);
+    out.pick_k = 0.0;
+}
+
+fn _rest(kind as i64, o as *v.TOp) as void {
+    let is *u8 as z = cast(*u8, o);
+    let is i64 as i with mut = 0;
+    while (i < sizeof(v.TOp)) {
+        z[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    o.kind = kind;
+    if (kind == v.TOP_SCALE) {
+        o.a = 1.0;
+        o.b = 1.0;
+    }
+    if (kind == v.TOP_MATRIX) {
+        o.a = 1.0;
+        o.d = 1.0;
+    }
+}
+
+// The transform a fraction u of the way from a to b; either may be null, for none. When
+// they name the same functions they move function by function, so a turn goes the whole
+// way round. When not, the two matrices are mixed, which a box w by h is needed for.
+fn lerp(ar as *arena.Arena, e as *style.Engine, a as *v.Transform, b as *v.Transform, u as f64, w as f64, h as f64, em as f64) as *v.Transform {
+    let is i64 as na with mut = 0;
+    let is i64 as nb with mut = 0;
+    if (a != null) { na = a.n; }
+    if (b != null) { nb = b.n; }
+    let is i64 as n with mut = na;
+    if (nb > n) { n = nb; }
+    let is *v.Transform as out = cast(*v.Transform, arena.alloc(ar, sizeof(v.Transform)));
+    if (n == 0) {
+        out.n = 0;
+        out.ops = cast(*v.TOp, 0);
+        return out;
+    }
+    let is i64 as same with mut = 1;
+    let is i64 as k with mut = 0;
+    while (k < na && k < nb) {
+        if (a.ops[k].kind != b.ops[k].kind) { same = 0; }
+        k = k + 1;
+    }
+    if (same == 0) {
+        let is [6]f64 as ma with mut;
+        let is [6]f64 as mb with mut;
+        matrix_of(e, a, w, h, em, cast(*f64, &ma));
+        matrix_of(e, b, w, h, em, cast(*f64, &mb));
+        out.n = 1;
+        out.ops = cast(*v.TOp, arena.alloc(ar, sizeof(v.TOp)));
+        _rest(v.TOP_MATRIX, &out.ops[0]);
+        out.ops[0].a = _mix(ma[0], mb[0], u);
+        out.ops[0].b = _mix(ma[1], mb[1], u);
+        out.ops[0].c = _mix(ma[2], mb[2], u);
+        out.ops[0].d = _mix(ma[3], mb[3], u);
+        out.ops[0].e = _mix(ma[4], mb[4], u);
+        out.ops[0].f = _mix(ma[5], mb[5], u);
+        return out;
+    }
+    out.n = n;
+    out.ops = cast(*v.TOp, arena.alloc(ar, n * sizeof(v.TOp)));
+    k = 0;
+    while (k < n) {
+        let is v.TOp as rest with mut;
+        let is *v.TOp as oa with mut = &rest;
+        let is *v.TOp as ob with mut = &rest;
+        if (k < na) { oa = &a.ops[k]; }
+        if (k < nb) { ob = &b.ops[k]; }
+        let is i64 as kind with mut = oa.kind;
+        if (k >= na) { kind = ob.kind; }
+        _rest(kind, &rest);
+        let is *v.TOp as o = &out.ops[k];
+        o.kind = kind;
+        o.a = _mix(oa.a, ob.a, u);
+        o.b = _mix(oa.b, ob.b, u);
+        o.c = _mix(oa.c, ob.c, u);
+        o.d = _mix(oa.d, ob.d, u);
+        o.e = _mix(oa.e, ob.e, u);
+        o.f = _mix(oa.f, ob.f, u);
+        _mix_len(&oa.x, &ob.x, u, &o.x);
+        _mix_len(&oa.y, &ob.y, u, &o.y);
+        k = k + 1;
+    }
+    return out;
+}

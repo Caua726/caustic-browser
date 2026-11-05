@@ -1,0 +1,1318 @@
+// paint/svg.cst — the shapes inside an <svg>, as pixels.
+//
+// The whole picture is worked out at once into an image: rect, circle, ellipse, line,
+// polyline, polygon, path, g and use, filled and stroked, in a colour or a gradient, under
+// any transform. Paint comes from attributes, from style="", and from fill and stroke in a
+// stylesheet. <text>, clipping, masks, filters, patterns and dashes are not drawn.
+
+use "../dom/dom.cst" as dom;
+use "../css/decl.cst" as decl;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "caustic-media/text/outline/path.cst" as path;
+use "caustic-media/text/raster/raster.cst" as raster;
+use "std/math.cst" as fm;
+use "std/mem.cst" as mem;
+
+let is i64 as PAINT_NONE  with imut = 0;
+let is i64 as PAINT_COLOR with imut = 1;
+let is i64 as PAINT_GRAD  with imut = 2;
+
+let is i64 as CAP_BUTT   with imut = 0;
+let is i64 as CAP_ROUND  with imut = 1;
+let is i64 as CAP_SQUARE with imut = 2;
+let is i64 as JOIN_MITER with imut = 0;
+let is i64 as JOIN_ROUND with imut = 1;
+let is i64 as JOIN_BEVEL with imut = 2;
+
+let is i64 as MAX_DEPTH  with imut = 32;
+let is i64 as MAX_SHAPE  with imut = 16777216;   // pixels a shape's box may cover
+let is i64 as CURVE_STEPS with imut = 24;
+let is i64 as RAMP with imut = 256;
+let is f64 as PI with imut = 3.14159265358979;
+
+struct _Mat {
+    a as f64;    // x' = a x + c y + e
+    b as f64;    // y' = b x + d y + f
+    c as f64;
+    d as f64;
+    e as f64;
+    f as f64;
+}
+
+struct _Paint {
+    kind  as i64;
+    color as i64;      // 0xAARRGGBB
+    grad  as *dom.Node;
+}
+
+struct _State {
+    fill   as _Paint;
+    stroke as _Paint;
+    width  as f64;
+    cap    as i64;
+    join   as i64;
+    miter  as f64;
+    fill_a as f64;
+    stroke_a as f64;
+    alpha  as f64;
+    evenodd as i32;
+    m      as _Mat;
+}
+
+struct _Out {
+    root    as *dom.Node;
+    w       as i64;
+    h       as i64;
+    current as i64;
+    px      as *u8;
+}
+
+fn _maxf(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _minf(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+fn _abs(x as f64) as f64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+fn _is_ws(c as i64) as i64 {
+    if (c == 32 || c == 9 || c == 10 || c == 13 || c == 12) { return 1; }
+    return 0;
+}
+
+fn _is_digit(c as i64) as i64 { return cast(i64, c >= 48 && c <= 57); }
+
+// A number at s[*at], past white space and commas. 0 when there is none, with *at unmoved.
+fn _num(s as *u8, n as i64, at as *i64, out as *f64) as i64 {
+    let is i64 as i with mut = *at;
+    while (i < n && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 44)) { i = i + 1; }
+    let is f64 as sign with mut = 1.0;
+    if (i < n && (s[i] == 45 || s[i] == 43)) {
+        if (s[i] == 45) { sign = 0.0 - 1.0; }
+        i = i + 1;
+    }
+    let is i64 as digits with mut = 0;
+    let is f64 as val with mut = 0.0;
+    while (i < n && _is_digit(cast(i64, s[i])) == 1) {
+        val = val * 10.0 + cast(f64, cast(i64, s[i]) - 48);
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if (i < n && s[i] == 46) {
+        i = i + 1;
+        let is f64 as place with mut = 0.1;
+        while (i < n && _is_digit(cast(i64, s[i])) == 1) {
+            val = val + cast(f64, cast(i64, s[i]) - 48) * place;
+            place = place * 0.1;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if (digits == 0) { return 0; }
+    if (i + 1 < n && (s[i] == 101 || s[i] == 69)) {
+        let is i64 as j with mut = i + 1;
+        let is i64 as neg with mut = 0;
+        if (j < n && (s[j] == 45 || s[j] == 43)) {
+            neg = cast(i64, s[j] == 45);
+            j = j + 1;
+        }
+        if (j < n && _is_digit(cast(i64, s[j])) == 1) {
+            let is i64 as ex with mut = 0;
+            while (j < n && _is_digit(cast(i64, s[j])) == 1 && ex < 400) {
+                ex = ex * 10 + cast(i64, s[j]) - 48;
+                j = j + 1;
+            }
+            let is f64 as k with mut = 1.0;
+            let is i64 as q with mut = 0;
+            while (q < ex) {
+                k = k * 10.0;
+                q = q + 1;
+            }
+            if (neg == 1) { val = val / k; }
+            else { val = val * k; }
+            i = j;
+        }
+    }
+    *out = val * sign;
+    *at = i;
+    return 1;
+}
+
+fn _attr_num(n as *dom.Node, name as *u8, nlen as i64, dflt as f64) as f64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null) { return dflt; }
+    let is i64 as at with mut = 0;
+    let is f64 as v with mut = 0.0;
+    if (_num(a.value, a.value_len, &at, &v) == 0) { return dflt; }
+    return v;
+}
+
+// A property from style="", or else from the attribute of its name.
+fn _prop(n as *dom.Node, name as *u8, nlen as i64, out_n as *i64) as *u8 {
+    let is *dom.Attr as st = dom.find_attr(n, "style", 5);
+    if (st != null) {
+        let is *u8 as s = st.value;
+        let is i64 as len = st.value_len;
+        let is i64 as i with mut = 0;
+        while (i < len) {
+            while (i < len && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 59)) { i = i + 1; }
+            let is i64 as a = i;
+            while (i < len && s[i] != 58 && s[i] != 59) { i = i + 1; }
+            let is i64 as e with mut = i;
+            while (e > a && _is_ws(cast(i64, s[e - 1])) == 1) { e = e - 1; }
+            let is i64 as vs with mut = i;
+            if (i < len && s[i] == 58) { vs = i + 1; }
+            while (i < len && s[i] != 59) { i = i + 1; }
+            if (decl.eq(&s[a], e - a, name) == 1) {
+                while (vs < i && _is_ws(cast(i64, s[vs])) == 1) { vs = vs + 1; }
+                let is i64 as ve with mut = i;
+                while (ve > vs && _is_ws(cast(i64, s[ve - 1])) == 1) { ve = ve - 1; }
+                *out_n = ve - vs;
+                return &s[vs];
+            }
+        }
+    }
+    let is *dom.Attr as at = dom.find_attr(n, name, nlen);
+    if (at == null) { return cast(*u8, 0); }
+    *out_n = at.value_len;
+    return at.value;
+}
+
+fn _by_id(n as *dom.Node, id as *u8, len as i64) as *dom.Node {
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT) {
+            let is *dom.Attr as a = dom.find_attr(x, "id", 2);
+            if (a != null && a.value_len == len && mem.core.memcmp(a.value, id, len) == 0) { return x; }
+            let is *dom.Node as r = _by_id(x, id, len);
+            if (r != null) { return r; }
+        }
+        x = x.next;
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _doc_root(n as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = n;
+    while (x.parent != null) { x = x.parent; }
+    return x;
+}
+
+// rgb() and rgba(), the two that are written by hand in an attribute.
+fn _rgb_fn(s as *u8, n as i64, out as *i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n && s[i] != 40) { i = i + 1; }
+    i = i + 1;
+    let is [4]f64 as c with mut;
+    c[3] = 1.0;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        let is f64 as v with mut = 0.0;
+        while (i < n && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 47)) { i = i + 1; }
+        if (_num(s, n, &i, &v) == 0) { break; }
+        if (i < n && s[i] == 37) {
+            i = i + 1;
+            if (k < 3) { v = v * 2.55; }
+            else { v = v / 100.0; }
+        }
+        c[k] = v;
+        k = k + 1;
+    }
+    if (k < 3) { return 0; }
+    let is i64 as a = cast(i64, _minf(_maxf(c[3], 0.0), 1.0) * 255.0 + 0.5);
+    let is i64 as r = cast(i64, _minf(_maxf(c[0], 0.0), 255.0) + 0.5);
+    let is i64 as g = cast(i64, _minf(_maxf(c[1], 0.0), 255.0) + 0.5);
+    let is i64 as b = cast(i64, _minf(_maxf(c[2], 0.0), 255.0) + 0.5);
+    *out = (a << 24) | (r << 16) | (g << 8) | b;
+    return 1;
+}
+
+fn _color(o as *_Out, s as *u8, n as i64, out as *i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (s[0] == 35) { return decl.hash_color(&s[1], n - 1, out); }
+    if (decl.eq(s, n, "currentcolor") == 1) { *out = o.current; return 1; }
+    if (decl.eq(s, n, "transparent") == 1) { *out = 0; return 1; }
+    if (n > 3 && (s[0] == 114 || s[0] == 82) && (s[1] == 103 || s[1] == 71)) { return _rgb_fn(s, n, out); }
+    return decl.named_color(s, n, out);
+}
+
+fn _paint_of(o as *_Out, s as *u8, n as i64, was as *_Paint) as void {
+    if (decl.eq(s, n, "none") == 1) { was.kind = PAINT_NONE; return; }
+    if (n > 5 && s[0] == 117 && s[1] == 114 && s[2] == 108) {
+        let is i64 as i with mut = 4;
+        while (i < n && (s[i] == 39 || s[i] == 34 || s[i] == 35 || _is_ws(cast(i64, s[i])) == 1)) { i = i + 1; }
+        let is i64 as e with mut = i;
+        while (e < n && s[e] != 41 && s[e] != 39 && s[e] != 34) { e = e + 1; }
+        let is *dom.Node as g = _by_id(_doc_root(o.root), &s[i], e - i);
+        if (g != null) {
+            was.kind = PAINT_GRAD;
+            was.grad = g;
+            return;
+        }
+        was.kind = PAINT_NONE;
+        return;
+    }
+    let is i64 as col with mut = 0;
+    if (_color(o, s, n, &col) == 1) {
+        was.kind = PAINT_COLOR;
+        was.color = col;
+    }
+}
+
+fn _mul(x as *_Mat, y as *_Mat) as _Mat {
+    let is _Mat as r;
+    r.a = x.a * y.a + x.c * y.b;
+    r.b = x.b * y.a + x.d * y.b;
+    r.c = x.a * y.c + x.c * y.d;
+    r.d = x.b * y.c + x.d * y.d;
+    r.e = x.a * y.e + x.c * y.f + x.e;
+    r.f = x.b * y.e + x.d * y.f + x.f;
+    return r;
+}
+
+fn _ident() as _Mat {
+    let is _Mat as r;
+    r.a = 1.0; r.b = 0.0; r.c = 0.0; r.d = 1.0; r.e = 0.0; r.f = 0.0;
+    return r;
+}
+
+// translate, scale, rotate, skewX, skewY and matrix, in the order they are written.
+fn _transform(s as *u8, n as i64, m as *_Mat) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        while (i < n && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 44)) { i = i + 1; }
+        let is i64 as a = i;
+        while (i < n && s[i] != 40) { i = i + 1; }
+        if (i >= n) { return; }
+        let is i64 as e with mut = i;
+        while (e > a && _is_ws(cast(i64, s[e - 1])) == 1) { e = e - 1; }
+        i = i + 1;
+        let is [6]f64 as v with mut;
+        let is i64 as k with mut = 0;
+        while (k < 6 && _num(s, n, &i, &v[k]) == 1) { k = k + 1; }
+        while (i < n && s[i] != 41) { i = i + 1; }
+        i = i + 1;
+        let is _Mat as t = _ident();
+        let is *u8 as name = &s[a];
+        let is i64 as nl = e - a;
+        if (decl.eq(name, nl, "translate") == 1) {
+            if (k >= 1) { t.e = v[0]; }
+            if (k >= 2) { t.f = v[1]; }
+        } else if (decl.eq(name, nl, "scale") == 1) {
+            if (k >= 1) { t.a = v[0]; t.d = v[0]; }
+            if (k >= 2) { t.d = v[1]; }
+        } else if (decl.eq(name, nl, "rotate") == 1 && k >= 1) {
+            let is f64 as r = v[0] * PI / 180.0;
+            t.a = fm.cos(r);
+            t.b = fm.sin(r);
+            t.c = 0.0 - t.b;
+            t.d = t.a;
+            if (k >= 3) {
+                t.e = v[1] - t.a * v[1] - t.c * v[2];
+                t.f = v[2] - t.b * v[1] - t.d * v[2];
+            }
+        } else if (decl.eq(name, nl, "skewx") == 1 && k >= 1) {
+            t.c = fm.tan(v[0] * PI / 180.0);
+        } else if (decl.eq(name, nl, "skewy") == 1 && k >= 1) {
+            t.b = fm.tan(v[0] * PI / 180.0);
+        } else if (decl.eq(name, nl, "matrix") == 1 && k >= 6) {
+            t.a = v[0]; t.b = v[1]; t.c = v[2]; t.d = v[3]; t.e = v[4]; t.f = v[5];
+        }
+        *m = _mul(m, &t);
+    }
+}
+
+// --- Shapes into a path ---
+
+fn _arc_to(p as *path.Path, x0 as f64, y0 as f64, rx0 as f64, ry0 as f64, deg as f64, large as i64, sweep as i64, x1 as f64, y1 as f64) as void {
+    let is f64 as rx with mut = _abs(rx0);
+    let is f64 as ry with mut = _abs(ry0);
+    if (rx == 0.0 || ry == 0.0) {
+        path.line_to(p, x1, y1);
+        return;
+    }
+    if (x0 == x1 && y0 == y1) { return; }
+    let is f64 as phi = deg * PI / 180.0;
+    let is f64 as cp = fm.cos(phi);
+    let is f64 as sp = fm.sin(phi);
+    let is f64 as dx = (x0 - x1) / 2.0;
+    let is f64 as dy = (y0 - y1) / 2.0;
+    let is f64 as xp = cp * dx + sp * dy;
+    let is f64 as yp = cp * dy - sp * dx;
+    let is f64 as lam = xp * xp / (rx * rx) + yp * yp / (ry * ry);
+    if (lam > 1.0) {
+        let is f64 as k = fm.sqrt(lam);
+        rx = rx * k;
+        ry = ry * k;
+    }
+    let is f64 as num = rx * rx * ry * ry - rx * rx * yp * yp - ry * ry * xp * xp;
+    let is f64 as den = rx * rx * yp * yp + ry * ry * xp * xp;
+    let is f64 as co with mut = 0.0;
+    if (den > 0.0 && num > 0.0) { co = fm.sqrt(num / den); }
+    if (large == sweep) { co = 0.0 - co; }
+    let is f64 as cxp = co * rx * yp / ry;
+    let is f64 as cyp = 0.0 - co * ry * xp / rx;
+    let is f64 as cx = cp * cxp - sp * cyp + (x0 + x1) / 2.0;
+    let is f64 as cy = sp * cxp + cp * cyp + (y0 + y1) / 2.0;
+    let is f64 as a0 = fm.atan2((yp - cyp) / ry, (xp - cxp) / rx);
+    let is f64 as a1 = fm.atan2((0.0 - yp - cyp) / ry, (0.0 - xp - cxp) / rx);
+    let is f64 as d with mut = a1 - a0;
+    if (sweep == 0 && d > 0.0) { d = d - PI * 2.0; }
+    if (sweep == 1 && d < 0.0) { d = d + PI * 2.0; }
+    let is i64 as parts = cast(i64, fm.ceil(_abs(d) / (PI / 2.0) - 0.001));
+    if (parts < 1) {
+        path.line_to(p, x1, y1);
+        return;
+    }
+    let is f64 as step = d / cast(f64, parts);
+    let is f64 as t = 4.0 / 3.0 * fm.tan(step / 4.0);
+    let is i64 as k with mut = 0;
+    let is f64 as a with mut = a0;
+    while (k < parts) {
+        let is f64 as b = a + step;
+        let is f64 as ca = fm.cos(a);
+        let is f64 as sa = fm.sin(a);
+        let is f64 as cb = fm.cos(b);
+        let is f64 as sb = fm.sin(b);
+        let is f64 as c1x = ca - t * sa;
+        let is f64 as c1y = sa + t * ca;
+        let is f64 as c2x = cb + t * sb;
+        let is f64 as c2y = sb - t * cb;
+        let is f64 as ex with mut = cp * rx * cb - sp * ry * sb + cx;
+        let is f64 as ey with mut = sp * rx * cb + cp * ry * sb + cy;
+        if (k == parts - 1) { ex = x1; ey = y1; }
+        path.cubic_to(p,
+            cp * rx * c1x - sp * ry * c1y + cx, sp * rx * c1x + cp * ry * c1y + cy,
+            cp * rx * c2x - sp * ry * c2y + cx, sp * rx * c2x + cp * ry * c2y + cy,
+            ex, ey);
+        a = b;
+        k = k + 1;
+    }
+}
+
+fn _flag(s as *u8, n as i64, at as *i64, out as *i64) as i64 {
+    let is i64 as i with mut = *at;
+    while (i < n && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 44)) { i = i + 1; }
+    if (i >= n || (s[i] != 48 && s[i] != 49)) { return 0; }
+    *out = cast(i64, s[i] == 49);
+    *at = i + 1;
+    return 1;
+}
+
+fn _parse_d(s as *u8, n as i64, p as *path.Path) as void {
+    let is i64 as i with mut = 0;
+    let is f64 as cx with mut = 0.0;
+    let is f64 as cy with mut = 0.0;
+    let is f64 as sx with mut = 0.0;
+    let is f64 as sy with mut = 0.0;
+    let is f64 as lcx with mut = 0.0;     // the last control point, for S and T
+    let is f64 as lcy with mut = 0.0;
+    let is i64 as last with mut = 0;
+    let is i64 as cmd with mut = 0;
+    let is [7]f64 as a with mut;
+    while (i < n) {
+        while (i < n && (_is_ws(cast(i64, s[i])) == 1 || s[i] == 44)) { i = i + 1; }
+        if (i >= n) { return; }
+        let is i64 as ch = cast(i64, s[i]);
+        if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) {
+            cmd = ch;
+            i = i + 1;
+        } else if (cmd == 0 || cmd == 90 || cmd == 122) {
+            return;
+        }
+        let is i64 as lower with mut = cmd;
+        if (lower < 97) { lower = lower + 32; }
+        let is i64 as rel = cast(i64, cmd >= 97);
+        let is f64 as ox with mut = 0.0;
+        let is f64 as oy with mut = 0.0;
+        if (rel == 1) { ox = cx; oy = cy; }
+        if (lower == 122) {
+            path.close_path(p);
+            cx = sx;
+            cy = sy;
+            last = lower;
+            continue;
+        }
+        if (lower == 109) {
+            if (_num(s, n, &i, &a[0]) == 0 || _num(s, n, &i, &a[1]) == 0) { return; }
+            cx = ox + a[0];
+            cy = oy + a[1];
+            sx = cx;
+            sy = cy;
+            path.move_to(p, cx, cy);
+            // Pairs after the first are lines.
+            cmd = cmd - 1;
+            if (cmd == 76 || cmd == 108) { }
+        } else if (lower == 108) {
+            if (_num(s, n, &i, &a[0]) == 0 || _num(s, n, &i, &a[1]) == 0) { return; }
+            cx = ox + a[0];
+            cy = oy + a[1];
+            path.line_to(p, cx, cy);
+        } else if (lower == 104) {
+            if (_num(s, n, &i, &a[0]) == 0) { return; }
+            cx = ox + a[0];
+            path.line_to(p, cx, cy);
+        } else if (lower == 118) {
+            if (_num(s, n, &i, &a[0]) == 0) { return; }
+            cy = oy + a[0];
+            path.line_to(p, cx, cy);
+        } else if (lower == 99) {
+            let is i64 as k with mut = 0;
+            while (k < 6) {
+                if (_num(s, n, &i, &a[k]) == 0) { return; }
+                k = k + 1;
+            }
+            lcx = ox + a[2];
+            lcy = oy + a[3];
+            path.cubic_to(p, ox + a[0], oy + a[1], lcx, lcy, ox + a[4], oy + a[5]);
+            cx = ox + a[4];
+            cy = oy + a[5];
+        } else if (lower == 115) {
+            let is i64 as k with mut = 0;
+            while (k < 4) {
+                if (_num(s, n, &i, &a[k]) == 0) { return; }
+                k = k + 1;
+            }
+            let is f64 as c1x with mut = cx;
+            let is f64 as c1y with mut = cy;
+            if (last == 99 || last == 115) {
+                c1x = cx * 2.0 - lcx;
+                c1y = cy * 2.0 - lcy;
+            }
+            lcx = ox + a[0];
+            lcy = oy + a[1];
+            path.cubic_to(p, c1x, c1y, lcx, lcy, ox + a[2], oy + a[3]);
+            cx = ox + a[2];
+            cy = oy + a[3];
+        } else if (lower == 113) {
+            let is i64 as k with mut = 0;
+            while (k < 4) {
+                if (_num(s, n, &i, &a[k]) == 0) { return; }
+                k = k + 1;
+            }
+            lcx = ox + a[0];
+            lcy = oy + a[1];
+            path.quad_to(p, lcx, lcy, ox + a[2], oy + a[3]);
+            cx = ox + a[2];
+            cy = oy + a[3];
+        } else if (lower == 116) {
+            if (_num(s, n, &i, &a[0]) == 0 || _num(s, n, &i, &a[1]) == 0) { return; }
+            let is f64 as qx with mut = cx;
+            let is f64 as qy with mut = cy;
+            if (last == 113 || last == 116) {
+                qx = cx * 2.0 - lcx;
+                qy = cy * 2.0 - lcy;
+            }
+            lcx = qx;
+            lcy = qy;
+            path.quad_to(p, qx, qy, ox + a[0], oy + a[1]);
+            cx = ox + a[0];
+            cy = oy + a[1];
+        } else if (lower == 97) {
+            if (_num(s, n, &i, &a[0]) == 0 || _num(s, n, &i, &a[1]) == 0 || _num(s, n, &i, &a[2]) == 0) { return; }
+            let is i64 as lf with mut = 0;
+            let is i64 as sf with mut = 0;
+            if (_flag(s, n, &i, &lf) == 0 || _flag(s, n, &i, &sf) == 0) { return; }
+            if (_num(s, n, &i, &a[3]) == 0 || _num(s, n, &i, &a[4]) == 0) { return; }
+            _arc_to(p, cx, cy, a[0], a[1], a[2], lf, sf, ox + a[3], oy + a[4]);
+            cx = ox + a[3];
+            cy = oy + a[4];
+        } else {
+            return;
+        }
+        last = lower;
+    }
+}
+
+let is f64 as KAPPA with imut = 0.5522847498;
+
+fn _ellipse(p as *path.Path, cx as f64, cy as f64, rx as f64, ry as f64) as void {
+    let is f64 as kx = rx * KAPPA;
+    let is f64 as ky = ry * KAPPA;
+    path.move_to(p, cx + rx, cy);
+    path.cubic_to(p, cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+    path.cubic_to(p, cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+    path.cubic_to(p, cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+    path.cubic_to(p, cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
+    path.close_path(p);
+}
+
+fn _rect(p as *path.Path, x as f64, y as f64, w as f64, h as f64, rx0 as f64, ry0 as f64) as void {
+    let is f64 as rx = _minf(rx0, w / 2.0);
+    let is f64 as ry = _minf(ry0, h / 2.0);
+    if (rx <= 0.0 || ry <= 0.0) {
+        path.move_to(p, x, y);
+        path.line_to(p, x + w, y);
+        path.line_to(p, x + w, y + h);
+        path.line_to(p, x, y + h);
+        path.close_path(p);
+        return;
+    }
+    let is f64 as kx = rx * (1.0 - KAPPA);
+    let is f64 as ky = ry * (1.0 - KAPPA);
+    path.move_to(p, x + rx, y);
+    path.line_to(p, x + w - rx, y);
+    path.cubic_to(p, x + w - kx, y, x + w, y + ky, x + w, y + ry);
+    path.line_to(p, x + w, y + h - ry);
+    path.cubic_to(p, x + w, y + h - ky, x + w - kx, y + h, x + w - rx, y + h);
+    path.line_to(p, x + rx, y + h);
+    path.cubic_to(p, x + kx, y + h, x, y + h - ky, x, y + h - ry);
+    path.line_to(p, x, y + ry);
+    path.cubic_to(p, x, y + ky, x + kx, y, x + rx, y);
+    path.close_path(p);
+}
+
+fn _points(p as *path.Path, s as *u8, n as i64, closed as i64) as void {
+    let is i64 as at with mut = 0;
+    let is f64 as x with mut = 0.0;
+    let is f64 as y with mut = 0.0;
+    let is i64 as first with mut = 1;
+    while (_num(s, n, &at, &x) == 1 && _num(s, n, &at, &y) == 1) {
+        if (first == 1) { path.move_to(p, x, y); }
+        else { path.line_to(p, x, y); }
+        first = 0;
+    }
+    if (closed == 1 && first == 0) { path.close_path(p); }
+}
+
+// How many points a path could want, for a shape's own text, so that it never runs out.
+fn _shape_points(n as *dom.Node) as i64 {
+    let is i64 as most with mut = 64;
+    let is *dom.Attr as d = dom.find_attr(n, "d", 1);
+    if (d != null) { most = most + d.value_len * 4; }
+    let is *dom.Attr as pts = dom.find_attr(n, "points", 6);
+    if (pts != null) { most = most + pts.value_len; }
+    return most;
+}
+
+// Which shape an element is, into p. 0 when it is none.
+fn _shape(n as *dom.Node, p as *path.Path) as i64 {
+    let is *u8 as t = n.name;
+    let is i64 as l = n.name_len;
+    if (decl.eq(t, l, "rect") == 1) {
+        let is f64 as w = _attr_num(n, "width", 5, 0.0);
+        let is f64 as h = _attr_num(n, "height", 6, 0.0);
+        if (w <= 0.0 || h <= 0.0) { return 0; }
+        let is f64 as rx0 = _attr_num(n, "rx", 2, 0.0 - 1.0);
+        let is f64 as ry0 = _attr_num(n, "ry", 2, 0.0 - 1.0);
+        let is f64 as rx with mut = rx0;
+        let is f64 as ry with mut = ry0;
+        if (rx < 0.0) { rx = ry; }
+        if (ry < 0.0) { ry = rx; }
+        _rect(p, _attr_num(n, "x", 1, 0.0), _attr_num(n, "y", 1, 0.0), w, h, _maxf(rx, 0.0), _maxf(ry, 0.0));
+        return 1;
+    }
+    if (decl.eq(t, l, "circle") == 1) {
+        let is f64 as r = _attr_num(n, "r", 1, 0.0);
+        if (r <= 0.0) { return 0; }
+        _ellipse(p, _attr_num(n, "cx", 2, 0.0), _attr_num(n, "cy", 2, 0.0), r, r);
+        return 1;
+    }
+    if (decl.eq(t, l, "ellipse") == 1) {
+        let is f64 as rx = _attr_num(n, "rx", 2, 0.0);
+        let is f64 as ry = _attr_num(n, "ry", 2, 0.0);
+        if (rx <= 0.0 || ry <= 0.0) { return 0; }
+        _ellipse(p, _attr_num(n, "cx", 2, 0.0), _attr_num(n, "cy", 2, 0.0), rx, ry);
+        return 1;
+    }
+    if (decl.eq(t, l, "line") == 1) {
+        path.move_to(p, _attr_num(n, "x1", 2, 0.0), _attr_num(n, "y1", 2, 0.0));
+        path.line_to(p, _attr_num(n, "x2", 2, 0.0), _attr_num(n, "y2", 2, 0.0));
+        return 1;
+    }
+    if (decl.eq(t, l, "polyline") == 1 || decl.eq(t, l, "polygon") == 1) {
+        let is *dom.Attr as a = dom.find_attr(n, "points", 6);
+        if (a == null) { return 0; }
+        _points(p, a.value, a.value_len, decl.eq(t, l, "polygon"));
+        return 1;
+    }
+    if (decl.eq(t, l, "path") == 1) {
+        let is *dom.Attr as a = dom.find_attr(n, "d", 1);
+        if (a == null) { return 0; }
+        _parse_d(a.value, a.value_len, p);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Paint ---
+
+fn _bbox(p as *path.Path, x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as void {
+    let is path.Cursor as c = path.cursor();
+    let is path.Seg as s;
+    let is f64 as lx with mut = 1000000000.0;
+    let is f64 as ly with mut = 1000000000.0;
+    let is f64 as hx with mut = 0.0 - 1000000000.0;
+    let is f64 as hy with mut = 0.0 - 1000000000.0;
+    while (path.next(p, &c, &s) != 0) {
+        lx = _minf(lx, _minf(s.x0, s.x1));
+        ly = _minf(ly, _minf(s.y0, s.y1));
+        hx = _maxf(hx, _maxf(s.x0, s.x1));
+        hy = _maxf(hy, _maxf(s.y0, s.y1));
+        if (s.kind == path.QUAD || s.kind == path.CUBIC) {
+            lx = _minf(lx, s.x2);
+            ly = _minf(ly, s.y2);
+            hx = _maxf(hx, s.x2);
+            hy = _maxf(hy, s.y2);
+        }
+        if (s.kind == path.CUBIC) {
+            lx = _minf(lx, s.x3);
+            ly = _minf(ly, s.y3);
+            hx = _maxf(hx, s.x3);
+            hy = _maxf(hy, s.y3);
+        }
+    }
+    *x0 = lx;
+    *y0 = ly;
+    *x1 = hx;
+    *y1 = hy;
+}
+
+// A gradient as the pixels will ask for it: colour by position in the shape's own space.
+struct _GradLook {
+    radial as i64;
+    x1 as f64; y1 as f64;   // linear: from; radial: centre
+    dx as f64; dy as f64;   // linear: along it, over its squared length; radial: 1 over the radius
+    ramp as [1024]f64;      // RAMP colours, premultiplied
+}
+
+fn _stops_owner(o as *_Out, g0 as *dom.Node) as *dom.Node {
+    let is *dom.Node as g with mut = g0;
+    let is i64 as hops with mut = 0;
+    while (g != null && hops < 8) {
+        let is *dom.Node as x with mut = g.first;
+        while (x != null) {
+            if (x.kind == dom.ELEMENT && decl.eq(x.name, x.name_len, "stop") == 1) { return g; }
+            x = x.next;
+        }
+        let is *dom.Attr as h with mut = dom.find_attr(g, "href", 4);
+        if (h == null) { h = dom.find_attr(g, "xlink:href", 10); }
+        if (h == null || h.value_len < 2 || h.value[0] != 35) { return cast(*dom.Node, 0); }
+        g = _by_id(_doc_root(o.root), &h.value[1], h.value_len - 1);
+        hops = hops + 1;
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _unit_attr(g as *dom.Node, name as *u8, nlen as i64, dflt as f64) as f64 {
+    let is *dom.Attr as a = dom.find_attr(g, name, nlen);
+    if (a == null) { return dflt; }
+    let is i64 as at with mut = 0;
+    let is f64 as v with mut = 0.0;
+    if (_num(a.value, a.value_len, &at, &v) == 0) { return dflt; }
+    if (at < a.value_len && a.value[at] == 37) { return v / 100.0; }
+    return v;
+}
+
+fn _look_at(o as *_Out, g as *dom.Node, b as *_GradLook, x0 as f64, y0 as f64, x1 as f64, y1 as f64) as i64 {
+    let is *dom.Node as owner = _stops_owner(o, g);
+    if (owner == null) { return 0; }
+    let is i64 as user with mut = 0;
+    let is *dom.Attr as units = dom.find_attr(g, "gradientUnits", 13);
+    if (units != null && decl.eq(units.value, units.value_len, "userspaceonuse") == 1) { user = 1; }
+    let is f64 as w = _maxf(x1 - x0, 0.000001);
+    let is f64 as h = _maxf(y1 - y0, 0.000001);
+    b.radial = decl.eq(g.name, g.name_len, "radialgradient");
+    if (b.radial == 1) {
+        let is f64 as cx with mut = _unit_attr(g, "cx", 2, 0.5);
+        let is f64 as cy with mut = _unit_attr(g, "cy", 2, 0.5);
+        let is f64 as r = _unit_attr(g, "r", 1, 0.5);
+        let is f64 as rx with mut = r;
+        let is f64 as ry with mut = r;
+        if (user == 0) {
+            cx = x0 + cx * w;
+            cy = y0 + cy * h;
+            rx = r * w;
+            ry = r * h;
+        }
+        b.x1 = cx;
+        b.y1 = cy;
+        b.dx = 1.0 / _maxf(rx, 0.000001);
+        b.dy = 1.0 / _maxf(ry, 0.000001);
+    } else {
+        let is f64 as ax with mut = _unit_attr(g, "x1", 2, 0.0);
+        let is f64 as ay with mut = _unit_attr(g, "y1", 2, 0.0);
+        let is f64 as bx with mut = _unit_attr(g, "x2", 2, 1.0);
+        let is f64 as by with mut = _unit_attr(g, "y2", 2, 0.0);
+        if (user == 0) {
+            ax = x0 + ax * w;
+            ay = y0 + ay * h;
+            bx = x0 + bx * w;
+            by = y0 + by * h;
+        }
+        let is f64 as dx = bx - ax;
+        let is f64 as dy = by - ay;
+        let is f64 as ll = _maxf(dx * dx + dy * dy, 0.000001);
+        b.x1 = ax;
+        b.y1 = ay;
+        b.dx = dx / ll;
+        b.dy = dy / ll;
+    }
+    // Stops in order, and the ramp between them, premultiplied.
+    let is [32]f64 as at with mut;
+    let is [32]i64 as cols with mut;
+    let is i64 as n with mut = 0;
+    let is *dom.Node as s with mut = owner.first;
+    let is f64 as last with mut = 0.0;
+    while (s != null && n < 32) {
+        if (s.kind == dom.ELEMENT && decl.eq(s.name, s.name_len, "stop") == 1) {
+            let is f64 as off = _minf(_maxf(_unit_attr(s, "offset", 6, last), last), 1.0);
+            let is i64 as col with mut = 4278190080;
+            let is i64 as vl with mut = 0;
+            let is *u8 as v = _prop(s, "stop-color", 10, &vl);
+            if (v != null) { _color(o, v, vl, &col); }
+            let is i64 as ol with mut = 0;
+            let is *u8 as op = _prop(s, "stop-opacity", 12, &ol);
+            if (op != null) {
+                let is i64 as pos with mut = 0;
+                let is f64 as a with mut = 1.0;
+                if (_num(op, ol, &pos, &a) == 1) {
+                    let is i64 as ab = cast(i64, cast(f64, (col >> 24) & 255) * _minf(_maxf(a, 0.0), 1.0));
+                    col = (col & 16777215) | (ab << 24);
+                }
+            }
+            at[n] = off;
+            cols[n] = col;
+            n = n + 1;
+            last = off;
+        }
+        s = s.next;
+    }
+    if (n == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    let is i64 as seg with mut = 0;
+    while (k < RAMP) {
+        let is f64 as t = cast(f64, k) / cast(f64, RAMP - 1);
+        while (seg + 1 < n && t > at[seg + 1]) { seg = seg + 1; }
+        let is i64 as a = cols[seg];
+        let is i64 as c with mut = a;
+        let is f64 as f with mut = 0.0;
+        if (seg + 1 < n && t >= at[seg]) {
+            c = cols[seg + 1];
+            if (at[seg + 1] > at[seg]) { f = (t - at[seg]) / (at[seg + 1] - at[seg]); }
+            else { f = 1.0; }
+        }
+        let is f64 as aa = cast(f64, (a >> 24) & 255) / 255.0;
+        let is f64 as ca = cast(f64, (c >> 24) & 255) / 255.0;
+        b.ramp[k * 4] = cast(f64, (a >> 16) & 255) / 255.0 * aa * (1.0 - f) + cast(f64, (c >> 16) & 255) / 255.0 * ca * f;
+        b.ramp[k * 4 + 1] = cast(f64, (a >> 8) & 255) / 255.0 * aa * (1.0 - f) + cast(f64, (c >> 8) & 255) / 255.0 * ca * f;
+        b.ramp[k * 4 + 2] = cast(f64, a & 255) / 255.0 * aa * (1.0 - f) + cast(f64, c & 255) / 255.0 * ca * f;
+        b.ramp[k * 4 + 3] = aa * (1.0 - f) + ca * f;
+        k = k + 1;
+    }
+    return 1;
+}
+
+// One path, already in pixels by m, over what is there.
+fn _composite(o as *_Out, p as *path.Path, m as *_Mat, paint as *_Paint, alpha as f64, rule as i32, bbox_of as *path.Path) as void {
+    if (paint.kind == PAINT_NONE || alpha <= 0.0) { return; }
+    let is raster.flatten.Transform as t = raster.transform(m.a, m.c, m.b, m.d, m.e, m.f);
+    let is raster.Box as box;
+    if (raster.bounds(p, &t, &box) == 0) { return; }
+    if (box.w <= 0 || box.h <= 0 || box.w * box.h > MAX_SHAPE) { return; }
+    let is raster.Raster as r = raster.open(box.w, box.h);
+    if (raster.ok(&r) == 0) { return; }
+    let is *u8 as cov = mem.core.mmap_anon(box.w * box.h);
+    let is i64 as cv = cast(i64, cov);
+    if (cv == 0 || cv == 0 - 1) {
+        raster.close(&r);
+        return;
+    }
+    if (raster.draw(&r, p, &t, &box, rule, cov, box.w) == 0) {
+        mem.core.munmap(cov, box.w * box.h);
+        raster.close(&r);
+        return;
+    }
+    let is f64 as cr with mut = 0.0;
+    let is f64 as cg with mut = 0.0;
+    let is f64 as cb with mut = 0.0;
+    let is f64 as ca with mut = 0.0;
+    let is i64 as use_grad with mut = 0;
+    let is _GradLook as look;
+    // Back from a pixel to the shape's own space, where a gradient was written.
+    let is f64 as det = m.a * m.d - m.b * m.c;
+    let is f64 as ia with mut = 0.0;
+    let is f64 as ib with mut = 0.0;
+    let is f64 as ic with mut = 0.0;
+    let is f64 as id with mut = 0.0;
+    if (paint.kind == PAINT_GRAD) {
+        let is f64 as x0 with mut = 0.0;
+        let is f64 as y0 with mut = 0.0;
+        let is f64 as x1 with mut = 0.0;
+        let is f64 as y1 with mut = 0.0;
+        _bbox(bbox_of, &x0, &y0, &x1, &y1);
+        if (det != 0.0 && _look_at(o, paint.grad, &look, x0, y0, x1, y1) == 1) {
+            use_grad = 1;
+            ia = m.d / det;
+            ib = 0.0 - m.b / det;
+            ic = 0.0 - m.c / det;
+            id = m.a / det;
+        } else {
+            mem.core.munmap(cov, box.w * box.h);
+            raster.close(&r);
+            return;
+        }
+    } else {
+        let is f64 as a0 = cast(f64, (paint.color >> 24) & 255) / 255.0;
+        ca = a0;
+        cr = cast(f64, (paint.color >> 16) & 255) / 255.0 * a0;
+        cg = cast(f64, (paint.color >> 8) & 255) / 255.0 * a0;
+        cb = cast(f64, paint.color & 255) / 255.0 * a0;
+    }
+    let is i64 as y with mut = 0;
+    while (y < box.h) {
+        let is i64 as py = box.top + y;
+        if (py >= 0 && py < o.h) {
+            let is i64 as x with mut = 0;
+            while (x < box.w) {
+                let is i64 as c8 = cast(i64, cov[y * box.w + x]);
+                let is i64 as px = box.left + x;
+                if (c8 > 0 && px >= 0 && px < o.w) {
+                    let is f64 as k = cast(f64, c8) / 255.0 * alpha;
+                    if (use_grad == 1) {
+                        let is f64 as qx = cast(f64, px) + 0.5 - m.e;
+                        let is f64 as qy = cast(f64, py) + 0.5 - m.f;
+                        let is f64 as ux = ia * qx + ic * qy;
+                        let is f64 as uy = ib * qx + id * qy;
+                        let is f64 as tt with mut = 0.0;
+                        if (look.radial == 1) {
+                            let is f64 as ddx = (ux - look.x1) * look.dx;
+                            let is f64 as ddy = (uy - look.y1) * look.dy;
+                            tt = fm.sqrt(ddx * ddx + ddy * ddy);
+                        } else {
+                            tt = (ux - look.x1) * look.dx + (uy - look.y1) * look.dy;
+                        }
+                        tt = _minf(_maxf(tt, 0.0), 1.0);
+                        let is i64 as at = cast(i64, tt * cast(f64, RAMP - 1) + 0.5);
+                        cr = look.ramp[at * 4];
+                        cg = look.ramp[at * 4 + 1];
+                        cb = look.ramp[at * 4 + 2];
+                        ca = look.ramp[at * 4 + 3];
+                    }
+                    let is *u8 as d = &o.px[(py * o.w + px) * 4];
+                    let is f64 as sa = ca * k;
+                    let is f64 as keep = 1.0 - sa;
+                    d[0] = cast(u8, cast(i64, cr * k * 255.0 + cast(f64, cast(i64, d[0])) * keep + 0.5));
+                    d[1] = cast(u8, cast(i64, cg * k * 255.0 + cast(f64, cast(i64, d[1])) * keep + 0.5));
+                    d[2] = cast(u8, cast(i64, cb * k * 255.0 + cast(f64, cast(i64, d[2])) * keep + 0.5));
+                    d[3] = cast(u8, cast(i64, sa * 255.0 + cast(f64, cast(i64, d[3])) * keep + 0.5));
+                }
+                x = x + 1;
+            }
+        }
+        y = y + 1;
+    }
+    mem.core.munmap(cov, box.w * box.h);
+    raster.close(&r);
+}
+
+// --- Strokes ---
+//
+// A stroke is every piece of its outline as a polygon of its own, each wound the same way,
+// filled together with the non-zero rule so that where they overlap counts once.
+
+fn _poly(sp as *path.Path, xs as *f64, ys as *f64, n as i64) as void {
+    let is f64 as area with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is i64 as j = (k + 1) % n;
+        area = area + xs[k] * ys[j] - xs[j] * ys[k];
+        k = k + 1;
+    }
+    if (area == 0.0) { return; }
+    if (area > 0.0) {
+        path.move_to(sp, xs[0], ys[0]);
+        k = 1;
+        while (k < n) {
+            path.line_to(sp, xs[k], ys[k]);
+            k = k + 1;
+        }
+    } else {
+        path.move_to(sp, xs[n - 1], ys[n - 1]);
+        k = n - 2;
+        while (k >= 0) {
+            path.line_to(sp, xs[k], ys[k]);
+            k = k - 1;
+        }
+    }
+    path.close_path(sp);
+}
+
+let is i64 as ROUND_SIDES with imut = 24;
+
+fn _disc(sp as *path.Path, x as f64, y as f64, r as f64) as void {
+    let is [24]f64 as xs with mut;
+    let is [24]f64 as ys with mut;
+    let is i64 as k with mut = 0;
+    while (k < ROUND_SIDES) {
+        let is f64 as a = PI * 2.0 * cast(f64, k) / cast(f64, ROUND_SIDES);
+        xs[k] = x + r * fm.cos(a);
+        ys[k] = y + r * fm.sin(a);
+        k = k + 1;
+    }
+    _poly(sp, &xs[0], &ys[0], ROUND_SIDES);
+}
+
+fn _segment(sp as *path.Path, x0 as f64, y0 as f64, x1 as f64, y1 as f64, hw as f64) as void {
+    let is f64 as dx = x1 - x0;
+    let is f64 as dy = y1 - y0;
+    let is f64 as l = fm.sqrt(dx * dx + dy * dy);
+    if (l <= 0.0) { return; }
+    let is f64 as nx = 0.0 - dy / l * hw;
+    let is f64 as ny = dx / l * hw;
+    let is [4]f64 as xs with mut;
+    let is [4]f64 as ys with mut;
+    xs[0] = x0 + nx; ys[0] = y0 + ny;
+    xs[1] = x1 + nx; ys[1] = y1 + ny;
+    xs[2] = x1 - nx; ys[2] = y1 - ny;
+    xs[3] = x0 - nx; ys[3] = y0 - ny;
+    _poly(sp, &xs[0], &ys[0], 4);
+}
+
+// The corner at (x1, y1) between two segments.
+fn _joint(sp as *path.Path, x0 as f64, y0 as f64, x1 as f64, y1 as f64, x2 as f64, y2 as f64, hw as f64, st as *_State) as void {
+    if (st.join == JOIN_ROUND) {
+        _disc(sp, x1, y1, hw);
+        return;
+    }
+    let is f64 as ax = x1 - x0;
+    let is f64 as ay = y1 - y0;
+    let is f64 as bx = x2 - x1;
+    let is f64 as by = y2 - y1;
+    let is f64 as la = fm.sqrt(ax * ax + ay * ay);
+    let is f64 as lb = fm.sqrt(bx * bx + by * by);
+    if (la <= 0.0 || lb <= 0.0) { return; }
+    let is f64 as cross = ax * by - ay * bx;
+    if (cross == 0.0) { return; }
+    // The outside of the turn.
+    let is f64 as side with mut = 1.0;
+    if (cross > 0.0) { side = 0.0 - 1.0; }
+    let is f64 as n1x = 0.0 - ay / la * hw * side;
+    let is f64 as n1y = ax / la * hw * side;
+    let is f64 as n2x = 0.0 - by / lb * hw * side;
+    let is f64 as n2y = bx / lb * hw * side;
+    let is [4]f64 as xs with mut;
+    let is [4]f64 as ys with mut;
+    xs[0] = x1;
+    ys[0] = y1;
+    xs[1] = x1 + n1x;
+    ys[1] = y1 + n1y;
+    let is i64 as count with mut = 3;
+    if (st.join == JOIN_MITER) {
+        let is f64 as mx = n1x + n2x;
+        let is f64 as my = n1y + n2y;
+        let is f64 as ml2 = mx * mx + my * my;
+        if (ml2 > 0.0) {
+            // Half the angle between them says how long the point is.
+            let is f64 as k = 2.0 * hw * hw / ml2;
+            let is f64 as ratio = fm.sqrt(mx * mx * k * k + my * my * k * k) / hw;
+            if (ratio <= st.miter) {
+                xs[2] = x1 + mx * k;
+                ys[2] = y1 + my * k;
+                xs[3] = x1 + n2x;
+                ys[3] = y1 + n2y;
+                count = 4;
+            }
+        }
+    }
+    if (count == 3) {
+        xs[2] = x1 + n2x;
+        ys[2] = y1 + n2y;
+    }
+    _poly(sp, &xs[0], &ys[0], count);
+}
+
+// The polyline of one contour, in lx and ly, into polygons.
+fn _stroke_contour(sp as *path.Path, lx as *f64, ly as *f64, n as i64, closed as i64, st as *_State) as void {
+    let is f64 as hw = st.width / 2.0;
+    if (n == 1) {
+        if (st.cap == CAP_ROUND) { _disc(sp, lx[0], ly[0], hw); }
+        if (st.cap == CAP_SQUARE) { _segment(sp, lx[0] - hw, ly[0], lx[0] + hw, ly[0], hw); }
+        return;
+    }
+    let is i64 as k with mut = 0;
+    while (k + 1 < n) {
+        let is f64 as x0 with mut = lx[k];
+        let is f64 as y0 with mut = ly[k];
+        let is f64 as x1 with mut = lx[k + 1];
+        let is f64 as y1 with mut = ly[k + 1];
+        if (st.cap == CAP_SQUARE && closed == 0) {
+            let is f64 as dx = x1 - x0;
+            let is f64 as dy = y1 - y0;
+            let is f64 as l = fm.sqrt(dx * dx + dy * dy);
+            if (l > 0.0) {
+                if (k == 0) { x0 = x0 - dx / l * hw; y0 = y0 - dy / l * hw; }
+                if (k + 2 == n) { x1 = x1 + dx / l * hw; y1 = y1 + dy / l * hw; }
+            }
+        }
+        _segment(sp, x0, y0, x1, y1, hw);
+        k = k + 1;
+    }
+    k = 1;
+    while (k + 1 < n) {
+        _joint(sp, lx[k - 1], ly[k - 1], lx[k], ly[k], lx[k + 1], ly[k + 1], hw, st);
+        k = k + 1;
+    }
+    if (closed == 1 && n >= 3) {
+        _joint(sp, lx[n - 2], ly[n - 2], lx[0], ly[0], lx[1], ly[1], hw, st);
+    }
+    if (closed == 0 && st.cap == CAP_ROUND) {
+        _disc(sp, lx[0], ly[0], hw);
+        _disc(sp, lx[n - 1], ly[n - 1], hw);
+    }
+}
+
+// Every contour of p as lines, and what those lines come to as a stroke.
+fn _stroke(o as *_Out, p as *path.Path, st as *_State) as void {
+    if (st.stroke.kind == PAINT_NONE || st.width <= 0.0) { return; }
+    let is i64 as cap = path.count(p) * CURVE_STEPS + 8;
+    let is i64 as bytes = cap * 16;
+    let is *u8 as mem0 = mem.core.mmap_anon(bytes);
+    let is i64 as mv = cast(i64, mem0);
+    if (mv == 0 || mv == 0 - 1) { return; }
+    let is *f64 as lx = cast(*f64, mem0);
+    let is *f64 as ly = cast(*f64, cast(i64, mem0) + cap * 8);
+    // A polygon for each piece: a round joint or cap can come at every line.
+    let is path.Path as sp = path.open(cap * (ROUND_SIDES + 8) + 64);
+    if (path.ok(&sp) == 0) {
+        mem.core.munmap(mem0, bytes);
+        return;
+    }
+    let is path.Cursor as c = path.cursor();
+    let is path.Seg as s;
+    let is i64 as n with mut = 0;
+    while (path.next(p, &c, &s) != 0) {
+        if (s.kind == path.MOVE) {
+            if (n > 0) { _stroke_contour(&sp, lx, ly, n, 0, st); }
+            n = 0;
+            lx[0] = s.x1;
+            ly[0] = s.y1;
+            n = 1;
+        } else if (s.kind == path.LINE && n < cap) {
+            lx[n] = s.x1;
+            ly[n] = s.y1;
+            n = n + 1;
+        } else if (s.kind == path.QUAD) {
+            let is i64 as k with mut = 1;
+            while (k <= CURVE_STEPS && n < cap) {
+                let is f64 as t = cast(f64, k) / cast(f64, CURVE_STEPS);
+                let is f64 as u = 1.0 - t;
+                lx[n] = u * u * s.x0 + 2.0 * u * t * s.x1 + t * t * s.x2;
+                ly[n] = u * u * s.y0 + 2.0 * u * t * s.y1 + t * t * s.y2;
+                n = n + 1;
+                k = k + 1;
+            }
+        } else if (s.kind == path.CUBIC) {
+            let is i64 as k with mut = 1;
+            while (k <= CURVE_STEPS && n < cap) {
+                let is f64 as t = cast(f64, k) / cast(f64, CURVE_STEPS);
+                let is f64 as u = 1.0 - t;
+                lx[n] = u * u * u * s.x0 + 3.0 * u * u * t * s.x1 + 3.0 * u * t * t * s.x2 + t * t * t * s.x3;
+                ly[n] = u * u * u * s.y0 + 3.0 * u * u * t * s.y1 + 3.0 * u * t * t * s.y2 + t * t * t * s.y3;
+                n = n + 1;
+                k = k + 1;
+            }
+        } else if (s.kind == path.CLOSE) {
+            if (n > 0) {
+                // Back to where it began, and it has no ends to cap.
+                if (n < cap && (lx[n - 1] != s.x1 || ly[n - 1] != s.y1)) {
+                    lx[n] = s.x1;
+                    ly[n] = s.y1;
+                    n = n + 1;
+                }
+                _stroke_contour(&sp, lx, ly, n, 1, st);
+            }
+            n = 0;
+        }
+    }
+    if (n > 0) { _stroke_contour(&sp, lx, ly, n, 0, st); }
+    _composite(o, &sp, &st.m, &st.stroke, st.stroke_a * st.alpha, raster.NONZERO, p);
+    path.close(&sp);
+    mem.core.munmap(mem0, bytes);
+}
+
+// --- The tree ---
+
+// What an element changes about what its children inherit.
+fn _take_state(o as *_Out, n as *dom.Node, st as *_State) as void {
+    let is i64 as l with mut = 0;
+    let is *u8 as v with mut = _prop(n, "fill", 4, &l);
+    if (v != null) { _paint_of(o, v, l, &st.fill); }
+    v = _prop(n, "stroke", 6, &l);
+    if (v != null) { _paint_of(o, v, l, &st.stroke); }
+    // A stylesheet beats an attribute, but one that only came down from the parent does not.
+    if (n.style != null) {
+        let is *style.Style as cs = style.of(n);
+        let is *style.Style as ps with mut = cast(*style.Style, 0);
+        if (n.parent != null && n.parent.kind == dom.ELEMENT && n.parent.style != null) { ps = style.of(n.parent); }
+        let is i64 as f = cs.v.i[pr.P_FILL];
+        if (f != pr.K_AUTO && (ps == null || ps.v.i[pr.P_FILL] != f)) {
+            if (f == pr.K_NONE) { st.fill.kind = PAINT_NONE; }
+            else {
+                st.fill.kind = PAINT_COLOR;
+                st.fill.color = f;
+                if (f == 0 - 1) { st.fill.color = o.current; }
+            }
+        }
+        let is i64 as k = cs.v.i[pr.P_STROKE];
+        if (k != pr.K_AUTO && (ps == null || ps.v.i[pr.P_STROKE] != k)) {
+            if (k == pr.K_NONE) { st.stroke.kind = PAINT_NONE; }
+            else {
+                st.stroke.kind = PAINT_COLOR;
+                st.stroke.color = k;
+                if (k == 0 - 1) { st.stroke.color = o.current; }
+            }
+        }
+    }
+    let is i64 as at with mut = 0;
+    let is f64 as x with mut = 0.0;
+    v = _prop(n, "stroke-width", 12, &l);
+    if (v != null && _num(v, l, &at, &x) == 1) { st.width = _maxf(x, 0.0); }
+    at = 0;
+    v = _prop(n, "stroke-miterlimit", 17, &l);
+    if (v != null && _num(v, l, &at, &x) == 1) { st.miter = _maxf(x, 1.0); }
+    at = 0;
+    v = _prop(n, "fill-opacity", 12, &l);
+    if (v != null && _num(v, l, &at, &x) == 1) { st.fill_a = _minf(_maxf(x, 0.0), 1.0); }
+    at = 0;
+    v = _prop(n, "stroke-opacity", 14, &l);
+    if (v != null && _num(v, l, &at, &x) == 1) { st.stroke_a = _minf(_maxf(x, 0.0), 1.0); }
+    at = 0;
+    v = _prop(n, "opacity", 7, &l);
+    if (v != null && _num(v, l, &at, &x) == 1) { st.alpha = st.alpha * _minf(_maxf(x, 0.0), 1.0); }
+    v = _prop(n, "stroke-linecap", 14, &l);
+    if (v != null) {
+        if (decl.eq(v, l, "round") == 1) { st.cap = CAP_ROUND; }
+        if (decl.eq(v, l, "square") == 1) { st.cap = CAP_SQUARE; }
+        if (decl.eq(v, l, "butt") == 1) { st.cap = CAP_BUTT; }
+    }
+    v = _prop(n, "stroke-linejoin", 15, &l);
+    if (v != null) {
+        if (decl.eq(v, l, "round") == 1) { st.join = JOIN_ROUND; }
+        if (decl.eq(v, l, "bevel") == 1) { st.join = JOIN_BEVEL; }
+        if (decl.eq(v, l, "miter") == 1) { st.join = JOIN_MITER; }
+    }
+    v = _prop(n, "fill-rule", 9, &l);
+    if (v != null) { st.evenodd = cast(i32, decl.eq(v, l, "evenodd")); }
+    let is *dom.Attr as tr = dom.find_attr(n, "transform", 9);
+    if (tr != null) { _transform(tr.value, tr.value_len, &st.m); }
+}
+
+fn _hidden(n as *dom.Node) as i64 {
+    let is i64 as l with mut = 0;
+    let is *u8 as v = _prop(n, "display", 7, &l);
+    if (v != null && decl.eq(v, l, "none") == 1) { return 1; }
+    if (n.style != null && style.of(n).v.i[pr.P_DISPLAY] == pr.K_NONE) {
+        // What the sheet says of the parts a picture only refers to does not count here,
+        // and <defs> and its kin never reach this.
+        return 1;
+    }
+    return 0;
+}
+
+fn _element(o as *_Out, n as *dom.Node, from as *_State, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *u8 as t = n.name;
+    let is i64 as l with mut = n.name_len;
+    if (decl.eq(t, l, "defs") == 1 || decl.eq(t, l, "clippath") == 1 || decl.eq(t, l, "mask") == 1 ||
+        decl.eq(t, l, "symbol") == 1 || decl.eq(t, l, "lineargradient") == 1 || decl.eq(t, l, "radialgradient") == 1 ||
+        decl.eq(t, l, "pattern") == 1 || decl.eq(t, l, "marker") == 1 || decl.eq(t, l, "filter") == 1 ||
+        decl.eq(t, l, "title") == 1 || decl.eq(t, l, "desc") == 1 || decl.eq(t, l, "metadata") == 1 ||
+        decl.eq(t, l, "style") == 1 || decl.eq(t, l, "script") == 1 || decl.eq(t, l, "text") == 1) {
+        return;
+    }
+    let is _State as st with mut = *from;
+    if (_prop(n, "display", 7, &l) != null || n.style != null) {
+        if (_hidden(n) == 1) { return; }
+    }
+    l = n.name_len;
+    _take_state(o, n, &st);
+    if (decl.eq(t, l, "g") == 1 || decl.eq(t, l, "svg") == 1 || decl.eq(t, l, "a") == 1 || decl.eq(t, l, "switch") == 1) {
+        let is *dom.Node as x with mut = n.first;
+        while (x != null) {
+            if (x.kind == dom.ELEMENT) { _element(o, x, &st, depth + 1); }
+            x = x.next;
+        }
+        return;
+    }
+    if (decl.eq(t, l, "use") == 1) {
+        let is *dom.Attr as h with mut = dom.find_attr(n, "href", 4);
+        if (h == null) { h = dom.find_attr(n, "xlink:href", 10); }
+        if (h == null || h.value_len < 2 || h.value[0] != 35) { return; }
+        let is *dom.Node as to = _by_id(_doc_root(o.root), &h.value[1], h.value_len - 1);
+        if (to == null) { return; }
+        let is _Mat as tr = _ident();
+        tr.e = _attr_num(n, "x", 1, 0.0);
+        tr.f = _attr_num(n, "y", 1, 0.0);
+        st.m = _mul(&st.m, &tr);
+        // A symbol is drawn only by being used.
+        if (decl.eq(to.name, to.name_len, "symbol") == 1) {
+            let is *dom.Node as x with mut = to.first;
+            while (x != null) {
+                if (x.kind == dom.ELEMENT) { _element(o, x, &st, depth + 1); }
+                x = x.next;
+            }
+            return;
+        }
+        _element(o, to, &st, depth + 1);
+        return;
+    }
+    let is path.Path as p = path.open(_shape_points(n));
+    if (path.ok(&p) == 0) { return; }
+    if (_shape(n, &p) == 1 && path.count(&p) > 0) {
+        let is i32 as rule with mut = raster.NONZERO;
+        if (st.evenodd == 1) { rule = raster.EVENODD; }
+        _composite(o, &p, &st.m, &st.fill, st.fill_a * st.alpha, rule, &p);
+        _stroke(o, &p, &st);
+    }
+    path.close(&p);
+}
+
+// The picture of an <svg> element, into w by h RGBA pixels that start out empty.
+fn render(root0 as *u8, w as i64, h as i64, current as i64, out as *u8) as void {
+    let is *dom.Node as root = cast(*dom.Node, root0);
+    let is _Out as o with mut;
+    o.root = root;
+    o.w = w;
+    o.h = h;
+    o.current = current;
+    o.px = out;
+    let is _State as st with mut;
+    mem.memzero(cast(*u8, &st), sizeof(_State));
+    st.fill.kind = PAINT_COLOR;
+    st.fill.color = 4278190080;
+    st.stroke.kind = PAINT_NONE;
+    st.width = 1.0;
+    st.miter = 4.0;
+    st.fill_a = 1.0;
+    st.stroke_a = 1.0;
+    st.alpha = 1.0;
+    st.m = _ident();
+    let is f64 as bw = cast(f64, w);
+    let is f64 as bh = cast(f64, h);
+    let is *dom.Attr as vb = dom.find_attr(root, "viewBox", 7);
+    if (vb != null) {
+        let is [4]f64 as nums with mut;
+        let is i64 as at with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < 4 && _num(vb.value, vb.value_len, &at, &nums[k]) == 1) { k = k + 1; }
+        if (k == 4 && nums[2] > 0.0 && nums[3] > 0.0) {
+            let is f64 as sx with mut = bw / nums[2];
+            let is f64 as sy with mut = bh / nums[3];
+            let is *dom.Attr as par = dom.find_attr(root, "preserveAspectRatio", 19);
+            let is i64 as stretch = cast(i64, par != null && par.value_len >= 4 && decl.eq(par.value, 4, "none") == 1);
+            if (stretch == 0) {
+                let is f64 as s = _minf(sx, sy);
+                sx = s;
+                sy = s;
+            }
+            st.m.a = sx;
+            st.m.d = sy;
+            st.m.e = (bw - nums[2] * sx) / 2.0 - nums[0] * sx;
+            st.m.f = (bh - nums[3] * sy) / 2.0 - nums[1] * sy;
+        }
+    }
+    _take_state(&o, root, &st);
+    let is *dom.Node as x with mut = root.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT) { _element(&o, x, &st, 0); }
+        x = x.next;
+    }
+}

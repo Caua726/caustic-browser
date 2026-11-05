@@ -141,7 +141,8 @@ let is i64 as TOK_ERR_ALLOC with imut = 0 - 1;
 // ceilings a page cannot talk us past.
 let is i64 as INIT_TEXT  with imut = 65536;
 let is i64 as INIT_ARENA with imut = 65536;
-let is i64 as MAX_NAME   with imut = 1024;   // a tag or DOCTYPE name
+let is i64 as INIT_NAME  with imut = 4096;
+let is i64 as MAX_NAME   with imut = 1024;   // the start tag a text region remembers
 let is i64 as MAX_TMP    with imut = 4096;   // entity name, or end-tag name
 let is i64 as MAX_ATTRS  with imut = 512;
 let is i64 as MAX_ID     with imut = 4096;   // DOCTYPE public/system identifier
@@ -163,8 +164,11 @@ struct Tokenizer {
     textlen as i64;
     textcap as i64;
 
-    name    as [MAX_NAME]u8;  // tag name, DOCTYPE name, or comment data
+    // Tag name, DOCTYPE name, or comment data. It grows because nothing bounds a
+    // comment, and a license at the top of a page is usually one.
+    name    as *u8;
     namelen as i64;
+    namecap as i64;
     self_closing as i64;
 
     // The start tag that opened the current RCDATA/RAWTEXT/script region.
@@ -197,6 +201,10 @@ struct Tokenizer {
 
     num      as i64;          // numeric character reference accumulator
     num_over as i64;          // ...and whether it ran past U+10FFFF
+
+    // Is the adjusted current node foreign? Only the tree builder can know, and
+    // it decides what `<![CDATA[` means. See tok_set_cdata_ok.
+    cdata_ok as i64;
 
     errors as i64;
     inited as i64;
@@ -277,10 +285,15 @@ fn _arena_push(t as *Tokenizer, b as i64) as void {
 }
 
 fn _name_push(t as *Tokenizer, b as i64) as void {
-    if (t.namelen < MAX_NAME - 1) {
-        t.name[t.namelen] = cast(u8, b);
-        t.namelen = t.namelen + 1;
+    if (t.namelen + 1 > t.namecap) {
+        let is i64 as nc with mut = 0;
+        let is *u8 as p = _grow(t.name, t.namecap, t.namelen + 1, &nc);
+        if (cast(i64, p) == 0) { return; }
+        t.name = p;
+        t.namecap = nc;
     }
+    t.name[t.namelen] = cast(u8, b);
+    t.namelen = t.namelen + 1;
 }
 fn _tmp_push(t as *Tokenizer, b as i64) as void {
     if (t.tmplen < MAX_TMP - 2) {
@@ -383,6 +396,7 @@ fn tok_init(t as *Tokenizer, src as *u8, len as i64) as i64 {
     t.force_quirks = 0;
     t.num = 0; t.num_over = 0;
     t.errors = 0;
+    t.cdata_ok = 0;
     t.arenalen = 0;
 
     t.text = mem.core.mmap_anon(INIT_TEXT);
@@ -405,6 +419,19 @@ fn tok_init(t as *Tokenizer, src as *u8, len as i64) as i64 {
     }
     t.arenacap = INIT_ARENA;
 
+    t.name = mem.core.mmap_anon(INIT_NAME);
+    if (_map_ok(t.name) == 0) {
+        mem.core.munmap(t.arena, t.arenacap);
+        mem.core.munmap(t.text, t.textcap);
+        mem.core.munmap(t.src, t.owns_src);
+        t.src = cast(*u8, 0);
+        t.text = cast(*u8, 0);
+        t.arena = cast(*u8, 0);
+        t.name = cast(*u8, 0);
+        return TOK_ERR_ALLOC;
+    }
+    t.namecap = INIT_NAME;
+
     ent.ent_ensure();
     t.inited = 1;
     return 0;
@@ -415,9 +442,11 @@ fn tok_free(t as *Tokenizer) as void {
     if (cast(i64, t.text) != 0) { mem.core.munmap(t.text, t.textcap); }
     if (cast(i64, t.arena) != 0) { mem.core.munmap(t.arena, t.arenacap); }
     if (cast(i64, t.src) != 0) { mem.core.munmap(t.src, t.owns_src); }
+    if (cast(i64, t.name) != 0) { mem.core.munmap(t.name, t.namecap); }
     t.text = cast(*u8, 0);
     t.arena = cast(*u8, 0);
     t.src = cast(*u8, 0);
+    t.name = cast(*u8, 0);
     t.inited = 0;
 }
 
@@ -433,6 +462,9 @@ fn tok_set_last_start(t as *Tokenizer, name as *u8) as void {
     }
     t.last_start_len = i;
 }
+// `<![CDATA[` is a section only while the adjusted current node is foreign. The tree
+// builder says which before asking for each token.
+fn tok_set_cdata_ok(t as *Tokenizer, ok as i64) as void { t.cdata_ok = ok; }
 
 // --- attributes ----------------------------------------------------------
 fn _attr_start(t as *Tokenizer) as void {
@@ -645,8 +677,8 @@ fn _new_tag(t as *Tokenizer, kind as i64) as void {
 
 fn _remember_start(t as *Tokenizer) as void {
     let is i64 as i with mut = 0;
-    while (i < t.namelen) { t.last_start[i] = t.name[i]; i = i + 1; }
-    t.last_start_len = t.namelen;
+    while (i < t.namelen && i < MAX_NAME) { t.last_start[i] = t.name[i]; i = i + 1; }
+    t.last_start_len = i;
 }
 
 // Emit the tag being built, and remember it if it is a start tag.
@@ -1231,10 +1263,11 @@ fn _step(t as *Tokenizer) as void {
         if (_match_at(t, "doctype", 1) == 7) { t.pos = t.pos + 7; t.state = ST_DOCTYPE; return; }
         if (_match_at(t, "[CDATA[", 0) == 7) {
             // Legal only in foreign content, and the tokenizer does not know
-            // whether it is there — the tree builder does, and switches to
-            // ST_CDATA itself. Outside it the spec says bogus comment whose
+            // whether it is there — the tree builder does, and says so through
+            // tok_set_cdata_ok. Outside it the spec says bogus comment whose
             // data is "[CDATA[", which is this.
             t.pos = t.pos + 7;
+            if (t.cdata_ok == 1) { t.state = ST_CDATA; return; }
             t.errors = t.errors + 1;
             t.namelen = 0;
             _name_push(t, 91); _name_push(t, 67); _name_push(t, 68);
@@ -1737,7 +1770,7 @@ fn tok_next(t as *Tokenizer) as i64 {
 // --- reading the current token -------------------------------------------
 fn tok_text(t as *Tokenizer) as *u8 { return t.text; }
 fn tok_text_len(t as *Tokenizer) as i64 { return t.textlen; }
-fn tok_name(t as *Tokenizer) as *u8 { return cast(*u8, &t.name); }
+fn tok_name(t as *Tokenizer) as *u8 { return t.name; }
 fn tok_name_len(t as *Tokenizer) as i64 { return t.namelen; }
 fn tok_self_closing(t as *Tokenizer) as i64 { return t.self_closing; }
 fn tok_nattr(t as *Tokenizer) as i64 { return t.nattr; }

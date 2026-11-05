@@ -195,6 +195,14 @@ fn tab(t as *tree.Tree, parent as i64, title as *u8, n as i64) as i64 {
     return w;
 }
 
+// A new title for a tab. The text is not copied, so it has to outlive the tab.
+fn set_tab_title(t as *tree.Tree, w as i64, title as *u8, n as i64) as void {
+    let is *Tab as d = cast(*Tab, tree.data(t, w));
+    d.title = title;
+    d.n = n;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
 fn _scroller(t as *tree.Tree, w as i64) as i64 { return tree.parent(t, tree.parent(t, w)); }
 
 // Scrolled into view at the next layout, the first time a new tab has a place.

@@ -1,0 +1,308 @@
+// layout/box.cst — the tree layout works on, and what every part of layout shares.
+//
+// A box is what CSS draws: an element can have none, and text and anonymous wrappers
+// have no element. Where a box is depends on where its block formatting context is:
+//
+//   x, y   its border box, from the content box of the context it is in
+//   w, h   its content box
+//   ax, ay its border box from the page's corner, once everything is placed
+//
+// Boxes that establish a context can therefore be laid out and then moved by setting
+// their x and y, without touching anything inside. That is what makes shrink-to-fit,
+// tables and flexbox simple: they lay a box out, look at it, and put it somewhere.
+//
+// Table and flex layout call back into block layout, and block layout has to reach
+// them, and modules here cannot import each other in a circle. So block layout calls
+// them through the hooks below, which layout.cst fills in.
+
+use "../base/arena.cst" as arena;
+use "../css/style.cst" as style;
+use "../css/props.cst" as pr;
+use "../dom/dom.cst" as dom;
+use "../paint/display_list.cst" as dl;
+
+let is i64 as B_BLOCK    with imut = 1;
+let is i64 as B_INLINE   with imut = 2;
+let is i64 as B_TEXT     with imut = 3;
+let is i64 as B_BR       with imut = 4;
+let is i64 as B_REPLACED with imut = 5;
+let is i64 as B_TABLE    with imut = 6;
+let is i64 as B_ROWGROUP with imut = 7;
+let is i64 as B_ROW      with imut = 8;
+let is i64 as B_CELL     with imut = 9;
+let is i64 as B_CAPTION  with imut = 10;
+let is i64 as B_FLEX     with imut = 11;
+let is i64 as B_COL      with imut = 12;
+let is i64 as B_GRID     with imut = 13;
+
+let is i64 as FRAG_TEXT   with imut = 1;
+let is i64 as FRAG_BOX    with imut = 2;   // the part of an inline box on one line
+let is i64 as FRAG_ATOMIC with imut = 3;
+
+let is i64 as MARK_NONE   with imut = 0;
+let is i64 as MARK_TEXT   with imut = 1;
+let is i64 as MARK_DISC   with imut = 2;
+let is i64 as MARK_CIRCLE with imut = 3;
+let is i64 as MARK_SQUARE with imut = 4;
+let is i64 as MARK_IMAGE  with imut = 5;
+
+let is i64 as CTL_NONE   with imut = 0;
+let is i64 as CTL_CHECK  with imut = 1;
+let is i64 as CTL_RADIO  with imut = 2;
+let is i64 as CTL_RANGE  with imut = 3;
+let is i64 as CTL_COLOR  with imut = 4;
+let is i64 as CTL_DATE   with imut = 5;
+let is i64 as CTL_SELECT with imut = 6;
+
+let is i64 as TOP with imut = 0;
+let is i64 as RIGHT with imut = 1;
+let is i64 as BOTTOM with imut = 2;
+let is i64 as LEFT with imut = 3;
+
+// None yet: a baseline is a position, and any number can be one.
+let is f64 as NO_BASE with imut = 0.0 - 1000000000.0;
+
+struct Frag {
+    kind as i64;
+    box  as *Box;
+    x    as f64;    // from the context's content box, as a box's
+    y    as f64;
+    w    as f64;
+    h    as f64;
+    text as *u8;    // FRAG_TEXT
+    len  as i64;
+    asc  as f64;    // above the baseline, until the line is finished
+    shift as f64;   // how far its baseline is above the line's
+    next as *Frag;
+}
+
+struct Item {
+    kind as i64;
+    box  as *Box;
+    text as *u8;
+    len  as i64;
+    w    as f64;
+}
+
+struct Box {
+    kind   as i64;
+    node   as *dom.Node;     // null for what has no element
+    st     as *style.Style;
+    parent as *Box;
+    first  as *Box;
+    last   as *Box;
+    next   as *Box;
+
+    atomic     as i64;   // lays out inside, sits in a line as one piece: inline-block and the like
+    is_float   as i64;
+    is_abs     as i64;
+    is_fixed   as i64;
+    flex_item  as i64;
+    inline_ctx as i64;   // its children are lines, not blocks
+    anon       as i64;
+
+    x as f64;
+    y as f64;
+    w as f64;
+    h as f64;
+    ax as f64;
+    ay as f64;
+    m as [4]f64;
+    b as [4]f64;
+    p as [4]f64;
+
+    def_h  as f64;       // its content height when known in advance, else negative
+    min_cw as f64;       // its intrinsic widths, content box, negative until asked
+    max_cw as f64;
+    first_base as f64;   // from its context's content box
+    last_base  as f64;
+
+    // Block margins that may yet collapse hold this box's y back.
+    awaiting   as i64;
+    await_next as *Box;
+
+    // Static position of what is out of flow, from its context's content box.
+    sx as f64;
+    sy as f64;
+
+    // The origin its own position is measured from, and the one for what is inside it
+    // and for its fragments, on the page, once placed.
+    ox as f64;
+    oy as f64;
+    kx as f64;
+    ky as f64;
+
+    // How far what is inside it can be scrolled, when it clips.
+    max_sx as f64;
+    max_sy as f64;
+
+    // Inline content.
+    text    as *u8;      // B_TEXT, whitespace already collapsed
+    tlen    as i64;
+    items   as *Item;
+    nitems  as i64;
+    frags   as *Frag;
+    frag_end as *Frag;
+
+    // What a replaced box or a form control is by itself.
+    img      as *dl.Image;
+    iw       as f64;
+    ih       as f64;
+    ratio    as f64;     // width over height, when that is known and the size is not: an <svg>
+    control  as i64;     // CTL_*
+    vcenter  as i64;     // what is in it sits in the middle of its height, as in a button
+    checked  as i64;
+
+    // List items.
+    marker   as i64;
+    mtext    as *u8;
+    mlen     as i64;
+    mimg     as *dl.Image;
+
+    // Tables.
+    col     as i64;
+    row     as i64;
+    colspan as i64;
+    rowspan as i64;
+
+    // Flex items, while their container works on them.
+    main      as f64;
+    base      as f64;
+    hypo      as f64;
+    frozen    as i64;
+    next_item as *Box;
+}
+
+// Something painted, in the order it was, so that what is on top at a point is the last one
+// there. Coordinates are from the page's corner, or the window's for what is fixed, and they
+// are the ones before inv, the way back out of any transform it is under.
+struct HitItem {
+    x     as f64;
+    y     as f64;
+    w     as f64;
+    h     as f64;
+    cx0   as f64;      // the clip it was painted under
+    cy0   as f64;
+    cx1   as f64;
+    cy1   as f64;
+    node  as *dom.Node;
+    box   as *Box;
+    text  as i64;
+    fixed as i64;
+    inv   as *[6]f64;  // null when nothing transforms it
+}
+
+struct Ctx {
+    a      as *arena.Arena;   // boxes, fragments, and strings made for them
+    hits   as *HitItem;       // from that arena, gone with it
+    nhits  as i64;
+    caphits as i64;
+    e      as *style.Engine;
+    vw     as f64;
+    vh     as f64;
+    doc_w  as f64;            // how far what was placed reached
+    doc_h  as f64;
+    ext_r  as f64;            // and so far, within the nearest thing that clips
+    ext_b  as f64;
+    images as ImageFn;
+    user   as *u8;
+    base   as *u8;
+}
+
+// The image at this URL if the page has loaded it, else null.
+type ImageFn = fn(*u8, *u8, i64) as *dl.Image;
+
+type LayoutFn = fn(*Ctx, *Box) as void;
+type WidthsFn = fn(*Ctx, *Box) as void;
+
+let is LayoutFn as table_layout with mut = cast(LayoutFn, 0);
+let is LayoutFn as flex_layout  with mut = cast(LayoutFn, 0);
+let is LayoutFn as grid_layout  with mut = cast(LayoutFn, 0);
+let is WidthsFn as table_widths with mut = cast(WidthsFn, 0);
+let is WidthsFn as flex_widths  with mut = cast(WidthsFn, 0);
+let is WidthsFn as grid_widths  with mut = cast(WidthsFn, 0);
+
+fn alloc_box(c as *Ctx, kind as i64, node as *dom.Node, st as *style.Style) as *Box {
+    let is *Box as b = cast(*Box, arena.alloc(c.a, sizeof(Box)));
+    b.kind = kind;
+    b.node = node;
+    b.st = st;
+    b.def_h = 0.0 - 1.0;
+    b.min_cw = 0.0 - 1.0;
+    b.max_cw = 0.0 - 1.0;
+    b.first_base = NO_BASE;
+    b.last_base = NO_BASE;
+    b.colspan = 1;
+    b.rowspan = 1;
+    return b;
+}
+
+fn append(parent as *Box, c as *Box) as void {
+    c.parent = parent;
+    c.next = cast(*Box, 0);
+    if (parent.last == null) { parent.first = c; }
+    else { parent.last.next = c; }
+    parent.last = c;
+}
+
+// Takes c's children away from it, handing back the first.
+fn take_children(b as *Box) as *Box {
+    let is *Box as f = b.first;
+    b.first = cast(*Box, 0);
+    b.last = cast(*Box, 0);
+    return f;
+}
+
+// Whether this box takes up room among blocks, as opposed to being out of flow or in a line.
+fn is_block_level(b as *Box) as i64 {
+    if (b.is_float == 1 || b.is_abs == 1 || b.atomic == 1) { return 0; }
+    if (b.kind == B_INLINE || b.kind == B_TEXT || b.kind == B_BR) { return 0; }
+    return 1;
+}
+
+fn is_inline_level(b as *Box) as i64 {
+    if (b.is_float == 1 || b.is_abs == 1) { return 0; }
+    if (b.atomic == 1 || b.kind == B_INLINE || b.kind == B_TEXT || b.kind == B_BR) { return 1; }
+    return 0;
+}
+
+fn is_out_of_flow(b as *Box) as i64 {
+    if (b.is_float == 1 || b.is_abs == 1) { return 1; }
+    return 0;
+}
+
+fn border_w(b as *Box) as f64 { return b.b[LEFT] + b.p[LEFT] + b.w + b.p[RIGHT] + b.b[RIGHT]; }
+fn border_h(b as *Box) as f64 { return b.b[TOP] + b.p[TOP] + b.h + b.p[BOTTOM] + b.b[BOTTOM]; }
+fn margin_w(b as *Box) as f64 { return b.m[LEFT] + border_w(b) + b.m[RIGHT]; }
+fn margin_h(b as *Box) as f64 { return b.m[TOP] + border_h(b) + b.m[BOTTOM]; }
+
+fn edges_w(b as *Box) as f64 { return b.b[LEFT] + b.p[LEFT] + b.p[RIGHT] + b.b[RIGHT]; }
+fn edges_h(b as *Box) as f64 { return b.b[TOP] + b.p[TOP] + b.p[BOTTOM] + b.b[BOTTOM]; }
+
+fn prop(b as *Box, p as i64) as i64 { return b.st.v.i[p]; }
+
+// A length property against a containing size. A negative base means the size is not
+// known yet, which makes a percentage zero.
+fn resolve(b as *Box, p as i64, base as f64) as f64 {
+    let is *pr.Values as v0 = &b.st.v;
+    if (v0.i[p] != 0 && v0.i[p] != pr.K_NUMBER) { return 0.0; }
+    if (base < 0.0) { return v0.f[p]; }
+    if (b.st.late != null) {
+        let is *style.Late as l = style.late_of(b.st, p);
+        if (l != null) { return style.late_value(l, base); }
+    }
+    return v0.f[p] + v0.p[p] * base / 100.0;
+}
+
+// Whether a length property holds a length, as opposed to auto or none.
+fn is_len(b as *Box, p as i64) as i64 {
+    if (b.st.v.i[p] == 0) { return 1; }
+    return 0;
+}
+
+// A length with a percentage, whose percentage of an unknown size means auto.
+fn is_definite(b as *Box, p as i64, base as f64) as i64 {
+    if (b.st.v.i[p] != 0) { return 0; }
+    if (b.st.v.p[p] != 0.0 && base < 0.0) { return 0; }
+    return 1;
+}

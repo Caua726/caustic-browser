@@ -1,0 +1,258 @@
+// css/dump.cst — a page's stylesheets as text, one rule to a block.
+//
+//     browser --dump-css FILE
+//
+// Selectors come back rebuilt from what was parsed, and declarations as longhands, so
+// what this prints is what the browser understood, not what the page said. Anything
+// missing from a rule was dropped as invalid or unknown.
+
+use "std/io.cst" as io;
+use "./props.cst" as pr;
+use "./values.cst" as v;
+use "./sheet.cst" as sh;
+
+let is i64 as BUF with imut = 65536;
+let is [BUF]u8 as _buf with mut;
+
+fn _put(w as *io.Writer, s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        io.put(w, s[i]);
+        i = i + 1;
+    }
+}
+
+fn _word_at(w as *io.Writer, list as *u8, k as i64) as void {
+    let is i64 as at with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < k) {
+        while (list[at] != 32) { at = at + 1; }
+        at = at + 1;
+        i = i + 1;
+    }
+    while (list[at] != 32 && list[at] != 0) {
+        io.put(w, list[at]);
+        at = at + 1;
+    }
+}
+
+fn _bytes(w as *io.Writer, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        io.put(w, s[i]);
+        i = i + 1;
+    }
+}
+
+fn _int(w as *io.Writer, v0 as i64) as void {
+    let is i64 as x with mut = v0;
+    if (x < 0) {
+        io.put(w, cast(u8, 45));
+        x = 0 - x;
+    }
+    let is [24]u8 as t with mut;
+    let is i64 as n with mut = 0;
+    if (x == 0) {
+        t[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        t[n] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        io.put(w, t[n]);
+    }
+}
+
+// Two decimals is all a length here needs to be recognised.
+fn _num(w as *io.Writer, x0 as f64) as void {
+    let is f64 as x with mut = x0;
+    if (x < 0.0) {
+        io.put(w, cast(u8, 45));
+        x = 0.0 - x;
+    }
+    let is i64 as whole = cast(i64, x);
+    let is i64 as frac = cast(i64, (x - cast(f64, whole)) * 100.0 + 0.5);
+    _int(w, whole);
+    if (frac > 0) {
+        io.put(w, cast(u8, 46));
+        if (frac < 10) { io.put(w, cast(u8, 48)); }
+        _int(w, frac);
+    }
+}
+
+fn _hex2(w as *io.Writer, b as i64) as void {
+    let is *u8 as d = "0123456789abcdef";
+    io.put(w, d[(b >> 4) & 15]);
+    io.put(w, d[b & 15]);
+}
+
+fn _len_part(w as *io.Writer, first as *i64, x as f64, unit as *u8) as void {
+    if (x == 0.0) { return; }
+    if (*first == 0) { _put(w, " + "); }
+    *first = 0;
+    _num(w, x);
+    _put(w, unit);
+}
+
+fn _value(w as *io.Writer, val as *v.Value) as void {
+    let is i64 as k = val.kind;
+    if (k == v.V_KW || k == v.V_GLOBAL) {
+        _word_at(w, pr._KEYWORDS, val.kw - 1);
+        return;
+    }
+    if (k == v.V_NUM) {
+        _num(w, val.num);
+        return;
+    }
+    if (k == v.V_COLOR) {
+        if (val.color == v.COLOR_CURRENT) {
+            _put(w, "currentcolor");
+            return;
+        }
+        io.put(w, cast(u8, 35));
+        _hex2(w, (val.color >> 16) & 255);
+        _hex2(w, (val.color >> 8) & 255);
+        _hex2(w, val.color & 255);
+        let is i64 as a = (val.color >> 24) & 255;
+        if (a != 255) { _hex2(w, a); }
+        return;
+    }
+    if (k == v.V_STR) {
+        io.put(w, cast(u8, 34));
+        _bytes(w, val.s, val.n);
+        io.put(w, cast(u8, 34));
+        return;
+    }
+    if (k == v.V_URL) {
+        _put(w, "url(");
+        _bytes(w, val.s, val.n);
+        io.put(w, cast(u8, 41));
+        return;
+    }
+    if (k == v.V_LEN) {
+        let is i64 as first with mut = 1;
+        _len_part(w, &first, val.len.px, "px");
+        _len_part(w, &first, val.len.pct, "%");
+        _len_part(w, &first, val.len.em, "em");
+        _len_part(w, &first, val.len.rem, "rem");
+        _len_part(w, &first, val.len.vw, "vw");
+        _len_part(w, &first, val.len.vh, "vh");
+        if (first == 1) { io.put(w, cast(u8, 48)); }
+    }
+}
+
+fn _simple(w as *io.Writer, s as *sh.Simple) as void {
+    let is i64 as k = s.kind;
+    if (k == sh.S_TYPE) { _bytes(w, s.s, s.n); return; }
+    if (k == sh.S_ANY) { io.put(w, cast(u8, 42)); return; }
+    if (k == sh.S_ID) { io.put(w, cast(u8, 35)); _bytes(w, s.s, s.n); return; }
+    if (k == sh.S_CLASS) { io.put(w, cast(u8, 46)); _bytes(w, s.s, s.n); return; }
+    if (k == sh.S_ATTR) {
+        io.put(w, cast(u8, 91));
+        _bytes(w, s.s, s.n);
+        if (s.op != sh.A_HAS) {
+            if (s.op == sh.A_WORD) { io.put(w, cast(u8, 126)); }
+            if (s.op == sh.A_DASH) { io.put(w, cast(u8, 124)); }
+            if (s.op == sh.A_PREFIX) { io.put(w, cast(u8, 94)); }
+            if (s.op == sh.A_SUFFIX) { io.put(w, cast(u8, 36)); }
+            if (s.op == sh.A_SUBSTR) { io.put(w, cast(u8, 42)); }
+            _put(w, "=\"");
+            _bytes(w, s.val, s.val_n);
+            io.put(w, cast(u8, 34));
+        }
+        io.put(w, cast(u8, 93));
+        return;
+    }
+    if (k == sh.S_ROOT) { _put(w, ":root"); return; }
+    if (k == sh.S_EMPTY) { _put(w, ":empty"); return; }
+    if (k == sh.S_LINK) { _put(w, ":link"); return; }
+    if (k == sh.S_NEVER) { _put(w, ":(never)"); return; }
+    if (k == sh.S_HOVER) { _put(w, ":hover"); return; }
+    if (k == sh.S_ACTIVE) { _put(w, ":active"); return; }
+    if (k == sh.S_FOCUS) { _put(w, ":focus"); return; }
+    if (k == sh.S_FOCUS_WITHIN) { _put(w, ":focus-within"); return; }
+    if (k == sh.S_FOCUS_VISIBLE) { _put(w, ":focus-visible"); return; }
+    if (k == sh.S_TARGET) { _put(w, ":target"); return; }
+    if (k == sh.S_ONLY) { _put(w, ":only-child"); return; }
+    if (k == sh.S_ONLY_TYPE) { _put(w, ":only-of-type"); return; }
+    if (k == sh.S_CHECKED) { _put(w, ":checked"); return; }
+    if (k == sh.S_DISABLED) { _put(w, ":disabled"); return; }
+    if (k == sh.S_ENABLED) { _put(w, ":enabled"); return; }
+    if (k == sh.S_NTH || k == sh.S_NTH_LAST || k == sh.S_NTH_TYPE || k == sh.S_NTH_LAST_TYPE) {
+        if (k == sh.S_NTH) { _put(w, ":nth-child("); }
+        if (k == sh.S_NTH_LAST) { _put(w, ":nth-last-child("); }
+        if (k == sh.S_NTH_TYPE) { _put(w, ":nth-of-type("); }
+        if (k == sh.S_NTH_LAST_TYPE) { _put(w, ":nth-last-of-type("); }
+        _int(w, s.a);
+        _put(w, "n+");
+        _int(w, s.b);
+        io.put(w, cast(u8, 41));
+        return;
+    }
+    if (k == sh.S_NOT) { _put(w, ":not("); }
+    if (k == sh.S_IS) { _put(w, ":is("); }
+    if (k == sh.S_HAS) { _put(w, ":has("); }
+    _list(w, s.sub);
+    io.put(w, cast(u8, 41));
+}
+
+fn _compound(w as *io.Writer, c as *sh.Compound) as void {
+    if (c.left != null) {
+        _compound(w, c.left);
+        if (c.comb == sh.C_DESCENDANT) { io.put(w, cast(u8, 32)); }
+        if (c.comb == sh.C_CHILD) { _put(w, " > "); }
+        if (c.comb == sh.C_ADJACENT) { _put(w, " + "); }
+        if (c.comb == sh.C_SIBLING) { _put(w, " ~ "); }
+    }
+    let is *sh.Simple as s with mut = c.first;
+    while (s != null) {
+        // ::before keeps a universal simple selector that only marks its place.
+        if (!(s.kind == sh.S_ANY && s.next == null && c.left == null && s != c.first)) { _simple(w, s); }
+        s = s.next;
+    }
+}
+
+fn _list(w as *io.Writer, l as *sh.Selector) as void {
+    let is *sh.Selector as x with mut = l;
+    while (x != null) {
+        _compound(w, x.right);
+        if (x.pseudo == sh.PSEUDO_BEFORE) { _put(w, "::before"); }
+        if (x.pseudo == sh.PSEUDO_AFTER) { _put(w, "::after"); }
+        if (x.next != null) { _put(w, ", "); }
+        x = x.next;
+    }
+}
+
+fn dump(s as *sh.Sheet, fd as i64) as void {
+    let is io.Writer as wr with mut = io.Writer(fd, cast(*u8, &_buf), BUF);
+    let is *io.Writer as w = &wr;
+    let is *sh.Rule as r with mut = s.first;
+    while (r != null) {
+        _list(w, r.selectors);
+        if (r.media != null) { _put(w, " /* under @media */"); }
+        _put(w, " {\n");
+        let is i64 as k with mut = 0;
+        while (k < r.decls.n) {
+            let is *v.Decl as d = &r.decls.d[k];
+            _put(w, "  ");
+            if (d.prop >= 0) {
+                _word_at(w, pr._PROPS, d.prop);
+                _put(w, ": ");
+                _value(w, &d.val);
+            } else {
+                _bytes(w, d.name, d.name_n);
+                _put(w, ": (var)");
+            }
+            if (d.important == 1) { _put(w, " !important"); }
+            _put(w, ";\n");
+            k = k + 1;
+        }
+        _put(w, "}\n");
+        r = r.next;
+    }
+    io.flush(w);
+}

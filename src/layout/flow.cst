@@ -1,0 +1,1553 @@
+// layout/flow.cst — normal flow: blocks stacked in a formatting context, floats beside
+// them, and lines of text.
+//
+// Margins are why this is not simply a recursion that returns heights. Two adjacent
+// margins collapse, including through the top of a parent into its first child, so
+// while they might still collapse no one knows where the box below them starts. The
+// context therefore keeps a pending margin, and boxes that begin there wait on a list
+// for a y. The first thing with a real edge settles it for all of them at once.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "../dom/dom.cst" as dom;
+use "./box.cst" as bx;
+use "./measure.cst" as m;
+use "std/mem.cst" as mem;
+
+let is i64 as MAX_OPEN with imut = 64;
+
+let is i64 as I_WORD   with imut = 1;
+let is i64 as I_SPACE  with imut = 2;
+let is i64 as I_OPEN   with imut = 3;
+let is i64 as I_CLOSE  with imut = 4;
+let is i64 as I_ATOMIC with imut = 5;
+let is i64 as I_BREAK  with imut = 6;
+let is i64 as I_FLOAT  with imut = 7;
+let is i64 as I_ABS    with imut = 8;
+
+struct FloatRec {
+    x as f64;
+    y as f64;
+    w as f64;
+    h as f64;
+    left as i64;
+}
+
+struct Bfc {
+    y      as f64;     // the running bottom of what has been placed
+    mpos   as f64;     // the margins waiting to collapse: the largest
+    mneg   as f64;     // and the most negative
+    await  as *bx.Box;
+    fl     as *FloatRec;
+    nfl    as i64;
+    capfl  as i64;
+    floor  as f64;     // a float may not start above the top of an earlier one
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn bfc_init(f as *Bfc) as void {
+    f.y = 0.0;
+    f.mpos = 0.0;
+    f.mneg = 0.0;
+    f.await = cast(*bx.Box, 0);
+    f.fl = cast(*FloatRec, 0);
+    f.nfl = 0;
+    f.capfl = 0;
+    f.floor = 0.0;
+}
+
+fn _margin(f as *Bfc, v as f64) as void {
+    if (v > f.mpos) { f.mpos = v; }
+    if (v < f.mneg) { f.mneg = v; }
+}
+
+fn _pending(f as *Bfc) as f64 { return f.mpos + f.mneg; }
+
+// The margins resolve here: everything waiting on them starts at this y.
+fn _flush(f as *Bfc) as void {
+    f.y = f.y + _pending(f);
+    f.mpos = 0.0;
+    f.mneg = 0.0;
+    let is *bx.Box as x with mut = f.await;
+    while (x != null) {
+        let is *bx.Box as next = x.await_next;
+        x.y = f.y;
+        x.awaiting = 0;
+        x.await_next = cast(*bx.Box, 0);
+        x = next;
+    }
+    f.await = cast(*bx.Box, 0);
+}
+
+// --- Sizes ---
+
+// A box's margins, borders and padding against the width of what holds it.
+fn edges(b as *bx.Box, cw as f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        b.m[k] = 0.0;
+        if (s.i[pr.P_MARGIN_TOP + k] == 0) { b.m[k] = bx.resolve(b, pr.P_MARGIN_TOP + k, cw); }
+        b.p[k] = _max(bx.resolve(b, pr.P_PADDING_TOP + k, cw), 0.0);
+        let is i64 as bs = s.i[pr.P_BORDER_TOP_STYLE + k];
+        b.b[k] = 0.0;
+        if (bs != pr.K_NONE && bs != pr.K_HIDDEN) { b.b[k] = _max(s.f[pr.P_BORDER_TOP_WIDTH + k], 0.0); }
+        k = k + 1;
+    }
+    // A cell has no margin of its own in a table's grid.
+    if (b.kind == bx.B_CELL) {
+        k = 0;
+        while (k < 4) {
+            b.m[k] = 0.0;
+            k = k + 1;
+        }
+    }
+}
+
+fn _box_sized(b as *bx.Box) as i64 {
+    if (bx.prop(b, pr.P_BOX_SIZING) == pr.K_BORDER_BOX) { return 1; }
+    return 0;
+}
+
+fn clamp_w(b as *bx.Box, w0 as f64, cw as f64) as f64 {
+    let is f64 as w with mut = w0;
+    if (bx.is_definite(b, pr.P_MAX_WIDTH, cw) == 1) {
+        let is f64 as mx with mut = bx.resolve(b, pr.P_MAX_WIDTH, cw);
+        if (_box_sized(b) == 1) { mx = mx - bx.edges_w(b); }
+        if (w > mx) { w = mx; }
+    }
+    if (bx.is_definite(b, pr.P_MIN_WIDTH, cw) == 1) {
+        let is f64 as mn with mut = bx.resolve(b, pr.P_MIN_WIDTH, cw);
+        if (_box_sized(b) == 1) { mn = mn - bx.edges_w(b); }
+        if (w < mn) { w = mn; }
+    }
+    if (w < 0.0) { w = 0.0; }
+    return w;
+}
+
+fn clamp_h(b as *bx.Box, h0 as f64, ch as f64) as f64 {
+    let is f64 as h with mut = h0;
+    if (bx.is_definite(b, pr.P_MAX_HEIGHT, ch) == 1) {
+        let is f64 as mx with mut = bx.resolve(b, pr.P_MAX_HEIGHT, ch);
+        if (_box_sized(b) == 1) { mx = mx - bx.edges_h(b); }
+        if (h > mx) { h = mx; }
+    }
+    if (bx.is_definite(b, pr.P_MIN_HEIGHT, ch) == 1) {
+        let is f64 as mn with mut = bx.resolve(b, pr.P_MIN_HEIGHT, ch);
+        if (_box_sized(b) == 1) { mn = mn - bx.edges_h(b); }
+        if (h < mn) { h = mn; }
+    }
+    if (h < 0.0) { h = 0.0; }
+    return h;
+}
+
+// Its content width if the page gave one that means something here.
+fn specified_w(b as *bx.Box, cw as f64, out as *f64) as i64 {
+    if (bx.is_definite(b, pr.P_WIDTH, cw) == 0) { return 0; }
+    let is f64 as w with mut = bx.resolve(b, pr.P_WIDTH, cw);
+    if (_box_sized(b) == 1) { w = w - bx.edges_w(b); }
+    *out = _max(w, 0.0);
+    return 1;
+}
+
+// And likewise its height, which also says what a percentage inside it means.
+fn specified_h(b as *bx.Box, ch as f64) as f64 {
+    if (bx.is_definite(b, pr.P_HEIGHT, ch) == 0) { return 0.0 - 1.0; }
+    let is f64 as h with mut = bx.resolve(b, pr.P_HEIGHT, ch);
+    if (_box_sized(b) == 1) { h = h - bx.edges_h(b); }
+    return _max(h, 0.0);
+}
+
+fn _is_root(b as *bx.Box) as i64 {
+    if (b.kind == bx.B_TABLE || b.kind == bx.B_FLEX || b.kind == bx.B_GRID || b.kind == bx.B_REPLACED || b.kind == bx.B_CELL || b.kind == bx.B_CAPTION) { return 1; }
+    if (b.atomic == 1 || b.is_float == 1 || b.is_abs == 1 || b.flex_item == 1) { return 1; }
+    let is *pr.Values as s = &b.st.v;
+    if (s.i[pr.P_OVERFLOW_X] != pr.K_VISIBLE || s.i[pr.P_OVERFLOW_Y] != pr.K_VISIBLE) { return 1; }
+    if (s.i[pr.P_DISPLAY] == pr.K_FLOW_ROOT) { return 1; }
+    if (b.vcenter == 1) { return 1; }
+    if (s.i[pr.P_COLUMN_COUNT] != pr.K_AUTO || s.i[pr.P_COLUMN_WIDTH] != pr.K_AUTO) { return 1; }
+    return 0;
+}
+
+fn is_context_root(b as *bx.Box) as i64 { return _is_root(b); }
+
+// --- Intrinsic widths ---
+
+fn _outer_edges(b as *bx.Box) as f64 {
+    // Percentages are of a size not known yet, so they count as nothing here.
+    let is *pr.Values as s = &b.st.v;
+    let is f64 as e with mut = 0.0;
+    if (s.i[pr.P_MARGIN_LEFT] == 0) { e = e + s.f[pr.P_MARGIN_LEFT]; }
+    if (s.i[pr.P_MARGIN_RIGHT] == 0) { e = e + s.f[pr.P_MARGIN_RIGHT]; }
+    e = e + _max(s.f[pr.P_PADDING_LEFT], 0.0) + _max(s.f[pr.P_PADDING_RIGHT], 0.0);
+    if (s.i[pr.P_BORDER_LEFT_STYLE] != pr.K_NONE && s.i[pr.P_BORDER_LEFT_STYLE] != pr.K_HIDDEN) { e = e + s.f[pr.P_BORDER_LEFT_WIDTH]; }
+    if (s.i[pr.P_BORDER_RIGHT_STYLE] != pr.K_NONE && s.i[pr.P_BORDER_RIGHT_STYLE] != pr.K_HIDDEN) { e = e + s.f[pr.P_BORDER_RIGHT_WIDTH]; }
+    return e;
+}
+
+fn _replaced_w(b as *bx.Box) as f64 {
+    if (bx.is_definite(b, pr.P_WIDTH, 0.0 - 1.0) == 1) {
+        let is f64 as w with mut = bx.resolve(b, pr.P_WIDTH, 0.0 - 1.0);
+        if (_box_sized(b) == 1) { w = w - _edges_guess(b); }
+        return _max(w, 0.0);
+    }
+    if (bx.is_definite(b, pr.P_HEIGHT, 0.0 - 1.0) == 1 && b.ih > 0.0) {
+        return bx.resolve(b, pr.P_HEIGHT, 0.0 - 1.0) * b.iw / b.ih;
+    }
+    return b.iw;
+}
+
+fn _edges_guess(b as *bx.Box) as f64 {
+    let is *pr.Values as s = &b.st.v;
+    return _max(s.f[pr.P_PADDING_LEFT], 0.0) + _max(s.f[pr.P_PADDING_RIGHT], 0.0);
+}
+
+// What a child adds to the width of whatever holds it, in each sense.
+fn outer_min(c as *bx.Ctx, b as *bx.Box) as f64 {
+    if (b.kind == bx.B_REPLACED) {
+        // A percentage width lets an image shrink to nothing, and so does having no size.
+        if (b.st.v.p[pr.P_WIDTH] != 0.0 || b.st.v.p[pr.P_MAX_WIDTH] != 0.0) { return _outer_edges(b); }
+        if (b.iw == 0.0 && b.ratio > 0.0 && bx.is_len(b, pr.P_WIDTH) == 0) { return _outer_edges(b); }
+        return _replaced_w(b) + _outer_edges(b);
+    }
+    let is f64 as w with mut = 0.0;
+    if (specified_w(b, 0.0 - 1.0, &w) == 1) {
+        if (_box_sized(b) == 1) { return w + _outer_margins(b); }
+        return w + _outer_edges(b);
+    }
+    intrinsic(c, b);
+    return b.min_cw + _outer_edges(b);
+}
+
+fn outer_max(c as *bx.Ctx, b as *bx.Box) as f64 {
+    if (b.kind == bx.B_REPLACED) {
+        if (b.iw == 0.0 && b.ratio > 0.0 && bx.is_len(b, pr.P_WIDTH) == 0) { return 300.0 + _outer_edges(b); }
+        return _replaced_w(b) + _outer_edges(b);
+    }
+    let is f64 as w with mut = 0.0;
+    if (specified_w(b, 0.0 - 1.0, &w) == 1) {
+        if (_box_sized(b) == 1) { return w + _outer_margins(b); }
+        return w + _outer_edges(b);
+    }
+    intrinsic(c, b);
+    let is f64 as mw with mut = b.max_cw;
+    if (b.st.v.i[pr.P_MAX_WIDTH] == 0 && b.st.v.p[pr.P_MAX_WIDTH] == 0.0 && b.st.v.f[pr.P_MAX_WIDTH] < mw) {
+        mw = b.st.v.f[pr.P_MAX_WIDTH];
+    }
+    return mw + _outer_edges(b);
+}
+
+fn _outer_margins(b as *bx.Box) as f64 {
+    let is *pr.Values as s = &b.st.v;
+    let is f64 as e with mut = 0.0;
+    if (s.i[pr.P_MARGIN_LEFT] == 0) { e = e + s.f[pr.P_MARGIN_LEFT]; }
+    if (s.i[pr.P_MARGIN_RIGHT] == 0) { e = e + s.f[pr.P_MARGIN_RIGHT]; }
+    return e;
+}
+
+// Fills in b's narrowest and widest useful content widths.
+fn intrinsic(c as *bx.Ctx, b as *bx.Box) as void {
+    if (b.min_cw >= 0.0) { return; }
+    if (b.kind == bx.B_TABLE) {
+        call(bx.table_widths, c, b);
+        return;
+    }
+    if (b.kind == bx.B_FLEX) {
+        call(bx.flex_widths, c, b);
+        return;
+    }
+    if (b.kind == bx.B_GRID) {
+        call(bx.grid_widths, c, b);
+        return;
+    }
+    if (b.kind == bx.B_REPLACED) {
+        b.min_cw = _replaced_w(b);
+        b.max_cw = b.min_cw;
+        return;
+    }
+    let is f64 as lo with mut = 0.0;
+    let is f64 as hi with mut = 0.0;
+    if (b.inline_ctx == 1) {
+        _ensure_items(c, b);
+        _inline_widths(c, b, &lo, &hi);
+    } else {
+        let is f64 as float_run with mut = 0.0;
+        let is *bx.Box as x with mut = b.first;
+        while (x != null) {
+            if (x.is_abs == 1) { x = x.next; continue; }
+            let is f64 as a = outer_min(c, x);
+            let is f64 as d = outer_max(c, x);
+            lo = _max(lo, a);
+            if (x.is_float == 1) {
+                float_run = float_run + d;
+                hi = _max(hi, float_run);
+            } else {
+                float_run = 0.0;
+                hi = _max(hi, d);
+            }
+            x = x.next;
+        }
+    }
+    if (b.iw > 0.0 && b.kind == bx.B_BLOCK) {
+        lo = b.iw;
+        hi = b.iw;
+    }
+    b.min_cw = lo;
+    b.max_cw = _max(hi, lo);
+}
+
+fn _can_wrap(st as *style.Style) as i64 {
+    let is i64 as ws = st.v.i[pr.P_WHITE_SPACE];
+    if (ws == pr.K_NOWRAP || ws == pr.K_PRE) { return 0; }
+    return 1;
+}
+
+fn _inline_widths(c as *bx.Ctx, b as *bx.Box, lo as *f64, hi as *f64) as void {
+    let is f64 as line with mut = 0.0;
+    let is f64 as run with mut = 0.0;     // since the last place a line could break
+    let is f64 as best_lo with mut = 0.0;
+    let is f64 as best_hi with mut = 0.0;
+    let is i64 as pending_space with mut = 0;
+    let is f64 as sw with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < b.nitems) {
+        let is *bx.Item as it = &b.items[k];
+        k = k + 1;
+        let is i64 as kd = it.kind;
+        if (kd == I_SPACE) {
+            if (line > 0.0) {
+                pending_space = 1;
+                sw = it.w;
+            }
+            if (_can_wrap(it.box.st) == 1) {
+                best_lo = _max(best_lo, run);
+                run = 0.0;
+            }
+            continue;
+        }
+        if (kd == I_WORD) {
+            if (pending_space == 1) {
+                line = line + sw;
+                if (_can_wrap(it.box.st) == 0) { run = run + sw; }
+                pending_space = 0;
+            }
+            line = line + it.w;
+            // Pieces of one word still have a place to break between them.
+            if (it.len > 0 && _can_wrap(it.box.st) == 1 && _breaks_after(it.text, it.len) == 1) {
+                run = run + it.w;
+                best_lo = _max(best_lo, run);
+                run = 0.0;
+            } else {
+                run = run + it.w;
+            }
+            continue;
+        }
+        if (kd == I_OPEN || kd == I_CLOSE) {
+            let is *bx.Box as x = it.box;
+            let is f64 as e with mut = 0.0;
+            let is *pr.Values as s = &x.st.v;
+            if (kd == I_OPEN) {
+                if (s.i[pr.P_MARGIN_LEFT] == 0) { e = s.f[pr.P_MARGIN_LEFT]; }
+                e = e + s.f[pr.P_PADDING_LEFT];
+                if (s.i[pr.P_BORDER_LEFT_STYLE] != pr.K_NONE) { e = e + s.f[pr.P_BORDER_LEFT_WIDTH]; }
+            } else {
+                if (s.i[pr.P_MARGIN_RIGHT] == 0) { e = s.f[pr.P_MARGIN_RIGHT]; }
+                e = e + s.f[pr.P_PADDING_RIGHT];
+                if (s.i[pr.P_BORDER_RIGHT_STYLE] != pr.K_NONE) { e = e + s.f[pr.P_BORDER_RIGHT_WIDTH]; }
+            }
+            line = line + e;
+            run = run + e;
+            continue;
+        }
+        if (kd == I_ATOMIC) {
+            let is f64 as a = outer_min(c, it.box);
+            let is f64 as d = outer_max(c, it.box);
+            if (pending_space == 1) {
+                line = line + sw;
+                pending_space = 0;
+            }
+            best_lo = _max(best_lo, run);
+            run = 0.0;
+            best_lo = _max(best_lo, a);
+            line = line + d;
+            continue;
+        }
+        if (kd == I_FLOAT) {
+            best_lo = _max(best_lo, outer_min(c, it.box));
+            line = line + outer_max(c, it.box);
+            continue;
+        }
+        if (kd == I_BREAK) {
+            best_lo = _max(best_lo, run);
+            best_hi = _max(best_hi, line);
+            run = 0.0;
+            line = 0.0;
+            pending_space = 0;
+            continue;
+        }
+    }
+    best_lo = _max(best_lo, run);
+    best_hi = _max(best_hi, line);
+    *lo = best_lo;
+    *hi = best_hi;
+}
+
+// --- Widths in flow ---
+
+// The width and side margins of a block in normal flow, CSS 2 section 10.3.3.
+fn block_width(c as *bx.Ctx, b as *bx.Box, cw as f64) as void {
+    edges(b, cw);
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as auto_l = cast(i64, s.i[pr.P_MARGIN_LEFT] == pr.K_AUTO);
+    let is i64 as auto_r = cast(i64, s.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO);
+    let is f64 as w with mut = 0.0;
+    let is i64 as have with mut = specified_w(b, cw, &w);
+    let is i64 as wk = s.i[pr.P_WIDTH];
+    let is f64 as room = cw - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b);
+    if (b.kind == bx.B_REPLACED) {
+        replaced_size(b, cw, 0.0 - 1.0);
+        w = b.w;
+        have = 1;
+    } else if (have == 0 && (b.kind == bx.B_TABLE || wk == pr.K_FIT_CONTENT || wk == pr.K_MIN_CONTENT ||
+                             wk == pr.K_MAX_CONTENT || (b.kind == bx.B_BLOCK && b.iw > 0.0))) {
+        intrinsic(c, b);
+        if (wk == pr.K_MIN_CONTENT) { w = b.min_cw; }
+        else if (wk == pr.K_MAX_CONTENT) { w = b.max_cw; }
+        else { w = _min(_max(b.min_cw, room), b.max_cw); }
+        have = 1;
+    }
+    if (have == 0) {
+        w = clamp_w(b, _max(room, 0.0), cw);
+        if (w == _max(room, 0.0)) {
+            b.w = w;
+            return;
+        }
+    }
+    w = clamp_w(b, w, cw);
+    b.w = w;
+    let is f64 as free = cw - w - bx.edges_w(b) - b.m[bx.LEFT] - b.m[bx.RIGHT];
+    if (auto_l == 1 && auto_r == 1) {
+        if (free > 0.0) {
+            b.m[bx.LEFT] = free / 2.0;
+            b.m[bx.RIGHT] = free / 2.0;
+        }
+    } else if (auto_l == 1) {
+        b.m[bx.LEFT] = free;
+    } else if (auto_r == 1) {
+        b.m[bx.RIGHT] = free;
+    } else if (b.parent != null && free > 0.0 && b.is_float == 0) {
+        // <center> and align= move blocks too, and text-align can only do that here.
+        let is i64 as ta = bx.prop(b.parent, pr.P_TEXT_ALIGN);
+        if (ta == pr.K_WEBKIT_CENTER) { b.m[bx.LEFT] = b.m[bx.LEFT] + free / 2.0; }
+    }
+}
+
+// A replaced box's content size from its natural size and what the page says.
+fn replaced_size(b as *bx.Box, cw as f64, ch as f64) as void {
+    let is f64 as ratio with mut = 1.0;
+    if (b.ih > 0.0 && b.iw > 0.0) { ratio = b.iw / b.ih; }
+    else if (b.ratio > 0.0) { ratio = b.ratio; }
+    let is f64 as w with mut = 0.0;
+    let is i64 as have_w = specified_w(b, cw, &w);
+    let is f64 as h = specified_h(b, ch);
+    let is f64 as uw with mut = b.iw;
+    let is f64 as uh with mut = b.ih;
+    // A shape with no size of its own fills the line, as CSS 2 section 10.3.2 suggests.
+    if (b.iw == 0.0 && b.ratio > 0.0) {
+        uw = 300.0;
+        if (cw >= 0.0) { uw = _max(cw - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b), 0.0); }
+        uh = uw / ratio;
+    }
+    if (have_w == 1 && h >= 0.0) {
+        uw = w;
+        uh = h;
+    } else if (have_w == 1) {
+        uw = w;
+        uh = w / ratio;
+    } else if (h >= 0.0) {
+        uh = h;
+        uw = h * ratio;
+    }
+    let is f64 as cw2 = clamp_w(b, uw, cw);
+    if (cw2 != uw && h < 0.0) {
+        uh = cw2 / ratio;
+    }
+    uw = cw2;
+    let is f64 as ch2 = clamp_h(b, uh, ch);
+    if (ch2 != uh && have_w == 0) {
+        uw = ch2 * ratio;
+    }
+    b.w = uw;
+    b.h = ch2;
+}
+
+// --- Floats ---
+
+fn _add_float(c as *bx.Ctx, f as *Bfc, x as f64, y as f64, w as f64, h as f64, left as i64) as void {
+    if (f.nfl == f.capfl) {
+        let is i64 as cap with mut = f.capfl * 2;
+        if (cap == 0) { cap = 16; }
+        let is *FloatRec as r = cast(*FloatRec, arena.alloc(c.a, cap * sizeof(FloatRec)));
+        if (f.nfl > 0) { mem.core.memcpy(cast(*u8, r), cast(*u8, f.fl), f.nfl * sizeof(FloatRec)); }
+        f.fl = r;
+        f.capfl = cap;
+    }
+    let is *FloatRec as e = &f.fl[f.nfl];
+    f.nfl = f.nfl + 1;
+    e.x = x;
+    e.y = y;
+    e.w = w;
+    e.h = h;
+    e.left = left;
+}
+
+// The room between floats in a band of the context.
+fn _bounds(f as *Bfc, y as f64, h as f64, lo as f64, hi as f64, out_l as *f64, out_r as *f64) as void {
+    let is f64 as l with mut = lo;
+    let is f64 as r with mut = hi;
+    let is i64 as k with mut = 0;
+    while (k < f.nfl) {
+        let is *FloatRec as e = &f.fl[k];
+        if (e.y < y + h && e.y + e.h > y && e.h > 0.0) {
+            if (e.left == 1) { l = _max(l, e.x + e.w); }
+            else { r = _min(r, e.x); }
+        }
+        k = k + 1;
+    }
+    *out_l = l;
+    *out_r = r;
+}
+
+// Below which y the next float out of the way ends; -1 for none.
+fn _next_clear(f as *Bfc, y as f64) as f64 {
+    let is f64 as best with mut = 0.0 - 1.0;
+    let is i64 as k with mut = 0;
+    while (k < f.nfl) {
+        let is f64 as b = f.fl[k].y + f.fl[k].h;
+        if (b > y && (best < 0.0 || b < best)) { best = b; }
+        k = k + 1;
+    }
+    return best;
+}
+
+fn _floats_bottom(f as *Bfc, want as i64) as f64 {
+    let is f64 as best with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < f.nfl) {
+        let is i64 as side_ok = cast(i64, want == 0 || (want == 1 && f.fl[k].left == 1) || (want == 2 && f.fl[k].left == 0));
+        if (side_ok == 1) { best = _max(best, f.fl[k].y + f.fl[k].h); }
+        k = k + 1;
+    }
+    return best;
+}
+
+fn _place_float(c as *bx.Ctx, b as *bx.Box, f as *Bfc, cx as f64, cw as f64, y0 as f64, ch as f64) as void {
+    size_root(c, b, cw, ch);
+    _position_float(c, b, f, cx, cw, y0);
+}
+
+// A float already sized goes as high and as far to its side as it can.
+fn _position_float(c as *bx.Ctx, b as *bx.Box, f as *Bfc, cx as f64, cw as f64, y0 as f64) as void {
+    let is i64 as clr = bx.prop(b, pr.P_CLEAR);
+    let is f64 as y with mut = _max(y0, f.floor);
+    if (clr == pr.K_LEFT || clr == pr.K_BOTH) { y = _max(y, _floats_bottom(f, 1)); }
+    if (clr == pr.K_RIGHT || clr == pr.K_BOTH) { y = _max(y, _floats_bottom(f, 2)); }
+    let is f64 as mw = bx.margin_w(b);
+    let is f64 as mh = bx.margin_h(b);
+    let is f64 as l with mut = cx;
+    let is f64 as r with mut = cx + cw;
+    while (1 == 1) {
+        _bounds(f, y, _max(mh, 0.01), cx, cx + cw, &l, &r);
+        if (r - l >= mw || (l == cx && r == cx + cw)) { break; }
+        let is f64 as n = _next_clear(f, y);
+        if (n < 0.0) { break; }
+        y = n;
+    }
+    let is i64 as left = cast(i64, bx.prop(b, pr.P_FLOAT) == pr.K_LEFT);
+    let is f64 as x with mut = l;
+    if (left == 0) { x = r - mw; }
+    b.x = x + b.m[bx.LEFT];
+    b.y = y + b.m[bx.TOP];
+    _add_float(c, f, x, y, mw, mh, left);
+    f.floor = y;
+}
+
+// Width by shrink-to-fit unless the page set one, then everything inside. For what
+// establishes its own context and is not a block in flow.
+fn size_root(c as *bx.Ctx, b as *bx.Box, cw as f64, ch as f64) as void {
+    edges(b, cw);
+    if (b.kind == bx.B_REPLACED) {
+        replaced_size(b, cw, ch);
+        return;
+    }
+    let is f64 as w with mut = 0.0;
+    if (specified_w(b, cw, &w) == 0) {
+        intrinsic(c, b);
+        let is f64 as room = cw - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b);
+        w = _min(_max(b.min_cw, room), b.max_cw);
+    }
+    b.w = clamp_w(b, w, cw);
+    b.def_h = specified_h(b, ch);
+    contents(c, b, ch);
+}
+
+// --- Inside a box that is its own context ---
+
+// Everything in b, whose width is set. Its height comes out of this.
+fn contents(c as *bx.Ctx, b as *bx.Box, ch as f64) as void {
+    b.first_base = bx.NO_BASE;
+    b.last_base = bx.NO_BASE;
+    if (b.kind == bx.B_TABLE) {
+        call(bx.table_layout, c, b);
+    } else if (b.kind == bx.B_FLEX) {
+        call(bx.flex_layout, c, b);
+    } else if (b.kind == bx.B_GRID) {
+        call(bx.grid_layout, c, b);
+    } else if (b.kind == bx.B_REPLACED) {
+        return;
+    } else {
+        let is f64 as col_w with mut = 0.0;
+        let is f64 as col_gap with mut = 0.0;
+        let is i64 as cols = _column_plan(b, &col_w, &col_gap);
+        let is f64 as whole_w = b.w;
+        if (cols > 1) { b.w = col_w; }
+        let is Bfc as f with mut;
+        bfc_init(&f);
+        _flow_children(c, b, &f, 0.0);
+        _flush(&f);
+        let is f64 as h with mut = _max(f.y, _floats_bottom(&f, 0));
+        if (cols > 1) {
+            b.w = whole_w;
+            h = _balance(c, b, h, cols, col_w, col_gap);
+        }
+        if (b.def_h >= 0.0) { h = b.def_h; }
+        if (b.ih > 0.0 && b.def_h < 0.0 && h < b.ih) { h = b.ih; }
+        b.h = clamp_h(b, h, ch);
+        if (b.vcenter == 1) { _center_lines(b, f.y); }
+        return;
+    }
+    if (b.def_h >= 0.0) { b.h = b.def_h; }
+    b.h = clamp_h(b, b.h, ch);
+}
+
+// --- Columns ---
+//
+// What flows in columns is laid out first as one column of the right width, and then cut.
+// A cut falls between two lines or between two boxes that cannot be cut, and the parts
+// move over to where their column is. Everything inside the box hangs off its content
+// box, so moving them is only adding to their places.
+
+struct _ColUnit {
+    top  as f64;
+    bot  as f64;
+    box  as *bx.Box;      // a box that moves whole, or null for a line
+    frag as *bx.Frag;     // a line: its first fragment
+    n    as i64;          // and how many it has
+    mark as i64;          // a box's own edge: takes no room, and goes with what follows it
+    keep as i64;          // stays with the line before it: one line alone is not left behind
+}
+
+let is i64 as MAX_COL_UNITS with imut = 8192;
+
+// How many columns and how wide. 1 when it does not have any.
+fn _column_plan(b as *bx.Box, w as *f64, gap as *f64) as i64 {
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as has_n = cast(i64, s.i[pr.P_COLUMN_COUNT] != pr.K_AUTO);
+    let is i64 as has_w = cast(i64, s.i[pr.P_COLUMN_WIDTH] != pr.K_AUTO);
+    if (has_n == 0 && has_w == 0) { return 1; }
+    // As wide a gap as the font is tall, unless told.
+    *gap = s.f[pr.P_FONT_SIZE];
+    if (s.i[pr.P_COLUMN_GAP] == 0) { *gap = bx.resolve(b, pr.P_COLUMN_GAP, b.w); }
+    let is i64 as n with mut = 1;
+    if (has_n == 1) { n = cast(i64, s.f[pr.P_COLUMN_COUNT]); }
+    if (has_w == 1) {
+        let is f64 as cw = bx.resolve(b, pr.P_COLUMN_WIDTH, b.w);
+        if (cw > 0.0) {
+            let is i64 as fits = cast(i64, (b.w + *gap) / (cw + *gap));
+            if (has_n == 0 || fits < n) { n = fits; }
+        }
+    }
+    if (n <= 1) { return 1; }
+    *w = (b.w - cast(f64, n - 1) * *gap) / cast(f64, n);
+    if (*w <= 0.0) { return 1; }
+    return n;
+}
+
+fn _add_unit(c as *bx.Ctx, us as *_ColUnit, n as *i64) as *_ColUnit {
+    if (*n >= MAX_COL_UNITS) { return cast(*_ColUnit, 0); }
+    let is *_ColUnit as u = &us[*n];
+    *n = *n + 1;
+    u.box = cast(*bx.Box, 0);
+    u.frag = cast(*bx.Frag, 0);
+    u.n = 0;
+    u.mark = 0;
+    u.keep = 0;
+    return u;
+}
+
+fn _unit_lines(c as *bx.Ctx, b as *bx.Box, us as *_ColUnit, n as *i64) as void {
+    let is *_ColUnit as u with mut = cast(*_ColUnit, 0);
+    let is *bx.Frag as f with mut = b.frags;
+    let is i64 as line with mut = 0;
+    while (f != null) {
+        if (u == null || f.y >= u.bot - 0.5) {
+            u = _add_unit(c, us, n);
+            if (u == null) { return; }
+            u.top = f.y;
+            u.bot = f.y + f.h;
+            u.frag = f;
+            u.keep = cast(i64, line == 1);
+            line = line + 1;
+        }
+        u.n = u.n + 1;
+        if (f.y < u.top) { u.top = f.y; }
+        if (f.y + f.h > u.bot) { u.bot = f.y + f.h; }
+        f = f.next;
+    }
+}
+
+fn _unit_walk(c as *bx.Ctx, b as *bx.Box, us as *_ColUnit, n as *i64) as void {
+    if (b.inline_ctx == 1) {
+        _unit_lines(c, b, us, n);
+        return;
+    }
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.kind != bx.B_TEXT && x.kind != bx.B_BR && x.kind != bx.B_COL && x.is_abs == 0) {
+            let is *_ColUnit as u = _add_unit(c, us, n);
+            if (u == null) { return; }
+            u.box = x;
+            u.top = x.y - x.m[bx.TOP];
+            u.bot = x.y + bx.border_h(x) + x.m[bx.BOTTOM];
+            if (_is_root(x) == 0 && x.is_float == 0 && x.first != null) {
+                u.mark = 1;
+                u.bot = u.top;
+                _unit_walk(c, x, us, n);
+            }
+        }
+        x = x.next;
+    }
+}
+
+fn _unit_fits(us as *_ColUnit, n as i64, h as f64, cols as i64) as i64 {
+    let is i64 as col with mut = 1;
+    let is f64 as start with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *_ColUnit as u = &us[i];
+        if (u.mark == 0 && u.keep == 0 && u.bot - start > h && u.top > start) {
+            col = col + 1;
+            start = u.top;
+        }
+        i = i + 1;
+    }
+    return cast(i64, col <= cols);
+}
+
+fn _move_unit(u as *_ColUnit, dx as f64, dy as f64) as void {
+    if (u.box != null) {
+        u.box.x = u.box.x + dx;
+        u.box.y = u.box.y + dy;
+        return;
+    }
+    let is *bx.Frag as f with mut = u.frag;
+    let is i64 as k with mut = 0;
+    while (k < u.n && f != null) {
+        f.x = f.x + dx;
+        f.y = f.y + dy;
+        if (f.kind == bx.FRAG_ATOMIC) {
+            f.box.x = f.box.x + dx;
+            f.box.y = f.box.y + dy;
+        }
+        f = f.next;
+        k = k + 1;
+    }
+}
+
+// Cuts what was laid out as one column h tall into cols of the same height, as short as
+// will hold it all, and says how tall that is.
+fn _balance(c as *bx.Ctx, b as *bx.Box, h as f64, cols as i64, w as f64, gap as f64) as f64 {
+    let is *_ColUnit as us = cast(*_ColUnit, arena.alloc(c.a, MAX_COL_UNITS * sizeof(_ColUnit)));
+    let is i64 as n with mut = 0;
+    _unit_walk(c, b, us, &n);
+    if (n == 0) { return h; }
+    let is f64 as lo with mut = h / cast(f64, cols);
+    let is f64 as hi with mut = h;
+    if (b.def_h >= 0.0) {
+        lo = b.def_h;
+    } else {
+        let is i64 as k with mut = 0;
+        while (k < 24) {
+            let is f64 as mid = (lo + hi) / 2.0;
+            if (_unit_fits(us, n, mid, cols) == 1) { hi = mid; }
+            else { lo = mid; }
+            k = k + 1;
+        }
+        lo = hi;
+    }
+    let is f64 as tall = lo;
+    let is f64 as first_gap with mut = 0.0;
+    let is i64 as q with mut = 0;
+    while (q < n && us[q].mark == 1) { q = q + 1; }
+    if (q < n && us[q].box == null) { first_gap = us[q].top; }
+    // A box that has been told to move takes what is inside it, so a block moved whole
+    // is not moved again with its lines: those hang off the same place it does.
+    let is i64 as col with mut = 0;
+    let is f64 as start with mut = 0.0;
+    let is f64 as used with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *_ColUnit as u = &us[i];
+        if (u.mark == 0 && u.keep == 0 && u.bot - start > tall && u.top > start) {
+            col = col + 1;
+            // A line's text starts a little below the top of its line, in every column.
+            start = u.top;
+            if (u.box == null) { start = start - first_gap; }
+        }
+        if (u.mark == 0 && u.bot - start > used) { used = u.bot - start; }
+        let is f64 as dx = cast(f64, col) * (w + gap);
+        let is f64 as dy = 0.0 - start;
+        if (dx != 0.0 || dy != 0.0) { _move_unit(u, dx, dy); }
+        i = i + 1;
+    }
+    return used;
+}
+
+// What is in a button or a field keeps to the middle of it, however tall it is made.
+fn _center_lines(b as *bx.Box, used as f64) as void {
+    let is f64 as free = (b.h - used) / 2.0;
+    if (free <= 0.0) { return; }
+    let is *bx.Frag as f with mut = b.frags;
+    while (f != null) {
+        f.y = f.y + free;
+        if (f.kind == bx.FRAG_ATOMIC) { f.box.y = f.box.y + free; }
+        f = f.next;
+    }
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (b.inline_ctx == 0 && x.is_abs == 0) { x.y = x.y + free; }
+        x = x.next;
+    }
+}
+
+fn _flow_children(c as *bx.Ctx, b as *bx.Box, f as *Bfc, cx as f64) as void {
+    if (b.inline_ctx == 1) {
+        _inline(c, b, f, cx);
+        return;
+    }
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.is_abs == 1) {
+            x.sx = cx;
+            x.sy = f.y + _pending(f);
+        } else if (x.is_float == 1) {
+            _place_float(c, x, f, cx, b.w, f.y + _pending(f), b.def_h);
+        } else {
+            _flow_block(c, x, f, cx, b.w, b.def_h);
+            if (x.first_base != bx.NO_BASE) {
+                if (b.first_base == bx.NO_BASE) { b.first_base = x.first_base; }
+                b.last_base = x.last_base;
+            }
+        }
+        x = x.next;
+    }
+}
+
+fn _clear(b as *bx.Box, f as *Bfc) as void {
+    let is i64 as clr = bx.prop(b, pr.P_CLEAR);
+    if (clr == pr.K_NONE) { return; }
+    let is f64 as lim with mut = 0.0;
+    if (clr == pr.K_LEFT || clr == pr.K_BOTH) { lim = _max(lim, _floats_bottom(f, 1)); }
+    if (clr == pr.K_RIGHT || clr == pr.K_BOTH) { lim = _max(lim, _floats_bottom(f, 2)); }
+    if (f.y + _pending(f) >= lim) { return; }
+    // Clearance: the box goes below the floats whatever its margin would have done.
+    _flush(f);
+    f.y = lim;
+}
+
+// A block among blocks.
+fn _flow_block(c as *bx.Ctx, b as *bx.Box, f as *Bfc, cx as f64, cw as f64, ch as f64) as void {
+    // It may have been laid out before, for another width, by whatever holds it.
+    b.first_base = bx.NO_BASE;
+    b.last_base = bx.NO_BASE;
+    b.awaiting = 0;
+    b.await_next = cast(*bx.Box, 0);
+    _clear(b, f);
+    block_width(c, b, cw);
+    let is f64 as x0 = cx + b.m[bx.LEFT];
+    b.x = x0;
+    b.def_h = specified_h(b, ch);
+    _margin(f, b.m[bx.TOP]);
+
+    if (_is_root(b) == 1) {
+        _flush(f);
+        // A box with its own context cannot run under a float: it narrows, or moves down.
+        if (f.nfl > 0) {
+            let is f64 as l with mut = cx;
+            let is f64 as r with mut = cx + cw;
+            let is f64 as need = _max(bx.border_w(b), 1.0);
+            _bounds(f, f.y, 1.0, cx, cx + cw, &l, &r);
+            while (r - l < need + b.m[bx.LEFT] + b.m[bx.RIGHT] && (l != cx || r != cx + cw)) {
+                if (bx.is_len(b, pr.P_WIDTH) == 0 && r - l > b.m[bx.LEFT] + b.m[bx.RIGHT] + bx.edges_w(b) &&
+                    b.kind != bx.B_REPLACED && b.kind != bx.B_TABLE) {
+                    b.w = r - l - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b);
+                    break;
+                }
+                let is f64 as n = _next_clear(f, f.y);
+                if (n < 0.0) { break; }
+                f.y = n;
+                _bounds(f, f.y, 1.0, cx, cx + cw, &l, &r);
+            }
+            b.x = l + b.m[bx.LEFT];
+            if (bx.is_len(b, pr.P_WIDTH) == 0 && b.kind != bx.B_REPLACED && b.kind != bx.B_TABLE &&
+                r - l - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b) < b.w) {
+                b.w = _max(r - l - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b), 0.0);
+            }
+        }
+        b.y = f.y;
+        contents(c, b, ch);
+        f.y = f.y + bx.border_h(b);
+        if (b.first_base != bx.NO_BASE) {
+            let is f64 as d = b.y + b.b[bx.TOP] + b.p[bx.TOP];
+            b.first_base = b.first_base + d;
+            b.last_base = b.last_base + d;
+        }
+        _margin(f, b.m[bx.BOTTOM]);
+        return;
+    }
+
+    let is f64 as top = b.b[bx.TOP] + b.p[bx.TOP];
+    if (top > 0.0) {
+        _flush(f);
+        b.y = f.y;
+        f.y = f.y + top;
+    } else {
+        b.awaiting = 1;
+        b.await_next = f.await;
+        f.await = b;
+    }
+    _flow_children(c, b, f, x0 + b.b[bx.LEFT] + b.p[bx.LEFT]);
+
+    let is f64 as bot = b.p[bx.BOTTOM] + b.b[bx.BOTTOM];
+    let is i64 as min_h = cast(i64, b.st.v.i[pr.P_MIN_HEIGHT] == 0 && (b.st.v.f[pr.P_MIN_HEIGHT] > 0.0 || b.st.v.p[pr.P_MIN_HEIGHT] > 0.0));
+
+    // Nothing in it had an edge: its own margins collapse through it.
+    if (b.awaiting == 1 && b.def_h < 0.0 && bot == 0.0 && min_h == 0) {
+        f.await = b.await_next;
+        b.awaiting = 0;
+        b.await_next = cast(*bx.Box, 0);
+        b.y = f.y + _pending(f);
+        b.h = 0.0;
+        _margin(f, b.m[bx.BOTTOM]);
+        return;
+    }
+    if (b.awaiting == 1) { _flush(f); }
+    let is f64 as content_top = b.y + top;
+    if (b.def_h < 0.0 && bot == 0.0 && min_h == 0) {
+        // The last child's bottom margin can still go through this box's bottom.
+        let is f64 as h = _max(f.y - content_top, 0.0);
+        b.h = clamp_h(b, h, ch);
+        f.y = content_top + b.h;
+        _margin(f, b.m[bx.BOTTOM]);
+        return;
+    }
+    _flush(f);
+    let is f64 as h with mut = _max(f.y - content_top, 0.0);
+    if (b.def_h >= 0.0) { h = b.def_h; }
+    b.h = clamp_h(b, h, ch);
+    f.y = content_top + b.h + bot;
+    _margin(f, b.m[bx.BOTTOM]);
+}
+
+// --- Inline items ---
+
+fn _push_item(c as *bx.Ctx, b as *bx.Box, cap as *i64, kind as i64, box as *bx.Box, text as *u8, len as i64, w as f64) as void {
+    if (b.nitems == *cap) {
+        let is i64 as nc with mut = *cap * 2;
+        if (nc == 0) { nc = 32; }
+        let is *bx.Item as x = cast(*bx.Item, arena.alloc(c.a, nc * sizeof(bx.Item)));
+        if (b.nitems > 0) { mem.core.memcpy(cast(*u8, x), cast(*u8, b.items), b.nitems * sizeof(bx.Item)); }
+        b.items = x;
+        *cap = nc;
+    }
+    let is *bx.Item as it = &b.items[b.nitems];
+    b.nitems = b.nitems + 1;
+    it.kind = kind;
+    it.box = box;
+    it.text = text;
+    it.len = len;
+    it.w = w;
+}
+
+fn _char_len(c as i64) as i64 {
+    if (c < 128) { return 1; }
+    if (c < 224) { return 2; }
+    if (c < 240) { return 3; }
+    return 4;
+}
+
+// CJK text has no spaces and can break between any two of its characters.
+fn _is_cjk_lead(c as i64) as i64 {
+    if (c >= 227 && c <= 237) { return 1; }
+    if (c == 240) { return 1; }
+    return 0;
+}
+
+// Whether a line can break straight after this piece of a word.
+fn _breaks_after(s as *u8, n as i64) as i64 {
+    if (n == 0) { return 0; }
+    let is i64 as last = cast(i64, s[n - 1]);
+    if (last == 45) { return 1; }
+    if (last >= 128 && n >= 3 && _is_cjk_lead(cast(i64, s[n - 3])) == 1) { return 1; }
+    return 0;
+}
+
+fn _letter_extra(st as *style.Style, s as *u8, n as i64) as f64 {
+    let is f64 as ls = st.v.f[pr.P_LETTER_SPACING];
+    if (ls == 0.0) { return 0.0; }
+    let is i64 as chars with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        i = i + _char_len(cast(i64, s[i]));
+        chars = chars + 1;
+    }
+    return ls * cast(f64, chars);
+}
+
+fn _text_items(c as *bx.Ctx, b as *bx.Box, x as *bx.Box, cap as *i64, was_space as *i64) as void {
+    let is *style.Style as st = x.st;
+    let is i64 as ws = st.v.i[pr.P_WHITE_SPACE];
+    let is i64 as pre = cast(i64, ws == pr.K_PRE);
+    let is i64 as pre_wrap = cast(i64, ws == pr.K_PRE_WRAP || ws == pr.K_BREAK_SPACES);
+    let is f64 as sw = m.space(st) + st.v.f[pr.P_WORD_SPACING] + st.v.f[pr.P_LETTER_SPACING];
+    let is *u8 as s = x.text;
+    let is i64 as n = x.tlen;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as ch = cast(i64, s[i]);
+        if (ch == 10) {
+            _push_item(c, b, cap, I_BREAK, x, &s[i], 1, 0.0);
+            *was_space = 1;
+            i = i + 1;
+            continue;
+        }
+        if (ch == 32 && pre == 0) {
+            if (pre_wrap == 1) {
+                // Kept, and a place to break, so a run of them is one word of spaces.
+                let is i64 as st_i = i;
+                while (i < n && s[i] == 32) { i = i + 1; }
+                _push_item(c, b, cap, I_WORD, x, &s[st_i], i - st_i, cast(f64, i - st_i) * sw);
+                *was_space = 0;
+                continue;
+            }
+            if (*was_space == 0) {
+                _push_item(c, b, cap, I_SPACE, x, &s[i], 1, sw);
+                *was_space = 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        // A word, or as much of one as cannot break.
+        let is i64 as st_i = i;
+        while (i < n && s[i] != 10 && (pre == 1 || s[i] != 32)) {
+            let is i64 as q = cast(i64, s[i]);
+            let is i64 as cl = _char_len(q);
+            i = i + cl;
+            if (pre == 1) { continue; }
+            if (q == 45 && i < n && s[i] != 32 && s[i] != 10 && i - st_i > 1) { break; }
+            if (_is_cjk_lead(q) == 1) { break; }
+            if (i < n && _is_cjk_lead(cast(i64, s[i])) == 1) { break; }
+        }
+        if (i > n) { i = n; }
+        let is f64 as w = m.width(st, &s[st_i], i - st_i) + _letter_extra(st, &s[st_i], i - st_i);
+        _push_item(c, b, cap, I_WORD, x, &s[st_i], i - st_i, w);
+        *was_space = 0;
+    }
+}
+
+fn _gather(c as *bx.Ctx, b as *bx.Box, under as *bx.Box, cap as *i64, was_space as *i64) as void {
+    let is *bx.Box as x with mut = under.first;
+    while (x != null) {
+        if (x.is_float == 1) {
+            _push_item(c, b, cap, I_FLOAT, x, cast(*u8, 0), 0, 0.0);
+        } else if (x.is_abs == 1) {
+            _push_item(c, b, cap, I_ABS, x, cast(*u8, 0), 0, 0.0);
+        } else if (x.kind == bx.B_TEXT) {
+            _text_items(c, b, x, cap, was_space);
+        } else if (x.kind == bx.B_BR) {
+            _push_item(c, b, cap, I_BREAK, x, cast(*u8, 0), 0, 0.0);
+            *was_space = 1;
+        } else if (x.atomic == 1 || x.kind == bx.B_REPLACED) {
+            _push_item(c, b, cap, I_ATOMIC, x, cast(*u8, 0), 0, 0.0);
+            *was_space = 0;
+        } else if (x.kind == bx.B_INLINE) {
+            _push_item(c, b, cap, I_OPEN, x, cast(*u8, 0), 0, 0.0);
+            _gather(c, b, x, cap, was_space);
+            _push_item(c, b, cap, I_CLOSE, x, cast(*u8, 0), 0, 0.0);
+        }
+        x = x.next;
+    }
+}
+
+fn _ensure_items(c as *bx.Ctx, b as *bx.Box) as void {
+    if (b.items != null) { return; }
+    let is i64 as cap with mut = 0;
+    let is i64 as was_space with mut = 1;
+    b.nitems = 0;
+    _gather(c, b, b, &cap, &was_space);
+    if (b.items == null) { b.items = cast(*bx.Item, arena.alloc(c.a, sizeof(bx.Item))); }
+}
+
+// --- Lines ---
+
+struct _Line {
+    c     as *bx.Ctx;
+    b     as *bx.Box;
+    f     as *Bfc;
+    cx    as f64;
+    top   as f64;
+    left  as f64;
+    right as f64;
+    x     as f64;      // how far the line has come, from left
+    asc   as f64;
+    desc  as f64;
+    has   as i64;
+    first as *bx.Frag; // the first fragment of this line
+    space as *bx.Item; // waits for a word to prove it is not the end of the line
+    open  as [MAX_OPEN]*bx.Box;
+    ofrag as [MAX_OPEN]*bx.Frag;
+    oshift as [MAX_OPEN]f64;
+    nopen as i64;
+    shift as f64;
+    queued as *bx.Box;  // floats that did not fit on the line they were met on
+    qlast  as *bx.Box;
+    strut_asc as f64;
+    strut_desc as f64;
+    last_text as *bx.Frag;
+}
+
+fn _half_leading(st as *style.Style, asc as *f64, desc as *f64) as void {
+    let is f64 as a = m.ascent(st);
+    let is f64 as h = m.height(st);
+    let is f64 as lh = m.line_height(st);
+    let is f64 as d = h - a;
+    let is f64 as l = (lh - h) / 2.0;
+    *asc = a + l;
+    *desc = d + l;
+}
+
+fn _grow_line(l as *_Line, asc as f64, desc as f64) as void {
+    if (asc > l.asc) { l.asc = asc; }
+    if (desc > l.desc) { l.desc = desc; }
+}
+
+fn _add_frag(l as *_Line, kind as i64, box as *bx.Box) as *bx.Frag {
+    let is *bx.Frag as f = cast(*bx.Frag, arena.alloc(l.c.a, sizeof(bx.Frag)));
+    f.kind = kind;
+    f.box = box;
+    f.x = l.x;
+    f.shift = l.shift;
+    if (l.b.frags == null) { l.b.frags = f; }
+    else { l.b.frag_end.next = f; }
+    l.b.frag_end = f;
+    if (l.first == null) { l.first = f; }
+    return f;
+}
+
+fn _va_shift(x as *bx.Box, parent as *style.Style) as f64 {
+    let is i64 as k = x.st.v.i[pr.P_VERTICAL_ALIGN];
+    let is f64 as em = parent.v.f[pr.P_FONT_SIZE];
+    if (k == pr.K_SUB) { return 0.0 - em * 0.25; }
+    if (k == pr.K_SUPER) { return em * 0.4; }
+    if (k == 0) { return bx.resolve(x, pr.P_VERTICAL_ALIGN, m.line_height(x.st)); }
+    return 0.0;
+}
+
+fn _start_line(l as *_Line) as void {
+    l.x = 0.0;
+    l.asc = l.strut_asc;
+    l.desc = l.strut_desc;
+    l.has = 0;
+    l.first = cast(*bx.Frag, 0);
+    l.space = cast(*bx.Item, 0);
+    l.last_text = cast(*bx.Frag, 0);
+    _bounds(l.f, l.top, l.strut_asc + l.strut_desc, l.cx, l.cx + l.b.w, &l.left, &l.right);
+    // What is still open carries on, on this line too.
+    let is f64 as saved = l.shift;
+    let is i64 as k with mut = 0;
+    while (k < l.nopen) {
+        l.shift = l.oshift[k];
+        l.ofrag[k] = _add_frag(l, bx.FRAG_BOX, l.open[k]);
+        k = k + 1;
+    }
+    l.shift = saved;
+}
+
+fn _commit_space(l as *_Line) as void {
+    if (l.space == null) { return; }
+    let is *bx.Item as sp = l.space;
+    l.space = cast(*bx.Item, 0);
+    let is *bx.Frag as t = l.last_text;
+    if (t != null && t.box == sp.box && cast(i64, &t.text[t.len]) == cast(i64, sp.text) &&
+        sp.box.st.v.f[pr.P_WORD_SPACING] == 0.0 && sp.box.st.v.f[pr.P_LETTER_SPACING] == 0.0) {
+        t.len = t.len + sp.len;
+        t.w = t.w + sp.w;
+    }
+    l.x = l.x + sp.w;
+}
+
+fn _add_word(l as *_Line, it as *bx.Item) as void {
+    let is *bx.Box as x = it.box;
+    let is *bx.Frag as t = l.last_text;
+    let is f64 as ls = x.st.v.f[pr.P_LETTER_SPACING];
+    if (t != null && t.box == x && cast(i64, &t.text[t.len]) == cast(i64, it.text) && ls == 0.0) {
+        t.len = t.len + it.len;
+        t.w = t.w + it.w;
+    } else {
+        let is *bx.Frag as f = _add_frag(l, bx.FRAG_TEXT, x);
+        f.text = it.text;
+        f.len = it.len;
+        f.w = it.w;
+        f.asc = m.ascent(x.st);
+        f.h = m.height(x.st);
+        l.last_text = f;
+    }
+    l.x = l.x + it.w;
+    l.has = 1;
+    let is f64 as a with mut = 0.0;
+    let is f64 as d with mut = 0.0;
+    _half_leading(x.st, &a, &d);
+    _grow_line(l, a + l.shift, d - l.shift);
+}
+
+// Moves the line down, past floats, until something this wide fits.
+fn _fit(l as *_Line, w as f64) as void {
+    while (w > l.right - l.left && (l.left != l.cx || l.right != l.cx + l.b.w)) {
+        let is f64 as n = _next_clear(l.f, l.top);
+        if (n < 0.0) { return; }
+        l.top = n;
+        _bounds(l.f, l.top, l.strut_asc + l.strut_desc, l.cx, l.cx + l.b.w, &l.left, &l.right);
+    }
+}
+
+// A flex or grid container's baseline is its first item's, or that item's bottom edge
+// when it has no line of its own.
+fn items_baseline(b as *bx.Box) as void {
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.is_abs == 0 && x.is_float == 0 && x.kind != bx.B_TEXT && x.kind != bx.B_BR && x.kind != bx.B_COL) {
+            if (x.last_base != bx.NO_BASE) { b.last_base = x.y + x.b[bx.TOP] + x.p[bx.TOP] + x.last_base; }
+            else { b.last_base = x.y + bx.border_h(x); }
+            return;
+        }
+        x = x.next;
+    }
+}
+
+fn _atomic_metrics(x as *bx.Box, parent as *style.Style, asc as *f64, desc as *f64) as void {
+    let is f64 as mh = bx.margin_h(x);
+    let is i64 as va = x.st.v.i[pr.P_VERTICAL_ALIGN];
+    let is f64 as a with mut = mh;
+    let is *pr.Values as s = &x.st.v;
+    if (x.kind != bx.B_REPLACED && x.last_base != bx.NO_BASE &&
+        s.i[pr.P_OVERFLOW_Y] == pr.K_VISIBLE) {
+        a = x.m[bx.TOP] + x.b[bx.TOP] + x.p[bx.TOP] + x.last_base;
+    }
+    if (va == pr.K_MIDDLE) {
+        a = mh / 2.0 + parent.v.f[pr.P_FONT_SIZE] * 0.25;
+    }
+    *asc = a;
+    *desc = mh - a;
+}
+
+// Finishes the line: its height, then every fragment put where it goes.
+fn _end_line(l as *_Line) as void {
+    let is *bx.Box as b = l.b;
+    let is f64 as lh = l.asc + l.desc;
+    let is f64 as base = l.top + l.asc;
+    let is f64 as free = l.right - l.left - l.x;
+    let is f64 as dx with mut = 0.0;
+    let is i64 as ta = bx.prop(b, pr.P_TEXT_ALIGN);
+    if (free > 0.0) {
+        if (ta == pr.K_CENTER || ta == pr.K_WEBKIT_CENTER) { dx = free / 2.0; }
+        if (ta == pr.K_RIGHT) { dx = free; }
+    }
+    let is f64 as origin = l.left + dx;
+    // The inline boxes still open end here.
+    let is i64 as k with mut = 0;
+    while (k < l.nopen) {
+        let is *bx.Frag as o = l.ofrag[k];
+        if (o != null) { o.w = l.x - o.x; }
+        k = k + 1;
+    }
+    let is *bx.Frag as f with mut = l.first;
+    while (f != null) {
+        f.x = f.x + origin;
+        let is f64 as line_base = base - f.shift;
+        if (f.kind == bx.FRAG_TEXT) {
+            f.y = line_base - f.asc;
+        } else if (f.kind == bx.FRAG_BOX) {
+            let is *bx.Box as x = f.box;
+            let is f64 as a = m.ascent(x.st);
+            f.y = line_base - a - x.p[bx.TOP] - x.b[bx.TOP];
+            f.h = m.height(x.st) + x.p[bx.TOP] + x.b[bx.TOP] + x.p[bx.BOTTOM] + x.b[bx.BOTTOM];
+        } else if (f.kind == bx.FRAG_ATOMIC) {
+            let is *bx.Box as x = f.box;
+            let is i64 as va = x.st.v.i[pr.P_VERTICAL_ALIGN];
+            let is f64 as y with mut = line_base - f.asc;
+            if (va == pr.K_TOP) { y = l.top; }
+            if (va == pr.K_BOTTOM) { y = l.top + lh - bx.margin_h(x); }
+            x.x = f.x + x.m[bx.LEFT];
+            x.y = y + x.m[bx.TOP];
+        }
+        f = f.next;
+    }
+    if (b.first_base == bx.NO_BASE) { b.first_base = base; }
+    b.last_base = base;
+    l.top = l.top + lh;
+}
+
+fn _place_queued(l as *_Line) as void {
+    let is *bx.Box as q with mut = l.queued;
+    l.queued = cast(*bx.Box, 0);
+    l.qlast = cast(*bx.Box, 0);
+    while (q != null) {
+        let is *bx.Box as next = q.await_next;
+        q.await_next = cast(*bx.Box, 0);
+        _position_float(l.c, q, l.f, l.cx, l.b.w, l.top);
+        q = next;
+    }
+}
+
+// Whether anything in the items would make a line at all.
+fn _makes_a_line(b as *bx.Box) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < b.nitems) {
+        let is i64 as kd = b.items[k].kind;
+        if (kd == I_WORD || kd == I_ATOMIC || kd == I_BREAK) { return 1; }
+        // An inline box with an edge of its own has something to draw even when empty.
+        if (kd == I_OPEN) {
+            let is *pr.Values as s = &b.items[k].box.st.v;
+            if (s.f[pr.P_PADDING_LEFT] > 0.0 || s.f[pr.P_PADDING_RIGHT] > 0.0 ||
+                (s.i[pr.P_BORDER_LEFT_STYLE] != pr.K_NONE && s.f[pr.P_BORDER_LEFT_WIDTH] > 0.0)) { return 1; }
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn _break_word(l as *_Line, it as *bx.Item) as i64 {
+    let is *style.Style as st = it.box.st;
+    let is i64 as wb = st.v.i[pr.P_WORD_BREAK];
+    let is i64 as ow = st.v.i[pr.P_OVERFLOW_WRAP];
+    if (wb != pr.K_BREAK_ALL && wb != pr.K_BREAK_WORD && ow != pr.K_BREAK_WORD && ow != pr.K_ANYWHERE) { return 0; }
+    // Letter by letter, each line taking as many as fit.
+    let is *u8 as s with mut = it.text;
+    let is i64 as left with mut = it.len;
+    while (left > 0) {
+        let is f64 as room = l.right - l.left - l.x;
+        let is i64 as n with mut = _char_len(cast(i64, s[0]));
+        let is i64 as best with mut = 0;
+        while (n <= left) {
+            if (m.width(st, s, n) > room) { break; }
+            best = n;
+            if (n == left) { break; }
+            n = n + _char_len(cast(i64, s[n]));
+        }
+        if (best == 0) {
+            if (l.has == 1) {
+                _end_line(l);
+                _start_line(l);
+                continue;
+            }
+            best = _char_len(cast(i64, s[0]));
+        }
+        if (best > left) { best = left; }
+        let is bx.Item as piece with mut;
+        piece.kind = I_WORD;
+        piece.box = it.box;
+        piece.text = s;
+        piece.len = best;
+        piece.w = m.width(st, s, best);
+        _add_word(l, &piece);
+        s = &s[best];
+        left = left - best;
+        if (left > 0) {
+            _end_line(l);
+            _start_line(l);
+        }
+    }
+    return 1;
+}
+
+// All of b's inline content, as lines.
+fn _inline(c as *bx.Ctx, b as *bx.Box, f as *Bfc, cx as f64) as void {
+    _ensure_items(c, b);
+    b.frags = cast(*bx.Frag, 0);
+    b.frag_end = cast(*bx.Frag, 0);
+    let is _Line as line with mut;
+    let is *_Line as l = &line;
+    l.c = c;
+    l.b = b;
+    l.f = f;
+    l.cx = cx;
+    l.nopen = 0;
+    l.shift = 0.0;
+    l.queued = cast(*bx.Box, 0);
+    l.qlast = cast(*bx.Box, 0);
+    _half_leading(b.st, &l.strut_asc, &l.strut_desc);
+
+    let is i64 as real = _makes_a_line(b);
+    if (real == 1) { _flush(f); }
+    l.top = f.y + _pending(f);
+    _start_line(l);
+    if (real == 1) {
+        let is f64 as indent = bx.resolve(b, pr.P_TEXT_INDENT, b.w);
+        l.x = indent;
+    }
+    let is i64 as wrap_default = _can_wrap(b.st);
+
+    let is i64 as k with mut = 0;
+    while (k < b.nitems) {
+        let is *bx.Item as it = &b.items[k];
+        k = k + 1;
+        let is i64 as kd = it.kind;
+        if (kd == I_SPACE) {
+            if (l.has == 1) { l.space = it; }
+            continue;
+        }
+        if (kd == I_WORD) {
+            let is f64 as sw with mut = 0.0;
+            if (l.space != null) { sw = l.space.w; }
+            let is i64 as wrap = _can_wrap(it.box.st);
+            if (wrap == 1 && l.has == 1 && l.x + sw + it.w > l.right - l.left) {
+                _end_line(l);
+                _place_queued(l);
+                _start_line(l);
+                sw = 0.0;
+            }
+            if (l.has == 0) { _fit(l, it.w); }
+            _commit_space(l);
+            if (it.w > l.right - l.left - l.x && wrap == 1 && _break_word(l, it) == 1) { continue; }
+            _add_word(l, it);
+            continue;
+        }
+        if (kd == I_OPEN) {
+            _commit_space(l);
+            let is *bx.Box as x = it.box;
+            edges(x, b.w);
+            let is f64 as e = x.m[bx.LEFT] + x.b[bx.LEFT] + x.p[bx.LEFT];
+            let is f64 as a with mut = 0.0;
+            let is f64 as d with mut = 0.0;
+            _half_leading(x.st, &a, &d);
+            let is *style.Style as ps with mut = b.st;
+            if (l.nopen > 0) { ps = l.open[l.nopen - 1].st; }
+            l.shift = l.shift + _va_shift(x, ps);
+            _grow_line(l, a + l.shift, d - l.shift);
+            l.x = l.x + x.m[bx.LEFT];
+            if (l.nopen < MAX_OPEN) {
+                l.open[l.nopen] = x;
+                l.oshift[l.nopen] = l.shift;
+                l.ofrag[l.nopen] = _add_frag(l, bx.FRAG_BOX, x);
+                l.nopen = l.nopen + 1;
+            }
+            l.x = l.x + x.b[bx.LEFT] + x.p[bx.LEFT];
+            if (e > 0.0) { l.has = 1; }
+            continue;
+        }
+        if (kd == I_CLOSE) {
+            _commit_space(l);
+            let is *bx.Box as x = it.box;
+            let is f64 as e = x.p[bx.RIGHT] + x.b[bx.RIGHT];
+            l.x = l.x + e;
+            if (l.nopen > 0 && l.open[l.nopen - 1] == x) {
+                let is *bx.Frag as o = l.ofrag[l.nopen - 1];
+                if (o != null) { o.w = l.x - o.x; }
+                l.nopen = l.nopen - 1;
+            }
+            l.x = l.x + x.m[bx.RIGHT];
+            if (e > 0.0) { l.has = 1; }
+            let is *style.Style as ps with mut = b.st;
+            if (l.nopen > 0) { ps = l.open[l.nopen - 1].st; }
+            l.shift = l.shift - _va_shift(x, ps);
+            continue;
+        }
+        if (kd == I_ATOMIC) {
+            let is *bx.Box as x = it.box;
+            size_root(c, x, b.w, b.def_h);
+            let is f64 as mw = bx.margin_w(x);
+            let is f64 as sw with mut = 0.0;
+            if (l.space != null) { sw = l.space.w; }
+            if (wrap_default == 1 && _can_wrap(x.st) == 1 && l.has == 1 && l.x + sw + mw > l.right - l.left) {
+                _end_line(l);
+                _place_queued(l);
+                _start_line(l);
+            }
+            if (l.has == 0) { _fit(l, mw); }
+            _commit_space(l);
+            let is *bx.Frag as fr = _add_frag(l, bx.FRAG_ATOMIC, x);
+            fr.w = mw;
+            let is f64 as a with mut = 0.0;
+            let is f64 as d with mut = 0.0;
+            let is *style.Style as ps with mut = b.st;
+            if (l.nopen > 0) { ps = l.open[l.nopen - 1].st; }
+            _atomic_metrics(x, ps, &a, &d);
+            let is f64 as own = _va_shift(x, ps);
+            fr.asc = a;
+            fr.shift = l.shift + own;
+            let is i64 as va = x.st.v.i[pr.P_VERTICAL_ALIGN];
+            if (va != pr.K_TOP && va != pr.K_BOTTOM) { _grow_line(l, a + fr.shift, d - fr.shift); }
+            else { _grow_line(l, 0.0, bx.margin_h(x) - l.asc); }
+            l.x = l.x + mw;
+            l.has = 1;
+            l.last_text = cast(*bx.Frag, 0);
+            continue;
+        }
+        if (kd == I_BREAK) {
+            l.space = cast(*bx.Item, 0);
+            l.has = 1;
+            _end_line(l);
+            _place_queued(l);
+            _start_line(l);
+            continue;
+        }
+        if (kd == I_FLOAT) {
+            let is *bx.Box as x = it.box;
+            // Laid out to see if it fits on this line. If not, it waits for the next.
+            size_root(c, x, b.w, b.def_h);
+            let is f64 as used = l.x + bx.margin_w(x);
+            if (l.has == 0 || used <= l.right - l.left) {
+                _position_float(c, x, f, cx, b.w, l.top);
+                _bounds(f, l.top, l.strut_asc + l.strut_desc, cx, cx + b.w, &l.left, &l.right);
+            } else {
+                x.await_next = cast(*bx.Box, 0);
+                if (l.queued == null) { l.queued = x; }
+                else { l.qlast.await_next = x; }
+                l.qlast = x;
+            }
+            continue;
+        }
+        if (kd == I_ABS) {
+            let is *bx.Box as x = it.box;
+            x.sx = l.left + l.x;
+            x.sy = l.top;
+            continue;
+        }
+    }
+    if (l.has == 1) { _end_line(l); }
+    _place_queued(l);
+    if (real == 1) { f.y = l.top; }
+}
+
+// Nothing is placed yet when the root is called: the box that stands for the window.
+fn root_layout(c as *bx.Ctx, root as *bx.Box) as void {
+    edges(root, c.vw);
+    root.w = c.vw;
+    root.def_h = c.vh;
+    root.x = 0.0;
+    root.y = 0.0;
+    contents(c, root, c.vh);
+}

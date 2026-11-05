@@ -1,0 +1,99 @@
+// css/ua.cst — the browser's own stylesheet, what a page looks like with none.
+//
+// Taken from the Rendering section of the HTML standard, with what cannot happen here
+// left out. It is written in CSS and goes through the same parser and cascade as a
+// page's own, so no element is special anywhere else in the engine.
+//
+// Scripting is off for good, so <noscript> stays visible.
+
+use "./sheet.cst" as sh;
+use "../loader/url.cst" as url;
+
+fn _r(s as *sh.Sheet, css as *u8) as void {
+    sh.parse(s, css, url.len_of(css), sh.ORIGIN_UA, cast(*u8, 0));
+}
+
+fn load(s as *sh.Sheet) as void {
+    _r(s, "html, address, blockquote, body, center, dialog, div, figure, figcaption, footer, form, header, hr, legend, listing, main, p, plaintext, pre, search, summary, xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, nav, section, dir, dd, dl, dt, menu, ol, ul, details, fieldset { display: block; }");
+    _r(s, "area, base, basefont, datalist, head, link, meta, noembed, noframes, param, rp, script, style, template, title { display: none; }");
+    _r(s, "[hidden], dialog:not([open]) { display: none; }");
+    _r(s, "details:not([open]) > :not(summary) { display: none; }");
+    _r(s, "li { display: list-item; }");
+    _r(s, "html { color: black; }");
+    _r(s, "body { margin: 8px; }");
+    _r(s, "blockquote, figure { margin: 1em 40px; }");
+    _r(s, "p, dl, multicol, pre, listing, plaintext, xmp { margin-top: 1em; margin-bottom: 1em; }");
+    _r(s, "dd { margin-left: 40px; }");
+    _r(s, "dir, menu, ol, ul { margin-top: 1em; margin-bottom: 1em; padding-left: 40px; }");
+    _r(s, "ol ol, ol ul, ol menu, ol dir, ul ol, ul ul, ul menu, ul dir, menu ol, menu ul, menu menu, menu dir, dir ol, dir ul, dir menu, dir dir { margin-top: 0; margin-bottom: 0; }");
+    _r(s, "ol { list-style-type: decimal; }");
+    _r(s, "ul, menu, dir { list-style-type: disc; }");
+    _r(s, "ul ul, ul menu, ul dir, menu ul, menu menu, menu dir, dir ul, dir menu, dir dir, ol ul, ol menu, ol dir { list-style-type: circle; }");
+    _r(s, "ul ul ul, ul ul menu, ul menu ul, menu ul ul, ol ul ul, ul ol ul, ol ol ul { list-style-type: square; }");
+    _r(s, "summary { display: block; }");
+    _r(s, "details > summary::before { content: \"▸ \"; }");
+    _r(s, "details[open] > summary::before { content: \"▾ \"; }");
+    _r(s, "h1 { margin: 0.67em 0; font-size: 2em; font-weight: bold; }");
+    _r(s, "h2 { margin: 0.83em 0; font-size: 1.5em; font-weight: bold; }");
+    _r(s, "h3 { margin: 1em 0; font-size: 1.17em; font-weight: bold; }");
+    _r(s, "h4 { margin: 1.33em 0; font-weight: bold; }");
+    _r(s, "h5 { margin: 1.67em 0; font-size: 0.83em; font-weight: bold; }");
+    _r(s, "h6 { margin: 2.33em 0; font-size: 0.67em; font-weight: bold; }");
+    _r(s, "article h1, aside h1, nav h1, section h1 { margin: 0.83em 0; font-size: 1.5em; }");
+    _r(s, "hr { margin: 0.5em auto; border: 1px inset gray; }");
+    _r(s, "fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0; }");
+    _r(s, "legend { padding: 0 2px; }");
+    _r(s, "pre, listing, plaintext, xmp { font-family: monospace; white-space: pre; }");
+    _r(s, "code, kbd, samp, tt { font-family: monospace; }");
+    _r(s, "pre, code, kbd, samp, tt, listing, plaintext, xmp { font-size: 0.8125em; }");
+    _r(s, "pre code, pre kbd, pre samp, pre tt { font-size: 1em; }");
+    _r(s, "b, strong { font-weight: bold; }");
+    _r(s, "th { font-weight: bold; text-align: -internal-center; }");
+    _r(s, "i, cite, em, var, dfn, address { font-style: italic; }");
+    _r(s, "small { font-size: smaller; }");
+    _r(s, "big { font-size: larger; }");
+    _r(s, "sub { vertical-align: sub; font-size: smaller; }");
+    _r(s, "sup { vertical-align: super; font-size: smaller; }");
+    _r(s, "mark { background-color: yellow; color: black; }");
+    _r(s, "u, ins { text-decoration: underline; }");
+    _r(s, "s, strike, del { text-decoration: line-through; }");
+    _r(s, "abbr[title], acronym[title] { text-decoration: underline; }");
+    _r(s, "a:link { color: #0000ee; text-decoration: underline; cursor: pointer; }");
+    _r(s, "nobr { white-space: nowrap; }");
+    _r(s, "center { text-align: -webkit-center; }");
+    _r(s, "q::before { content: '\"'; }");
+    _r(s, "q::after { content: '\"'; }");
+    _r(s, "table { display: table; border-spacing: 2px; border-collapse: separate; text-indent: 0; }");
+    _r(s, "caption { display: table-caption; text-align: -webkit-center; }");
+    _r(s, "colgroup { display: table-column-group; }");
+    _r(s, "col { display: table-column; }");
+    _r(s, "thead { display: table-header-group; vertical-align: middle; }");
+    _r(s, "tbody { display: table-row-group; vertical-align: middle; }");
+    _r(s, "tfoot { display: table-footer-group; vertical-align: middle; }");
+    _r(s, "tr { display: table-row; vertical-align: inherit; }");
+    _r(s, "td, th { display: table-cell; padding: 1px; vertical-align: inherit; }");
+    _r(s, "img, input, textarea, select, button, meter, progress, canvas, video, audio, iframe, embed, object, svg { display: inline-block; }");
+    _r(s, "input, select, textarea, button { font-family: sans-serif; font-size: 13.333px; color: black; text-align: start; text-indent: 0; line-height: normal; white-space: normal; }");
+    _r(s, "textarea { font-family: monospace; white-space: pre-wrap; }");
+    _r(s, "input, textarea { border: 1px solid #767676; border-radius: 3px; background-color: white; padding: 2px 3px; cursor: text; }");
+    _r(s, "input[type=hidden] { display: none; }");
+    _r(s, "input:hover, textarea:hover, select:hover, button:hover { border-color: #4f4f4f; }");
+    _r(s, "input[type=submit]:hover, input[type=button]:hover, input[type=reset]:hover, button:hover { background-color: #e5e5e5; }");
+    _r(s, "input[type=submit]:active, input[type=button]:active, input[type=reset]:active, button:active { background-color: #f5f5f5; border-color: #8d8d8d; }");
+    _r(s, ":focus-visible { outline: 2px solid #1a73e8; }");
+    _r(s, "[disabled] { color: #808080; }");
+    _r(s, "summary { cursor: default; }");
+    _r(s, "label { cursor: default; }");
+    _r(s, "a:-webkit-any-link:active { color: #ee0000; }");
+    _r(s, "input[type=checkbox], input[type=radio] { width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; cursor: default; }");
+    _r(s, "input[type=radio] { border-radius: 50%; }");
+    _r(s, "input[type=submit], input[type=button], input[type=reset], button, select { border: 1px solid #767676; border-radius: 3px; background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; }");
+    _r(s, "select { background-color: white; padding: 2px 5px; text-align: start; }");
+    _r(s, "::placeholder { color: #757575; }");
+    _r(s, "input[type=range] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; border-radius: 0; background-color: transparent; cursor: default; }");
+    _r(s, "input[type=color] { width: 44px; height: 23px; padding: 1px 2px; background-color: #efefef; cursor: default; }");
+    _r(s, "option, optgroup, datalist { display: none; }");
+    _r(s, "noscript { display: inline; }");
+    _r(s, "ruby { display: inline; }");
+    _r(s, "rt { font-size: 50%; }");
+}

@@ -1,0 +1,330 @@
+// dom/tags.cst — the element names the HTML parser treats by name, as numbers.
+//
+// The tree builder asks "is this one of these twenty-five tags?" for every token,
+// so a tag is a small integer and each list in the spec is one bit in a table. An
+// element this table does not know is NONE and is compared by its name, which is
+// what the spec's "any other start tag" comes to anyway.
+//
+// The number says only what the name is, not what the element is: `<title>` inside
+// `<svg>` is an SVG element whose tag is also TITLE. Namespace lives on the node.
+//
+// Foreign names are here in lower case because that is what a token carries, so
+// SVG's foreignObject is FOREIGNOBJECT.
+
+let is i64 as NONE with imut = 0;
+let is i64 as A              with imut = 1;
+let is i64 as ADDRESS        with imut = 2;
+let is i64 as ANNOTATION_XML with imut = 3;
+let is i64 as APPLET         with imut = 4;
+let is i64 as AREA           with imut = 5;
+let is i64 as ARTICLE        with imut = 6;
+let is i64 as ASIDE          with imut = 7;
+let is i64 as B              with imut = 8;
+let is i64 as BASE           with imut = 9;
+let is i64 as BASEFONT       with imut = 10;
+let is i64 as BGSOUND        with imut = 11;
+let is i64 as BIG            with imut = 12;
+let is i64 as BLOCKQUOTE     with imut = 13;
+let is i64 as BODY           with imut = 14;
+let is i64 as BR             with imut = 15;
+let is i64 as BUTTON         with imut = 16;
+let is i64 as CAPTION        with imut = 17;
+let is i64 as CENTER         with imut = 18;
+let is i64 as CODE           with imut = 19;
+let is i64 as COL            with imut = 20;
+let is i64 as COLGROUP       with imut = 21;
+let is i64 as DD             with imut = 22;
+let is i64 as DESC           with imut = 23;
+let is i64 as DETAILS        with imut = 24;
+let is i64 as DIALOG         with imut = 25;
+let is i64 as DIR            with imut = 26;
+let is i64 as DIV            with imut = 27;
+let is i64 as DL             with imut = 28;
+let is i64 as DT             with imut = 29;
+let is i64 as EM             with imut = 30;
+let is i64 as EMBED          with imut = 31;
+let is i64 as FIELDSET       with imut = 32;
+let is i64 as FIGCAPTION     with imut = 33;
+let is i64 as FIGURE         with imut = 34;
+let is i64 as FONT           with imut = 35;
+let is i64 as FOOTER         with imut = 36;
+let is i64 as FOREIGNOBJECT  with imut = 37;
+let is i64 as FORM           with imut = 38;
+let is i64 as FRAME          with imut = 39;
+let is i64 as FRAMESET       with imut = 40;
+let is i64 as H1             with imut = 41;
+let is i64 as H2             with imut = 42;
+let is i64 as H3             with imut = 43;
+let is i64 as H4             with imut = 44;
+let is i64 as H5             with imut = 45;
+let is i64 as H6             with imut = 46;
+let is i64 as HEAD           with imut = 47;
+let is i64 as HEADER         with imut = 48;
+let is i64 as HGROUP         with imut = 49;
+let is i64 as HR             with imut = 50;
+let is i64 as HTML           with imut = 51;
+let is i64 as I              with imut = 52;
+let is i64 as IFRAME         with imut = 53;
+let is i64 as IMAGE          with imut = 54;
+let is i64 as IMG            with imut = 55;
+let is i64 as INPUT          with imut = 56;
+let is i64 as KEYGEN         with imut = 57;
+let is i64 as LI             with imut = 58;
+let is i64 as LINK           with imut = 59;
+let is i64 as LISTING        with imut = 60;
+let is i64 as MAIN           with imut = 61;
+let is i64 as MALIGNMARK     with imut = 62;
+let is i64 as MARQUEE        with imut = 63;
+let is i64 as MATH           with imut = 64;
+let is i64 as MENU           with imut = 65;
+let is i64 as META           with imut = 66;
+let is i64 as MGLYPH         with imut = 67;
+let is i64 as MI             with imut = 68;
+let is i64 as MN             with imut = 69;
+let is i64 as MO             with imut = 70;
+let is i64 as MS             with imut = 71;
+let is i64 as MTEXT          with imut = 72;
+let is i64 as NAV            with imut = 73;
+let is i64 as NOBR           with imut = 74;
+let is i64 as NOEMBED        with imut = 75;
+let is i64 as NOFRAMES       with imut = 76;
+let is i64 as NOSCRIPT       with imut = 77;
+let is i64 as OBJECT         with imut = 78;
+let is i64 as OL             with imut = 79;
+let is i64 as OPTGROUP       with imut = 80;
+let is i64 as OPTION         with imut = 81;
+let is i64 as P              with imut = 82;
+let is i64 as PARAM          with imut = 83;
+let is i64 as PLAINTEXT      with imut = 84;
+let is i64 as PRE            with imut = 85;
+let is i64 as RB             with imut = 86;
+let is i64 as RP             with imut = 87;
+let is i64 as RT             with imut = 88;
+let is i64 as RTC            with imut = 89;
+let is i64 as RUBY           with imut = 90;
+let is i64 as S              with imut = 91;
+let is i64 as SCRIPT         with imut = 92;
+let is i64 as SEARCH         with imut = 93;
+let is i64 as SECTION        with imut = 94;
+let is i64 as SELECT         with imut = 95;
+let is i64 as SMALL          with imut = 96;
+let is i64 as SOURCE         with imut = 97;
+let is i64 as SPAN           with imut = 98;
+let is i64 as STRIKE         with imut = 99;
+let is i64 as STRONG         with imut = 100;
+let is i64 as STYLE          with imut = 101;
+let is i64 as SUB            with imut = 102;
+let is i64 as SUMMARY        with imut = 103;
+let is i64 as SUP            with imut = 104;
+let is i64 as SVG            with imut = 105;
+let is i64 as TABLE          with imut = 106;
+let is i64 as TBODY          with imut = 107;
+let is i64 as TD             with imut = 108;
+let is i64 as TEMPLATE       with imut = 109;
+let is i64 as TEXTAREA       with imut = 110;
+let is i64 as TFOOT          with imut = 111;
+let is i64 as TH             with imut = 112;
+let is i64 as THEAD          with imut = 113;
+let is i64 as TITLE          with imut = 114;
+let is i64 as TR             with imut = 115;
+let is i64 as TRACK          with imut = 116;
+let is i64 as TT             with imut = 117;
+let is i64 as U              with imut = 118;
+let is i64 as UL             with imut = 119;
+let is i64 as VAR            with imut = 120;
+let is i64 as WBR            with imut = 121;
+let is i64 as XMP            with imut = 122;
+
+let is i64 as COUNT with imut = 123;
+
+// The lists in the spec, as bits.
+let is i64 as F_SPECIAL    with imut = 1;   // the "special" category, §13.2.4.2, in the HTML namespace
+let is i64 as F_FORMATTING with imut = 2;   // what goes in the list of active formatting elements
+let is i64 as F_IMPLIED    with imut = 4;   // what generating implied end tags closes
+let is i64 as F_THOROUGH   with imut = 8;   // what generating them thoroughly closes
+let is i64 as F_BLOCK      with imut = 16;   // a start tag in body that closes a <p> and is then ordinary
+let is i64 as F_BLOCK_END  with imut = 32;   // the end tags in body that share one rule
+let is i64 as F_HEADING    with imut = 64;   // h1 to h6
+let is i64 as F_IN_HEAD    with imut = 128;   // start tags that body hands to the "in head" rules
+let is i64 as F_BREAKOUT   with imut = 256;   // a start tag that ends foreign content
+let is i64 as F_SCOPE      with imut = 512;   // what ends "in scope", in the HTML namespace
+
+let is i64 as SLOTS with imut = 512;   // a power of two, well past COUNT
+
+let is [COUNT]i64 as _name with mut;   // *u8, by id
+let is [COUNT]i64 as _len  with mut;
+let is [COUNT]i64 as _bits with mut;
+let is [SLOTS]i64 as _slot with mut;   // open addressing; 0 is empty
+let is i64 as _ready with mut = 0;
+
+fn _hash(s as *u8, n as i64) as i64 {
+    let is i64 as h with mut = 2166136261;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = ((h ^ cast(i64, s[i])) * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h & (SLOTS - 1);
+}
+
+fn _add(id as i64, s as *u8, bits as i64) as void {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    _name[id] = cast(i64, s);
+    _len[id] = n;
+    _bits[id] = bits;
+    let is i64 as h with mut = _hash(s, n);
+    while (_slot[h] != 0) { h = (h + 1) & (SLOTS - 1); }
+    _slot[h] = id;
+}
+
+fn ensure() as void {
+    if (_ready == 1) { return; }
+    _ready = 1;
+    _add(A, "a", F_FORMATTING);
+    _add(ADDRESS, "address", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(ANNOTATION_XML, "annotation-xml", 0);
+    _add(APPLET, "applet", F_SPECIAL | F_SCOPE);
+    _add(AREA, "area", F_SPECIAL);
+    _add(ARTICLE, "article", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(ASIDE, "aside", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(B, "b", F_FORMATTING | F_BREAKOUT);
+    _add(BASE, "base", F_SPECIAL | F_IN_HEAD);
+    _add(BASEFONT, "basefont", F_SPECIAL | F_IN_HEAD);
+    _add(BGSOUND, "bgsound", F_SPECIAL | F_IN_HEAD);
+    _add(BIG, "big", F_FORMATTING | F_BREAKOUT);
+    _add(BLOCKQUOTE, "blockquote", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(BODY, "body", F_SPECIAL | F_BREAKOUT);
+    _add(BR, "br", F_SPECIAL | F_BREAKOUT);
+    _add(BUTTON, "button", F_SPECIAL | F_BLOCK_END);
+    _add(CAPTION, "caption", F_SPECIAL | F_THOROUGH | F_SCOPE);
+    _add(CENTER, "center", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(CODE, "code", F_FORMATTING | F_BREAKOUT);
+    _add(COL, "col", F_SPECIAL);
+    _add(COLGROUP, "colgroup", F_SPECIAL | F_THOROUGH);
+    _add(DD, "dd", F_SPECIAL | F_IMPLIED | F_THOROUGH | F_BREAKOUT);
+    _add(DESC, "desc", 0);
+    _add(DETAILS, "details", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(DIALOG, "dialog", F_BLOCK | F_BLOCK_END);
+    _add(DIR, "dir", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(DIV, "div", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(DL, "dl", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(DT, "dt", F_SPECIAL | F_IMPLIED | F_THOROUGH | F_BREAKOUT);
+    _add(EM, "em", F_FORMATTING | F_BREAKOUT);
+    _add(EMBED, "embed", F_SPECIAL | F_BREAKOUT);
+    _add(FIELDSET, "fieldset", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(FIGCAPTION, "figcaption", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(FIGURE, "figure", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(FONT, "font", F_FORMATTING);
+    _add(FOOTER, "footer", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(FOREIGNOBJECT, "foreignobject", 0);
+    _add(FORM, "form", F_SPECIAL);
+    _add(FRAME, "frame", F_SPECIAL);
+    _add(FRAMESET, "frameset", F_SPECIAL);
+    _add(H1, "h1", F_SPECIAL | F_HEADING | F_BREAKOUT);
+    _add(H2, "h2", F_SPECIAL | F_HEADING | F_BREAKOUT);
+    _add(H3, "h3", F_SPECIAL | F_HEADING | F_BREAKOUT);
+    _add(H4, "h4", F_SPECIAL | F_HEADING | F_BREAKOUT);
+    _add(H5, "h5", F_SPECIAL | F_HEADING | F_BREAKOUT);
+    _add(H6, "h6", F_SPECIAL | F_HEADING | F_BREAKOUT);
+    _add(HEAD, "head", F_SPECIAL | F_BREAKOUT);
+    _add(HEADER, "header", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(HGROUP, "hgroup", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(HR, "hr", F_SPECIAL | F_BREAKOUT);
+    _add(HTML, "html", F_SPECIAL | F_SCOPE);
+    _add(I, "i", F_FORMATTING | F_BREAKOUT);
+    _add(IFRAME, "iframe", F_SPECIAL);
+    _add(IMAGE, "image", 0);
+    _add(IMG, "img", F_SPECIAL | F_BREAKOUT);
+    _add(INPUT, "input", F_SPECIAL);
+    _add(KEYGEN, "keygen", F_SPECIAL);
+    _add(LI, "li", F_SPECIAL | F_IMPLIED | F_THOROUGH | F_BREAKOUT);
+    _add(LINK, "link", F_SPECIAL | F_IN_HEAD);
+    _add(LISTING, "listing", F_SPECIAL | F_BLOCK_END | F_BREAKOUT);
+    _add(MAIN, "main", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(MALIGNMARK, "malignmark", 0);
+    _add(MARQUEE, "marquee", F_SPECIAL | F_SCOPE);
+    _add(MATH, "math", 0);
+    _add(MENU, "menu", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(META, "meta", F_SPECIAL | F_IN_HEAD | F_BREAKOUT);
+    _add(MGLYPH, "mglyph", 0);
+    _add(MI, "mi", 0);
+    _add(MN, "mn", 0);
+    _add(MO, "mo", 0);
+    _add(MS, "ms", 0);
+    _add(MTEXT, "mtext", 0);
+    _add(NAV, "nav", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(NOBR, "nobr", F_FORMATTING | F_BREAKOUT);
+    _add(NOEMBED, "noembed", F_SPECIAL);
+    _add(NOFRAMES, "noframes", F_SPECIAL | F_IN_HEAD);
+    _add(NOSCRIPT, "noscript", F_SPECIAL);
+    _add(OBJECT, "object", F_SPECIAL | F_SCOPE);
+    _add(OL, "ol", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(OPTGROUP, "optgroup", F_IMPLIED | F_THOROUGH);
+    _add(OPTION, "option", F_IMPLIED | F_THOROUGH);
+    _add(P, "p", F_SPECIAL | F_IMPLIED | F_THOROUGH | F_BLOCK | F_BREAKOUT);
+    _add(PARAM, "param", F_SPECIAL);
+    _add(PLAINTEXT, "plaintext", F_SPECIAL);
+    _add(PRE, "pre", F_SPECIAL | F_BLOCK_END | F_BREAKOUT);
+    _add(RB, "rb", F_IMPLIED | F_THOROUGH);
+    _add(RP, "rp", F_IMPLIED | F_THOROUGH);
+    _add(RT, "rt", F_IMPLIED | F_THOROUGH);
+    _add(RTC, "rtc", F_IMPLIED | F_THOROUGH);
+    _add(RUBY, "ruby", F_BREAKOUT);
+    _add(S, "s", F_FORMATTING | F_BREAKOUT);
+    _add(SCRIPT, "script", F_SPECIAL | F_IN_HEAD);
+    _add(SEARCH, "search", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(SECTION, "section", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(SELECT, "select", F_SPECIAL | F_BLOCK_END | F_SCOPE);
+    _add(SMALL, "small", F_FORMATTING | F_BREAKOUT);
+    _add(SOURCE, "source", F_SPECIAL);
+    _add(SPAN, "span", F_BREAKOUT);
+    _add(STRIKE, "strike", F_FORMATTING | F_BREAKOUT);
+    _add(STRONG, "strong", F_FORMATTING | F_BREAKOUT);
+    _add(STYLE, "style", F_SPECIAL | F_IN_HEAD);
+    _add(SUB, "sub", F_BREAKOUT);
+    _add(SUMMARY, "summary", F_SPECIAL | F_BLOCK | F_BLOCK_END);
+    _add(SUP, "sup", F_BREAKOUT);
+    _add(SVG, "svg", 0);
+    _add(TABLE, "table", F_SPECIAL | F_BREAKOUT | F_SCOPE);
+    _add(TBODY, "tbody", F_SPECIAL | F_THOROUGH);
+    _add(TD, "td", F_SPECIAL | F_THOROUGH | F_SCOPE);
+    _add(TEMPLATE, "template", F_SPECIAL | F_IN_HEAD | F_SCOPE);
+    _add(TEXTAREA, "textarea", F_SPECIAL);
+    _add(TFOOT, "tfoot", F_SPECIAL | F_THOROUGH);
+    _add(TH, "th", F_SPECIAL | F_THOROUGH | F_SCOPE);
+    _add(THEAD, "thead", F_SPECIAL | F_THOROUGH);
+    _add(TITLE, "title", F_SPECIAL | F_IN_HEAD);
+    _add(TR, "tr", F_SPECIAL | F_THOROUGH);
+    _add(TRACK, "track", F_SPECIAL);
+    _add(TT, "tt", F_FORMATTING | F_BREAKOUT);
+    _add(U, "u", F_FORMATTING | F_BREAKOUT);
+    _add(UL, "ul", F_SPECIAL | F_BLOCK | F_BLOCK_END | F_BREAKOUT);
+    _add(VAR, "var", F_BREAKOUT);
+    _add(WBR, "wbr", F_SPECIAL);
+    _add(XMP, "xmp", F_SPECIAL);
+}
+
+// The tag with this name, or NONE. The name is a token's, so already lower case.
+fn lookup(s as *u8, n as i64) as i64 {
+    let is i64 as h with mut = _hash(s, n);
+    while (_slot[h] != 0) {
+        let is i64 as id = _slot[h];
+        if (_len[id] == n) {
+            let is *u8 as c = cast(*u8, _name[id]);
+            let is i64 as i with mut = 0;
+            while (i < n && c[i] == s[i]) { i = i + 1; }
+            if (i == n) { return id; }
+        }
+        h = (h + 1) & (SLOTS - 1);
+    }
+    return NONE;
+}
+
+fn has(id as i64, flag as i64) as i64 {
+    if ((_bits[id] & flag) != 0) { return 1; }
+    return 0;
+}
+
+fn name_of(id as i64) as *u8 { return cast(*u8, _name[id]); }
+fn len_of(id as i64) as i64 { return _len[id]; }

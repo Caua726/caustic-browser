@@ -1,0 +1,2223 @@
+// =======================================================
+// caustic-browser/src/html/tree.cst
+// The tree builder, WHATWG §13.2.6: tokens in, a document out.
+//
+// Every string of bytes is a document here. There is no input this rejects and no
+// tag soup it gives up on: each mistake has one defined recovery, and browsers agree
+// on what a broken page looks like only because they all run these same rules. So
+// this follows the spec's modes and algorithms one for one, under the spec's names,
+// and a rule that looks strange is the spec's and not a slip.
+//
+// HOW A MODE READS. Each insertion mode is one function over the token in `p`, and
+// its branches are the entries in the spec's list for that mode, in order. "Reprocess
+// the token" is a call to _dispatch, and "process using the rules for X" is a call to
+// that mode's function with the mode left alone. Both recurse, but only a few levels:
+// each step either consumes the token or moves on to a mode that will.
+//
+// CHARACTERS ARRIVE AS RUNS, not one at a time. The rules only ever ask whether a
+// character is whitespace or NUL, so _chars cuts a run at those edges and hands each
+// piece to the modes as one token. A piece is all the same class, which makes it
+// behave exactly as that many one-character tokens would.
+//
+// WHAT IS LEFT OUT, all of it needing something this browser does not have:
+//   * Parse errors are not reported. Only their recoveries change the tree, and those
+//     are all here. Where the spec says only "parse error", there is no code.
+//   * Scripting is Disabled, the spec's mode for a browser without scripts. <script>
+//     collects its text and nothing runs, <noscript> content parses as content, and
+//     everything reentrant about document.write has nothing to do.
+//   * The fragment case, which only innerHTML reaches, and there is no JavaScript.
+//   * Processing instructions: the tokenizer still makes `<?x?>` a bogus comment.
+//   * Declarative shadow roots and <template for>: both parse as a plain <template>.
+//   * Encodings. Bytes are taken as UTF-8.
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "./tokenizer.cst" as tk;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as t;
+
+// --- insertion modes -----------------------------------------------------
+let is i64 as M_INITIAL             with imut = 0;
+let is i64 as M_BEFORE_HTML         with imut = 1;
+let is i64 as M_BEFORE_HEAD         with imut = 2;
+let is i64 as M_IN_HEAD             with imut = 3;
+let is i64 as M_IN_HEAD_NOSCRIPT    with imut = 4;
+let is i64 as M_AFTER_HEAD          with imut = 5;
+let is i64 as M_IN_BODY             with imut = 6;
+let is i64 as M_TEXT                with imut = 7;
+let is i64 as M_IN_TABLE            with imut = 8;
+let is i64 as M_IN_TABLE_TEXT       with imut = 9;
+let is i64 as M_IN_CAPTION          with imut = 10;
+let is i64 as M_IN_COLGROUP         with imut = 11;
+let is i64 as M_IN_TBODY            with imut = 12;
+let is i64 as M_IN_ROW              with imut = 13;
+let is i64 as M_IN_CELL             with imut = 14;
+let is i64 as M_IN_TEMPLATE         with imut = 15;
+let is i64 as M_AFTER_BODY          with imut = 16;
+let is i64 as M_IN_FRAMESET         with imut = 17;
+let is i64 as M_AFTER_FRAMESET      with imut = 18;
+let is i64 as M_AFTER_AFTER_BODY    with imut = 19;
+let is i64 as M_AFTER_AFTER_FRAMESET with imut = 20;
+
+// A piece of a character run.
+let is i64 as C_WS   with imut = 0;
+let is i64 as C_NUL  with imut = 1;
+let is i64 as C_TEXT with imut = 2;
+
+// The four scopes of §13.2.4.2.
+let is i64 as SCOPE_PLAIN  with imut = 0;
+let is i64 as SCOPE_LIST   with imut = 1;
+let is i64 as SCOPE_BUTTON with imut = 2;
+let is i64 as SCOPE_TABLE  with imut = 3;
+
+let is i64 as INIT_STACK with imut = 64;
+
+struct Parser {
+    d  as *dom.Document;
+    tz as tk.Tokenizer;
+
+    mode as i64;
+    orig as i64;              // where "text" and "in table text" go back to
+
+    open     as **dom.Node;   // the stack of open elements; [0] is the html element
+    nopen    as i64;
+    open_cap as i64;
+
+    fmt     as **dom.Node;    // the list of active formatting elements; null is a marker
+    nfmt    as i64;
+    fmt_cap as i64;
+
+    tmpl     as *i64;         // the stack of template insertion modes
+    ntmpl    as i64;
+    tmpl_cap as i64;
+
+    head as *dom.Node;        // the head element pointer
+    form as *dom.Node;        // the form element pointer
+
+    frameset_ok as i64;
+    foster      as i64;       // foster parenting is enabled
+    skip_lf     as i64;       // a newline right after <pre>, <listing> or <textarea> is dropped
+    stopped     as i64;
+
+    // The token being processed. `tag` is NONE for anything but a tag.
+    k    as i64;
+    tag  as i64;
+    name as *u8;
+    nlen as i64;
+
+    // When k is TOK_CHAR: the piece of the run.
+    cs     as *u8;
+    cn     as i64;
+    cclass as i64;
+
+    // The pending table character tokens.
+    pend     as *u8;
+    npend    as i64;
+    pend_cap as i64;
+
+    // What _place found.
+    at_parent as *dom.Node;
+    at_ref    as *dom.Node;
+}
+
+// --- bytes ---------------------------------------------------------------
+fn _lc(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn _is_ws(c as i64) as i64 {
+    if (c == 9 || c == 10 || c == 12 || c == 13 || c == 32) { return 1; }
+    return 0;
+}
+
+// Does the text start with this literal, in any case?
+fn _pre(s as *u8, n as i64, lit as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (lit[i] != 0) {
+        if (i >= n) { return 0; }
+        if (_lc(cast(i64, s[i])) != _lc(cast(i64, lit[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Is it exactly this literal, in any case?
+fn _ci(s as *u8, n as i64, lit as *u8) as i64 {
+    if (_pre(s, n, lit) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (lit[i] != 0) { i = i + 1; }
+    if (i == n) { return 1; }
+    return 0;
+}
+
+fn _at(s as *u8, i as i64) as *u8 { return cast(*u8, cast(i64, s) + i); }
+
+// `from to from to …`, in a string. The length of `to` for this `from`, or 0, with
+// `to` in *out. The tables are small and only foreign content reads them.
+fn _pair(table as *u8, name as *u8, n as i64, out as **u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (table[i] != 0) {
+        let is i64 as key = i;
+        while (table[i] != 32) { i = i + 1; }
+        let is i64 as klen = i - key;
+        i = i + 1;
+        let is i64 as val = i;
+        while (table[i] != 32 && table[i] != 0) { i = i + 1; }
+        let is i64 as vlen = i - val;
+        if (table[i] == 32) { i = i + 1; }
+        if (klen == n) {
+            let is i64 as j with mut = 0;
+            while (j < n && table[key + j] == name[j]) { j = j + 1; }
+            if (j == n) {
+                *out = _at(table, val);
+                return vlen;
+            }
+        }
+    }
+    return 0;
+}
+
+fn _svg_tag(name as *u8, n as i64, out as **u8) as i64 {
+    let is i64 as a = _pair("altglyph altGlyph altglyphdef altGlyphDef altglyphitem altGlyphItem animatecolor animateColor animatemotion animateMotion animatetransform animateTransform clippath clipPath", name, n, out);
+    if (a > 0) { return a; }
+    let is i64 as b = _pair("feblend feBlend fecolormatrix feColorMatrix fecomponenttransfer feComponentTransfer fecomposite feComposite feconvolvematrix feConvolveMatrix fediffuselighting feDiffuseLighting fedisplacementmap feDisplacementMap fedistantlight feDistantLight fedropshadow feDropShadow feflood feFlood", name, n, out);
+    if (b > 0) { return b; }
+    let is i64 as c = _pair("fefunca feFuncA fefuncb feFuncB fefuncg feFuncG fefuncr feFuncR fegaussianblur feGaussianBlur feimage feImage femerge feMerge femergenode feMergeNode femorphology feMorphology feoffset feOffset fepointlight fePointLight fespecularlighting feSpecularLighting fespotlight feSpotLight fetile feTile feturbulence feTurbulence", name, n, out);
+    if (c > 0) { return c; }
+    return _pair("foreignobject foreignObject glyphref glyphRef lineargradient linearGradient radialgradient radialGradient textpath textPath", name, n, out);
+}
+
+fn _svg_attr(name as *u8, n as i64, out as **u8) as i64 {
+    let is i64 as a = _pair("attributename attributeName attributetype attributeType basefrequency baseFrequency baseprofile baseProfile calcmode calcMode clippathunits clipPathUnits diffuseconstant diffuseConstant edgemode edgeMode filterunits filterUnits glyphref glyphRef gradienttransform gradientTransform gradientunits gradientUnits", name, n, out);
+    if (a > 0) { return a; }
+    let is i64 as b = _pair("kernelmatrix kernelMatrix kernelunitlength kernelUnitLength keypoints keyPoints keysplines keySplines keytimes keyTimes lengthadjust lengthAdjust limitingconeangle limitingConeAngle markerheight markerHeight markerunits markerUnits markerwidth markerWidth maskcontentunits maskContentUnits maskunits maskUnits numoctaves numOctaves", name, n, out);
+    if (b > 0) { return b; }
+    let is i64 as c = _pair("pathlength pathLength patterncontentunits patternContentUnits patterntransform patternTransform patternunits patternUnits pointsatx pointsAtX pointsaty pointsAtY pointsatz pointsAtZ preservealpha preserveAlpha preserveaspectratio preserveAspectRatio primitiveunits primitiveUnits refx refX refy refY repeatcount repeatCount repeatdur repeatDur", name, n, out);
+    if (c > 0) { return c; }
+    return _pair("requiredextensions requiredExtensions requiredfeatures requiredFeatures specularconstant specularConstant specularexponent specularExponent spreadmethod spreadMethod startoffset startOffset stddeviation stdDeviation stitchtiles stitchTiles surfacescale surfaceScale systemlanguage systemLanguage tablevalues tableValues targetx targetX targety targetY textlength textLength viewbox viewBox viewtarget viewTarget xchannelselector xChannelSelector ychannelselector yChannelSelector zoomandpan zoomAndPan", name, n, out);
+}
+
+// --- what kind of node is it ---------------------------------------------
+fn _is(n as *dom.Node, tag as i64) as i64 {
+    if (n.ns == dom.NS_HTML && n.tag == tag) { return 1; }
+    return 0;
+}
+
+// Does this HTML element have the name in the current tag token?
+fn _same_name(p as *Parser, n as *dom.Node) as i64 {
+    if (n.ns != dom.NS_HTML) { return 0; }
+    if (p.tag != t.NONE) {
+        if (n.tag == p.tag) { return 1; }
+        return 0;
+    }
+    if (n.tag != t.NONE || n.name_len != p.nlen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < p.nlen) {
+        if (n.name[i] != p.name[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _mathml_text_point(n as *dom.Node) as i64 {
+    if (n.ns != dom.NS_MATHML) { return 0; }
+    if (n.tag == t.MI || n.tag == t.MO || n.tag == t.MN || n.tag == t.MS || n.tag == t.MTEXT) { return 1; }
+    return 0;
+}
+
+fn _svg_html_point(n as *dom.Node) as i64 {
+    if (n.ns != dom.NS_SVG) { return 0; }
+    if (n.tag == t.FOREIGNOBJECT || n.tag == t.DESC || n.tag == t.TITLE) { return 1; }
+    return 0;
+}
+
+fn _html_point(n as *dom.Node) as i64 {
+    if (n.ns == dom.NS_MATHML && n.tag == t.ANNOTATION_XML && n.html_point == 1) { return 1; }
+    return _svg_html_point(n);
+}
+
+// The foreign elements that are both special and the end of a scope.
+fn _foreign_stop(n as *dom.Node) as i64 {
+    if (_mathml_text_point(n) == 1) { return 1; }
+    if (n.ns == dom.NS_MATHML && n.tag == t.ANNOTATION_XML) { return 1; }
+    return _svg_html_point(n);
+}
+
+fn _special(n as *dom.Node) as i64 {
+    if (n.ns == dom.NS_HTML) { return t.has(n.tag, t.F_SPECIAL); }
+    return _foreign_stop(n);
+}
+
+fn _scope_stop(n as *dom.Node, kind as i64) as i64 {
+    if (kind == SCOPE_TABLE) {
+        if (_is(n, t.HTML) == 1 || _is(n, t.TABLE) == 1 || _is(n, t.TEMPLATE) == 1) { return 1; }
+        return 0;
+    }
+    if (n.ns != dom.NS_HTML) { return _foreign_stop(n); }
+    if (t.has(n.tag, t.F_SCOPE) == 1) { return 1; }
+    if (kind == SCOPE_LIST && (n.tag == t.OL || n.tag == t.UL)) { return 1; }
+    if (kind == SCOPE_BUTTON && n.tag == t.BUTTON) { return 1; }
+    return 0;
+}
+
+fn _section(tag as i64) as i64 {
+    if (tag == t.TBODY || tag == t.TFOOT || tag == t.THEAD) { return 1; }
+    return 0;
+}
+
+// caption, col, colgroup, tbody, td, tfoot, th, thead, tr: what ends a cell or a caption.
+fn _table_part(tag as i64) as i64 {
+    if (_section(tag) == 1) { return 1; }
+    if (tag == t.CAPTION || tag == t.COL || tag == t.COLGROUP) { return 1; }
+    if (tag == t.TD || tag == t.TH || tag == t.TR) { return 1; }
+    return 0;
+}
+
+// --- the stack of open elements ------------------------------------------
+fn _cur(p as *Parser) as *dom.Node { return p.open[p.nopen - 1]; }
+
+fn _pop(p as *Parser) as void { p.nopen = p.nopen - 1; }
+
+fn _more(p as *Parser, old as *u8, used as i64, bytes as i64) as *u8 {
+    let is *u8 as a = dom.alloc(p.d, bytes);
+    if (used > 0) { mem.core.memcpy(a, old, used); }
+    return a;
+}
+
+fn _push(p as *Parser, n as *dom.Node) as void {
+    if (p.nopen == p.open_cap) {
+        p.open_cap = p.open_cap * 2;
+        p.open = cast(**dom.Node, _more(p, cast(*u8, p.open), p.nopen * 8, p.open_cap * 8));
+    }
+    p.open[p.nopen] = n;
+    p.nopen = p.nopen + 1;
+}
+
+fn _open_index(p as *Parser, n as *dom.Node) as i64 {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        if (p.open[i] == n) { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+fn _open_remove(p as *Parser, at as i64) as void {
+    let is i64 as i with mut = at;
+    while (i < p.nopen - 1) {
+        p.open[i] = p.open[i + 1];
+        i = i + 1;
+    }
+    p.nopen = p.nopen - 1;
+}
+
+fn _open_insert(p as *Parser, at as i64, n as *dom.Node) as void {
+    _push(p, n);
+    let is i64 as i with mut = p.nopen - 1;
+    while (i > at) {
+        p.open[i] = p.open[i - 1];
+        i = i - 1;
+    }
+    p.open[at] = n;
+}
+
+// Pop until an HTML element with this tag has been popped. Callers know it is there;
+// the html element stays on the stack if they are ever wrong.
+fn _pop_until(p as *Parser, tag as i64) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        _pop(p);
+        if (_is(n, tag) == 1) { return; }
+    }
+}
+
+fn _in_scope_of(p as *Parser, tag as i64, kind as i64) as i64 {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        if (_is(n, tag) == 1) { return 1; }
+        if (_scope_stop(n, kind) == 1) { return 0; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _in_scope(p as *Parser, tag as i64) as i64 { return _in_scope_of(p, tag, SCOPE_PLAIN); }
+fn _in_button_scope(p as *Parser, tag as i64) as i64 { return _in_scope_of(p, tag, SCOPE_BUTTON); }
+fn _in_table_scope(p as *Parser, tag as i64) as i64 { return _in_scope_of(p, tag, SCOPE_TABLE); }
+
+fn _node_in_scope(p as *Parser, target as *dom.Node) as i64 {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        if (n == target) { return 1; }
+        if (_scope_stop(n, SCOPE_PLAIN) == 1) { return 0; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _heading_in_scope(p as *Parser) as i64 {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        if (n.ns == dom.NS_HTML && t.has(n.tag, t.F_HEADING) == 1) { return 1; }
+        if (_scope_stop(n, SCOPE_PLAIN) == 1) { return 0; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _template_open(p as *Parser) as i64 {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        if (_is(p.open[i], t.TEMPLATE) == 1) { return 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Generate implied end tags, except for this tag (NONE to except nothing).
+fn _implied(p as *Parser, except as i64) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        if (n.ns != dom.NS_HTML || n.tag == except || t.has(n.tag, t.F_IMPLIED) == 0) { return; }
+        _pop(p);
+    }
+}
+
+fn _implied_thoroughly(p as *Parser) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        if (n.ns != dom.NS_HTML || t.has(n.tag, t.F_THOROUGH) == 0) { return; }
+        _pop(p);
+    }
+}
+
+fn _close_p(p as *Parser) as void {
+    _implied(p, t.P);
+    _pop_until(p, t.P);
+}
+
+fn _close_p_if_open(p as *Parser) as void {
+    if (_in_button_scope(p, t.P) == 1) { _close_p(p); }
+}
+
+fn _clear_to_table(p as *Parser) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        if (_is(n, t.TABLE) == 1 || _is(n, t.TEMPLATE) == 1 || _is(n, t.HTML) == 1) { return; }
+        _pop(p);
+    }
+}
+
+fn _clear_to_section(p as *Parser) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        if (n.ns == dom.NS_HTML && _section(n.tag) == 1) { return; }
+        if (_is(n, t.TEMPLATE) == 1 || _is(n, t.HTML) == 1) { return; }
+        _pop(p);
+    }
+}
+
+fn _clear_to_row(p as *Parser) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        if (_is(n, t.TR) == 1 || _is(n, t.TEMPLATE) == 1 || _is(n, t.HTML) == 1) { return; }
+        _pop(p);
+    }
+}
+
+// --- the list of active formatting elements ------------------------------
+fn _fmt_add(p as *Parser, n as *dom.Node) as void {
+    if (p.nfmt == p.fmt_cap) {
+        p.fmt_cap = p.fmt_cap * 2;
+        p.fmt = cast(**dom.Node, _more(p, cast(*u8, p.fmt), p.nfmt * 8, p.fmt_cap * 8));
+    }
+    p.fmt[p.nfmt] = n;
+    p.nfmt = p.nfmt + 1;
+}
+
+fn _marker(p as *Parser) as void { _fmt_add(p, cast(*dom.Node, 0)); }
+
+fn _fmt_index(p as *Parser, n as *dom.Node) as i64 {
+    let is i64 as i with mut = p.nfmt - 1;
+    while (i >= 0) {
+        if (p.fmt[i] == n) { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+fn _fmt_remove(p as *Parser, at as i64) as void {
+    let is i64 as i with mut = at;
+    while (i < p.nfmt - 1) {
+        p.fmt[i] = p.fmt[i + 1];
+        i = i + 1;
+    }
+    p.nfmt = p.nfmt - 1;
+}
+
+fn _fmt_insert(p as *Parser, at as i64, n as *dom.Node) as void {
+    _fmt_add(p, n);
+    let is i64 as i with mut = p.nfmt - 1;
+    while (i > at) {
+        p.fmt[i] = p.fmt[i - 1];
+        i = i - 1;
+    }
+    p.fmt[at] = n;
+}
+
+// The last entry after the last marker with the current token's name, or -1.
+fn _fmt_find(p as *Parser) as i64 {
+    let is i64 as i with mut = p.nfmt - 1;
+    while (i >= 0) {
+        let is *dom.Node as e = p.fmt[i];
+        if (e == null) { return 0 - 1; }
+        if (_same_name(p, e) == 1) { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// Push onto the list, with the Noah's Ark clause: three of a family at most.
+fn _fmt_push(p as *Parser, el as *dom.Node) as void {
+    let is i64 as same with mut = 0;
+    let is i64 as earliest with mut = 0 - 1;
+    let is i64 as i with mut = p.nfmt - 1;
+    while (i >= 0) {
+        let is *dom.Node as e = p.fmt[i];
+        if (e == null) { break; }
+        if (e.tag == el.tag && e.ns == el.ns && dom.same_attrs(e, el) == 1) {
+            same = same + 1;
+            earliest = i;
+        }
+        i = i - 1;
+    }
+    if (same >= 3) { _fmt_remove(p, earliest); }
+    _fmt_add(p, el);
+}
+
+fn _fmt_clear_to_marker(p as *Parser) as void {
+    while (p.nfmt > 0) {
+        p.nfmt = p.nfmt - 1;
+        if (p.fmt[p.nfmt] == null) { return; }
+    }
+}
+
+// --- the stack of template insertion modes -------------------------------
+fn _tmpl_push(p as *Parser, mode as i64) as void {
+    if (p.ntmpl == p.tmpl_cap) {
+        p.tmpl_cap = p.tmpl_cap * 2;
+        p.tmpl = cast(*i64, _more(p, cast(*u8, p.tmpl), p.ntmpl * 8, p.tmpl_cap * 8));
+    }
+    p.tmpl[p.ntmpl] = mode;
+    p.ntmpl = p.ntmpl + 1;
+}
+
+// In template mode: this mode replaces the current one, and the token is reprocessed.
+fn _tmpl_switch(p as *Parser, mode as i64) as void {
+    p.ntmpl = p.ntmpl - 1;
+    _tmpl_push(p, mode);
+    p.mode = mode;
+    _dispatch(p);
+}
+
+// --- inserting nodes -----------------------------------------------------
+
+// The appropriate place for inserting a node, into at_parent and at_ref. `over` is
+// the override target, null for none.
+fn _place(p as *Parser, over as *dom.Node) as void {
+    let is *dom.Node as target with mut = over;
+    let is *dom.Node as ref with mut = cast(*dom.Node, 0);
+    if (target == null) { target = _cur(p); }
+    if (p.foster == 1 && target.ns == dom.NS_HTML
+        && (target.tag == t.TABLE || target.tag == t.TR || _section(target.tag) == 1)) {
+        let is i64 as i with mut = p.nopen - 1;
+        while (i >= 0 && _is(p.open[i], t.TEMPLATE) == 0 && _is(p.open[i], t.TABLE) == 0) { i = i - 1; }
+        if (i < 0) {
+            target = p.open[0];
+        } else if (_is(p.open[i], t.TEMPLATE) == 1) {
+            target = p.open[i];
+        } else if (p.open[i].parent != null) {
+            target = p.open[i].parent;
+            ref = p.open[i];
+        } else {
+            target = p.open[i - 1];
+        }
+    }
+    if (_is(target, t.TEMPLATE) == 1) {
+        target = target.content;
+        ref = cast(*dom.Node, 0);
+    }
+    p.at_parent = target;
+    p.at_ref = ref;
+}
+
+fn _new_element(p as *Parser, ns as i64, tag as i64, name as *u8, nlen as i64) as *dom.Node {
+    let is *dom.Node as el = dom.element(p.d, ns, tag, name, nlen);
+    if (ns == dom.NS_HTML && tag == t.TEMPLATE) { el.content = dom.fragment(p.d, el); }
+    return el;
+}
+
+fn _attach(p as *Parser, el as *dom.Node) as void {
+    _place(p, cast(*dom.Node, 0));
+    dom.insert_before(p.at_parent, el, p.at_ref);
+    _push(p, el);
+}
+
+// Adjust foreign attributes: a few names are really a namespace and a local name.
+// Returns the attribute's namespace; a hit moves the name past its prefix.
+fn _foreign_attr(name as **u8, nlen as *i64) as i64 {
+    let is *u8 as s = *name;
+    let is i64 as n = *nlen;
+    if (_ci(s, n, "xmlns") == 1) { return dom.ATTR_XMLNS; }
+    if (_ci(s, n, "xmlns:xlink") == 1) {
+        *name = _at(s, 6);
+        *nlen = n - 6;
+        return dom.ATTR_XMLNS;
+    }
+    if (_ci(s, n, "xml:lang") == 1 || _ci(s, n, "xml:space") == 1) {
+        *name = _at(s, 4);
+        *nlen = n - 4;
+        return dom.ATTR_XML;
+    }
+    if (_ci(s, n, "xlink:actuate") == 1 || _ci(s, n, "xlink:arcrole") == 1 || _ci(s, n, "xlink:href") == 1
+        || _ci(s, n, "xlink:role") == 1 || _ci(s, n, "xlink:show") == 1 || _ci(s, n, "xlink:title") == 1
+        || _ci(s, n, "xlink:type") == 1) {
+        *name = _at(s, 6);
+        *nlen = n - 6;
+        return dom.ATTR_XLINK;
+    }
+    return dom.ATTR_PLAIN;
+}
+
+// The current start tag's attributes onto a new element, fixed up as its namespace
+// requires. Doing it at the element rather than on the token covers every caller.
+fn _copy_attrs(p as *Parser, el as *dom.Node) as void {
+    let is *tk.Tokenizer as z = &p.tz;
+    let is i64 as count = tk.tok_nattr(z);
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is *u8 as name with mut = tk.tok_attr_name(z, i);
+        let is i64 as nlen with mut = tk.tok_attr_name_len(z, i);
+        let is i64 as ns with mut = dom.ATTR_PLAIN;
+        if (el.ns == dom.NS_SVG) {
+            let is *u8 as to with mut = cast(*u8, 0);
+            let is i64 as tlen = _svg_attr(name, nlen, &to);
+            if (tlen > 0) {
+                name = to;
+                nlen = tlen;
+            }
+        }
+        if (el.ns == dom.NS_MATHML && _ci(name, nlen, "definitionurl") == 1) {
+            name = "definitionURL";
+        }
+        if (el.ns != dom.NS_HTML) { ns = _foreign_attr(&name, &nlen); }
+        dom.add_attr(p.d, el, ns, name, nlen, tk.tok_attr_value(z, i), tk.tok_attr_value_len(z, i));
+        i = i + 1;
+    }
+    if (el.ns == dom.NS_MATHML && el.tag == t.ANNOTATION_XML) {
+        let is *dom.Attr as a = dom.find_attr(el, "encoding", 8);
+        if (a != null && (_ci(a.value, a.value_len, "text/html") == 1
+            || _ci(a.value, a.value_len, "application/xhtml+xml") == 1)) {
+            el.html_point = 1;
+        }
+    }
+}
+
+// Insert an HTML element for the current token.
+fn _insert(p as *Parser) as *dom.Node {
+    let is *dom.Node as el = _new_element(p, dom.NS_HTML, p.tag, p.name, p.nlen);
+    _copy_attrs(p, el);
+    _attach(p, el);
+    return el;
+}
+
+// Insert an HTML element for a start tag of this name with no attributes.
+fn _insert_tag(p as *Parser, tag as i64) as *dom.Node {
+    let is *dom.Node as el = _new_element(p, dom.NS_HTML, tag, t.name_of(tag), t.len_of(tag));
+    _attach(p, el);
+    return el;
+}
+
+fn _insert_foreign(p as *Parser, ns as i64) as *dom.Node {
+    let is *u8 as name with mut = p.name;
+    let is i64 as nlen with mut = p.nlen;
+    if (ns == dom.NS_SVG) {
+        let is *u8 as to with mut = cast(*u8, 0);
+        let is i64 as tlen = _svg_tag(name, nlen, &to);
+        if (tlen > 0) {
+            name = to;
+            nlen = tlen;
+        }
+    }
+    let is *dom.Node as el = _new_element(p, ns, p.tag, name, nlen);
+    _copy_attrs(p, el);
+    _attach(p, el);
+    return el;
+}
+
+// Insert the characters.
+fn _insert_chars(p as *Parser, s as *u8, n as i64) as void {
+    _place(p, cast(*dom.Node, 0));
+    let is *dom.Node as parent = p.at_parent;
+    let is *dom.Node as ref = p.at_ref;
+    if (parent.kind == dom.DOCUMENT) { return; }
+    let is *dom.Node as before with mut = parent.last;
+    if (ref != null) { before = ref.prev; }
+    if (before != null && before.kind == dom.TEXT) {
+        dom.text_append(p.d, before, s, n);
+        return;
+    }
+    dom.insert_before(parent, dom.text(p.d, s, n), ref);
+}
+
+fn _comment_node(p as *Parser) as *dom.Node {
+    return dom.comment(p.d, tk.tok_name(&p.tz), tk.tok_name_len(&p.tz));
+}
+
+fn _comment(p as *Parser) as void {
+    _place(p, cast(*dom.Node, 0));
+    dom.insert_before(p.at_parent, _comment_node(p), p.at_ref);
+}
+
+// Insert a comment given (parent, null).
+fn _comment_in(p as *Parser, parent as *dom.Node) as void {
+    dom.append(parent, _comment_node(p));
+}
+
+// Add what the element does not have: a second <html> or <body> start tag.
+fn _merge_attrs(p as *Parser, el as *dom.Node) as void {
+    let is *tk.Tokenizer as z = &p.tz;
+    let is i64 as count = tk.tok_nattr(z);
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is *u8 as name = tk.tok_attr_name(z, i);
+        let is i64 as nlen = tk.tok_attr_name_len(z, i);
+        if (dom.find_attr(el, name, nlen) == null) {
+            dom.add_attr(p.d, el, dom.ATTR_PLAIN, name, nlen, tk.tok_attr_value(z, i), tk.tok_attr_value_len(z, i));
+        }
+        i = i + 1;
+    }
+}
+
+// The value of the current token's attribute, or null with *vlen untouched.
+fn _token_attr(p as *Parser, name as *u8, vlen as *i64) as *u8 {
+    let is *tk.Tokenizer as z = &p.tz;
+    let is i64 as count = tk.tok_nattr(z);
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        if (_ci(tk.tok_attr_name(z, i), tk.tok_attr_name_len(z, i), name) == 1) {
+            *vlen = tk.tok_attr_value_len(z, i);
+            return tk.tok_attr_value(z, i);
+        }
+        i = i + 1;
+    }
+    return cast(*u8, 0);
+}
+
+fn _is_hidden_input(p as *Parser) as i64 {
+    let is i64 as vlen with mut = 0;
+    let is *u8 as v = _token_attr(p, "type", &vlen);
+    if (v == null) { return 0; }
+    return _ci(v, vlen, "hidden");
+}
+
+// Generic raw text and RCDATA element parsing, and <script>: the element holds text
+// until its end tag, and only the tokenizer state differs.
+fn _text_element(p as *Parser, state as i64) as void {
+    _insert(p);
+    tk.tok_set_state(&p.tz, state);
+    p.orig = p.mode;
+    p.mode = M_TEXT;
+}
+
+// --- formatting ----------------------------------------------------------
+fn _reconstruct(p as *Parser) as void {
+    if (p.nfmt == 0) { return; }
+    let is *dom.Node as last = p.fmt[p.nfmt - 1];
+    if (last == null || _open_index(p, last) >= 0) { return; }
+    let is i64 as i with mut = p.nfmt - 1;
+    while (i > 0) {
+        let is *dom.Node as e = p.fmt[i - 1];
+        if (e == null || _open_index(p, e) >= 0) { break; }
+        i = i - 1;
+    }
+    while (i < p.nfmt) {
+        let is *dom.Node as el = dom.clone(p.d, p.fmt[i]);
+        _attach(p, el);
+        p.fmt[i] = el;
+        i = i + 1;
+    }
+}
+
+// "Any other end tag" in body.
+fn _any_other_end(p as *Parser) as void {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        if (_same_name(p, n) == 1) {
+            _implied(p, p.tag);
+            p.nopen = i;
+            return;
+        }
+        if (_special(n) == 1) { return; }
+        i = i - 1;
+    }
+}
+
+// The adoption agency algorithm. The name is the spec's, and so is the shape: this is
+// what turns `<b><p>x</b>y</p>` into a tree where `x` is bold and `y` is not.
+//
+// The bookmark is an index into the list as it stands with the formatting element
+// still in it, which is what keeps it true while entries come and go.
+fn _adoption(p as *Parser) as void {
+    let is *dom.Node as cur = _cur(p);
+    if (_same_name(p, cur) == 1 && _fmt_index(p, cur) < 0) {
+        _pop(p);
+        return;
+    }
+    let is i64 as outer with mut = 0;
+    while (outer < 8) {
+        outer = outer + 1;
+
+        let is i64 as fi = _fmt_find(p);
+        if (fi < 0) {
+            _any_other_end(p);
+            return;
+        }
+        let is *dom.Node as fe = p.fmt[fi];
+        let is i64 as oi = _open_index(p, fe);
+        if (oi < 0) {
+            _fmt_remove(p, fi);
+            return;
+        }
+        if (_node_in_scope(p, fe) == 0) { return; }
+
+        let is i64 as fb with mut = oi + 1;
+        while (fb < p.nopen && _special(p.open[fb]) == 0) { fb = fb + 1; }
+        if (fb >= p.nopen) {
+            p.nopen = oi;
+            _fmt_remove(p, fi);
+            return;
+        }
+        let is *dom.Node as furthest = p.open[fb];
+        let is *dom.Node as common = p.open[oi - 1];
+
+        let is i64 as bookmark with mut = fi;
+        let is i64 as moved with mut = 0;
+        let is *dom.Node as last with mut = furthest;
+        let is i64 as inner with mut = 0;
+        let is i64 as ni with mut = fb - 1;
+        while (ni > oi) {
+            inner = inner + 1;
+            let is *dom.Node as node = p.open[ni];
+            let is i64 as nf with mut = _fmt_index(p, node);
+            if (inner > 3 && nf >= 0) {
+                _fmt_remove(p, nf);
+                if (nf < bookmark) { bookmark = bookmark - 1; }
+                nf = 0 - 1;
+            }
+            if (nf < 0) {
+                _open_remove(p, ni);
+                ni = ni - 1;
+                continue;
+            }
+            let is *dom.Node as copy = dom.clone(p.d, node);
+            p.fmt[nf] = copy;
+            p.open[ni] = copy;
+            if (moved == 0) {
+                bookmark = nf + 1;
+                moved = 1;
+            }
+            dom.remove(last);
+            dom.append(copy, last);
+            last = copy;
+            ni = ni - 1;
+        }
+
+        _place(p, common);
+        let is *dom.Node as target = p.at_parent;
+        let is *dom.Node as ref = p.at_ref;
+        dom.remove(last);
+        if (dom.contains(last, target) == 0
+            && (target.kind != dom.DOCUMENT || dom.has_element_child(target) == 0)
+            && (ref == null || ref.parent == target)) {
+            dom.insert_before(target, last, ref);
+        }
+
+        let is *dom.Node as fresh = dom.clone(p.d, fe);
+        dom.move_children(furthest, fresh);
+        dom.append(furthest, fresh);
+
+        let is i64 as at = _fmt_index(p, fe);
+        _fmt_remove(p, at);
+        if (at < bookmark) { bookmark = bookmark - 1; }
+        _fmt_insert(p, bookmark, fresh);
+
+        _open_remove(p, oi);
+        _open_insert(p, _open_index(p, furthest) + 1, fresh);
+    }
+}
+
+// --- reset the insertion mode appropriately ------------------------------
+fn _reset_mode(p as *Parser) as void {
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        let is i64 as last = cast(i64, i == 0);
+        if (n.ns == dom.NS_HTML) {
+            let is i64 as tag = n.tag;
+            if ((tag == t.TD || tag == t.TH) && last == 0) { p.mode = M_IN_CELL; return; }
+            if (tag == t.TR) { p.mode = M_IN_ROW; return; }
+            if (_section(tag) == 1) { p.mode = M_IN_TBODY; return; }
+            if (tag == t.CAPTION) { p.mode = M_IN_CAPTION; return; }
+            if (tag == t.COLGROUP) { p.mode = M_IN_COLGROUP; return; }
+            if (tag == t.TABLE) { p.mode = M_IN_TABLE; return; }
+            if (tag == t.TEMPLATE) { p.mode = p.tmpl[p.ntmpl - 1]; return; }
+            if (tag == t.HEAD && last == 0) { p.mode = M_IN_HEAD; return; }
+            if (tag == t.BODY) { p.mode = M_IN_BODY; return; }
+            if (tag == t.FRAMESET) { p.mode = M_IN_FRAMESET; return; }
+            if (tag == t.HTML) {
+                if (p.head == null) { p.mode = M_BEFORE_HEAD; }
+                else { p.mode = M_AFTER_HEAD; }
+                return;
+            }
+        }
+        if (last == 1) { p.mode = M_IN_BODY; return; }
+        i = i - 1;
+    }
+}
+
+// --- "initial" -----------------------------------------------------------
+fn _old_public(s as *u8, n as i64) as i64 {
+    if (_pre(s, n, "+//Silmaril//dtd html Pro v0r11 19970101//") == 1) { return 1; }
+    if (_pre(s, n, "-//AS//DTD HTML 3.0 asWedit + extensions//") == 1) { return 1; }
+    if (_pre(s, n, "-//AdvaSoft Ltd//DTD HTML 3.0 asWedit + extensions//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.0 Level 1//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.0 Level 2//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.0 Strict Level 1//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.0 Strict Level 2//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.0 Strict//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 2.1E//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 3.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 3.2 Final//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 3.2//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML 3//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Level 0//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Level 1//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Level 2//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Level 3//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Strict Level 0//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Strict Level 1//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Strict Level 2//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Strict Level 3//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML Strict//") == 1) { return 1; }
+    if (_pre(s, n, "-//IETF//DTD HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//Metrius//DTD Metrius Presentational//") == 1) { return 1; }
+    if (_pre(s, n, "-//Microsoft//DTD Internet Explorer 2.0 HTML Strict//") == 1) { return 1; }
+    if (_pre(s, n, "-//Microsoft//DTD Internet Explorer 2.0 HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//Microsoft//DTD Internet Explorer 2.0 Tables//") == 1) { return 1; }
+    if (_pre(s, n, "-//Microsoft//DTD Internet Explorer 3.0 HTML Strict//") == 1) { return 1; }
+    if (_pre(s, n, "-//Microsoft//DTD Internet Explorer 3.0 HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//Microsoft//DTD Internet Explorer 3.0 Tables//") == 1) { return 1; }
+    if (_pre(s, n, "-//Netscape Comm. Corp.//DTD HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//Netscape Comm. Corp.//DTD Strict HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//O'Reilly and Associates//DTD HTML 2.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//O'Reilly and Associates//DTD HTML Extended 1.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//O'Reilly and Associates//DTD HTML Extended Relaxed 1.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//SQ//DTD HTML 2.0 HoTMetaL + extensions//") == 1) { return 1; }
+    if (_pre(s, n, "-//SoftQuad Software//DTD HoTMetaL PRO 6.0::19990601::extensions to HTML 4.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//SoftQuad//DTD HoTMetaL PRO 4.0::19971010::extensions to HTML 4.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//Spyglass//DTD HTML 2.0 Extended//") == 1) { return 1; }
+    if (_pre(s, n, "-//Sun Microsystems Corp.//DTD HotJava HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//Sun Microsystems Corp.//DTD HotJava Strict HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 3 1995-03-24//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 3.2 Draft//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 3.2 Final//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 3.2//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 3.2S Draft//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 4.0 Frameset//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML 4.0 Transitional//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML Experimental 19960712//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD HTML Experimental 970421//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3C//DTD W3 HTML//") == 1) { return 1; }
+    if (_pre(s, n, "-//W3O//DTD W3 HTML 3.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//WebTechs//DTD Mozilla HTML 2.0//") == 1) { return 1; }
+    if (_pre(s, n, "-//WebTechs//DTD Mozilla HTML//") == 1) { return 1; }
+    return 0;
+}
+
+// What the current DOCTYPE token sets the document's mode to.
+fn _doctype_mode(p as *Parser) as i64 {
+    let is *tk.Tokenizer as z = &p.tz;
+    let is *u8 as pub = tk.tok_doctype_public(z);
+    let is i64 as plen = tk.tok_doctype_public_len(z);
+    let is *u8 as sys = tk.tok_doctype_system(z);
+    let is i64 as slen = tk.tok_doctype_system_len(z);
+
+    if (tk.tok_force_quirks(z) != 0) { return dom.QUIRKS; }
+    let is *u8 as name = tk.tok_name(z);
+    let is i64 as nlen = tk.tok_name_len(z);
+    if (nlen != 4 || name[0] != 104 || name[1] != 116 || name[2] != 109 || name[3] != 108) { return dom.QUIRKS; }
+    if (_ci(pub, plen, "-//W3O//DTD W3 HTML Strict 3.0//EN//") == 1) { return dom.QUIRKS; }
+    if (_ci(pub, plen, "-/W3C/DTD HTML 4.0 Transitional/EN") == 1) { return dom.QUIRKS; }
+    if (_ci(pub, plen, "HTML") == 1) { return dom.QUIRKS; }
+    if (_ci(sys, slen, "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") == 1) { return dom.QUIRKS; }
+    if (_old_public(pub, plen) == 1) { return dom.QUIRKS; }
+
+    let is i64 as html401 = cast(i64, _pre(pub, plen, "-//W3C//DTD HTML 4.01 Frameset//") == 1
+        || _pre(pub, plen, "-//W3C//DTD HTML 4.01 Transitional//") == 1);
+    if (html401 == 1 && slen == 0) { return dom.QUIRKS; }
+    if (html401 == 1) { return dom.LIMITED_QUIRKS; }
+    if (_pre(pub, plen, "-//W3C//DTD XHTML 1.0 Frameset//") == 1) { return dom.LIMITED_QUIRKS; }
+    if (_pre(pub, plen, "-//W3C//DTD XHTML 1.0 Transitional//") == 1) { return dom.LIMITED_QUIRKS; }
+    return dom.NO_QUIRKS;
+}
+
+fn _initial(p as *Parser) as void {
+    let is i64 as k = p.k;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) { return; }
+    if (k == tk.TOK_COMMENT) {
+        _comment_in(p, p.d.node);
+        return;
+    }
+    if (k == tk.TOK_DOCTYPE) {
+        let is *tk.Tokenizer as z = &p.tz;
+        dom.append(p.d.node, dom.doctype(p.d, tk.tok_name(z), tk.tok_name_len(z),
+            tk.tok_doctype_public(z), tk.tok_doctype_public_len(z),
+            tk.tok_doctype_system(z), tk.tok_doctype_system_len(z)));
+        p.d.mode = _doctype_mode(p);
+        p.mode = M_BEFORE_HTML;
+        return;
+    }
+    p.d.mode = dom.QUIRKS;
+    p.mode = M_BEFORE_HTML;
+    _dispatch(p);
+}
+
+// --- "before html" -------------------------------------------------------
+fn _before_html(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_COMMENT) {
+        _comment_in(p, p.d.node);
+        return;
+    }
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) { return; }
+    if (k == tk.TOK_START && tag == t.HTML) {
+        let is *dom.Node as el = _new_element(p, dom.NS_HTML, t.HTML, p.name, p.nlen);
+        _copy_attrs(p, el);
+        dom.append(p.d.node, el);
+        _push(p, el);
+        p.mode = M_BEFORE_HEAD;
+        return;
+    }
+    if (k == tk.TOK_END && tag != t.HEAD && tag != t.BODY && tag != t.HTML && tag != t.BR) { return; }
+    let is *dom.Node as root = _new_element(p, dom.NS_HTML, t.HTML, t.name_of(t.HTML), t.len_of(t.HTML));
+    dom.append(p.d.node, root);
+    _push(p, root);
+    p.mode = M_BEFORE_HEAD;
+    _dispatch(p);
+}
+
+// --- "before head" -------------------------------------------------------
+fn _before_head(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) { return; }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START && tag == t.HTML) { _in_body(p); return; }
+    if (k == tk.TOK_START && tag == t.HEAD) {
+        p.head = _insert(p);
+        p.mode = M_IN_HEAD;
+        return;
+    }
+    if (k == tk.TOK_END && tag != t.HEAD && tag != t.BODY && tag != t.HTML && tag != t.BR) { return; }
+    p.head = _insert_tag(p, t.HEAD);
+    p.mode = M_IN_HEAD;
+    _dispatch(p);
+}
+
+// --- "in head" -----------------------------------------------------------
+fn _end_template(p as *Parser) as void {
+    if (_template_open(p) == 0) { return; }
+    _implied_thoroughly(p);
+    _pop_until(p, t.TEMPLATE);
+    _fmt_clear_to_marker(p);
+    p.ntmpl = p.ntmpl - 1;
+    _reset_mode(p);
+}
+
+fn _in_head(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) {
+        _insert_chars(p, p.cs, p.cn);
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START) {
+        if (tag == t.HTML) { _in_body(p); return; }
+        if (tag == t.BASE || tag == t.BASEFONT || tag == t.BGSOUND || tag == t.LINK || tag == t.META) {
+            _insert(p);
+            _pop(p);
+            return;
+        }
+        if (tag == t.TITLE) { _text_element(p, tk.ST_RCDATA); return; }
+        if (tag == t.NOFRAMES || tag == t.STYLE) { _text_element(p, tk.ST_RAWTEXT); return; }
+        if (tag == t.NOSCRIPT) {
+            _insert(p);
+            p.mode = M_IN_HEAD_NOSCRIPT;
+            return;
+        }
+        if (tag == t.SCRIPT) { _text_element(p, tk.ST_SCRIPT); return; }
+        if (tag == t.TEMPLATE) {
+            _marker(p);
+            p.frameset_ok = 0;
+            p.mode = M_IN_TEMPLATE;
+            _tmpl_push(p, M_IN_TEMPLATE);
+            _insert(p);
+            return;
+        }
+        if (tag == t.HEAD) { return; }
+    }
+    if (k == tk.TOK_END) {
+        if (tag == t.HEAD) {
+            _pop(p);
+            p.mode = M_AFTER_HEAD;
+            return;
+        }
+        if (tag == t.TEMPLATE) { _end_template(p); return; }
+        if (tag != t.BODY && tag != t.HTML && tag != t.BR) { return; }
+    }
+    _pop(p);
+    p.mode = M_AFTER_HEAD;
+    _dispatch(p);
+}
+
+// --- "in head noscript" --------------------------------------------------
+fn _in_head_noscript(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START && tag == t.HTML) { _in_body(p); return; }
+    if (k == tk.TOK_END && tag == t.NOSCRIPT) {
+        _pop(p);
+        p.mode = M_IN_HEAD;
+        return;
+    }
+    if ((k == tk.TOK_CHAR && p.cclass == C_WS) || k == tk.TOK_COMMENT) { _in_head(p); return; }
+    if (k == tk.TOK_START && (tag == t.BASEFONT || tag == t.BGSOUND || tag == t.LINK || tag == t.META
+        || tag == t.NOFRAMES || tag == t.STYLE)) {
+        _in_head(p);
+        return;
+    }
+    if (k == tk.TOK_START && (tag == t.HEAD || tag == t.NOSCRIPT)) { return; }
+    if (k == tk.TOK_END && tag != t.BR) { return; }
+    _pop(p);
+    p.mode = M_IN_HEAD;
+    _dispatch(p);
+}
+
+// --- "after head" --------------------------------------------------------
+fn _after_head(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) {
+        _insert_chars(p, p.cs, p.cn);
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START) {
+        if (tag == t.HTML) { _in_body(p); return; }
+        if (tag == t.BODY) {
+            _insert(p);
+            p.frameset_ok = 0;
+            p.mode = M_IN_BODY;
+            return;
+        }
+        if (tag == t.FRAMESET) {
+            _insert(p);
+            p.mode = M_IN_FRAMESET;
+            return;
+        }
+        if (t.has(tag, t.F_IN_HEAD) == 1) {
+            _push(p, p.head);
+            _in_head(p);
+            let is i64 as at = _open_index(p, p.head);
+            if (at >= 0) { _open_remove(p, at); }
+            return;
+        }
+        if (tag == t.HEAD) { return; }
+    }
+    if (k == tk.TOK_END) {
+        if (tag == t.TEMPLATE) { _in_head(p); return; }
+        if (tag != t.BODY && tag != t.HTML && tag != t.BR) { return; }
+    }
+    _insert_tag(p, t.BODY);
+    p.frameset_ok = 1;
+    p.mode = M_IN_BODY;
+    _dispatch(p);
+}
+
+// --- "in body" -----------------------------------------------------------
+
+// The character rules of "in body", for a piece that is already known not to be NUL.
+fn _body_chars(p as *Parser, s as *u8, n as i64, cclass as i64) as void {
+    _reconstruct(p);
+    _insert_chars(p, s, n);
+    if (cclass == C_TEXT) { p.frameset_ok = 0; }
+}
+
+fn _ends_item_search(n as *dom.Node) as i64 {
+    if (_special(n) == 0) { return 0; }
+    if (_is(n, t.ADDRESS) == 1 || _is(n, t.DIV) == 1 || _is(n, t.P) == 1) { return 0; }
+    return 1;
+}
+
+fn _start_li(p as *Parser) as void {
+    p.frameset_ok = 0;
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        if (_is(n, t.LI) == 1) {
+            _implied(p, t.LI);
+            _pop_until(p, t.LI);
+            break;
+        }
+        if (_ends_item_search(n) == 1) { break; }
+        i = i - 1;
+    }
+    _close_p_if_open(p);
+    _insert(p);
+}
+
+fn _start_dd_dt(p as *Parser) as void {
+    p.frameset_ok = 0;
+    let is i64 as i with mut = p.nopen - 1;
+    while (i >= 0) {
+        let is *dom.Node as n = p.open[i];
+        if (_is(n, t.DD) == 1) {
+            _implied(p, t.DD);
+            _pop_until(p, t.DD);
+            break;
+        }
+        if (_is(n, t.DT) == 1) {
+            _implied(p, t.DT);
+            _pop_until(p, t.DT);
+            break;
+        }
+        if (_ends_item_search(n) == 1) { break; }
+        i = i - 1;
+    }
+    _close_p_if_open(p);
+    _insert(p);
+}
+
+fn _start_a(p as *Parser) as void {
+    let is i64 as at = _fmt_find(p);
+    if (at >= 0) {
+        let is *dom.Node as a = p.fmt[at];
+        _adoption(p);
+        let is i64 as f = _fmt_index(p, a);
+        if (f >= 0) { _fmt_remove(p, f); }
+        let is i64 as o = _open_index(p, a);
+        if (o >= 0) { _open_remove(p, o); }
+    }
+    _reconstruct(p);
+    _fmt_push(p, _insert(p));
+}
+
+fn _body_start(p as *Parser) as void {
+    let is i64 as tag = p.tag;
+    if (tag == t.HTML) {
+        if (_template_open(p) == 1) { return; }
+        _merge_attrs(p, p.open[0]);
+        return;
+    }
+    if (t.has(tag, t.F_IN_HEAD) == 1) { _in_head(p); return; }
+    if (tag == t.BODY) {
+        if (p.nopen == 1 || _is(p.open[1], t.BODY) == 0 || _template_open(p) == 1) { return; }
+        p.frameset_ok = 0;
+        _merge_attrs(p, p.open[1]);
+        return;
+    }
+    if (tag == t.FRAMESET) {
+        if (p.nopen == 1 || _is(p.open[1], t.BODY) == 0) { return; }
+        if (p.frameset_ok == 0) { return; }
+        dom.remove(p.open[1]);
+        p.nopen = 1;
+        _insert(p);
+        p.mode = M_IN_FRAMESET;
+        return;
+    }
+    if (t.has(tag, t.F_BLOCK) == 1) {
+        _close_p_if_open(p);
+        _insert(p);
+        return;
+    }
+    if (t.has(tag, t.F_HEADING) == 1) {
+        _close_p_if_open(p);
+        let is *dom.Node as cur = _cur(p);
+        if (cur.ns == dom.NS_HTML && t.has(cur.tag, t.F_HEADING) == 1) { _pop(p); }
+        _insert(p);
+        return;
+    }
+    if (tag == t.PRE || tag == t.LISTING) {
+        _close_p_if_open(p);
+        _insert(p);
+        p.skip_lf = 1;
+        p.frameset_ok = 0;
+        return;
+    }
+    if (tag == t.FORM) {
+        let is i64 as in_template = _template_open(p);
+        if (p.form != null && in_template == 0) { return; }
+        _close_p_if_open(p);
+        let is *dom.Node as el = _insert(p);
+        if (in_template == 0) { p.form = el; }
+        return;
+    }
+    if (tag == t.LI) { _start_li(p); return; }
+    if (tag == t.DD || tag == t.DT) { _start_dd_dt(p); return; }
+    if (tag == t.PLAINTEXT) {
+        _close_p_if_open(p);
+        _insert(p);
+        tk.tok_set_state(&p.tz, tk.ST_PLAINTEXT);
+        return;
+    }
+    if (tag == t.BUTTON) {
+        if (_in_scope(p, t.BUTTON) == 1) {
+            _implied(p, t.NONE);
+            _pop_until(p, t.BUTTON);
+        }
+        _reconstruct(p);
+        _insert(p);
+        p.frameset_ok = 0;
+        return;
+    }
+    if (tag == t.A) { _start_a(p); return; }
+    if (tag == t.NOBR) {
+        _reconstruct(p);
+        if (_in_scope(p, t.NOBR) == 1) {
+            _adoption(p);
+            _reconstruct(p);
+        }
+        _fmt_push(p, _insert(p));
+        return;
+    }
+    if (t.has(tag, t.F_FORMATTING) == 1) {
+        _reconstruct(p);
+        _fmt_push(p, _insert(p));
+        return;
+    }
+    if (tag == t.APPLET || tag == t.MARQUEE || tag == t.OBJECT) {
+        _reconstruct(p);
+        _insert(p);
+        _marker(p);
+        p.frameset_ok = 0;
+        return;
+    }
+    if (tag == t.TABLE) {
+        if (p.d.mode != dom.QUIRKS) { _close_p_if_open(p); }
+        _insert(p);
+        p.frameset_ok = 0;
+        p.mode = M_IN_TABLE;
+        return;
+    }
+    if (tag == t.AREA || tag == t.BR || tag == t.EMBED || tag == t.IMG || tag == t.KEYGEN || tag == t.WBR) {
+        _reconstruct(p);
+        _insert(p);
+        _pop(p);
+        p.frameset_ok = 0;
+        return;
+    }
+    if (tag == t.INPUT) {
+        if (_in_scope(p, t.SELECT) == 1) { _pop_until(p, t.SELECT); }
+        _reconstruct(p);
+        _insert(p);
+        _pop(p);
+        if (_is_hidden_input(p) == 0) { p.frameset_ok = 0; }
+        return;
+    }
+    if (tag == t.PARAM || tag == t.SOURCE || tag == t.TRACK) {
+        _insert(p);
+        _pop(p);
+        return;
+    }
+    if (tag == t.HR) {
+        _close_p_if_open(p);
+        if (_in_scope(p, t.SELECT) == 1) { _implied(p, t.NONE); }
+        _insert(p);
+        _pop(p);
+        p.frameset_ok = 0;
+        return;
+    }
+    if (tag == t.IMAGE) {
+        p.tag = t.IMG;
+        p.name = t.name_of(t.IMG);
+        p.nlen = t.len_of(t.IMG);
+        _dispatch(p);
+        return;
+    }
+    if (tag == t.TEXTAREA) {
+        p.skip_lf = 1;
+        p.frameset_ok = 0;
+        _text_element(p, tk.ST_RCDATA);
+        return;
+    }
+    if (tag == t.XMP) {
+        _close_p_if_open(p);
+        _reconstruct(p);
+        p.frameset_ok = 0;
+        _text_element(p, tk.ST_RAWTEXT);
+        return;
+    }
+    if (tag == t.IFRAME) {
+        p.frameset_ok = 0;
+        _text_element(p, tk.ST_RAWTEXT);
+        return;
+    }
+    if (tag == t.NOEMBED) { _text_element(p, tk.ST_RAWTEXT); return; }
+    if (tag == t.SELECT) {
+        if (_in_scope(p, t.SELECT) == 1) {
+            _pop_until(p, t.SELECT);
+            return;
+        }
+        _reconstruct(p);
+        _insert(p);
+        p.frameset_ok = 0;
+        return;
+    }
+    if (tag == t.OPTION) {
+        if (_in_scope(p, t.SELECT) == 1) { _implied(p, t.OPTGROUP); }
+        else if (_is(_cur(p), t.OPTION) == 1) { _pop(p); }
+        _reconstruct(p);
+        _insert(p);
+        return;
+    }
+    if (tag == t.OPTGROUP) {
+        if (_in_scope(p, t.SELECT) == 1) { _implied(p, t.NONE); }
+        else if (_is(_cur(p), t.OPTION) == 1) { _pop(p); }
+        _reconstruct(p);
+        _insert(p);
+        return;
+    }
+    if (tag == t.RB || tag == t.RTC) {
+        if (_in_scope(p, t.RUBY) == 1) { _implied(p, t.NONE); }
+        _insert(p);
+        return;
+    }
+    if (tag == t.RP || tag == t.RT) {
+        if (_in_scope(p, t.RUBY) == 1) { _implied(p, t.RTC); }
+        _insert(p);
+        return;
+    }
+    if (tag == t.MATH || tag == t.SVG) {
+        _reconstruct(p);
+        if (tag == t.MATH) { _insert_foreign(p, dom.NS_MATHML); }
+        else { _insert_foreign(p, dom.NS_SVG); }
+        if (tk.tok_self_closing(&p.tz) != 0) { _pop(p); }
+        return;
+    }
+    if (_table_part(tag) == 1 || tag == t.FRAME || tag == t.HEAD) { return; }
+    _reconstruct(p);
+    _insert(p);
+}
+
+fn _body_end(p as *Parser) as void {
+    let is i64 as tag = p.tag;
+    if (tag == t.TEMPLATE) { _in_head(p); return; }
+    if (tag == t.BODY) {
+        if (_in_scope(p, t.BODY) == 0) { return; }
+        p.mode = M_AFTER_BODY;
+        return;
+    }
+    if (tag == t.HTML) {
+        if (_in_scope(p, t.BODY) == 0) { return; }
+        p.mode = M_AFTER_BODY;
+        _dispatch(p);
+        return;
+    }
+    if (t.has(tag, t.F_BLOCK_END) == 1) {
+        if (_in_scope(p, tag) == 0) { return; }
+        _implied(p, t.NONE);
+        _pop_until(p, tag);
+        return;
+    }
+    if (tag == t.FORM) {
+        if (_template_open(p) == 0) {
+            let is *dom.Node as node = p.form;
+            p.form = cast(*dom.Node, 0);
+            if (node == null || _node_in_scope(p, node) == 0) { return; }
+            _implied(p, t.NONE);
+            _open_remove(p, _open_index(p, node));
+            return;
+        }
+        if (_in_scope(p, t.FORM) == 0) { return; }
+        _implied(p, t.NONE);
+        _pop_until(p, t.FORM);
+        return;
+    }
+    if (tag == t.P) {
+        if (_in_button_scope(p, t.P) == 0) { _insert_tag(p, t.P); }
+        _close_p(p);
+        return;
+    }
+    if (tag == t.LI) {
+        if (_in_scope_of(p, t.LI, SCOPE_LIST) == 0) { return; }
+        _implied(p, t.LI);
+        _pop_until(p, t.LI);
+        return;
+    }
+    if (tag == t.DD || tag == t.DT) {
+        if (_in_scope(p, tag) == 0) { return; }
+        _implied(p, tag);
+        _pop_until(p, tag);
+        return;
+    }
+    if (t.has(tag, t.F_HEADING) == 1) {
+        if (_heading_in_scope(p) == 0) { return; }
+        _implied(p, t.NONE);
+        while (p.nopen > 1) {
+            let is *dom.Node as n = _cur(p);
+            _pop(p);
+            if (n.ns == dom.NS_HTML && t.has(n.tag, t.F_HEADING) == 1) { return; }
+        }
+        return;
+    }
+    if (t.has(tag, t.F_FORMATTING) == 1) { _adoption(p); return; }
+    if (tag == t.APPLET || tag == t.MARQUEE || tag == t.OBJECT) {
+        if (_in_scope(p, tag) == 0) { return; }
+        _implied(p, t.NONE);
+        _pop_until(p, tag);
+        _fmt_clear_to_marker(p);
+        return;
+    }
+    if (tag == t.BR) {
+        _reconstruct(p);
+        _insert_tag(p, t.BR);
+        _pop(p);
+        p.frameset_ok = 0;
+        return;
+    }
+    _any_other_end(p);
+}
+
+fn _in_body(p as *Parser) as void {
+    let is i64 as k = p.k;
+    if (k == tk.TOK_CHAR) {
+        if (p.cclass != C_NUL) { _body_chars(p, p.cs, p.cn, p.cclass); }
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_EOF) {
+        if (p.ntmpl > 0) { _in_template(p); return; }
+        p.stopped = 1;
+        return;
+    }
+    if (k == tk.TOK_START) { _body_start(p); return; }
+    _body_end(p);
+}
+
+// --- "text" --------------------------------------------------------------
+fn _in_text(p as *Parser) as void {
+    if (p.k == tk.TOK_CHAR) {
+        _insert_chars(p, p.cs, p.cn);
+        return;
+    }
+    if (p.k == tk.TOK_EOF) {
+        _pop(p);
+        p.mode = p.orig;
+        _dispatch(p);
+        return;
+    }
+    if (p.k == tk.TOK_END) {
+        _pop(p);
+        p.mode = p.orig;
+    }
+}
+
+// --- "in table" ----------------------------------------------------------
+fn _in_table(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR) {
+        let is *dom.Node as cur = _cur(p);
+        if (cur.ns == dom.NS_HTML && (cur.tag == t.TABLE || cur.tag == t.TEMPLATE || cur.tag == t.TR || _section(cur.tag) == 1)) {
+            p.npend = 0;
+            p.orig = p.mode;
+            p.mode = M_IN_TABLE_TEXT;
+            _dispatch(p);
+            return;
+        }
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START) {
+        if (tag == t.CAPTION) {
+            _clear_to_table(p);
+            _marker(p);
+            _insert(p);
+            p.mode = M_IN_CAPTION;
+            return;
+        }
+        if (tag == t.COLGROUP) {
+            _clear_to_table(p);
+            _insert(p);
+            p.mode = M_IN_COLGROUP;
+            return;
+        }
+        if (tag == t.COL) {
+            _clear_to_table(p);
+            _insert_tag(p, t.COLGROUP);
+            p.mode = M_IN_COLGROUP;
+            _dispatch(p);
+            return;
+        }
+        if (_section(tag) == 1) {
+            _clear_to_table(p);
+            _insert(p);
+            p.mode = M_IN_TBODY;
+            return;
+        }
+        if (tag == t.TD || tag == t.TH || tag == t.TR) {
+            _clear_to_table(p);
+            _insert_tag(p, t.TBODY);
+            p.mode = M_IN_TBODY;
+            _dispatch(p);
+            return;
+        }
+        if (tag == t.TABLE) {
+            if (_in_table_scope(p, t.TABLE) == 0) { return; }
+            _pop_until(p, t.TABLE);
+            _reset_mode(p);
+            _dispatch(p);
+            return;
+        }
+        if (tag == t.STYLE || tag == t.SCRIPT || tag == t.TEMPLATE) { _in_head(p); return; }
+        if (tag == t.INPUT && _is_hidden_input(p) == 1) {
+            _insert(p);
+            _pop(p);
+            return;
+        }
+        if (tag == t.FORM) {
+            let is i64 as in_template = _template_open(p);
+            if (p.form != null && in_template == 0) { return; }
+            let is *dom.Node as el = _insert(p);
+            if (in_template == 0) { p.form = el; }
+            _pop(p);
+            return;
+        }
+    }
+    if (k == tk.TOK_END) {
+        if (tag == t.TABLE) {
+            if (_in_table_scope(p, t.TABLE) == 0) { return; }
+            _pop_until(p, t.TABLE);
+            _reset_mode(p);
+            return;
+        }
+        if (tag == t.BODY || tag == t.HTML || _table_part(tag) == 1) { return; }
+        if (tag == t.TEMPLATE) { _in_head(p); return; }
+    }
+    if (k == tk.TOK_EOF) { _in_body(p); return; }
+    p.foster = 1;
+    _in_body(p);
+    p.foster = 0;
+}
+
+// --- "in table text" -----------------------------------------------------
+
+// Pieces of the pending characters that are not all whitespace go through "in body"
+// with foster parenting on, which puts them in front of the table. Whitespace alone
+// stays where it is, because a table laid out in source with indentation is normal.
+fn _flush_pending(p as *Parser) as void {
+    let is i64 as text with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < p.npend) {
+        if (_is_ws(cast(i64, p.pend[i])) == 0) { text = 1; }
+        i = i + 1;
+    }
+    if (text == 0) {
+        if (p.npend > 0) { _insert_chars(p, p.pend, p.npend); }
+        return;
+    }
+    p.foster = 1;
+    i = 0;
+    while (i < p.npend) {
+        let is i64 as ws = _is_ws(cast(i64, p.pend[i]));
+        let is i64 as j with mut = i + 1;
+        while (j < p.npend && _is_ws(cast(i64, p.pend[j])) == ws) { j = j + 1; }
+        if (ws == 1) { _body_chars(p, _at(p.pend, i), j - i, C_WS); }
+        else { _body_chars(p, _at(p.pend, i), j - i, C_TEXT); }
+        i = j;
+    }
+    p.foster = 0;
+}
+
+fn _in_table_text(p as *Parser) as void {
+    if (p.k == tk.TOK_CHAR) {
+        if (p.cclass == C_NUL) { return; }
+        let is i64 as need = p.npend + p.cn;
+        if (need > p.pend_cap) {
+            let is i64 as cap with mut = p.pend_cap * 2;
+            if (cap < 256) { cap = 256; }
+            if (cap < need) { cap = need; }
+            p.pend = _more(p, p.pend, p.npend, cap);
+            p.pend_cap = cap;
+        }
+        mem.core.memcpy(_at(p.pend, p.npend), p.cs, p.cn);
+        p.npend = need;
+        return;
+    }
+    _flush_pending(p);
+    p.mode = p.orig;
+    _dispatch(p);
+}
+
+// --- "in caption" --------------------------------------------------------
+fn _close_caption(p as *Parser) as i64 {
+    if (_in_table_scope(p, t.CAPTION) == 0) { return 0; }
+    _implied(p, t.NONE);
+    _pop_until(p, t.CAPTION);
+    _fmt_clear_to_marker(p);
+    p.mode = M_IN_TABLE;
+    return 1;
+}
+
+fn _in_caption(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_END && tag == t.CAPTION) {
+        _close_caption(p);
+        return;
+    }
+    if ((k == tk.TOK_START && _table_part(tag) == 1) || (k == tk.TOK_END && tag == t.TABLE)) {
+        if (_close_caption(p) == 1) { _dispatch(p); }
+        return;
+    }
+    if (k == tk.TOK_END && (tag == t.BODY || tag == t.HTML || _table_part(tag) == 1)) { return; }
+    _in_body(p);
+}
+
+// --- "in column group" ---------------------------------------------------
+fn _in_colgroup(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) {
+        _insert_chars(p, p.cs, p.cn);
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START && tag == t.HTML) { _in_body(p); return; }
+    if (k == tk.TOK_START && tag == t.COL) {
+        _insert(p);
+        _pop(p);
+        return;
+    }
+    if (k == tk.TOK_END && tag == t.COLGROUP) {
+        if (_is(_cur(p), t.COLGROUP) == 0) { return; }
+        _pop(p);
+        p.mode = M_IN_TABLE;
+        return;
+    }
+    if (k == tk.TOK_END && tag == t.COL) { return; }
+    if ((k == tk.TOK_START || k == tk.TOK_END) && tag == t.TEMPLATE) { _in_head(p); return; }
+    if (k == tk.TOK_EOF) { _in_body(p); return; }
+    if (_is(_cur(p), t.COLGROUP) == 0) { return; }
+    _pop(p);
+    p.mode = M_IN_TABLE;
+    _dispatch(p);
+}
+
+// --- "in table body" -----------------------------------------------------
+fn _any_section_in_table_scope(p as *Parser) as i64 {
+    if (_in_table_scope(p, t.TBODY) == 1) { return 1; }
+    if (_in_table_scope(p, t.THEAD) == 1) { return 1; }
+    return _in_table_scope(p, t.TFOOT);
+}
+
+fn _in_tbody(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_START && tag == t.TR) {
+        _clear_to_section(p);
+        _insert(p);
+        p.mode = M_IN_ROW;
+        return;
+    }
+    if (k == tk.TOK_START && (tag == t.TH || tag == t.TD)) {
+        _clear_to_section(p);
+        _insert_tag(p, t.TR);
+        p.mode = M_IN_ROW;
+        _dispatch(p);
+        return;
+    }
+    if (k == tk.TOK_END && _section(tag) == 1) {
+        if (_in_table_scope(p, tag) == 0) { return; }
+        _clear_to_section(p);
+        _pop(p);
+        p.mode = M_IN_TABLE;
+        return;
+    }
+    if ((k == tk.TOK_START && (tag == t.CAPTION || tag == t.COL || tag == t.COLGROUP || _section(tag) == 1))
+        || (k == tk.TOK_END && tag == t.TABLE)) {
+        if (_any_section_in_table_scope(p) == 0) { return; }
+        _clear_to_section(p);
+        _pop(p);
+        p.mode = M_IN_TABLE;
+        _dispatch(p);
+        return;
+    }
+    if (k == tk.TOK_END && (tag == t.BODY || tag == t.CAPTION || tag == t.COL || tag == t.COLGROUP
+        || tag == t.HTML || tag == t.TD || tag == t.TH || tag == t.TR)) {
+        return;
+    }
+    _in_table(p);
+}
+
+// --- "in row" ------------------------------------------------------------
+fn _in_row(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_START && (tag == t.TH || tag == t.TD)) {
+        _clear_to_row(p);
+        _insert(p);
+        p.mode = M_IN_CELL;
+        _marker(p);
+        return;
+    }
+    if (k == tk.TOK_END && tag == t.TR) {
+        if (_in_table_scope(p, t.TR) == 0) { return; }
+        _clear_to_row(p);
+        _pop(p);
+        p.mode = M_IN_TBODY;
+        return;
+    }
+    if ((k == tk.TOK_START && (tag == t.CAPTION || tag == t.COL || tag == t.COLGROUP || tag == t.TR || _section(tag) == 1))
+        || (k == tk.TOK_END && tag == t.TABLE)) {
+        if (_in_table_scope(p, t.TR) == 0) { return; }
+        _clear_to_row(p);
+        _pop(p);
+        p.mode = M_IN_TBODY;
+        _dispatch(p);
+        return;
+    }
+    if (k == tk.TOK_END && _section(tag) == 1) {
+        if (_in_table_scope(p, tag) == 0) { return; }
+        if (_in_table_scope(p, t.TR) == 0) { return; }
+        _clear_to_row(p);
+        _pop(p);
+        p.mode = M_IN_TBODY;
+        _dispatch(p);
+        return;
+    }
+    if (k == tk.TOK_END && (tag == t.BODY || tag == t.CAPTION || tag == t.COL || tag == t.COLGROUP
+        || tag == t.HTML || tag == t.TD || tag == t.TH)) {
+        return;
+    }
+    _in_table(p);
+}
+
+// --- "in cell" -----------------------------------------------------------
+fn _close_cell(p as *Parser) as void {
+    _implied(p, t.NONE);
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        _pop(p);
+        if (_is(n, t.TD) == 1 || _is(n, t.TH) == 1) { break; }
+    }
+    _fmt_clear_to_marker(p);
+    p.mode = M_IN_ROW;
+}
+
+fn _in_cell(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_END && (tag == t.TD || tag == t.TH)) {
+        if (_in_table_scope(p, tag) == 0) { return; }
+        _implied(p, t.NONE);
+        _pop_until(p, tag);
+        _fmt_clear_to_marker(p);
+        p.mode = M_IN_ROW;
+        return;
+    }
+    if (k == tk.TOK_START && _table_part(tag) == 1) {
+        _close_cell(p);
+        _dispatch(p);
+        return;
+    }
+    if (k == tk.TOK_END && (tag == t.BODY || tag == t.CAPTION || tag == t.COL || tag == t.COLGROUP || tag == t.HTML)) {
+        return;
+    }
+    if (k == tk.TOK_END && (tag == t.TABLE || tag == t.TR || _section(tag) == 1)) {
+        if (_in_table_scope(p, tag) == 0) { return; }
+        _close_cell(p);
+        _dispatch(p);
+        return;
+    }
+    _in_body(p);
+}
+
+// --- "in template" -------------------------------------------------------
+fn _in_template(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR || k == tk.TOK_COMMENT || k == tk.TOK_DOCTYPE) { _in_body(p); return; }
+    if (k == tk.TOK_START) {
+        if (t.has(tag, t.F_IN_HEAD) == 1) { _in_head(p); return; }
+        if (tag == t.CAPTION || tag == t.COLGROUP || _section(tag) == 1) { _tmpl_switch(p, M_IN_TABLE); return; }
+        if (tag == t.COL) { _tmpl_switch(p, M_IN_COLGROUP); return; }
+        if (tag == t.TR) { _tmpl_switch(p, M_IN_TBODY); return; }
+        if (tag == t.TD || tag == t.TH) { _tmpl_switch(p, M_IN_ROW); return; }
+        _tmpl_switch(p, M_IN_BODY);
+        return;
+    }
+    if (k == tk.TOK_END) {
+        if (tag == t.TEMPLATE) { _in_head(p); }
+        return;
+    }
+    if (_template_open(p) == 0) {
+        p.stopped = 1;
+        return;
+    }
+    _pop_until(p, t.TEMPLATE);
+    _fmt_clear_to_marker(p);
+    p.ntmpl = p.ntmpl - 1;
+    _reset_mode(p);
+    _dispatch(p);
+}
+
+// --- "after body" --------------------------------------------------------
+fn _after_body(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) { _in_body(p); return; }
+    if (k == tk.TOK_COMMENT) {
+        _comment_in(p, p.open[0]);
+        return;
+    }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START && tag == t.HTML) { _in_body(p); return; }
+    if (k == tk.TOK_END && tag == t.HTML) {
+        p.mode = M_AFTER_AFTER_BODY;
+        return;
+    }
+    if (k == tk.TOK_EOF) {
+        p.stopped = 1;
+        return;
+    }
+    p.mode = M_IN_BODY;
+    _dispatch(p);
+}
+
+// --- "in frameset" -------------------------------------------------------
+fn _in_frameset(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) {
+        _insert_chars(p, p.cs, p.cn);
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_START && tag == t.HTML) { _in_body(p); return; }
+    if (k == tk.TOK_START && tag == t.FRAMESET) {
+        _insert(p);
+        return;
+    }
+    if (k == tk.TOK_END && tag == t.FRAMESET) {
+        if (p.nopen == 1) { return; }
+        _pop(p);
+        if (_is(_cur(p), t.FRAMESET) == 0) { p.mode = M_AFTER_FRAMESET; }
+        return;
+    }
+    if (k == tk.TOK_START && tag == t.FRAME) {
+        _insert(p);
+        _pop(p);
+        return;
+    }
+    if (k == tk.TOK_START && tag == t.NOFRAMES) { _in_head(p); return; }
+    if (k == tk.TOK_EOF) { p.stopped = 1; }
+}
+
+// --- "after frameset" ----------------------------------------------------
+fn _after_frameset(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR && p.cclass == C_WS) {
+        _insert_chars(p, p.cs, p.cn);
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_START && tag == t.HTML) { _in_body(p); return; }
+    if (k == tk.TOK_END && tag == t.HTML) {
+        p.mode = M_AFTER_AFTER_FRAMESET;
+        return;
+    }
+    if (k == tk.TOK_START && tag == t.NOFRAMES) { _in_head(p); return; }
+    if (k == tk.TOK_EOF) { p.stopped = 1; }
+}
+
+// --- "after after body" and "after after frameset" -----------------------
+fn _after_after_body(p as *Parser) as void {
+    let is i64 as k = p.k;
+    if (k == tk.TOK_COMMENT) {
+        _comment_in(p, p.d.node);
+        return;
+    }
+    if (k == tk.TOK_DOCTYPE || (k == tk.TOK_CHAR && p.cclass == C_WS) || (k == tk.TOK_START && p.tag == t.HTML)) {
+        _in_body(p);
+        return;
+    }
+    if (k == tk.TOK_EOF) {
+        p.stopped = 1;
+        return;
+    }
+    p.mode = M_IN_BODY;
+    _dispatch(p);
+}
+
+fn _after_after_frameset(p as *Parser) as void {
+    let is i64 as k = p.k;
+    if (k == tk.TOK_COMMENT) {
+        _comment_in(p, p.d.node);
+        return;
+    }
+    if (k == tk.TOK_DOCTYPE || (k == tk.TOK_CHAR && p.cclass == C_WS) || (k == tk.TOK_START && p.tag == t.HTML)) {
+        _in_body(p);
+        return;
+    }
+    if (k == tk.TOK_EOF) {
+        p.stopped = 1;
+        return;
+    }
+    if (k == tk.TOK_START && p.tag == t.NOFRAMES) { _in_head(p); }
+}
+
+// --- foreign content, §13.2.6.5 ------------------------------------------
+
+// HTML tag soup inside <svg>: close the foreign elements and let HTML have it.
+fn _break_out(p as *Parser) as void {
+    while (p.nopen > 1) {
+        let is *dom.Node as n = _cur(p);
+        if (n.ns == dom.NS_HTML || _mathml_text_point(n) == 1 || _html_point(n) == 1) { break; }
+        _pop(p);
+    }
+    _by_mode(p);
+}
+
+fn _has_font_attr(p as *Parser) as i64 {
+    let is i64 as vlen with mut = 0;
+    if (_token_attr(p, "color", &vlen) != null) { return 1; }
+    if (_token_attr(p, "face", &vlen) != null) { return 1; }
+    if (_token_attr(p, "size", &vlen) != null) { return 1; }
+    return 0;
+}
+
+// The element's name lowered against a token's, which is already lower.
+fn _same_lower(n as *dom.Node, name as *u8, nlen as i64) as i64 {
+    if (n.name_len != nlen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < nlen) {
+        if (_lc(cast(i64, n.name[i])) != cast(i64, name[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _foreign(p as *Parser) as void {
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (k == tk.TOK_CHAR) {
+        if (p.cclass == C_NUL) {
+            let is i64 as i with mut = 0;
+            while (i < p.cn) {
+                _insert_chars(p, "�", 3);
+                i = i + 1;
+            }
+            return;
+        }
+        _insert_chars(p, p.cs, p.cn);
+        if (p.cclass == C_TEXT) { p.frameset_ok = 0; }
+        return;
+    }
+    if (k == tk.TOK_COMMENT) { _comment(p); return; }
+    if (k == tk.TOK_DOCTYPE) { return; }
+    if (k == tk.TOK_START) {
+        if (t.has(tag, t.F_BREAKOUT) == 1 || (tag == t.FONT && _has_font_attr(p) == 1)) {
+            _break_out(p);
+            return;
+        }
+        _insert_foreign(p, _cur(p).ns);
+        if (tk.tok_self_closing(&p.tz) != 0) { _pop(p); }
+        return;
+    }
+    if (tag == t.BR || tag == t.P) {
+        _break_out(p);
+        return;
+    }
+    let is *dom.Node as cur = _cur(p);
+    if (tag == t.SCRIPT && cur.ns == dom.NS_SVG && cur.tag == t.SCRIPT) {
+        _pop(p);
+        return;
+    }
+    let is i64 as i with mut = p.nopen - 1;
+    while (i > 0) {
+        if (_same_lower(p.open[i], p.name, p.nlen) == 1) {
+            p.nopen = i;
+            return;
+        }
+        i = i - 1;
+        if (p.open[i].ns == dom.NS_HTML) {
+            _by_mode(p);
+            return;
+        }
+    }
+}
+
+// --- the dispatcher, §13.2.6 ---------------------------------------------
+fn _by_mode(p as *Parser) as void {
+    let is i64 as m = p.mode;
+    if (m == M_IN_BODY) { _in_body(p); return; }
+    if (m == M_TEXT) { _in_text(p); return; }
+    if (m == M_INITIAL) { _initial(p); return; }
+    if (m == M_BEFORE_HTML) { _before_html(p); return; }
+    if (m == M_BEFORE_HEAD) { _before_head(p); return; }
+    if (m == M_IN_HEAD) { _in_head(p); return; }
+    if (m == M_IN_HEAD_NOSCRIPT) { _in_head_noscript(p); return; }
+    if (m == M_AFTER_HEAD) { _after_head(p); return; }
+    if (m == M_IN_TABLE) { _in_table(p); return; }
+    if (m == M_IN_TABLE_TEXT) { _in_table_text(p); return; }
+    if (m == M_IN_CAPTION) { _in_caption(p); return; }
+    if (m == M_IN_COLGROUP) { _in_colgroup(p); return; }
+    if (m == M_IN_TBODY) { _in_tbody(p); return; }
+    if (m == M_IN_ROW) { _in_row(p); return; }
+    if (m == M_IN_CELL) { _in_cell(p); return; }
+    if (m == M_IN_TEMPLATE) { _in_template(p); return; }
+    if (m == M_AFTER_BODY) { _after_body(p); return; }
+    if (m == M_IN_FRAMESET) { _in_frameset(p); return; }
+    if (m == M_AFTER_FRAMESET) { _after_frameset(p); return; }
+    if (m == M_AFTER_AFTER_BODY) { _after_after_body(p); return; }
+    _after_after_frameset(p);
+}
+
+fn _dispatch(p as *Parser) as void {
+    if (p.nopen == 0) { _by_mode(p); return; }
+    let is *dom.Node as n = _cur(p);
+    if (n.ns == dom.NS_HTML) { _by_mode(p); return; }
+    let is i64 as k = p.k;
+    let is i64 as tag = p.tag;
+    if (_mathml_text_point(n) == 1) {
+        if (k == tk.TOK_CHAR) { _by_mode(p); return; }
+        if (k == tk.TOK_START && tag != t.MGLYPH && tag != t.MALIGNMARK) { _by_mode(p); return; }
+    }
+    if (n.ns == dom.NS_MATHML && n.tag == t.ANNOTATION_XML && k == tk.TOK_START && tag == t.SVG) {
+        _by_mode(p);
+        return;
+    }
+    if (_html_point(n) == 1 && (k == tk.TOK_START || k == tk.TOK_CHAR)) { _by_mode(p); return; }
+    if (k == tk.TOK_EOF) { _by_mode(p); return; }
+    _foreign(p);
+}
+
+fn _class(c as i64) as i64 {
+    if (c == 0) { return C_NUL; }
+    if (_is_ws(c) == 1) { return C_WS; }
+    return C_TEXT;
+}
+
+// A character run, cut into pieces of one class.
+//
+// In "text", and in body once frameset-ok is gone, nothing tells whitespace from text
+// any more, so those pieces stay together. That is most of the characters in a page,
+// and without it each word would be its own trip through the rules.
+fn _chars(p as *Parser) as void {
+    let is *u8 as s = tk.tok_text(&p.tz);
+    let is i64 as n = tk.tok_text_len(&p.tz);
+    let is i64 as i with mut = 0;
+    if (p.skip_lf == 1) {
+        p.skip_lf = 0;
+        if (n > 0 && s[0] == 10) { i = 1; }
+    }
+    p.k = tk.TOK_CHAR;
+    p.tag = t.NONE;
+    while (i < n && p.stopped == 0) {
+        let is i64 as whole = cast(i64, p.mode == M_TEXT || (p.mode == M_IN_BODY && p.frameset_ok == 0));
+        let is i64 as cls with mut = _class(cast(i64, s[i]));
+        if (whole == 1 && cls == C_WS) { cls = C_TEXT; }
+        let is i64 as j with mut = i + 1;
+        while (j < n) {
+            let is i64 as other with mut = _class(cast(i64, s[j]));
+            if (whole == 1 && other == C_WS) { other = C_TEXT; }
+            if (other != cls) { break; }
+            j = j + 1;
+        }
+        p.cs = _at(s, i);
+        p.cn = j - i;
+        p.cclass = cls;
+        _dispatch(p);
+        i = j;
+    }
+}
+
+// --- the parser ----------------------------------------------------------
+
+// Parse these bytes into the document, which must be fresh. 0 on success; the
+// tokenizer's TOK_ERR_ALLOC when it has no memory to start with. `src` is not kept.
+fn parse(d as *dom.Document, src as *u8, len as i64) as i64 {
+    let is Parser as ps with mut;
+    mem.memzero(cast(*u8, &ps), sizeof(Parser));
+    let is *Parser as p = &ps;
+
+    let is *u8 as bytes with mut = src;
+    let is i64 as count with mut = len;
+    if (count >= 3 && src[0] == 239 && src[1] == 187 && src[2] == 191) {
+        bytes = _at(src, 3);
+        count = count - 3;
+    }
+
+    let is i64 as err = tk.tok_init(&p.tz, bytes, count);
+    if (err != 0) { return err; }
+    t.ensure();
+
+    p.d = d;
+    p.frameset_ok = 1;
+    p.open_cap = INIT_STACK;
+    p.open = cast(**dom.Node, dom.alloc(d, INIT_STACK * 8));
+    p.fmt_cap = INIT_STACK;
+    p.fmt = cast(**dom.Node, dom.alloc(d, INIT_STACK * 8));
+    p.tmpl_cap = INIT_STACK;
+    p.tmpl = cast(*i64, dom.alloc(d, INIT_STACK * 8));
+
+    while (p.stopped == 0) {
+        tk.tok_set_cdata_ok(&p.tz, cast(i64, p.nopen > 0 && _cur(p).ns != dom.NS_HTML));
+        let is i64 as k = tk.tok_next(&p.tz);
+        if (k == tk.TOK_CHAR) {
+            _chars(p);
+            continue;
+        }
+        p.skip_lf = 0;
+        p.k = k;
+        p.tag = t.NONE;
+        p.nlen = 0;
+        if (k == tk.TOK_START || k == tk.TOK_END) {
+            p.name = tk.tok_name(&p.tz);
+            p.nlen = tk.tok_name_len(&p.tz);
+            p.tag = t.lookup(p.name, p.nlen);
+        }
+        _dispatch(p);
+        if (k == tk.TOK_EOF) { break; }
+    }
+    tk.tok_free(&p.tz);
+    return 0;
+}

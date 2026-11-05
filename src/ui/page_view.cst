@@ -1,9 +1,17 @@
 // ui/page_view.cst — the page's place in the window.
 //
-// A widget of our own among the toolkit's. It knows nothing about pages: it plays
-// a display list back through render/ and text/, inside the rectangle it is given.
+// A widget of our own among the toolkit's. It knows nothing about pages: it plays a
+// display list back through render/ and text/, inside the rectangle it is given, scrolled
+// by however much it has been told. What a click or a pointer over it means is for whoever
+// created it to decide, through the hooks.
+//
+// It also answers layout's questions about text, because the toolkit's text service is
+// here and the engine must not reach for it.
 
 use "caustic-media/math/math.cst" as math;
+use "caustic-media/input/keys.cst" as keys;
+use "caustic-media/gpu/texture.cst" as texture;
+use "caustic-media/render/draw2d.cst" as draw2d;
 use "caustic-media/render/shapes2d.cst" as shapes;
 use "caustic-media/text/layout/model.cst" as model;
 use "caustic-media/ui/tree.cst" as tree;
@@ -11,36 +19,144 @@ use "caustic-media/ui/widget.cst" as widget;
 use "caustic-media/ui/geom.cst" as geom;
 use "caustic-media/ui/layout.cst" as layout;
 use "caustic-media/ui/painter.cst" as painter;
+use "caustic-media/ui/event.cst" as event;
 use "caustic-media/ui/text.cst" as txt;
+use "../layout/measure.cst" as measure;
 use "../paint/display_list.cst" as dl;
+use "../paint/pixels.cst" as pixels;
+use "../paint/svg.cst" as svg;
+use "std/mem.cst" as mem;
 
 let is i64 as WHITE with imut = 16777215;
 
+let is f64 as WHEEL_STEP with imut = 54.0;
+let is f64 as ARROW_STEP with imut = 40.0;
+let is f64 as BAR_WIDTH  with imut = 6.0;
+let is f64 as BAR_ROOM   with imut = 12.0;   // what counts as being over the bar
+let is f64 as BAR_MIN    with imut = 24.0;
+let is f64 as CLICK_SLOP with imut = 4.0;    // a press that moved more is not a click
+
+// draw2d keeps this many clips. Deeper ones are skipped, so overflow shows rather than
+// the canvas going wrong; the count still has to balance.
+let is i64 as MAX_CLIPS with imut = 30;
+
+struct Pointer {
+    x      as f64;    // in the view
+    y      as f64;
+    sx     as f64;    // how far it is scrolled, so x + sx is in the page
+    sy     as f64;
+    dx     as f64;    // the wheel's, in pixels
+    dy     as f64;
+    mods   as i64;
+    button as i64;
+    clicks as i64;
+    key    as i64;
+}
+
+type PointerFn = fn(*u8, *Pointer) as void;
+type AskFn = fn(*u8, *Pointer) as i64;
+
+struct Hooks {
+    user     as *u8;
+    pressed  as AskFn;      // 1 when the press is taken, and starts no selection
+    released as PointerFn;
+    clicked  as PointerFn;
+    moved    as AskFn;      // the pointer's shape over what is there
+    wheel    as AskFn;      // 1 when something inside the page scrolled instead
+    key      as AskFn;      // 1 when the key did something
+    menu     as PointerFn;  // asked for a context menu
+}
+
 struct Data {
-    list as *dl.List;
+    list  as *dl.List;
+    hooks as *Hooks;
+    over_x as f64;     // where the pointer last was in the view
+    over_y as f64;
+    over_on as i64;    // and that it still is
+    sx    as f64;
+    sy    as f64;
+    doc_w as f64;
+    doc_h as f64;
+    down_x as f64;
+    down_y as f64;
+    down_button as i64;
+    dragging as i64;     // the scroll bar
+    drag_from as f64;
+    drag_start as f64;
+    shape as i64;        // the pointer's, from the last time it moved
+    hint  as *u8;        // a line shown over the corner of the page
+    hint_n as i64;
+
+    // Text selected, from one run's byte to another's, in the list's order.
+    sel_on   as i64;
+    selecting as i64;
+    sel_a_cmd as i64;
+    sel_a_off as i64;
+    sel_b_cmd as i64;
+    sel_b_off as i64;
+    sel_count as i64;    // the list's length it belongs to
+
+    // A field being typed in: a widget held in place over a box of the page.
+    field   as i64;
+    field_x as f64;
+    field_y as f64;
+    field_w as f64;
+    field_h as f64;
+    field_fixed as i64;
+}
+
+struct FieldData {
+    inset_x as f64;
+    inset_y as f64;
 }
 
 let is tree.Kind as _kind with mut;
+let is tree.Kind as _field_kind with mut;
 let is i32 as _ready with mut = 0;
 // Every text command is laid out into this and drawn at once, so one will do.
 let is txt.Run as _run with mut;
+let is txt.Run as _mrun with mut;
 
-fn _init() as void {
+fn _init(t as *tree.Tree) as void {
+    measure.set_backend(fn_ptr(_measure_text), cast(*u8, t));
     if (_ready == 1) { return; }
     _kind = widget.kind("page_view", sizeof(Data));
     _kind.measure = fn_ptr(_measure);
     _kind.paint = fn_ptr(_paint);
+    _kind.caret = fn_ptr(_area_rect);
+    _kind.event = fn_ptr(_event);
+    _kind.shape = fn_ptr(_shape);
+    _kind.arrange = fn_ptr(_arrange);
+    _field_kind = widget.kind("page_field", sizeof(FieldData));
+    _field_kind.measure = fn_ptr(_measure);
+    _field_kind.arrange = fn_ptr(_field_arrange);
     _run = txt.run();
+    _mrun = txt.run();
     _ready = 1;
 }
 
 // A new view of list as the last child of parent. The list stays the caller's and
 // has to outlive the view. Its handle, or 0 with the tree's last_error set.
-fn create(t as *tree.Tree, parent as i64, list as *dl.List) as i64 {
-    _init();
+fn create(t as *tree.Tree, parent as i64, list as *dl.List, hooks as *Hooks) as i64 {
+    _init(t);
     let is i64 as w = tree.create(t, &_kind, parent);
     if (w == 0) { return 0; }
-    cast(*Data, tree.data(t, w)).list = list;
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.list = list;
+    d.hooks = hooks;
+    d.sx = 0.0;
+    d.sy = 0.0;
+    d.doc_w = 0.0;
+    d.doc_h = 0.0;
+    d.down_button = 0;
+    d.dragging = 0;
+    d.shape = cast(i64, tree.SHAPE_DEFAULT);
+    d.hint = cast(*u8, 0);
+    d.hint_n = 0;
+    d.sel_on = 0;
+    d.selecting = 0;
+    d.field = 0;
+    tree.set_focusable(t, w, 1);
     return w;
 }
 
@@ -48,10 +164,199 @@ fn list_of(t as *tree.Tree, w as i64) as *dl.List {
     return cast(*Data, tree.data(t, w)).list;
 }
 
-// Show another list, or the same one after it moved.
+// Show another list, or the same one after it moved. What was selected stays if the list
+// still has the same commands, which it does when only a colour changed under the pointer.
 fn set_list(t as *tree.Tree, w as i64, list as *dl.List) as void {
-    cast(*Data, tree.data(t, w)).list = list;
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.list = list;
+    if (d.sel_count != dl.count(list)) {
+        d.sel_on = 0;
+        d.selecting = 0;
+    }
     widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// Only one frame is waiting at a time, and a widget's data has no room to spare.
+let is f64 as _area_x0 with mut = 0.0;
+let is f64 as _area_y0 with mut = 0.0;
+let is f64 as _area_x1 with mut = 0.0;
+let is f64 as _area_y1 with mut = 0.0;
+
+// The same when only this much of the page, in its own coordinates, looks any different:
+// only that is painted again, the way a caret blinking is.
+fn set_list_part(t as *tree.Tree, w as i64, list as *dl.List, x0 as f64, y0 as f64, x1 as f64, y1 as f64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    // Something else is waiting on the one place the tree keeps for this.
+    let is i64 as other = tree.blinked(t);
+    if (other != 0 && other != w) {
+        set_list(t, w, list);
+        return;
+    }
+    d.list = list;
+    if (d.sel_count != dl.count(list)) {
+        d.sel_on = 0;
+        d.selecting = 0;
+    }
+    _area_x0 = x0;
+    _area_y0 = y0;
+    _area_x1 = x1;
+    _area_y1 = y1;
+    tree.blink(t, w);
+}
+
+fn _area_rect(t as *tree.Tree, w as i64, data as *u8, out as *math.rect.Rect) as i32 {
+    let is *Data as d = cast(*Data, data);
+    let is math.rect.Rect as r = tree.painted(t, w);
+    out.x = r.x + _area_x0 - d.sx;
+    out.y = r.y + _area_y0 - d.sy;
+    out.w = _area_x1 - _area_x0;
+    out.h = _area_y1 - _area_y0;
+    return 1;
+}
+
+fn clear_selection(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.sel_on = 0;
+    d.selecting = 0;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+fn has_selection(t as *tree.Tree, w as i64) as i64 {
+    return cast(*Data, tree.data(t, w)).sel_on;
+}
+
+fn _limit(v as f64, lo as f64, hi as f64) as f64 {
+    if (v > hi) { return hi; }
+    if (v < lo) { return lo; }
+    return v;
+}
+
+fn _clamp(t as *tree.Tree, w as i64, d as *Data) as void {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    let is f64 as mx with mut = d.doc_w - r.w;
+    let is f64 as my with mut = d.doc_h - r.h;
+    if (mx < 0.0) { mx = 0.0; }
+    if (my < 0.0) { my = 0.0; }
+    d.sx = _limit(d.sx, 0.0, mx);
+    d.sy = _limit(d.sy, 0.0, my);
+}
+
+// How big the page is, for scrolling. What is painted comes from the list.
+fn set_size(t as *tree.Tree, w as i64, doc_w as f64, doc_h as f64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.doc_w = doc_w;
+    d.doc_h = doc_h;
+    _clamp(t, w, d);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+fn scroll_y(t as *tree.Tree, w as i64) as f64 { return cast(*Data, tree.data(t, w)).sy; }
+fn scroll_x(t as *tree.Tree, w as i64) as f64 { return cast(*Data, tree.data(t, w)).sx; }
+
+fn _moved(t as *tree.Tree, w as i64, d as *Data) as void {
+    if (d.field != 0) { widget.changed(t, w, widget.CHANGED_LAYOUT); }
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    _rehover(d);
+}
+
+// The page moved under a pointer that did not: what it is over is something else now.
+fn _rehover(d as *Data) as void {
+    if (d.over_on == 0 || d.dragging == 1 || d.selecting == 1 || d.hooks == null) { return; }
+    let is Pointer as pt with mut;
+    mem.memzero(cast(*u8, &pt), sizeof(Pointer));
+    pt.x = d.over_x;
+    pt.y = d.over_y;
+    pt.sx = d.sx;
+    pt.sy = d.sy;
+    d.shape = call(d.hooks.moved, d.hooks.user, &pt);
+}
+
+fn scroll_to(t as *tree.Tree, w as i64, x as f64, y as f64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.sx = x;
+    d.sy = y;
+    _clamp(t, w, d);
+    _moved(t, w, d);
+}
+
+// --- A field held over the page ---
+
+// A holder over this box of the page, for the caller to put one widget in. It keeps to the
+// box however the page scrolls, and clips what it holds, so a widget's own frame and
+// padding can hang outside it: inset moves the widget's edge from the holder's, so the
+// text inside lands where the page drew it.
+fn open_field(t as *tree.Tree, w as i64, x as f64, y as f64, fw as f64, fh as f64, fixed as i64, inset_x as f64,
+              inset_y as f64) as i64 {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    close_field(t, w);
+    let is i64 as h = tree.create(t, &_field_kind, w);
+    if (h == 0) { return 0; }
+    cast(*FieldData, tree.data(t, h)).inset_x = inset_x;
+    cast(*FieldData, tree.data(t, h)).inset_y = inset_y;
+    d.field = h;
+    d.field_x = x;
+    d.field_y = y;
+    d.field_w = fw;
+    d.field_h = fh;
+    d.field_fixed = fixed;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return h;
+}
+
+fn move_field(t as *tree.Tree, w as i64, x as f64, y as f64, fw as f64, fh as f64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.field_x = x;
+    d.field_y = y;
+    d.field_w = fw;
+    d.field_h = fh;
+    widget.changed(t, w, widget.CHANGED_LAYOUT);
+}
+
+fn close_field(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    if (d.field == 0) { return; }
+    tree.destroy(t, d.field);
+    d.field = 0;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    if (d.field == 0) { return; }
+    let is f64 as ox with mut = d.sx;
+    let is f64 as oy with mut = d.sy;
+    if (d.field_fixed == 1) {
+        ox = 0.0;
+        oy = 0.0;
+    }
+    let is math.rect.Rect as at = math.rect.rect(d.field_x - ox, d.field_y - oy, d.field_w, d.field_h);
+    layout.place(t, d.field, &at);
+}
+
+fn _field_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *FieldData as f = cast(*FieldData, data);
+    let is math.rect.Rect as at = math.rect.rect(f.inset_x, f.inset_y, r.w - f.inset_x * 2.0, r.h - f.inset_y * 2.0);
+    layout.place(t, tree.first_child(t, w), &at);
+}
+
+// A line of text over the page's corner, or none with n of 0. It is not copied.
+fn set_hint(t as *tree.Tree, w as i64, s as *u8, n as i64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    if (d.hint_n == 0 && n == 0) { return; }
+    d.hint = s;
+    d.hint_n = n;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// The texture of an image goes with the page that showed it.
+fn release_image(t as *tree.Tree, im as *dl.Image) as void {
+    if (im.tex <= 0) {
+        im.tex = 0;
+        return;
+    }
+    let is *txt.Service as svc = txt.of(t);
+    if (cast(i64, svc) != 0 && cast(i64, svc.d) != 0) { texture.destroy(svc.d, im.tex); }
+    im.tex = 0;
 }
 
 // No size of its own: it takes what its parent gives it.
@@ -59,6 +364,493 @@ fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out a
     geom.size_zero(out);
     out.max_w = layout.UNBOUNDED;
     out.max_h = layout.UNBOUNDED;
+}
+
+// --- Layout's questions ---
+
+fn _measure_text(user as *u8, q as *measure.Query) as void {
+    let is *tree.Tree as t = cast(*tree.Tree, user);
+    let is *txt.Service as svc = txt.of(t);
+    q.width = cast(f64, q.len) * q.size * 0.5;
+    q.height = q.size * 1.2;
+    q.ascent = q.size * 0.95;
+    if (cast(i64, svc) == 0) { return; }
+    let is txt.Style as st with mut = txt.style_of(tree.theme(t).fonts.body);
+    st.family = q.family;
+    st.size = q.size;
+    st.weight = q.weight;
+    st.italic = cast(i32, q.italic);
+    let is model.Params as pp = model.params();
+    if (txt.lay_plain(svc, &_mrun, q.text, q.len, &st, &pp) == 0) { return; }
+    q.width = _mrun.width;
+    q.height = _mrun.height;
+    q.ascent = txt.baseline(&_mrun);
+}
+
+// --- Events ---
+
+fn _pointer(d as *Data, e as *event.Event, out as *Pointer) as void {
+    out.x = e.local_x;
+    out.y = e.local_y;
+    out.sx = d.sx;
+    out.sy = d.sy;
+    out.dx = 0.0;
+    out.dy = 0.0;
+    out.mods = cast(i64, e.mods);
+    out.button = cast(i64, e.button);
+    out.clicks = cast(i64, e.clicks);
+    out.key = cast(i64, e.key);
+}
+
+// --- Selecting text ---
+
+fn _char_len(b as i64) as i64 {
+    if (b < 128) { return 1; }
+    if (b < 224) { return 2; }
+    if (b < 240) { return 3; }
+    return 4;
+}
+
+fn _width_to(c as *dl.Cmd, n as i64) as f64 {
+    let is f64 as w = measure.text_width(c.text, n, c.family, c.size, c.weight, c.italic);
+    if (c.ls == 0.0) { return w; }
+    let is i64 as chars with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        i = i + _char_len(cast(i64, c.text[i]));
+        chars = chars + 1;
+    }
+    return w + c.ls * cast(f64, chars);
+}
+
+// The byte of a run nearest to a distance from its start.
+fn _offset_in(c as *dl.Cmd, x as f64) as i64 {
+    if (x <= 0.0) { return 0; }
+    if (x >= c.rw) { return c.len; }
+    let is i64 as i with mut = 0;
+    let is f64 as at with mut = 0.0;
+    while (i < c.len) {
+        let is i64 as next = i + _char_len(cast(i64, c.text[i]));
+        let is f64 as to = _width_to(c, next);
+        if (x < (at + to) / 2.0) { return i; }
+        at = to;
+        i = next;
+    }
+    return c.len;
+}
+
+// The run nearest to a point of the view, and the byte in it. 0 when the list has no text.
+fn _run_at(d as *Data, px as f64, py as f64, cmd as *i64, off as *i64) as i64 {
+    let is *dl.List as l = d.list;
+    let is f64 as best with mut = 0.0 - 1.0;
+    let is i64 as found with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < dl.count(l)) {
+        let is *dl.Cmd as c = dl.at(l, i);
+        if (c.kind == dl.RUN) {
+            let is f64 as x with mut = px + d.sx;
+            let is f64 as y with mut = py + d.sy;
+            if (c.fixed == 1) {
+                x = px;
+                y = py;
+            }
+            let is f64 as ddx with mut = 0.0;
+            let is f64 as ddy with mut = 0.0;
+            if (x < c.x) { ddx = c.x - x; }
+            if (x > c.x + c.rw) { ddx = x - c.x - c.rw; }
+            if (y < c.y) { ddy = c.y - y; }
+            if (y > c.y + c.rh) { ddy = y - c.y - c.rh; }
+            // A line above or below is further than anything along this one.
+            let is f64 as score = ddy * 100000.0 + ddx;
+            if (found < 0 || score < best) {
+                best = score;
+                found = i;
+            }
+        }
+        i = i + 1;
+    }
+    if (found < 0) { return 0; }
+    let is *dl.Cmd as c = dl.at(l, found);
+    let is f64 as x with mut = px + d.sx;
+    if (c.fixed == 1) { x = px; }
+    *cmd = found;
+    *off = _offset_in(c, x - c.x);
+    return 1;
+}
+
+// A run in the list and the byte at a point of the view, for whoever put a widget there.
+fn text_at(t as *tree.Tree, w as i64, px as f64, py as f64, out as **u8) as i64 {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    let is i64 as cmd with mut = 0;
+    let is i64 as off with mut = 0;
+    if (_run_at(d, px, py, &cmd, &off) == 0) { return 0 - 1; }
+    *out = dl.at(d.list, cmd).text;
+    return off;
+}
+
+fn _ordered(d as *Data, fc as *i64, fo as *i64, lc as *i64, lo as *i64) as void {
+    let is i64 as after = cast(i64, d.sel_a_cmd > d.sel_b_cmd || (d.sel_a_cmd == d.sel_b_cmd && d.sel_a_off > d.sel_b_off));
+    if (after == 1) {
+        *fc = d.sel_b_cmd;
+        *fo = d.sel_b_off;
+        *lc = d.sel_a_cmd;
+        *lo = d.sel_a_off;
+        return;
+    }
+    *fc = d.sel_a_cmd;
+    *fo = d.sel_a_off;
+    *lc = d.sel_b_cmd;
+    *lo = d.sel_b_off;
+}
+
+fn _is_word_byte(c as i64) as i64 {
+    if (c >= 128 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) { return 1; }
+    return 0;
+}
+
+// The largest selection so far. The last is the one most likely to be copied again.
+let is *u8 as _text_buf with mut = cast(*u8, 0);
+let is i64 as _text_cap with mut = 0;
+
+// Everything selected as text: a line break between runs on different lines, a space
+// between ones with a gap.
+fn _selection_text(d as *Data, out_n as *i64) as *u8 {
+    *out_n = 0;
+    if (d.sel_on == 0) { return cast(*u8, 0); }
+    let is i64 as fc with mut = 0;
+    let is i64 as fo with mut = 0;
+    let is i64 as lc with mut = 0;
+    let is i64 as lo with mut = 0;
+    _ordered(d, &fc, &fo, &lc, &lo);
+    let is *dl.List as l = d.list;
+    let is i64 as cap with mut = 16;
+    let is i64 as i with mut = fc;
+    while (i <= lc) {
+        if (dl.at(l, i).kind == dl.RUN) { cap = cap + dl.at(l, i).len + 2; }
+        i = i + 1;
+    }
+    if (cap > _text_cap) {
+        _text_buf = mem.core.mmap_anon(cap);
+        _text_cap = cap;
+    }
+    let is *u8 as out = _text_buf;
+    let is i64 as w with mut = 0;
+    let is f64 as last_y with mut = 0.0 - 1.0;
+    let is f64 as last_end with mut = 0.0;
+    i = fc;
+    while (i <= lc) {
+        let is *dl.Cmd as c = dl.at(l, i);
+        if (c.kind == dl.RUN) {
+            let is i64 as a with mut = 0;
+            let is i64 as b with mut = c.len;
+            if (i == fc) { a = fo; }
+            if (i == lc) { b = lo; }
+            if (b > a) {
+                if (last_y >= 0.0) {
+                    if (c.y > last_y + c.rh / 2.0 || c.y < last_y - c.rh / 2.0) {
+                        out[w] = cast(u8, 10);
+                        w = w + 1;
+                    } else if (c.x > last_end + c.size * 0.15 && w > 0 && out[w - 1] != 32) {
+                        out[w] = cast(u8, 32);
+                        w = w + 1;
+                    }
+                }
+                mem.core.memcpy(&out[w], &c.text[a], b - a);
+                w = w + b - a;
+                last_y = c.y;
+                last_end = c.x + c.rw;
+            }
+        }
+        i = i + 1;
+    }
+    *out_n = w;
+    return out;
+}
+
+fn _copy_to(t as *tree.Tree, d as *Data, which as i32) as void {
+    let is i64 as n with mut = 0;
+    let is *u8 as s = _selection_text(d, &n);
+    if (s == null) { return; }
+    if (n > 0) { tree.copy(t, which, s, n); }
+}
+
+fn copy_selection(t as *tree.Tree, w as i64) as void {
+    _copy_to(t, cast(*Data, tree.data(t, w)), tree.CLIPBOARD);
+}
+
+fn select_all(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    let is *dl.List as l = d.list;
+    let is i64 as first with mut = 0 - 1;
+    let is i64 as last with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < dl.count(l)) {
+        if (dl.at(l, i).kind == dl.RUN) {
+            if (first < 0) { first = i; }
+            last = i;
+        }
+        i = i + 1;
+    }
+    if (first < 0) { return; }
+    d.sel_a_cmd = first;
+    d.sel_a_off = 0;
+    d.sel_b_cmd = last;
+    d.sel_b_off = dl.at(l, last).len;
+    d.sel_count = dl.count(l);
+    d.sel_on = 1;
+    _copy_to(t, d, tree.PRIMARY);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// A press starts a selection: nothing yet, a word on a double click, the line on a triple.
+fn _begin_selection(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as void {
+    let is i64 as cmd with mut = 0;
+    let is i64 as off with mut = 0;
+    d.sel_on = 0;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    if (_run_at(d, e.local_x, e.local_y, &cmd, &off) == 0) { return; }
+    d.selecting = 1;
+    d.sel_a_cmd = cmd;
+    d.sel_a_off = off;
+    d.sel_b_cmd = cmd;
+    d.sel_b_off = off;
+    d.sel_count = dl.count(d.list);
+    let is *dl.Cmd as c = dl.at(d.list, cmd);
+    if (e.clicks == 2) {
+        let is i64 as a with mut = off;
+        let is i64 as b with mut = off;
+        while (a > 0 && _is_word_byte(cast(i64, c.text[a - 1])) == 1) { a = a - 1; }
+        while (b < c.len && _is_word_byte(cast(i64, c.text[b])) == 1) { b = b + 1; }
+        d.sel_a_off = a;
+        d.sel_b_off = b;
+        d.sel_on = cast(i64, b > a);
+    }
+    if (e.clicks >= 3) {
+        d.sel_a_off = 0;
+        d.sel_b_off = c.len;
+        d.sel_on = 1;
+    }
+}
+
+fn _extend_selection(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as void {
+    let is i64 as cmd with mut = 0;
+    let is i64 as off with mut = 0;
+    // Past an edge, the page comes along.
+    let is math.rect.Rect as r = layout.rect(t, w);
+    if (e.local_y < 0.0) { _scroll_by(t, w, d, 0.0, 0.0 - ARROW_STEP / 2.0); }
+    if (e.local_y > r.h) { _scroll_by(t, w, d, 0.0, ARROW_STEP / 2.0); }
+    if (_run_at(d, e.local_x, e.local_y, &cmd, &off) == 0) { return; }
+    d.sel_b_cmd = cmd;
+    d.sel_b_off = off;
+    d.sel_on = cast(i64, d.sel_a_cmd != d.sel_b_cmd || d.sel_a_off != d.sel_b_off);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+fn _bar_box(t as *tree.Tree, w as i64, d as *Data, top as *f64, h as *f64) as i64 {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    if (d.doc_h <= r.h || r.h <= 0.0) { return 0; }
+    let is f64 as bh with mut = r.h * r.h / d.doc_h;
+    if (bh < BAR_MIN) { bh = BAR_MIN; }
+    *h = bh;
+    *top = (r.h - bh) * d.sy / (d.doc_h - r.h);
+    return 1;
+}
+
+fn _scroll_by(t as *tree.Tree, w as i64, d as *Data, dx as f64, dy as f64) as i64 {
+    let is f64 as ox = d.sx;
+    let is f64 as oy = d.sy;
+    d.sx = d.sx + dx;
+    d.sy = d.sy + dy;
+    _clamp(t, w, d);
+    if (d.sx == ox && d.sy == oy) { return 0; }
+    _moved(t, w, d);
+    return 1;
+}
+
+fn _key(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    let is i32 as k = e.key;
+    if ((e.mods & keys.MOD_CONTROL) != 0 && k == keys.C) {
+        copy_selection(t, w);
+        return 1;
+    }
+    if ((e.mods & keys.MOD_CONTROL) != 0 && k == keys.A) {
+        select_all(t, w);
+        return 1;
+    }
+    let is Pointer as pk with mut;
+    _pointer(d, e, &pk);
+    if (call(d.hooks.key, d.hooks.user, &pk) == 1) { return 1; }
+    if (k == keys.SPACE) {
+        if ((e.mods & keys.MOD_SHIFT) != 0) { _scroll_by(t, w, d, 0.0, 0.0 - r.h * 0.9); }
+        else { _scroll_by(t, w, d, 0.0, r.h * 0.9); }
+        return 1;
+    }
+    if (k == keys.DOWN) { _scroll_by(t, w, d, 0.0, ARROW_STEP); return 1; }
+    if (k == keys.UP) { _scroll_by(t, w, d, 0.0, 0.0 - ARROW_STEP); return 1; }
+    if (k == keys.LEFT) {
+        if ((e.mods & keys.MOD_ALT) != 0) { return 0; }
+        _scroll_by(t, w, d, 0.0 - ARROW_STEP, 0.0);
+        return 1;
+    }
+    if (k == keys.RIGHT) {
+        if ((e.mods & keys.MOD_ALT) != 0) { return 0; }
+        _scroll_by(t, w, d, ARROW_STEP, 0.0);
+        return 1;
+    }
+    if (k == keys.PAGE_DOWN && (e.mods & keys.MOD_CONTROL) == 0) { _scroll_by(t, w, d, 0.0, r.h * 0.9); return 1; }
+    if (k == keys.PAGE_UP && (e.mods & keys.MOD_CONTROL) == 0) { _scroll_by(t, w, d, 0.0, 0.0 - r.h * 0.9); return 1; }
+    if (k == 32) {
+        if ((e.mods & keys.MOD_SHIFT) != 0) { _scroll_by(t, w, d, 0.0, 0.0 - r.h * 0.9); }
+        else { _scroll_by(t, w, d, 0.0, r.h * 0.9); }
+        return 1;
+    }
+    if (k == keys.HOME) { _scroll_by(t, w, d, 0.0 - d.sx, 0.0 - d.sy); return 1; }
+    if (k == keys.END) { _scroll_by(t, w, d, 0.0, d.doc_h); return 1; }
+    return 0;
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as k = e.kind;
+    if (k == event.SCROLL) {
+        let is f64 as dx with mut = e.dx;
+        let is f64 as dy with mut = e.dy;
+        if (e.discrete == 1) {
+            dx = dx * WHEEL_STEP;
+            dy = dy * WHEEL_STEP;
+            if ((e.mods & keys.MOD_SHIFT) != 0 && dx == 0.0) {
+                dx = dy;
+                dy = 0.0;
+            }
+        }
+        let is Pointer as pt with mut;
+        _pointer(d, e, &pt);
+        let is math.rect.Rect as wr = layout.window_rect(t, w);
+        pt.x = e.x - wr.x;
+        pt.y = e.y - wr.y;
+        pt.dx = dx;
+        pt.dy = dy;
+        if (call(d.hooks.wheel, d.hooks.user, &pt) == 1) {
+            _rehover(d);
+            return 1;
+        }
+        return _scroll_by(t, w, d, dx, dy);
+    }
+    if (k == event.POINTER_DOWN) {
+        let is math.rect.Rect as r = layout.rect(t, w);
+        let is f64 as top with mut = 0.0;
+        let is f64 as bh with mut = 0.0;
+        if (e.button == 1 && e.local_x >= r.w - BAR_ROOM && _bar_box(t, w, d, &top, &bh) == 1) {
+            d.dragging = 1;
+            d.drag_from = e.local_y;
+            d.drag_start = d.sy;
+            // A press off the thumb jumps there first, then drags from the same place.
+            if (e.local_y < top || e.local_y > top + bh) {
+                d.sy = (e.local_y - bh / 2.0) * (d.doc_h - r.h) / (r.h - bh);
+                _clamp(t, w, d);
+                d.drag_start = d.sy;
+                _moved(t, w, d);
+            }
+            return 1;
+        }
+        d.down_x = e.local_x;
+        d.down_y = e.local_y;
+        d.down_button = cast(i64, e.button);
+        let is Pointer as pt with mut;
+        _pointer(d, e, &pt);
+        let is i64 as taken = call(d.hooks.pressed, d.hooks.user, &pt);
+        if (e.button == 1) {
+            if (taken == 1) {
+                if (d.sel_on == 1) {
+                    d.sel_on = 0;
+                    widget.changed(t, w, widget.CHANGED_PAINT);
+                }
+            } else {
+                _begin_selection(t, w, d, e);
+            }
+        }
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (d.dragging == 1) {
+            let is math.rect.Rect as r = layout.rect(t, w);
+            let is f64 as top with mut = 0.0;
+            let is f64 as bh with mut = 0.0;
+            if (_bar_box(t, w, d, &top, &bh) == 1) {
+                d.sy = d.drag_start + (e.local_y - d.drag_from) * (d.doc_h - r.h) / (r.h - bh);
+                _clamp(t, w, d);
+                _moved(t, w, d);
+            }
+            return 1;
+        }
+        if (d.selecting == 1) {
+            let is f64 as mx = e.local_x - d.down_x;
+            let is f64 as my = e.local_y - d.down_y;
+            if (d.sel_on == 1 || mx * mx + my * my > CLICK_SLOP * CLICK_SLOP) { _extend_selection(t, w, d, e); }
+            return 1;
+        }
+        let is Pointer as pt with mut;
+        _pointer(d, e, &pt);
+        d.over_x = pt.x;
+        d.over_y = pt.y;
+        d.over_on = 1;
+        d.shape = call(d.hooks.moved, d.hooks.user, &pt);
+        return 1;
+    }
+    if (k == event.POINTER_UP) {
+        if (d.dragging == 1) {
+            d.dragging = 0;
+            return 1;
+        }
+        let is f64 as mx = e.local_x - d.down_x;
+        let is f64 as my = e.local_y - d.down_y;
+        let is i64 as button = d.down_button;
+        d.down_button = 0;
+        let is i64 as was_selecting = d.selecting;
+        d.selecting = 0;
+        if (was_selecting == 1 && d.sel_on == 1) { _copy_to(t, d, tree.PRIMARY); }
+        let is Pointer as pt with mut;
+        _pointer(d, e, &pt);
+        call(d.hooks.released, d.hooks.user, &pt);
+        // A drag that selected something was not a click on what it started over.
+        if (button != 0 && button == cast(i64, e.button) && d.sel_on == 0 && mx * mx + my * my <= CLICK_SLOP * CLICK_SLOP) {
+            call(d.hooks.clicked, d.hooks.user, &pt);
+        }
+        return 1;
+    }
+    if (k == event.POINTER_LEAVE) {
+        let is Pointer as pt with mut;
+        _pointer(d, e, &pt);
+        pt.x = 0.0 - 1.0;
+        pt.y = 0.0 - 1.0;
+        d.over_on = 0;
+        d.shape = cast(i64, tree.SHAPE_DEFAULT);
+        call(d.hooks.moved, d.hooks.user, &pt);
+        return 0;
+    }
+    if (k == event.CONTEXT_MENU) {
+        let is Pointer as pt with mut;
+        _pointer(d, e, &pt);
+        call(d.hooks.menu, d.hooks.user, &pt);
+        return 1;
+    }
+    if (k == event.KEY_DOWN) { return _key(t, w, d, e); }
+    return 0;
+}
+
+fn _shape(t as *tree.Tree, w as i64, data as *u8, p as *math.vec.Vec2) as i32 {
+    let is *Data as d = cast(*Data, data);
+    if (d.selecting == 1) { return tree.SHAPE_TEXT; }
+    return cast(i32, d.shape);
+}
+
+// --- Painting ---
+
+fn _color(c as *dl.Cmd) as math.color.Color {
+    let is math.color.Color as k with mut = math.color.hex(c.color);
+    k.a = k.a * c.alpha;
+    return k;
 }
 
 fn _text(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd) as void {
@@ -83,18 +875,417 @@ fn _text(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd) as void {
     txt.draw(svc, p.canvas, &_run, p.rect.x + c.x, p.rect.y + c.y, math.color.hex(c.color));
 }
 
-fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
-    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, math.color.hex(WHITE));
-    let is *dl.List as l = cast(*Data, data).list;
-    let is *txt.Service as svc = txt.of(t);
-    let is i64 as i with mut = 0;
-    while (i < dl.count(l)) {
-        let is *dl.Cmd as c = dl.at(l, i);
-        if (c.kind == dl.RECT) {
-            shapes.fill_rounded(p.canvas, p.rect.x + c.x, p.rect.y + c.y, c.w, c.h,
-                                c.radius, c.radius, c.radius, c.radius, math.color.hex(c.color));
+// One line from layout, already placed: the page's own font, and nothing to wrap.
+fn _line(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    let is txt.Style as st with mut = txt.style_of(p.theme.fonts.body);
+    st.family = c.family;
+    st.size = c.size;
+    st.weight = c.weight;
+    st.italic = cast(i32, c.italic);
+    st.underline = cast(i32, (c.deco & dl.DECO_UNDERLINE) != 0);
+    st.strike = cast(i32, (c.deco & dl.DECO_STRIKE) != 0);
+    let is model.Params as pp = model.params();
+    let is math.color.Color as col = _color(c);
+    // The shaper knows nothing of letter-spacing, so spaced text goes a character at a time,
+    // each where the ones before it end. A kerning pair stays in the sum this way.
+    if (c.ls != 0.0) {
+        let is i64 as i with mut = 0;
+        let is i64 as chars with mut = 0;
+        while (i < c.len) {
+            let is i64 as next = i + _char_len(cast(i64, c.text[i]));
+            let is f64 as at = measure.text_width(c.text, i, c.family, c.size, c.weight, c.italic) + c.ls * cast(f64, chars);
+            if (next <= c.len && txt.lay_plain(svc, &_run, &c.text[i], next - i, &st, &pp) != 0) {
+                txt.draw(svc, p.canvas, &_run, x + at, y, col);
+            }
+            chars = chars + 1;
+            i = next;
         }
-        if (c.kind == dl.TEXT && cast(i64, svc) != 0) { _text(svc, p, c); }
+        if ((c.deco & dl.DECO_OVERLINE) != 0) { shapes.fill_rect(p.canvas, x, y, c.rw, 1.0, col); }
+        return;
+    }
+    if (txt.lay_plain(svc, &_run, c.text, c.len, &st, &pp) == 0) { return; }
+    txt.draw(svc, p.canvas, &_run, x, y, col);
+    if ((c.deco & dl.DECO_OVERLINE) != 0) { shapes.fill_rect(p.canvas, x, y, _run.width, 1.0, col); }
+}
+
+// --- Images made here ---
+//
+// A gradient, an edge whose sides differ and an <svg> are worked out as pixels the first
+// time and drawn from a texture after that. They are kept by what they look like, so the
+// same one in another tab or after a restyle costs nothing. A texture is only thrown away
+// when it has gone unused for a few frames, since the last frame may still be drawing it.
+
+let is i64 as MAX_MADE with imut = 256;
+let is i64 as MAX_MADE_SIDE with imut = 2048;
+let is i64 as MADE_KEEP with imut = 4;
+
+struct _Made {
+    key  as i64;
+    tex  as i64;
+    last as i64;
+}
+
+let is [256]_Made as _made with mut;
+let is i64 as _made_frame with mut = 0;
+let is i64 as _made_dev with mut = 0;
+
+fn _mix(h as i64, v as i64) as i64 {
+    let is i64 as x = (h ^ v) * 1099511628211;
+    return x ^ ((x >> 29) & 34359738367);
+}
+
+fn _mixf(h as i64, v as f64) as i64 { return _mix(h, cast(i64, v * 256.0)); }
+
+// The slot of what is kept under key, or of where it can go. -1 when there is no room.
+fn _made_slot(svc as *txt.Service, key as i64, found as *i64) as i64 {
+    if (cast(i64, svc.d) != _made_dev) {
+        // A new device has none of the old textures.
+        mem.memzero(cast(*u8, &_made[0]), sizeof(_Made) * MAX_MADE);
+        _made_dev = cast(i64, svc.d);
+    }
+    *found = 0;
+    let is i64 as empty with mut = 0 - 1;
+    let is i64 as oldest with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_MADE) {
+        if (_made[i].tex == 0) {
+            if (empty < 0) { empty = i; }
+        } else if (_made[i].key == key) {
+            _made[i].last = _made_frame;
+            *found = 1;
+            return i;
+        } else if (_made[i].last + MADE_KEEP < _made_frame && (oldest < 0 || _made[i].last < _made[oldest].last)) {
+            oldest = i;
+        }
         i = i + 1;
     }
+    if (empty >= 0) { return empty; }
+    if (oldest < 0) { return 0 - 1; }
+    if (_made[oldest].tex > 0) { texture.destroy(svc.d, _made[oldest].tex); }
+    _made[oldest].tex = 0;
+    return oldest;
+}
+
+// Room for wp by hp pixels of nothing yet. Null when there is none.
+fn _made_pixels(wp as i64, hp as i64) as *u8 {
+    let is *u8 as px = mem.core.mmap_anon(wp * hp * 4);
+    let is i64 as v = cast(i64, px);
+    if (v == 0 || v == 0 - 1) { return cast(*u8, 0); }
+    return px;
+}
+
+fn _made_store(svc as *txt.Service, slot as i64, key as i64, px as *u8, wp as i64, hp as i64) as void {
+    let is texture.Desc as td = texture.desc(wp, hp, texture.RGBA8, texture.SAMPLED);
+    let is i64 as tex with mut = texture.create(svc.d, &td);
+    if (tex != 0) { texture.upload(svc.d, tex, px, wp * hp * 4); }
+    // One that will not fit on the card is not tried again every frame.
+    else { tex = 0 - 1; }
+    mem.core.munmap(px, wp * hp * 4);
+    _made[slot].key = key;
+    _made[slot].tex = tex;
+    _made[slot].last = _made_frame;
+}
+
+fn _made_side(v as f64, scale as f64) as i64 {
+    let is i64 as k = cast(i64, v * scale + 0.999);
+    if (k < 1) { return 1; }
+    if (k > MAX_MADE_SIDE) { return MAX_MADE_SIDE; }
+    return k;
+}
+
+fn _made_draw(p as *painter.Painter, slot as i64, c as *dl.Cmd, x as f64, y as f64) as void {
+    if (slot < 0 || _made[slot].tex <= 0) { return; }
+    draw2d.image_premultiplied(p.canvas, _made[slot].tex, 1, x, y, c.w, c.h, 0.0, 0.0, 1.0, 1.0,
+                               math.color.rgba(c.alpha, c.alpha, c.alpha, c.alpha));
+}
+
+fn _key_box(c as *dl.Cmd, wp as i64, hp as i64) as i64 {
+    let is i64 as h with mut = 1469598103934665603;
+    h = _mix(h, wp);
+    h = _mix(h, hp);
+    h = _mixf(h, c.w);
+    h = _mixf(h, c.h);
+    h = _mixf(h, c.radius);
+    h = _mixf(h, c.r2);
+    h = _mixf(h, c.r3);
+    return _mixf(h, c.r4);
+}
+
+fn _draw_gradient(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    let is *dl.GradPaint as g = c.grad;
+    if (g == null || g.n < 1 || c.w <= 0.0 || c.h <= 0.0) { return; }
+    let is f64 as sc = draw2d.scale(p.canvas);
+    let is i64 as wp = _made_side(c.w, sc);
+    let is i64 as hp = _made_side(c.h, sc);
+    let is i64 as key with mut = _key_box(c, wp, hp);
+    key = _mix(key, g.kind + g.repeating * 16);
+    key = _mixf(key, g.dx * 1000.0);
+    key = _mixf(key, g.dy * 1000.0);
+    key = _mixf(key, g.len);
+    key = _mixf(key, g.cx);
+    key = _mixf(key, g.cy);
+    key = _mixf(key, g.rx);
+    key = _mixf(key, g.ry);
+    key = _mixf(key, g.from * 1000.0);
+    let is i64 as i with mut = 0;
+    while (i < g.n) {
+        key = _mix(key, g.cols[i]);
+        key = _mixf(key, g.pos[i] * 10000.0);
+        i = i + 1;
+    }
+    let is i64 as found with mut = 0;
+    let is i64 as slot = _made_slot(svc, key, &found);
+    if (slot < 0) { return; }
+    if (found == 0) {
+        let is *u8 as px = _made_pixels(wp, hp);
+        if (px == null) { return; }
+        pixels.gradient(g, c.w, c.h, c.radius, c.r2, c.r3, c.r4, wp, hp, px);
+        _made_store(svc, slot, key, px, wp, hp);
+    }
+    _made_draw(p, slot, c, x, y);
+}
+
+fn _draw_ring(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    if (c.w <= 0.0 || c.h <= 0.0) { return; }
+    let is f64 as sc = draw2d.scale(p.canvas);
+    let is i64 as wp = _made_side(c.w, sc);
+    let is i64 as hp = _made_side(c.h, sc);
+    let is i64 as key with mut = _mix(_key_box(c, wp, hp), 2);
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        key = _mixf(key, c.bw[k]);
+        key = _mix(key, c.bc[k]);
+        k = k + 1;
+    }
+    let is i64 as found with mut = 0;
+    let is i64 as slot = _made_slot(svc, key, &found);
+    if (slot < 0) { return; }
+    if (found == 0) {
+        let is *u8 as px = _made_pixels(wp, hp);
+        if (px == null) { return; }
+        pixels.ring(c, wp, hp, px);
+        _made_store(svc, slot, key, px, wp, hp);
+    }
+    _made_draw(p, slot, c, x, y);
+}
+
+fn _draw_svg(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    if (c.w <= 0.0 || c.h <= 0.0) { return; }
+    let is f64 as sc = draw2d.scale(p.canvas);
+    let is i64 as wp = _made_side(c.w, sc);
+    let is i64 as hp = _made_side(c.h, sc);
+    let is i64 as key with mut = _mix(_key_box(c, wp, hp), 3);
+    key = _mix(key, cast(i64, c.node));
+    key = _mix(key, c.color);
+    let is i64 as found with mut = 0;
+    let is i64 as slot = _made_slot(svc, key, &found);
+    if (slot < 0) { return; }
+    if (found == 0) {
+        let is *u8 as px = _made_pixels(wp, hp);
+        if (px == null) { return; }
+        svg.render(c.node, wp, hp, c.color, px);
+        _made_store(svc, slot, key, px, wp, hp);
+    }
+    _made_draw(p, slot, c, x, y);
+}
+
+fn _image(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    let is *dl.Image as im = c.img;
+    if (im.tex == 0 && cast(i64, svc) != 0 && cast(i64, svc.d) != 0) {
+        let is texture.Desc as td = texture.desc(im.width, im.height, texture.RGBA8, texture.SAMPLED);
+        im.tex = texture.create(svc.d, &td);
+        if (im.tex != 0) { texture.upload(svc.d, im.tex, im.pixels, im.width * im.height * 4); }
+        // One that will not fit on the card is not tried again every frame.
+        else { im.tex = 0 - 1; }
+    }
+    if (im.tex <= 0) { return; }
+    draw2d.image(p.canvas, im.tex, 1, x, y, c.w, c.h, 0.0, 0.0, 1.0, 1.0, math.color.rgba(1.0, 1.0, 1.0, c.alpha));
+}
+
+// The tint under what is selected of this run, if any of it is.
+fn _highlight(d as *Data, p as *painter.Painter, i as i64, c as *dl.Cmd, x as f64, y as f64) as void {
+    if (d.sel_on == 0) { return; }
+    let is i64 as fc with mut = 0;
+    let is i64 as fo with mut = 0;
+    let is i64 as lc with mut = 0;
+    let is i64 as lo with mut = 0;
+    _ordered(d, &fc, &fo, &lc, &lo);
+    if (i < fc || i > lc) { return; }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = c.len;
+    if (i == fc) { a = fo; }
+    if (i == lc) { b = lo; }
+    if (b <= a) { return; }
+    let is f64 as x0 with mut = 0.0;
+    let is f64 as x1 with mut = c.rw;
+    if (a > 0) { x0 = _width_to(c, a); }
+    if (b < c.len) { x1 = _width_to(c, b); }
+    shapes.fill_rect(p.canvas, x + x0, y, x1 - x0, c.rh, math.color.rgba(0.2, 0.55, 1.0, 0.35));
+}
+
+fn _bar(t as *tree.Tree, w as i64, d as *Data, p as *painter.Painter) as void {
+    let is f64 as top with mut = 0.0;
+    let is f64 as bh with mut = 0.0;
+    if (_bar_box(t, w, d, &top, &bh) == 0) { return; }
+    let is f64 as x = p.rect.x + p.rect.w - BAR_WIDTH - 2.0;
+    let is f64 as y = p.rect.y + top;
+    shapes.fill_rounded(p.canvas, x, y, BAR_WIDTH, bh, 3.0, 3.0, 3.0, 3.0, math.color.rgba(0.35, 0.35, 0.38, 0.6));
+}
+
+fn _draw_hint(svc as *txt.Service, d as *Data, p as *painter.Painter) as void {
+    if (d.hint_n == 0 || cast(i64, svc) == 0) { return; }
+    let is txt.Style as st with mut = txt.style_of(p.theme.fonts.body);
+    st.family = p.theme.fonts.family;
+    st.size = 12.0;
+    st.weight = 400;
+    let is model.Params as pp = model.params();
+    pp.max_lines = 1;
+    pp.ellipsis = 1;
+    pp.width = p.rect.w * 0.6;
+    if (txt.lay_plain(svc, &_run, d.hint, d.hint_n, &st, &pp) == 0) { return; }
+    let is f64 as h = _run.height + 8.0;
+    let is f64 as y = p.rect.y + p.rect.h - h;
+    shapes.fill_rounded(p.canvas, p.rect.x, y, _run.width + 16.0, h, 0.0, 4.0, 0.0, 0.0, math.color.hex(1382685));
+    txt.draw(svc, p.canvas, &_run, p.rect.x + 8.0, y + 4.0, math.color.hex(15855348));
+}
+
+let is i64 as MAX_MOVED with imut = 16;
+let is [96]f64 as _moved_m with mut;
+
+// outer after what is in m, into m.
+fn _after(outer as *f64, m as *f64) as void {
+    let is f64 as m0 = outer[0] * m[0] + outer[2] * m[1];
+    let is f64 as m1 = outer[1] * m[0] + outer[3] * m[1];
+    let is f64 as m2 = outer[0] * m[2] + outer[2] * m[3];
+    let is f64 as m3 = outer[1] * m[2] + outer[3] * m[3];
+    let is f64 as m4 = outer[0] * m[4] + outer[2] * m[5] + outer[4];
+    let is f64 as m5 = outer[1] * m[4] + outer[3] * m[5] + outer[5];
+    m[0] = m0;
+    m[1] = m1;
+    m[2] = m2;
+    m[3] = m3;
+    m[4] = m4;
+    m[5] = m5;
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, math.color.hex(WHITE));
+    let is *Data as d = cast(*Data, data);
+    let is *dl.List as l = d.list;
+    let is *txt.Service as svc = txt.of(t);
+    let is i64 as clips with mut = 0;
+    let is i64 as moved with mut = 0;
+    let is i64 as kx0 with mut = 0;
+    let is i64 as ky0 with mut = 0;
+    let is i64 as kx1 with mut = 0;
+    let is i64 as ky1 with mut = 0;
+    let is i32 as part = draw2d.clip_bounds(p.canvas, &kx0, &ky0, &kx1, &ky1);
+    let is i64 as i with mut = 0;
+    _made_frame = _made_frame + 1;
+    while (i < dl.count(l)) {
+        let is *dl.Cmd as c = dl.at(l, i);
+        i = i + 1;
+        let is f64 as ox with mut = p.rect.x - d.sx;
+        let is f64 as oy with mut = p.rect.y - d.sy;
+        if (c.fixed == 1) {
+            ox = p.rect.x;
+            oy = p.rect.y;
+        }
+        if (c.kind == dl.CLIP) {
+            if (clips < MAX_CLIPS) { draw2d.push_clip_rounded(p.canvas, ox + c.x, oy + c.y, c.w, c.h, c.radius, c.r2, c.r3, c.r4); }
+            clips = clips + 1;
+            continue;
+        }
+        if (c.kind == dl.MOVED) {
+            // The matrix is about the page, and this canvas has the page somewhere in it.
+            let is f64 as me = c.m[4] + ox - c.m[0] * ox - c.m[2] * oy;
+            let is f64 as mf = c.m[5] + oy - c.m[1] * ox - c.m[3] * oy;
+            if (moved < MAX_MOVED) {
+                let is *f64 as to = &_moved_m[moved * 6];
+                to[0] = c.m[0];
+                to[1] = c.m[1];
+                to[2] = c.m[2];
+                to[3] = c.m[3];
+                to[4] = me;
+                to[5] = mf;
+                if (moved > 0) { _after(&_moved_m[(moved - 1) * 6], to); }
+                draw2d.set_transform(p.canvas, to[0], to[1], to[2], to[3], to[4], to[5]);
+            }
+            moved = moved + 1;
+            continue;
+        }
+        if (c.kind == dl.UNMOVED) {
+            moved = moved - 1;
+            if (moved > 0 && moved <= MAX_MOVED) {
+                let is *f64 as to = &_moved_m[(moved - 1) * 6];
+                draw2d.set_transform(p.canvas, to[0], to[1], to[2], to[3], to[4], to[5]);
+            } else if (moved == 0) {
+                draw2d.set_transform(p.canvas, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+            }
+            continue;
+        }
+        if (c.kind == dl.UNCLIP) {
+            clips = clips - 1;
+            if (clips < MAX_CLIPS) { draw2d.pop_clip(p.canvas); }
+            continue;
+        }
+        // Nothing above or below the view costs anything but this comparison, and that is
+        // what makes a long page as fast as a short one.
+        let is f64 as tall with mut = c.h;
+        let is f64 as above with mut = 0.0;
+        if (c.kind == dl.RUN || c.kind == dl.TEXT) { tall = c.size * 2.0; }
+        // A shadow reaches past its box by its blur, and a line may run upward.
+        if (c.kind == dl.SHADOW) {
+            above = c.leading;
+            tall = tall + c.leading;
+        }
+        if (c.kind == dl.LINE) {
+            if (c.h < 0.0) { above = 0.0 - c.h; }
+            tall = c.leading;
+            if (c.h > 0.0) { tall = c.h + c.leading; }
+        }
+        // And when only part of the window is being painted, nothing outside that part.
+        if (moved == 0 && part == 1 && c.kind != dl.TEXT) {
+            let is f64 as sc = draw2d.scale(p.canvas);
+            if ((oy + c.y - above) * sc >= cast(f64, ky1) || (oy + c.y + tall) * sc <= cast(f64, ky0)) { continue; }
+            if (c.kind != dl.LINE) {
+                let is f64 as wide with mut = c.w;
+                if (c.kind == dl.RUN) { wide = c.rw + c.size; }
+                if ((ox + c.x - above) * sc >= cast(f64, kx1) || (ox + c.x + wide + above) * sc <= cast(f64, kx0)) { continue; }
+            }
+        }
+        if (moved == 0 && c.kind != dl.TEXT && (oy + c.y - above > p.rect.y + p.rect.h || oy + c.y + tall < p.rect.y)) { continue; }
+        if (c.kind == dl.RECT) {
+            let is math.color.Color as col = _color(c);
+            if (c.radius > 0.0 || c.r2 > 0.0 || c.r3 > 0.0 || c.r4 > 0.0) {
+                shapes.fill_rounded(p.canvas, ox + c.x, oy + c.y, c.w, c.h, c.radius, c.r2, c.r3, c.r4, col);
+            } else {
+                shapes.fill_rect(p.canvas, ox + c.x, oy + c.y, c.w, c.h, col);
+            }
+        }
+        if (c.kind == dl.STROKE) {
+            shapes.stroke_rounded(p.canvas, ox + c.x, oy + c.y, c.w, c.h, c.radius, c.r2, c.r3, c.r4, c.leading, _color(c));
+        }
+        if (c.kind == dl.LINE) {
+            shapes.line(p.canvas, ox + c.x, oy + c.y, ox + c.x + c.w, oy + c.y + c.h, c.leading, _color(c));
+        }
+        if (c.kind == dl.SHADOW) {
+            shapes.shadow(p.canvas, ox + c.x, oy + c.y, c.w, c.h, c.radius, c.leading, _color(c));
+        }
+        if (c.kind == dl.IMAGE) { _image(svc, p, c, ox + c.x, oy + c.y); }
+        if (cast(i64, svc) != 0 && cast(i64, svc.d) != 0) {
+            if (c.kind == dl.GRADIENT) { _draw_gradient(svc, p, c, ox + c.x, oy + c.y); }
+            if (c.kind == dl.RING) { _draw_ring(svc, p, c, ox + c.x, oy + c.y); }
+            if (c.kind == dl.SVG) { _draw_svg(svc, p, c, ox + c.x, oy + c.y); }
+        }
+        if (cast(i64, svc) != 0) {
+            if (c.kind == dl.TEXT) { _text(svc, p, c); }
+            if (c.kind == dl.RUN) {
+                _highlight(d, p, i - 1, c, ox + c.x, oy + c.y);
+                _line(svc, p, c, ox + c.x, oy + c.y);
+            }
+        }
+    }
+    _bar(t, w, d, p);
+    _draw_hint(svc, d, p);
 }

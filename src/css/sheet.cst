@@ -1,0 +1,1017 @@
+// css/sheet.cst — a stylesheet's rules and selectors, from tokens.
+//
+// A selector is kept right to left, the order it is matched in. The rules of an @media
+// block stay in one flat list and each points at its condition, because the condition
+// can change with the window and the rules must not be parsed again when it does.
+
+use "../base/arena.cst" as arena;
+use "./tokens.cst" as tok;
+use "./values.cst" as v;
+use "./decl.cst" as decl;
+use "./props.cst" as pr;
+use "std/mem.cst" as mem;
+
+let is i64 as ORIGIN_UA     with imut = 0;
+let is i64 as ORIGIN_AUTHOR with imut = 1;
+
+// Simple selectors.
+let is i64 as S_TYPE      with imut = 1;
+let is i64 as S_ANY       with imut = 2;
+let is i64 as S_ID        with imut = 3;
+let is i64 as S_CLASS     with imut = 4;
+let is i64 as S_ATTR      with imut = 5;
+let is i64 as S_ROOT      with imut = 6;
+let is i64 as S_EMPTY     with imut = 7;
+let is i64 as S_LINK      with imut = 8;
+let is i64 as S_NEVER     with imut = 9;    // :hover and the rest of what no element is now
+let is i64 as S_NTH       with imut = 10;   // a, b
+let is i64 as S_NTH_LAST  with imut = 11;
+let is i64 as S_NTH_TYPE  with imut = 12;
+let is i64 as S_NTH_LAST_TYPE with imut = 13;
+let is i64 as S_ONLY      with imut = 14;
+let is i64 as S_ONLY_TYPE with imut = 15;
+let is i64 as S_NOT       with imut = 16;   // sub
+let is i64 as S_IS        with imut = 17;   // sub
+let is i64 as S_HAS       with imut = 18;   // sub
+let is i64 as S_CHECKED   with imut = 19;
+let is i64 as S_DISABLED  with imut = 20;
+let is i64 as S_ENABLED   with imut = 21;
+// What a person is doing to an element, so a change means styling again.
+let is i64 as S_HOVER     with imut = 22;
+let is i64 as S_ACTIVE    with imut = 23;
+let is i64 as S_FOCUS     with imut = 24;
+let is i64 as S_FOCUS_WITHIN with imut = 25;
+let is i64 as S_FOCUS_VISIBLE with imut = 26;
+let is i64 as S_TARGET    with imut = 27;
+
+// Attribute operators.
+let is i64 as A_HAS      with imut = 0;
+let is i64 as A_EQ       with imut = 1;
+let is i64 as A_WORD     with imut = 2;   // ~=
+let is i64 as A_DASH     with imut = 3;   // |=
+let is i64 as A_PREFIX   with imut = 4;   // ^=
+let is i64 as A_SUFFIX   with imut = 5;   // $=
+let is i64 as A_SUBSTR   with imut = 6;   // *=
+
+// How a compound relates to the one on its left.
+let is i64 as C_NONE       with imut = 0;
+let is i64 as C_DESCENDANT with imut = 1;
+let is i64 as C_CHILD      with imut = 2;
+let is i64 as C_ADJACENT   with imut = 3;
+let is i64 as C_SIBLING    with imut = 4;
+
+let is i64 as PSEUDO_NONE   with imut = 0;
+let is i64 as PSEUDO_BEFORE with imut = 1;
+let is i64 as PSEUDO_AFTER  with imut = 2;
+let is i64 as PSEUDO_PLACEHOLDER with imut = 3;
+
+struct Simple {
+    kind  as i64;
+    s     as *u8;
+    n     as i64;
+    op    as i64;     // S_ATTR
+    val   as *u8;
+    val_n as i64;
+    ci    as i64;     // S_ATTR: compare ignoring case
+    a     as i64;     // S_NTH*
+    b     as i64;
+    sub   as *Selector;
+    next  as *Simple;
+}
+
+struct Compound {
+    first as *Simple;
+    comb  as i64;       // to left
+    left  as *Compound;
+}
+
+struct Selector {
+    right  as *Compound;
+    spec   as i64;       // ids << 20 | classes << 10 | types
+    pseudo as i64;
+    next   as *Selector; // the next in its comma-separated list
+}
+
+let is i64 as MEDIA_MAX_FEATURES with imut = 8;
+
+// One query of a media list: a type and features that must all hold.
+struct Query {
+    negate   as i64;
+    type_ok  as i64;
+    min_w    as f64;  // -1 for no bound
+    max_w    as f64;
+    min_h    as f64;
+    max_h    as f64;
+    never    as i64;  // a feature this browser answers no to
+    next     as *Query;
+}
+
+// A condition on a rule: any of its queries, and also whatever encloses it.
+struct Media {
+    q      as *Query;
+    parent as *Media;
+}
+
+struct Rule {
+    selectors as *Selector;
+    decls     as v.DeclList;
+    media     as *Media;
+    order     as i64;
+    origin    as i64;
+    next      as *Rule;
+}
+
+struct Import {
+    url  as *u8;
+    n    as i64;
+    next as *Import;
+}
+
+// One stop of an @keyframes, where it comes in the animation.
+struct Frame {
+    at    as f64;
+    decls as *v.DeclList;
+    next  as *Frame;
+}
+
+struct Keyframes {
+    name  as *u8;
+    nlen  as i64;
+    first as *Frame;     // in order
+    next  as *Keyframes;
+}
+
+struct Sheet {
+    keyframes as *Keyframes;
+    a        as *arena.Arena;
+    first    as *Rule;
+    last     as *Rule;
+    nrules   as i64;
+    imports  as *Import;
+    viewport as i64;    // some rule depends on the window's size
+}
+
+struct _P {
+    sh     as *Sheet;
+    a      as *arena.Arena;
+    t      as *tok.Token;
+    n      as i64;
+    i      as i64;
+    origin as i64;
+}
+
+fn init(s as *Sheet, a as *arena.Arena) as void {
+    s.a = a;
+    s.first = cast(*Rule, 0);
+    s.last = cast(*Rule, 0);
+    s.nrules = 0;
+    s.keyframes = cast(*Keyframes, 0);
+    s.imports = cast(*Import, 0);
+    s.viewport = 0;
+}
+
+fn _kind(p as *_P) as i64 {
+    if (p.i >= p.n) { return tok.T_EOF; }
+    return p.t[p.i].kind;
+}
+
+fn _skip_ws(p as *_P) as void {
+    while (p.i < p.n && p.t[p.i].kind == tok.T_WS) { p.i = p.i + 1; }
+}
+
+// Past the block, function or bracket the cursor is on.
+fn _skip_group(p as *_P) as void {
+    let is i64 as depth with mut = 0;
+    while (p.i < p.n) {
+        let is i64 as k = p.t[p.i].kind;
+        p.i = p.i + 1;
+        if (k == tok.T_FUNCTION || k == tok.T_LPAREN || k == tok.T_LBRACKET || k == tok.T_LBRACE) { depth = depth + 1; }
+        if (k == tok.T_RPAREN || k == tok.T_RBRACKET || k == tok.T_RBRACE) { depth = depth - 1; }
+        if (depth <= 0) { return; }
+    }
+}
+
+fn _eq(s as *u8, n as i64, w as *u8) as i64 { return decl.eq(s, n, w); }
+
+fn _lowered(a as *arena.Arena, s as *u8, n as i64) as *u8 {
+    let is *u8 as out = arena.copy(a, s, n);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (out[i] >= 65 && out[i] <= 90) { out[i] = cast(u8, cast(i64, out[i]) + 32); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- Selectors ---
+
+fn _simple(p as *_P, kind as i64) as *Simple {
+    let is *Simple as s = cast(*Simple, arena.alloc(p.a, sizeof(Simple)));
+    s.kind = kind;
+    return s;
+}
+
+// [name], [name=value], and its operators. The cursor is past the opening bracket.
+fn _attr_selector(p as *_P, spec as *i64) as *Simple {
+    _skip_ws(p);
+    if (_kind(p) != tok.T_IDENT) { return null; }
+    let is *tok.Token as name = &p.t[p.i];
+    p.i = p.i + 1;
+    let is *Simple as s = _simple(p, S_ATTR);
+    s.s = _lowered(p.a, name.s, name.n);
+    s.n = name.n;
+    *spec = *spec + 1024;
+    _skip_ws(p);
+    if (_kind(p) == tok.T_RBRACKET) {
+        p.i = p.i + 1;
+        s.op = A_HAS;
+        return s;
+    }
+    if (_kind(p) != tok.T_DELIM) { return null; }
+    let is i64 as d = p.t[p.i].delim;
+    p.i = p.i + 1;
+    s.op = A_EQ;
+    if (d != 61) {
+        if (d == 126) { s.op = A_WORD; }
+        else if (d == 124) { s.op = A_DASH; }
+        else if (d == 94) { s.op = A_PREFIX; }
+        else if (d == 36) { s.op = A_SUFFIX; }
+        else if (d == 42) { s.op = A_SUBSTR; }
+        else { return null; }
+        if (_kind(p) != tok.T_DELIM || p.t[p.i].delim != 61) { return null; }
+        p.i = p.i + 1;
+    }
+    _skip_ws(p);
+    let is i64 as k = _kind(p);
+    if (k != tok.T_IDENT && k != tok.T_STRING) { return null; }
+    s.val = p.t[p.i].s;
+    s.val_n = p.t[p.i].n;
+    p.i = p.i + 1;
+    _skip_ws(p);
+    if (_kind(p) == tok.T_IDENT) {
+        if (_eq(p.t[p.i].s, p.t[p.i].n, "i") == 1) { s.ci = 1; }
+        p.i = p.i + 1;
+        _skip_ws(p);
+    }
+    if (_kind(p) != tok.T_RBRACKET) { return null; }
+    p.i = p.i + 1;
+    return s;
+}
+
+// an+b in the tokens up to end, which are odd because the tokenizer sees "2n+1" as a
+// dimension with a unit of "n+1".
+fn _nth(p as *_P, end as i64, s as *Simple) as i64 {
+    _skip_ws(p);
+    if (p.i >= end) { return 0; }
+    let is *tok.Token as t with mut = &p.t[p.i];
+    s.a = 0;
+    s.b = 0;
+    if (t.kind == tok.T_IDENT && _eq(t.s, t.n, "odd") == 1) {
+        s.a = 2;
+        s.b = 1;
+        p.i = p.i + 1;
+        return 1;
+    }
+    if (t.kind == tok.T_IDENT && _eq(t.s, t.n, "even") == 1) {
+        s.a = 2;
+        p.i = p.i + 1;
+        return 1;
+    }
+    if (t.kind == tok.T_NUMBER) {
+        s.b = cast(i64, t.num);
+        p.i = p.i + 1;
+        return 1;
+    }
+    let is *u8 as u with mut = t.s;
+    let is i64 as un with mut = t.n;
+    if (t.kind == tok.T_DIMENSION) {
+        s.a = cast(i64, t.num);
+    } else if (t.kind == tok.T_IDENT) {
+        s.a = 1;
+        if (un > 0 && u[0] == 45) {
+            s.a = 0 - 1;
+            u = &u[1];
+            un = un - 1;
+        }
+    } else if (t.kind == tok.T_DELIM && t.delim == 43) {
+        p.i = p.i + 1;
+        if (p.i >= end || p.t[p.i].kind != tok.T_IDENT) { return 0; }
+        t = &p.t[p.i];
+        s.a = 1;
+        u = t.s;
+        un = t.n;
+    } else {
+        return 0;
+    }
+    if (un == 0 || (u[0] | 32) != 110) { return 0; }
+    p.i = p.i + 1;
+    // Whatever "n" still has stuck to it is the b part: n-1 is one ident.
+    if (un > 1) {
+        let is i64 as sign with mut = 1;
+        let is i64 as k with mut = 1;
+        if (u[k] == 45) { sign = 0 - 1; k = k + 1; }
+        else if (u[k] == 43) { k = k + 1; }
+        let is i64 as val with mut = 0;
+        while (k < un && u[k] >= 48 && u[k] <= 57) {
+            val = val * 10 + cast(i64, u[k]) - 48;
+            k = k + 1;
+        }
+        if (k < un) { return 0; }
+        // "n-" alone leaves the digits to the next token.
+        if (un == 2 && u[1] == 45) {
+            _skip_ws(p);
+            if (p.i < end && p.t[p.i].kind == tok.T_NUMBER) {
+                s.b = 0 - cast(i64, p.t[p.i].num);
+                p.i = p.i + 1;
+            }
+            return 1;
+        }
+        s.b = sign * val;
+        return 1;
+    }
+    _skip_ws(p);
+    if (p.i < end && p.t[p.i].kind == tok.T_DELIM && (p.t[p.i].delim == 43 || p.t[p.i].delim == 45)) {
+        let is i64 as sign with mut = 1;
+        if (p.t[p.i].delim == 45) { sign = 0 - 1; }
+        p.i = p.i + 1;
+        _skip_ws(p);
+        if (p.i >= end || p.t[p.i].kind != tok.T_NUMBER) { return 0; }
+        s.b = sign * cast(i64, p.t[p.i].num);
+        p.i = p.i + 1;
+        return 1;
+    }
+    if (p.i < end && p.t[p.i].kind == tok.T_NUMBER) {
+        // +1 stuck to nothing: the tokenizer reads a signed number.
+        s.b = cast(i64, p.t[p.i].num);
+        p.i = p.i + 1;
+    }
+    return 1;
+}
+
+fn _max_spec(l as *Selector) as i64 {
+    let is i64 as m with mut = 0;
+    let is *Selector as x with mut = l;
+    while (x != null) {
+        if (x.spec > m) { m = x.spec; }
+        x = x.next;
+    }
+    return m;
+}
+
+// :name(...) with the cursor on the function token.
+fn _pseudo_fn(p as *_P, spec as *i64) as *Simple {
+    let is *tok.Token as t = &p.t[p.i];
+    let is i64 as at = p.i;
+    _skip_group(p);
+    let is i64 as after = p.i;
+    let is i64 as end with mut = after;
+    if (end > at + 1 && p.t[end - 1].kind == tok.T_RPAREN) { end = end - 1; }
+    p.i = at + 1;
+    let is *Simple as s with mut = cast(*Simple, 0);
+    if (_eq(t.s, t.n, "not") == 1 || _eq(t.s, t.n, "is") == 1 || _eq(t.s, t.n, "where") == 1 ||
+        _eq(t.s, t.n, "matches") == 1 || _eq(t.s, t.n, "-webkit-any") == 1 || _eq(t.s, t.n, "-moz-any") == 1 ||
+        _eq(t.s, t.n, "has") == 1) {
+        let is i64 as kind with mut = S_IS;
+        if (_eq(t.s, t.n, "not") == 1) { kind = S_NOT; }
+        if (_eq(t.s, t.n, "has") == 1) { kind = S_HAS; }
+        s = _simple(p, kind);
+        let is i64 as forgiving = cast(i64, kind == S_IS);
+        s.sub = _selector_list(p, end, forgiving);
+        if (s.sub == null && forgiving == 0) { p.i = after; return null; }
+        if (_eq(t.s, t.n, "where") == 0) { *spec = *spec + _max_spec(s.sub); }
+    } else if (_eq(t.s, t.n, "nth-child") == 1 || _eq(t.s, t.n, "nth-last-child") == 1 ||
+               _eq(t.s, t.n, "nth-of-type") == 1 || _eq(t.s, t.n, "nth-last-of-type") == 1) {
+        let is i64 as kind with mut = S_NTH;
+        if (_eq(t.s, t.n, "nth-last-child") == 1) { kind = S_NTH_LAST; }
+        if (_eq(t.s, t.n, "nth-of-type") == 1) { kind = S_NTH_TYPE; }
+        if (_eq(t.s, t.n, "nth-last-of-type") == 1) { kind = S_NTH_LAST_TYPE; }
+        s = _simple(p, kind);
+        if (_nth(p, end, s) == 0) { p.i = after; return null; }
+        *spec = *spec + 1024;
+    } else if (_eq(t.s, t.n, "lang") == 1 || _eq(t.s, t.n, "dir") == 1 || _eq(t.s, t.n, "host") == 1 ||
+               _eq(t.s, t.n, "state") == 1 || _eq(t.s, t.n, "-moz-locale-dir") == 1) {
+        s = _simple(p, S_NEVER);
+        *spec = *spec + 1024;
+    }
+    p.i = after;
+    return s;
+}
+
+fn _nth_simple(p as *_P, kind as i64, a as i64, b as i64) as *Simple {
+    let is *Simple as s = _simple(p, kind);
+    s.a = a;
+    s.b = b;
+    return s;
+}
+
+// :name with the cursor past the colon, or ::name past both. Null means this selector
+// cannot match in this browser: the list it is in is dropped, as the spec asks for a
+// name it does not know, unless it is in a forgiving list.
+fn _pseudo(p as *_P, spec as *i64, sel as *Selector, double as i64) as *Simple {
+    let is i64 as k = _kind(p);
+    if (k == tok.T_FUNCTION) {
+        if (double == 1) { _skip_group(p); return null; }
+        return _pseudo_fn(p, spec);
+    }
+    if (k != tok.T_IDENT) { return null; }
+    let is *tok.Token as t = &p.t[p.i];
+    p.i = p.i + 1;
+    let is *u8 as s = t.s;
+    let is i64 as n = t.n;
+    if (_eq(s, n, "before") == 1) { sel.pseudo = PSEUDO_BEFORE; *spec = *spec + 1; return _simple(p, S_ANY); }
+    if (_eq(s, n, "after") == 1) { sel.pseudo = PSEUDO_AFTER; *spec = *spec + 1; return _simple(p, S_ANY); }
+    if (_eq(s, n, "placeholder") == 1 || _eq(s, n, "-webkit-input-placeholder") == 1 || _eq(s, n, "-moz-placeholder") == 1) {
+        sel.pseudo = PSEUDO_PLACEHOLDER;
+        *spec = *spec + 1;
+        return _simple(p, S_ANY);
+    }
+    if (double == 1) { return null; }
+    *spec = *spec + 1024;
+    if (_eq(s, n, "root") == 1) { return _simple(p, S_ROOT); }
+    if (_eq(s, n, "empty") == 1) { return _simple(p, S_EMPTY); }
+    if (_eq(s, n, "link") == 1 || _eq(s, n, "any-link") == 1 || _eq(s, n, "-webkit-any-link") == 1) { return _simple(p, S_LINK); }
+    if (_eq(s, n, "first-child") == 1) { return _nth_simple(p, S_NTH, 0, 1); }
+    if (_eq(s, n, "last-child") == 1) { return _nth_simple(p, S_NTH_LAST, 0, 1); }
+    if (_eq(s, n, "first-of-type") == 1) { return _nth_simple(p, S_NTH_TYPE, 0, 1); }
+    if (_eq(s, n, "last-of-type") == 1) { return _nth_simple(p, S_NTH_LAST_TYPE, 0, 1); }
+    if (_eq(s, n, "only-child") == 1) { return _simple(p, S_ONLY); }
+    if (_eq(s, n, "only-of-type") == 1) { return _simple(p, S_ONLY_TYPE); }
+    if (_eq(s, n, "checked") == 1) { return _simple(p, S_CHECKED); }
+    if (_eq(s, n, "disabled") == 1) { return _simple(p, S_DISABLED); }
+    if (_eq(s, n, "enabled") == 1) { return _simple(p, S_ENABLED); }
+    if (_eq(s, n, "hover") == 1) { return _simple(p, S_HOVER); }
+    if (_eq(s, n, "active") == 1) { return _simple(p, S_ACTIVE); }
+    if (_eq(s, n, "focus") == 1) { return _simple(p, S_FOCUS); }
+    if (_eq(s, n, "focus-within") == 1) { return _simple(p, S_FOCUS_WITHIN); }
+    if (_eq(s, n, "focus-visible") == 1) { return _simple(p, S_FOCUS_VISIBLE); }
+    if (_eq(s, n, "target") == 1) { return _simple(p, S_TARGET); }
+    if (_eq(s, n, "visited") == 1 || _eq(s, n, "indeterminate") == 1 || _eq(s, n, "default") == 1 || _eq(s, n, "valid") == 1 ||
+        _eq(s, n, "invalid") == 1 || _eq(s, n, "required") == 1 || _eq(s, n, "optional") == 1 ||
+        _eq(s, n, "read-only") == 1 || _eq(s, n, "read-write") == 1 || _eq(s, n, "placeholder-shown") == 1 ||
+        _eq(s, n, "scope") == 1 || _eq(s, n, "defined") == 1 || _eq(s, n, "fullscreen") == 1 || _eq(s, n, "autofill") == 1) {
+        return _simple(p, S_NEVER);
+    }
+    return null;
+}
+
+// One compound under the cursor, its simple selectors linked in order. Null when it
+// is empty or invalid.
+fn _compound(p as *_P, end as i64, sel as *Selector, spec as *i64) as *Compound {
+    let is *Compound as c = cast(*Compound, arena.alloc(p.a, sizeof(Compound)));
+    let is *Simple as last with mut = cast(*Simple, 0);
+    let is i64 as bad with mut = 0;
+    while (p.i < end) {
+        let is *tok.Token as t = &p.t[p.i];
+        let is *Simple as s with mut = cast(*Simple, 0);
+        if (t.kind == tok.T_IDENT) {
+            if (last != null) { bad = 1; }
+            p.i = p.i + 1;
+            s = _simple(p, S_TYPE);
+            s.s = _lowered(p.a, t.s, t.n);
+            s.n = t.n;
+            *spec = *spec + 1;
+        } else if (t.kind == tok.T_DELIM && t.delim == 42) {
+            if (last != null) { bad = 1; }
+            p.i = p.i + 1;
+            s = _simple(p, S_ANY);
+        } else if (t.kind == tok.T_HASH) {
+            p.i = p.i + 1;
+            if (t.flag == 0) { bad = 1; }
+            s = _simple(p, S_ID);
+            s.s = t.s;
+            s.n = t.n;
+            *spec = *spec + 1048576;
+        } else if (t.kind == tok.T_DELIM && t.delim == 46) {
+            p.i = p.i + 1;
+            if (p.i >= end || p.t[p.i].kind != tok.T_IDENT) { return null; }
+            s = _simple(p, S_CLASS);
+            s.s = p.t[p.i].s;
+            s.n = p.t[p.i].n;
+            p.i = p.i + 1;
+            *spec = *spec + 1024;
+        } else if (t.kind == tok.T_LBRACKET) {
+            p.i = p.i + 1;
+            s = _attr_selector(p, spec);
+            if (s == null) { return null; }
+        } else if (t.kind == tok.T_COLON) {
+            p.i = p.i + 1;
+            let is i64 as double with mut = 0;
+            if (_kind(p) == tok.T_COLON) {
+                double = 1;
+                p.i = p.i + 1;
+            }
+            s = _pseudo(p, spec, sel, double);
+            if (s == null) { return null; }
+        } else {
+            break;
+        }
+        if (last == null) { c.first = s; }
+        else { last.next = s; }
+        last = s;
+    }
+    if (last == null || bad == 1) { return null; }
+    return c;
+}
+
+// One complex selector up to the comma or end, or null when invalid. It leaves the
+// cursor at that comma either way.
+fn _complex(p as *_P, end as i64) as *Selector {
+    let is *Selector as sel = cast(*Selector, arena.alloc(p.a, sizeof(Selector)));
+    let is i64 as spec with mut = 0;
+    let is *Compound as cur with mut = cast(*Compound, 0);
+    let is i64 as pending with mut = C_NONE;
+    _skip_ws(p);
+    // :has() takes relative selectors, and a leading combinator has no meaning here
+    // beyond "somewhere under it", which is what it does anyway.
+    if (p.i < end && p.t[p.i].kind == tok.T_DELIM &&
+        (p.t[p.i].delim == 62 || p.t[p.i].delim == 43 || p.t[p.i].delim == 126)) {
+        p.i = p.i + 1;
+        _skip_ws(p);
+    }
+    while (1 == 1) {
+        let is *Compound as c = _compound(p, end, sel, &spec);
+        if (c == null) { return null; }
+        c.left = cur;
+        c.comb = pending;
+        cur = c;
+        let is i64 as had_ws with mut = 0;
+        if (p.i < end && p.t[p.i].kind == tok.T_WS) {
+            had_ws = 1;
+            _skip_ws(p);
+        }
+        if (p.i >= end || p.t[p.i].kind == tok.T_COMMA) { break; }
+        pending = C_DESCENDANT;
+        if (p.t[p.i].kind == tok.T_DELIM && (p.t[p.i].delim == 62 || p.t[p.i].delim == 43 || p.t[p.i].delim == 126)) {
+            let is i64 as d = p.t[p.i].delim;
+            if (d == 62) { pending = C_CHILD; }
+            if (d == 43) { pending = C_ADJACENT; }
+            if (d == 126) { pending = C_SIBLING; }
+            p.i = p.i + 1;
+            _skip_ws(p);
+            if (p.i >= end) { return null; }
+        } else if (had_ws == 0) {
+            return null;
+        }
+    }
+    sel.right = cur;
+    sel.spec = spec;
+    return sel;
+}
+
+fn _to_comma(p as *_P, end as i64) as void {
+    while (p.i < end && p.t[p.i].kind != tok.T_COMMA) {
+        let is i64 as k = p.t[p.i].kind;
+        if (k == tok.T_FUNCTION || k == tok.T_LPAREN || k == tok.T_LBRACKET || k == tok.T_LBRACE) { _skip_group(p); }
+        else { p.i = p.i + 1; }
+    }
+}
+
+// The comma-separated selectors in p.i..end. One invalid selector makes the whole list
+// invalid and the result null, unless the list is forgiving, when it is only skipped.
+fn _selector_list(p as *_P, end as i64, forgiving as i64) as *Selector {
+    let is *Selector as first with mut = cast(*Selector, 0);
+    let is *Selector as last with mut = cast(*Selector, 0);
+    while (p.i < end) {
+        let is *Selector as s = _complex(p, end);
+        if (s == null) {
+            if (forgiving == 0) { return null; }
+            _to_comma(p, end);
+        } else {
+            _skip_ws(p);
+            if (p.i < end && p.t[p.i].kind != tok.T_COMMA) {
+                if (forgiving == 0) { return null; }
+                _to_comma(p, end);
+            } else {
+                if (first == null) { first = s; }
+                else { last.next = s; }
+                last = s;
+            }
+        }
+        if (p.i < end) { p.i = p.i + 1; }
+    }
+    return first;
+}
+
+// --- Declarations ---
+
+fn _has_var(t as *tok.Token, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (t[k].kind == tok.T_FUNCTION && _eq(t[k].s, t[k].n, "var") == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// One declaration's value is in t[0..n]: !important is taken off its end, and then it
+// becomes longhands, or waits for an element if it holds var().
+fn _value(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *tok.Token, n0 as i64) as void {
+    let is i64 as n with mut = n0;
+    while (n > 0 && t[n - 1].kind == tok.T_WS) { n = n - 1; }
+    let is i64 as important with mut = 0;
+    if (n >= 2 && t[n - 1].kind == tok.T_IDENT && _eq(t[n - 1].s, t[n - 1].n, "important") == 1) {
+        let is i64 as k with mut = n - 2;
+        while (k > 0 && t[k].kind == tok.T_WS) { k = k - 1; }
+        if (t[k].kind == tok.T_DELIM && t[k].delim == 33) {
+            important = 1;
+            n = k;
+            while (n > 0 && t[n - 1].kind == tok.T_WS) { n = n - 1; }
+        }
+    }
+    let is i64 as custom = cast(i64, nlen > 2 && name[0] == 45 && name[1] == 45);
+    if (custom == 1 || _has_var(t, n) == 1) {
+        let is v.Value as none with mut;
+        mem.memzero(cast(*u8, &none), sizeof(v.Value));
+        let is i64 as kind with mut = v.D_PENDING;
+        if (custom == 1) { kind = v.D_CUSTOM; }
+        decl._push(out, a, kind, &none, important);
+        let is *v.Decl as d = &out.d[out.n - 1];
+        d.name = arena.copy(a, name, nlen);
+        d.name_n = nlen;
+        d.toks = t;
+        d.ntoks = n;
+        return;
+    }
+    decl.parse(a, out, name, nlen, t, n, important);
+}
+
+// A declaration list in the tokens p.i..end.
+fn _decls(p as *_P, end as i64, out as *v.DeclList) as void {
+    while (p.i < end) {
+        let is i64 as k = p.t[p.i].kind;
+        if (k == tok.T_WS || k == tok.T_SEMI) { p.i = p.i + 1; continue; }
+        if (k != tok.T_IDENT) { _recover(p, end); continue; }
+        let is *tok.Token as name = &p.t[p.i];
+        p.i = p.i + 1;
+        _skip_ws(p);
+        if (p.i >= end || p.t[p.i].kind != tok.T_COLON) { _recover(p, end); continue; }
+        p.i = p.i + 1;
+        let is i64 as start = p.i;
+        // A brace before the end of the value: a nested rule, not a declaration.
+        let is i64 as nested with mut = 0;
+        while (p.i < end && p.t[p.i].kind != tok.T_SEMI) {
+            let is i64 as q = p.t[p.i].kind;
+            if (q == tok.T_LBRACE && name.n > 0 && !(name.s[0] == 45 && name.s[1] == 45)) { nested = 1; }
+            if (q == tok.T_FUNCTION || q == tok.T_LPAREN || q == tok.T_LBRACKET || q == tok.T_LBRACE) { _skip_group(p); }
+            else { p.i = p.i + 1; }
+        }
+        if (nested == 1) { continue; }
+        _skip_ws_range(p, &start, p.i);
+        _value(p.a, out, name.s, name.n, &p.t[start], p.i - start);
+    }
+}
+
+fn _skip_ws_range(p as *_P, start as *i64, end as i64) as void {
+    while (*start < end && p.t[*start].kind == tok.T_WS) { *start = *start + 1; }
+}
+
+fn _recover(p as *_P, end as i64) as void {
+    while (p.i < end && p.t[p.i].kind != tok.T_SEMI) {
+        let is i64 as q = p.t[p.i].kind;
+        if (q == tok.T_FUNCTION || q == tok.T_LPAREN || q == tok.T_LBRACKET || q == tok.T_LBRACE) { _skip_group(p); }
+        else { p.i = p.i + 1; }
+    }
+}
+
+// --- @media ---
+
+fn _parse_query(p as *_P, end as i64) as *Query {
+    let is *Query as q = cast(*Query, arena.alloc(p.a, sizeof(Query)));
+    q.type_ok = 1;
+    q.min_w = 0.0 - 1.0;
+    q.max_w = 0.0 - 1.0;
+    q.min_h = 0.0 - 1.0;
+    q.max_h = 0.0 - 1.0;
+    while (p.i < end && p.t[p.i].kind != tok.T_COMMA) {
+        let is *tok.Token as t = &p.t[p.i];
+        if (t.kind == tok.T_WS) { p.i = p.i + 1; continue; }
+        if (t.kind == tok.T_IDENT) {
+            p.i = p.i + 1;
+            if (_eq(t.s, t.n, "not") == 1) { q.negate = 1; continue; }
+            if (_eq(t.s, t.n, "only") == 1 || _eq(t.s, t.n, "and") == 1) { continue; }
+            if (_eq(t.s, t.n, "screen") == 1 || _eq(t.s, t.n, "all") == 1) { continue; }
+            q.type_ok = 0;
+            continue;
+        }
+        if (t.kind == tok.T_LPAREN) {
+            let is i64 as at = p.i;
+            _skip_group(p);
+            let is i64 as after = p.i;
+            _feature(p, at + 1, after - 1, q);
+            continue;
+        }
+        p.i = p.i + 1;
+        q.never = 1;
+    }
+    return q;
+}
+
+fn _px_of(t as *tok.Token, out as *f64) as i64 {
+    let is v.Len as l with mut;
+    if (t.kind == tok.T_NUMBER && t.num == 0.0) { *out = 0.0; return 1; }
+    if (t.kind != tok.T_DIMENSION) { return 0; }
+    if (decl._unit(&l, t.num, t.s, t.n) == 0) { return 0; }
+    *out = l.px + (l.em + l.rem) * 16.0;
+    return 1;
+}
+
+fn _feature(p as *_P, start as i64, end as i64, q as *Query) as void {
+    let is i64 as i with mut = start;
+    while (i < end && p.t[i].kind == tok.T_WS) { i = i + 1; }
+    if (i >= end || p.t[i].kind != tok.T_IDENT) {
+        // Range syntax, nested conditions: not understood, so not applied.
+        q.never = 1;
+        return;
+    }
+    let is *tok.Token as name = &p.t[i];
+    i = i + 1;
+    while (i < end && p.t[i].kind == tok.T_WS) { i = i + 1; }
+    let is f64 as px with mut = 0.0;
+    let is *tok.Token as val with mut = cast(*tok.Token, 0);
+    if (i < end && p.t[i].kind == tok.T_COLON) {
+        i = i + 1;
+        while (i < end && p.t[i].kind == tok.T_WS) { i = i + 1; }
+        if (i < end) { val = &p.t[i]; }
+    }
+    let is *u8 as s = name.s;
+    let is i64 as n = name.n;
+    if (val != null && _px_of(val, &px) == 1) {
+        if (_eq(s, n, "min-width") == 1) { q.min_w = px; p.sh.viewport = 1; return; }
+        if (_eq(s, n, "max-width") == 1) { q.max_w = px; p.sh.viewport = 1; return; }
+        if (_eq(s, n, "min-height") == 1) { q.min_h = px; p.sh.viewport = 1; return; }
+        if (_eq(s, n, "max-height") == 1) { q.max_h = px; p.sh.viewport = 1; return; }
+    }
+    if (val != null && val.kind == tok.T_IDENT) {
+        if (_eq(s, n, "prefers-color-scheme") == 1 && _eq(val.s, val.n, "light") == 1) { return; }
+        if (_eq(s, n, "orientation") == 1 && _eq(val.s, val.n, "landscape") == 1) { return; }
+        if (_eq(s, n, "hover") == 1 && _eq(val.s, val.n, "hover") == 1) { return; }
+        if (_eq(s, n, "pointer") == 1 && _eq(val.s, val.n, "fine") == 1) { return; }
+        if (_eq(s, n, "any-hover") == 1 && _eq(val.s, val.n, "hover") == 1) { return; }
+        if (_eq(s, n, "any-pointer") == 1 && _eq(val.s, val.n, "fine") == 1) { return; }
+    }
+    if (val == null && (_eq(s, n, "color") == 1 || _eq(s, n, "hover") == 1 || _eq(s, n, "pointer") == 1)) { return; }
+    q.never = 1;
+}
+
+fn _media_list(p as *_P, end as i64) as *Query {
+    let is *Query as first with mut = cast(*Query, 0);
+    let is *Query as last with mut = cast(*Query, 0);
+    while (p.i < end) {
+        let is *Query as q = _parse_query(p, end);
+        if (first == null) { first = q; }
+        else { last.next = q; }
+        last = q;
+        if (p.i < end) { p.i = p.i + 1; }
+    }
+    return first;
+}
+
+fn _query_holds(q as *Query, w as f64, h as f64) as i64 {
+    let is i64 as ok with mut = q.type_ok;
+    if (q.never == 1) { ok = 0; }
+    if (q.min_w >= 0.0 && w < q.min_w) { ok = 0; }
+    if (q.max_w >= 0.0 && w > q.max_w) { ok = 0; }
+    if (q.min_h >= 0.0 && h < q.min_h) { ok = 0; }
+    if (q.max_h >= 0.0 && h > q.max_h) { ok = 0; }
+    if (q.negate == 1) { return 1 - ok; }
+    return ok;
+}
+
+// Whether a rule's conditions hold in a window this size.
+fn media_holds(m0 as *Media, w as f64, h as f64) as i64 {
+    let is *Media as m with mut = m0;
+    while (m != null) {
+        // An empty list is true: it is what @media with no condition means.
+        if (m.q != null) {
+            let is i64 as any with mut = 0;
+            let is *Query as q with mut = m.q;
+            while (q != null) {
+                if (_query_holds(q, w, h) == 1) { any = 1; }
+                q = q.next;
+            }
+            if (any == 0) { return 0; }
+        }
+        m = m.parent;
+    }
+    return 1;
+}
+
+// --- Rules ---
+
+fn _add_rule(p as *_P, sel as *Selector, list as *v.DeclList, media as *Media) as void {
+    let is *Rule as r = cast(*Rule, arena.alloc(p.a, sizeof(Rule)));
+    r.selectors = sel;
+    r.decls = *list;
+    r.media = media;
+    r.origin = p.origin;
+    r.order = p.sh.nrules;
+    p.sh.nrules = p.sh.nrules + 1;
+    if (p.sh.first == null) { p.sh.first = r; }
+    else { p.sh.last.next = r; }
+    p.sh.last = r;
+}
+
+fn _at_rule(p as *_P, media as *Media) as void {
+    let is *tok.Token as name = &p.t[p.i];
+    p.i = p.i + 1;
+    let is i64 as start = p.i;
+    while (p.i < p.n) {
+        let is i64 as k = p.t[p.i].kind;
+        if (k == tok.T_SEMI) {
+            if (_eq(name.s, name.n, "import") == 1) { _import(p, start, p.i); }
+            p.i = p.i + 1;
+            return;
+        }
+        if (k == tok.T_LBRACE) { break; }
+        if (k == tok.T_FUNCTION || k == tok.T_LPAREN || k == tok.T_LBRACKET) { _skip_group(p); }
+        else { p.i = p.i + 1; }
+    }
+    if (p.i >= p.n) { return; }
+    let is i64 as prelude_end = p.i;
+    let is i64 as open = p.i;
+    _skip_group(p);
+    let is i64 as after = p.i;
+    let is i64 as end with mut = after;
+    if (end > open + 1 && p.t[end - 1].kind == tok.T_RBRACE) { end = end - 1; }
+
+    let is *u8 as s = name.s;
+    let is i64 as n = name.n;
+    let is i64 as enter with mut = 0;
+    let is *Media as inner with mut = media;
+    if (_eq(s, n, "media") == 1) {
+        enter = 1;
+        let is *Media as m = cast(*Media, arena.alloc(p.a, sizeof(Media)));
+        p.i = start;
+        m.q = _media_list(p, prelude_end);
+        m.parent = media;
+        inner = m;
+    } else if (_eq(s, n, "supports") == 1) {
+        enter = _supports(p, start, prelude_end);
+    } else if (_eq(s, n, "layer") == 1 || _eq(s, n, "scope") == 1) {
+        enter = 1;
+    }
+    if (enter == 1) {
+        p.i = open + 1;
+        _rules(p, end, inner);
+    }
+    if (_eq(s, n, "keyframes") == 1 || _eq(s, n, "-webkit-keyframes") == 1) {
+        _keyframes(p, start, prelude_end, open + 1, end);
+    }
+    p.i = after;
+}
+
+fn _add_frame(k as *Keyframes, a as *arena.Arena, at as f64, decls as *v.DeclList) as void {
+    let is *Frame as f = cast(*Frame, arena.alloc(a, sizeof(Frame)));
+    f.at = at;
+    f.decls = decls;
+    let is **Frame as w with mut = &k.first;
+    while (*w != null && (*w).at <= at) { w = &(*w).next; }
+    f.next = *w;
+    *w = f;
+}
+
+fn _keyframes(p as *_P, start as i64, prelude_end as i64, body as i64, end as i64) as void {
+    let is i64 as q with mut = start;
+    while (q < prelude_end && p.t[q].kind == tok.T_WS) { q = q + 1; }
+    if (q >= prelude_end) { return; }
+    let is *tok.Token as nm = &p.t[q];
+    if (nm.kind != tok.T_IDENT && nm.kind != tok.T_STRING) { return; }
+    let is *Keyframes as k = cast(*Keyframes, arena.alloc(p.a, sizeof(Keyframes)));
+    k.name = nm.s;
+    k.nlen = nm.n;
+    k.first = cast(*Frame, 0);
+    k.next = p.sh.keyframes;
+    p.sh.keyframes = k;
+    p.i = body;
+    while (p.i < end) {
+        let is [16]f64 as ats with mut;
+        let is i64 as na with mut = 0;
+        while (p.i < end && p.t[p.i].kind != tok.T_LBRACE) {
+            let is *tok.Token as t = &p.t[p.i];
+            if (na < 16) {
+                if (t.kind == tok.T_PERCENT) { ats[na] = t.num / 100.0; na = na + 1; }
+                if (t.kind == tok.T_IDENT && _eq(t.s, t.n, "from") == 1) { ats[na] = 0.0; na = na + 1; }
+                if (t.kind == tok.T_IDENT && _eq(t.s, t.n, "to") == 1) { ats[na] = 1.0; na = na + 1; }
+            }
+            p.i = p.i + 1;
+        }
+        if (p.i >= end) { return; }
+        let is i64 as open = p.i;
+        _skip_group(p);
+        let is i64 as after = p.i;
+        let is i64 as stop with mut = after;
+        if (stop > open + 1 && p.t[stop - 1].kind == tok.T_RBRACE) { stop = stop - 1; }
+        let is *v.DeclList as ds = cast(*v.DeclList, arena.alloc(p.a, sizeof(v.DeclList)));
+        ds.d = cast(*v.Decl, 0);
+        ds.n = 0;
+        ds.cap = 0;
+        p.i = open + 1;
+        _decls(p, stop, ds);
+        let is i64 as i with mut = 0;
+        while (i < na) {
+            _add_frame(k, p.a, ats[i], ds);
+            i = i + 1;
+        }
+        p.i = after;
+    }
+}
+
+// A condition is taken as true unless it says otherwise, or asks for what this browser
+// cannot do: a page has a plainer fallback outside the block for exactly that.
+fn _supports(p as *_P, start as i64, end as i64) as i64 {
+    let is i64 as k with mut = start;
+    while (k < end) {
+        let is *tok.Token as t = &p.t[k];
+        if (t.kind == tok.T_IDENT) {
+            if (_eq(t.s, t.n, "not") == 1) { return 0; }
+            if (_eq(t.s, t.n, "grid") == 1 || _eq(t.s, t.n, "subgrid") == 1 || _eq(t.s, t.n, "backdrop-filter") == 1 ||
+                _eq(t.s, t.n, "contain") == 1) { return 0; }
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _import(p as *_P, start as i64, end as i64) as void {
+    let is i64 as k with mut = start;
+    while (k < end && p.t[k].kind == tok.T_WS) { k = k + 1; }
+    if (k >= end) { return; }
+    let is *tok.Token as t with mut = &p.t[k];
+    if (t.kind == tok.T_FUNCTION && _eq(t.s, t.n, "url") == 1) {
+        k = k + 1;
+        while (k < end && p.t[k].kind == tok.T_WS) { k = k + 1; }
+        if (k >= end) { return; }
+        t = &p.t[k];
+    }
+    if (t.kind != tok.T_URL && t.kind != tok.T_STRING) { return; }
+    let is *Import as im = cast(*Import, arena.alloc(p.a, sizeof(Import)));
+    im.url = t.s;
+    im.n = t.n;
+    im.next = p.sh.imports;
+    p.sh.imports = im;
+}
+
+fn _rules(p as *_P, end as i64, media as *Media) as void {
+    while (p.i < end) {
+        let is i64 as k = p.t[p.i].kind;
+        if (k == tok.T_WS || k == tok.T_CDO || k == tok.T_CDC) { p.i = p.i + 1; continue; }
+        if (k == tok.T_AT) { _at_rule(p, media); continue; }
+        let is i64 as start = p.i;
+        while (p.i < end && p.t[p.i].kind != tok.T_LBRACE) {
+            let is i64 as q = p.t[p.i].kind;
+            if (q == tok.T_FUNCTION || q == tok.T_LPAREN || q == tok.T_LBRACKET) { _skip_group(p); }
+            else { p.i = p.i + 1; }
+        }
+        if (p.i >= end) { return; }
+        let is i64 as prelude_end = p.i;
+        let is i64 as open = p.i;
+        _skip_group(p);
+        let is i64 as after = p.i;
+        let is i64 as block_end with mut = after;
+        if (block_end > open + 1 && p.t[block_end - 1].kind == tok.T_RBRACE) { block_end = block_end - 1; }
+        p.i = start;
+        let is *Selector as sel = _selector_list(p, prelude_end, 0);
+        if (sel != null) {
+            let is v.DeclList as list with mut;
+            list.d = cast(*v.Decl, 0);
+            list.n = 0;
+            list.cap = 0;
+            p.i = open + 1;
+            _decls(p, block_end, &list);
+            if (list.n > 0) { _add_rule(p, sel, &list, media); }
+        }
+        p.i = after;
+    }
+}
+
+// The rules of src added to the sheet. url is what its relative URLs are relative to.
+fn parse(s as *Sheet, src as *u8, len as i64, origin as i64, url as *u8) as void {
+    let is tok.List as l with mut;
+    tok.tokenize(s.a, src, len, &l);
+    let is _P as ps with mut;
+    ps.sh = s;
+    ps.a = s.a;
+    ps.t = l.t;
+    ps.n = l.n;
+    ps.i = 0;
+    ps.origin = origin;
+    decl.set_base(url);
+    _rules(&ps, ps.n, cast(*Media, 0));
+}
+
+// A style attribute: a declaration list and nothing else.
+fn parse_inline(a as *arena.Arena, src as *u8, len as i64, out as *v.DeclList, url as *u8) as void {
+    let is tok.List as l with mut;
+    tok.tokenize(a, src, len, &l);
+    let is _P as ps with mut;
+    let is Sheet as none with mut;
+    init(&none, a);
+    ps.sh = &none;
+    ps.a = a;
+    ps.t = l.t;
+    ps.n = l.n;
+    ps.i = 0;
+    ps.origin = ORIGIN_AUTHOR;
+    decl.set_base(url);
+    _decls(&ps, ps.n, out);
+}

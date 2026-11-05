@@ -1,0 +1,283 @@
+// loader/net.cst — bytes for a URL, whatever its scheme.
+//
+// http and https go through caustic-net, which is the whole stack in one call: DNS, TLS,
+// HTTP/1.1, redirects, Content-Encoding and cookies. file: and data: are here because
+// they are short, and because everything above this wants one way to ask.
+//
+// Every call blocks until it has an answer or its deadline passes. There is one trust
+// store and one cookie jar for the whole program, as a browser has one profile.
+
+use "caustic-net/client/fetch.cst" as fetch;
+use "caustic-net/core/conn.cst" as conn;
+use "caustic-net/proto/cookie.cst" as cookie;
+use "caustic-net/tls/trust.cst" as trust;
+use "std/mem.cst" as mem;
+use "./file.cst" as file;
+use "./url.cst" as url;
+
+let is i64 as DEADLINE_MS with imut = 15000;
+let is i64 as MAX_URL     with imut = 4096;
+let is i64 as MAX_TYPE    with imut = 128;
+
+struct Resource {
+    data   as *u8;     // terminated, one byte past len
+    len    as i64;
+    cap    as i64;     // what was mapped: 0 when nothing was
+    status as i64;     // HTTP's; 200 for what has no such thing
+    ctype  as [MAX_TYPE]u8;     // lower case, up to any semicolon; empty when unknown
+    final  as [MAX_URL]u8;      // where it really came from, after redirects
+    error  as *u8;     // why it could not be had, in words a page can show
+}
+
+let is trust.TrustStore as _store with mut;
+let is cookie.Jar as _jar with mut;
+let is i64 as _ready with mut = 0;      // 1 the jar, 2 and a trust store
+let is fetch.Fetch as _f with mut;
+
+fn _setup() as void {
+    if (_ready != 0) { return; }
+    _ready = 1;
+    cookie.jar_init(&_jar, 256);
+    if (trust.trust_init(&_store) > 0) { _ready = 2; }
+}
+
+fn _init(r as *Resource, u as *u8) as void {
+    r.data = cast(*u8, 0);
+    r.len = 0;
+    r.cap = 0;
+    r.status = 200;
+    r.ctype[0] = cast(u8, 0);
+    r.error = cast(*u8, 0);
+    let is i64 as i with mut = 0;
+    while (i < MAX_URL - 1 && u[i] != 0) {
+        r.final[i] = u[i];
+        i = i + 1;
+    }
+    r.final[i] = cast(u8, 0);
+}
+
+fn _room(r as *Resource, n as i64) as i64 {
+    let is *u8 as p = mem.core.mmap_anon(n + 1);
+    let is i64 as v = cast(i64, p);
+    if (v == 0 || v == 0 - 1) { return 0; }
+    r.data = p;
+    r.cap = n + 1;
+    return 1;
+}
+
+fn free(r as *Resource) as void {
+    if (r.cap > 0) { mem.core.munmap(r.data, r.cap); }
+    r.data = cast(*u8, 0);
+    r.len = 0;
+    r.cap = 0;
+}
+
+fn _hex(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+// %XX in place. The new length.
+fn _unescape(s as *u8, n as i64) as i64 {
+    let is i64 as w with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (s[i] == 37 && i + 2 < n + 0 && _hex(cast(i64, s[i + 1])) >= 0 && _hex(cast(i64, s[i + 2])) >= 0) {
+            s[w] = cast(u8, _hex(cast(i64, s[i + 1])) * 16 + _hex(cast(i64, s[i + 2])));
+            i = i + 3;
+        } else {
+            s[w] = s[i];
+            i = i + 1;
+        }
+        w = w + 1;
+    }
+    return w;
+}
+
+fn _starts(s as *u8, w as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (w[i] != 0) {
+        let is i64 as c with mut = cast(i64, s[i]);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != cast(i64, w[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _ends(s as *u8, n as i64, w as *u8) as i64 {
+    let is i64 as m = url.len_of(w);
+    if (n < m) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < m) {
+        let is i64 as c with mut = cast(i64, s[n - m + i]);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != cast(i64, w[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _set_type(r as *Resource, s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_TYPE - 1 && s[i] != 0 && s[i] != 59 && s[i] != 32) {
+        let is i64 as c with mut = cast(i64, s[i]);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        r.ctype[i] = cast(u8, c);
+        i = i + 1;
+    }
+    r.ctype[i] = cast(u8, 0);
+}
+
+// What a file is, from its name.
+fn _type_of_path(r as *Resource, p as *u8, n as i64) as void {
+    if (_ends(p, n, ".html") == 1 || _ends(p, n, ".htm") == 1 || _ends(p, n, ".xhtml") == 1) { _set_type(r, "text/html"); return; }
+    if (_ends(p, n, ".css") == 1) { _set_type(r, "text/css"); return; }
+    if (_ends(p, n, ".png") == 1) { _set_type(r, "image/png"); return; }
+    if (_ends(p, n, ".jpg") == 1 || _ends(p, n, ".jpeg") == 1) { _set_type(r, "image/jpeg"); return; }
+    if (_ends(p, n, ".gif") == 1) { _set_type(r, "image/gif"); return; }
+    if (_ends(p, n, ".webp") == 1) { _set_type(r, "image/webp"); return; }
+    if (_ends(p, n, ".bmp") == 1) { _set_type(r, "image/bmp"); return; }
+    if (_ends(p, n, ".ico") == 1) { _set_type(r, "image/x-icon"); return; }
+    if (_ends(p, n, ".txt") == 1 || _ends(p, n, ".md") == 1 || _ends(p, n, ".log") == 1 || _ends(p, n, ".cst") == 1 ||
+        _ends(p, n, ".js") == 1 || _ends(p, n, ".json") == 1 || _ends(p, n, ".xml") == 1) { _set_type(r, "text/plain"); return; }
+    _set_type(r, "text/html");
+}
+
+fn _get_file(u as *u8, r as *Resource) as i64 {
+    // After the scheme: a path, possibly with an empty host before it.
+    let is *u8 as p with mut = &u[5];
+    if (p[0] == 47 && p[1] == 47) {
+        p = &p[2];
+        while (p[0] != 0 && p[0] != 47) { p = &p[1]; }
+    }
+    let is i64 as n with mut = 0;
+    while (p[n] != 0 && p[n] != 63 && p[n] != 35) { n = n + 1; }
+    let is [4096]u8 as path with mut;
+    if (n >= 4096) { r.error = "O caminho é longo demais"; return 0 - 1; }
+    mem.core.memcpy(&path[0], p, n);
+    n = _unescape(&path[0], n);
+    path[n] = cast(u8, 0);
+    let is file.File as f with mut;
+    if (file.read(&path[0], &f) != 0) {
+        r.error = "Não foi possível ler o arquivo";
+        return 0 - 1;
+    }
+    _type_of_path(r, &path[0], n);
+    if (_room(r, f.len) == 0) {
+        file.free(&f);
+        r.error = "Sem memória";
+        return 0 - 1;
+    }
+    if (f.len > 0) { mem.core.memcpy(r.data, f.data, f.len); }
+    r.len = f.len;
+    file.free(&f);
+    return 0;
+}
+
+fn _b64(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c - 65; }
+    if (c >= 97 && c <= 122) { return c - 71; }
+    if (c >= 48 && c <= 57) { return c + 4; }
+    if (c == 43 || c == 45) { return 62; }
+    if (c == 47 || c == 95) { return 63; }
+    return 0 - 1;
+}
+
+fn _get_data(u as *u8, r as *Resource) as i64 {
+    let is i64 as i with mut = 5;
+    let is i64 as base64 with mut = 0;
+    let is i64 as t = i;
+    while (u[i] != 0 && u[i] != 44) {
+        if (u[i] == 59 && _starts(&u[i + 1], "base64") == 1) { base64 = 1; }
+        i = i + 1;
+    }
+    if (u[i] == 0) { r.error = "Endereço data: inválido"; return 0 - 1; }
+    let is [128]u8 as ty with mut;
+    let is i64 as k with mut = 0;
+    while (t + k < i && k < 127) {
+        ty[k] = u[t + k];
+        k = k + 1;
+    }
+    ty[k] = cast(u8, 0);
+    _set_type(r, &ty[0]);
+    i = i + 1;
+    let is i64 as n = url.len_of(&u[i]);
+    if (_room(r, n) == 0) { r.error = "Sem memória"; return 0 - 1; }
+    mem.core.memcpy(r.data, &u[i], n);
+    let is i64 as m = _unescape(r.data, n);
+    if (base64 == 0) {
+        r.len = m;
+        return 0;
+    }
+    let is i64 as w with mut = 0;
+    let is i64 as acc with mut = 0;
+    let is i64 as bits with mut = 0;
+    k = 0;
+    while (k < m) {
+        let is i64 as val = _b64(cast(i64, r.data[k]));
+        k = k + 1;
+        if (val < 0) { continue; }
+        acc = (acc << 6) | val;
+        bits = bits + 6;
+        if (bits >= 8) {
+            bits = bits - 8;
+            r.data[w] = cast(u8, (acc >> bits) & 255);
+            w = w + 1;
+        }
+    }
+    r.len = w;
+    return 0;
+}
+
+fn _get_http(u as *u8, r as *Resource) as i64 {
+    _setup();
+    if (_ready != 2 && _starts(u, "https:") == 1) {
+        r.error = "Não há certificados confiáveis neste sistema";
+        return 0 - 1;
+    }
+    let is *fetch.Fetch as f = &_f;
+    if (fetch.fetch_init(f, &_store) != 0) {
+        r.error = "Sem memória";
+        return 0 - 1;
+    }
+    fetch.fetch_set_jar(f, &_jar);
+    let is i64 as rc = fetch.fetch_get(f, u, conn.deadline_in(DEADLINE_MS));
+    if (rc != 0) {
+        r.error = fetch.fetch_err_name(rc);
+        fetch.fetch_free(f);
+        return 0 - 1;
+    }
+    r.status = fetch.fetch_status(f);
+    let is [256]u8 as head with mut;
+    if (fetch.fetch_header(f, "content-type", &head[0], 256) > 0) { _set_type(r, &head[0]); }
+    let is *u8 as fin = fetch.fetch_final_url(f);
+    let is i64 as i with mut = 0;
+    while (i < MAX_URL - 1 && fin[i] != 0) {
+        r.final[i] = fin[i];
+        i = i + 1;
+    }
+    r.final[i] = cast(u8, 0);
+    let is i64 as n = fetch.fetch_body_len(f);
+    if (_room(r, n) == 0) {
+        fetch.fetch_free(f);
+        r.error = "Sem memória";
+        return 0 - 1;
+    }
+    if (n > 0) { mem.core.memcpy(r.data, fetch.fetch_body(f), n); }
+    r.len = n;
+    fetch.fetch_free(f);
+    return 0;
+}
+
+// The bytes at u, into r. 0, or -1 with r.error saying why. r is free()d either way.
+fn get(u as *u8, r as *Resource) as i64 {
+    _init(r, u);
+    if (_starts(u, "file:") == 1) { return _get_file(u, r); }
+    if (_starts(u, "data:") == 1) { return _get_data(u, r); }
+    if (_starts(u, "http:") == 1 || _starts(u, "https:") == 1) { return _get_http(u, r); }
+    r.error = "Este tipo de endereço não existe aqui";
+    return 0 - 1;
+}

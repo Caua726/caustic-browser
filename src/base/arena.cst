@@ -1,0 +1,70 @@
+// base/arena.cst — memory that all goes at once.
+//
+// A page's style, boxes and fragments live exactly as long as each other and are
+// never freed one by one, so the allocator only moves a pointer. What it hands out
+// is zeroed, because it comes straight from mmap and nothing is ever reused.
+
+use "std/mem.cst" as mem;
+use "std/io.cst" as io;
+
+let is i64 as BLOCK with imut = 1048576;
+
+struct Block {
+    next as *Block;
+    size as i64;
+}
+
+struct Arena {
+    blocks as *Block;
+    top    as *u8;
+    left   as i64;
+}
+
+fn init(a as *Arena) as void {
+    a.blocks = cast(*Block, 0);
+    a.top = cast(*u8, 0);
+    a.left = 0;
+}
+
+fn free(a as *Arena) as void {
+    let is *Block as b with mut = a.blocks;
+    while (cast(i64, b) != 0) {
+        let is *Block as next = b.next;
+        mem.core.munmap(cast(*u8, b), b.size);
+        b = next;
+    }
+    init(a);
+}
+
+// There is nothing useful a half-built page can do without memory, so this does not
+// return null: every caller would only have to carry the failure up to the same exit.
+fn alloc(a as *Arena, n as i64) as *u8 {
+    let is i64 as need = (n + 7) & (0 - 8);
+    if (need > a.left) {
+        let is i64 as head = (sizeof(Block) + 7) & (0 - 8);
+        let is i64 as size with mut = BLOCK;
+        if (need + head > size) { size = need + head; }
+        let is *u8 as p = mem.core.mmap_anon(size);
+        if (cast(i64, p) == 0 || cast(i64, p) == 0 - 1) {
+            io.write_str(2, "caustic-browser: out of memory\n");
+            io.exit(1);
+        }
+        let is *Block as b = cast(*Block, p);
+        b.next = a.blocks;
+        b.size = size;
+        a.blocks = b;
+        a.top = cast(*u8, cast(i64, p) + head);
+        a.left = size - head;
+    }
+    let is *u8 as out = a.top;
+    a.top = cast(*u8, cast(i64, a.top) + need);
+    a.left = a.left - need;
+    return out;
+}
+
+// n bytes and a terminating zero.
+fn copy(a as *Arena, s as *u8, n as i64) as *u8 {
+    let is *u8 as out = alloc(a, n + 1);
+    if (n > 0) { mem.core.memcpy(out, s, n); }
+    return out;
+}

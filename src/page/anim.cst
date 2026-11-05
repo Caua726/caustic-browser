@@ -1,0 +1,735 @@
+// page/anim.cst: what moves on its own. A transition eases a property from what it was
+// to what a change of style made it, and an animation follows its @keyframes.
+//
+// Neither takes part in the cascade. Each frame they write their value over the computed
+// style, and the page is painted again without being laid out, so only what does not move
+// anything else can be animated: colours, opacity, transforms, the corners of a box. Every
+// other property changes at once.
+//
+// A style lasts until the next restyle, and an animation has to outlast it. So what runs
+// is found again from the new styles each time, its start kept on the element, and a
+// transition is held here by its element and given the new style to write to.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "../css/sheet.cst" as sh;
+use "../css/style.cst" as style;
+use "../css/transform.cst" as tr;
+use "../css/values.cst" as v;
+use "../dom/dom.cst" as dom;
+use "../layout/box.cst" as bx;
+use "../layout/layout.cst" as layout;
+use "../paint/paint.cst" as paint;
+
+let is i64 as MAX_TRANS with imut = 256;
+let is i64 as MAX_DEPTH with imut = 512;
+
+struct Trans {
+    node   as *dom.Node;
+    pseudo as i64;           // 0 itself, 1 ::before, 2 ::after
+    st     as *style.Style;
+    prop   as i64;
+    from_i as i64;
+    from_f as f64;
+    from_p as f64;
+    to_i   as i64;
+    to_f   as f64;
+    to_p   as f64;
+    t0     as i64;           // milliseconds, the delay already counted in
+    dur    as i64;
+    ease   as *v.Ease;
+    seen   as i64;
+    box    as *bx.Box;
+}
+
+struct Run {
+    node  as *dom.Node;
+    st    as *style.Style;
+    base  as *pr.Values;     // the style under it
+    kf    as *sh.Keyframes;
+    t0    as i64;
+    dur   as f64;            // milliseconds
+    delay as f64;
+    count as f64;            // negative: for ever
+    dir   as i64;
+    fill  as i64;
+    ease  as *v.Ease;
+    box   as *bx.Box;
+    pseudo as i64;
+    done  as i64;
+    next  as *Run;
+}
+
+struct Anim {
+    e     as *style.Engine;
+    trans as *Trans;
+    n     as i64;
+    runs  as *Run;
+    frame as arena.Arena;    // what lasts one frame: transforms between two others
+    store as arena.Arena;    // the table of transitions, once there is one
+    round as i64;
+    now   as i64;
+    // What the last frame changed, in the page's coordinates, and whether that is
+    // anything less than everything.
+    full  as i64;
+    empty as i64;
+    x0    as f64;
+    y0    as f64;
+    x1    as f64;
+    y1    as f64;
+    prev_x0 as f64;
+    prev_y0 as f64;
+    prev_x1 as f64;
+    prev_y1 as f64;
+    next_x0 as f64;   // this frame's, which the next one will need
+    next_y0 as f64;
+    next_x1 as f64;
+    next_y1 as f64;
+    known as i64;     // there is a frame before this one to speak of
+    lasting as i64;   // what is written now is not gone with the frame
+}
+
+fn init(a as *Anim, e as *style.Engine) as void {
+    a.e = e;
+    a.trans = cast(*Trans, 0);
+    a.n = 0;
+    a.runs = cast(*Run, 0);
+    arena.init(&a.frame);
+    arena.init(&a.store);
+    a.round = 0;
+    a.now = 0;
+    a.full = 1;
+    a.empty = 1;
+    a.known = 0;
+    a.lasting = 0;
+}
+
+fn free(a as *Anim) as void {
+    a.trans = cast(*Trans, 0);
+    a.n = 0;
+    a.runs = cast(*Run, 0);
+    arena.free(&a.frame);
+    arena.free(&a.store);
+}
+
+// --- Which properties ---
+
+fn _is_color(p as i64) as i64 {
+    if (p == pr.P_COLOR || p == pr.P_BACKGROUND_COLOR || p == pr.P_OUTLINE_COLOR) { return 1; }
+    if (p >= pr.P_BORDER_TOP_COLOR && p <= pr.P_BORDER_LEFT_COLOR) { return 1; }
+    return 0;
+}
+
+fn _is_radius(p as i64) as i64 {
+    if (p == pr.P_BORDER_TOP_LEFT_RADIUS || p == pr.P_BORDER_TOP_RIGHT_RADIUS ||
+        p == pr.P_BORDER_BOTTOM_RIGHT_RADIUS || p == pr.P_BORDER_BOTTOM_LEFT_RADIUS) { return 1; }
+    return 0;
+}
+
+// Whether this can be animated at all: nothing else depends on where it leaves things.
+fn _animatable(p as i64) as i64 {
+    if (p == pr.P_OPACITY || p == pr.P_TRANSFORM) { return 1; }
+    return _is_color(p) | _is_radius(p);
+}
+
+// Which of a transition-property's names covers p: its place, or -1.
+fn _entry(st as *style.Style, p as i64) as i64 {
+    let is i64 as k = st.v.i[pr.P_TRANSITION_PROPERTY];
+    if (k == pr.K_ALL) { return 0; }
+    if (k == pr.K_NONE) { return 0 - 1; }
+    let is *v.PropList as l = cast(*v.PropList, k);
+    let is i64 as found with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < l.n) {
+        let is i64 as x = l.p[i];
+        if (x == v.TP_NONE) { return 0 - 1; }
+        if (x == p || x == v.TP_ALL ||
+            (x == v.TP_BG && p == pr.P_BACKGROUND_COLOR) ||
+            (x == v.TP_BORDER_COLOR && p >= pr.P_BORDER_TOP_COLOR && p <= pr.P_BORDER_LEFT_COLOR) ||
+            (x == v.TP_BORDER_RADIUS && _is_radius(p) == 1)) { found = i; }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn _time_at(st as *style.Style, prop as i64, i as i64) as f64 {
+    let is i64 as k = st.v.i[prop];
+    if (k == pr.K_NONE || k == 0) { return 0.0; }
+    let is *v.Times as t = cast(*v.Times, k);
+    if (t.n == 0) { return 0.0; }
+    return t.t[i % t.n];
+}
+
+let is v.Ease as _ease_default with mut;
+let is i64 as _ease_ready with mut = 0;
+
+fn _default_ease() as *v.Ease {
+    if (_ease_ready == 0) {
+        _ease_default.kind = v.EASE_BEZIER;
+        _ease_default.x1 = 0.25;
+        _ease_default.y1 = 0.1;
+        _ease_default.x2 = 0.25;
+        _ease_default.y2 = 1.0;
+        _ease_ready = 1;
+    }
+    return &_ease_default;
+}
+
+fn _ease_at(st as *style.Style, prop as i64, i as i64) as *v.Ease {
+    let is i64 as k = st.v.i[prop];
+    if (k == pr.K_NONE || k == 0) { return _default_ease(); }
+    let is *v.Eases as t = cast(*v.Eases, k);
+    if (t.n == 0) { return _default_ease(); }
+    return &t.e[i % t.n];
+}
+
+// --- Between two values ---
+
+fn _channel(a as i64, b as i64, shift as i64, u as f64) as i64 {
+    let is f64 as x = cast(f64, (a >> shift) & 255);
+    let is f64 as y = cast(f64, (b >> shift) & 255);
+    let is i64 as out with mut = cast(i64, x + (y - x) * u + 0.5);
+    if (out < 0) { out = 0; }
+    if (out > 255) { out = 255; }
+    return out << shift;
+}
+
+fn _mix_color(a as i64, b as i64, u as f64) as i64 {
+    return _channel(a, b, 24, u) | _channel(a, b, 16, u) | _channel(a, b, 8, u) | _channel(a, b, 0, u);
+}
+
+fn _resolved(o as *pr.Values, p as i64, c as i64) as i64 {
+    if (c == v.COLOR_CURRENT) { return o.i[pr.P_COLOR]; }
+    return c;
+}
+
+fn _transform_of(k as i64) as *v.Transform {
+    if (k == pr.K_NONE || k == 0) { return cast(*v.Transform, 0); }
+    return cast(*v.Transform, k);
+}
+
+// Writes into st what property p is a fraction u of the way from one value to another.
+fn _write(a as *Anim, st as *style.Style, p as i64, fi as i64, ff as f64, fp as f64, ti as i64, tf as f64, tp as f64, u as f64) as void {
+    let is *pr.Values as o = &st.v;
+    if (_is_color(p) == 1) {
+        o.i[p] = _mix_color(_resolved(o, p, fi), _resolved(o, p, ti), u);
+        return;
+    }
+    if (p == pr.P_TRANSFORM) {
+        let is f64 as em = o.f[pr.P_FONT_SIZE];
+        let is *arena.Arena as ar with mut = &a.frame;
+        if (a.lasting == 1) { ar = a.e.a; }
+        let is *v.Transform as t = tr.lerp(ar, a.e, _transform_of(fi), _transform_of(ti), u, 0.0, 0.0, em);
+        o.i[p] = cast(i64, t);
+        o.f[p] = cast(f64, v.V_DATA);
+        return;
+    }
+    o.i[p] = ti;
+    o.f[p] = ff + (tf - ff) * u;
+    o.p[p] = fp + (tp - fp) * u;
+}
+
+// --- Transitions ---
+
+fn _kept(a as *Anim, k as i64) as i64 {
+    let is *v.Transform as t = _transform_of(k);
+    if (t == null) { return k; }
+    let is *v.Transform as out = cast(*v.Transform, arena.alloc(&a.store, sizeof(v.Transform)));
+    out.n = t.n;
+    out.ops = cast(*v.TOp, 0);
+    if (t.n > 0) {
+        out.ops = cast(*v.TOp, arena.alloc(&a.store, t.n * sizeof(v.TOp)));
+        let is i64 as i with mut = 0;
+        while (i < t.n) {
+            out.ops[i] = t.ops[i];
+            i = i + 1;
+        }
+    }
+    return cast(i64, out);
+}
+
+fn _find(a as *Anim, n as *dom.Node, pseudo as i64, p as i64) as *Trans {
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        let is *Trans as t = &a.trans[i];
+        if (t.node == n && t.pseudo == pseudo && t.prop == p) { return t; }
+        i = i + 1;
+    }
+    return cast(*Trans, 0);
+}
+
+fn _add(a as *Anim) as *Trans {
+    if (a.trans == null) { a.trans = cast(*Trans, arena.alloc(&a.store, MAX_TRANS * sizeof(Trans))); }
+    if (a.trans == null || a.n == MAX_TRANS) { return cast(*Trans, 0); }
+    let is *Trans as t = &a.trans[a.n];
+    a.n = a.n + 1;
+    return t;
+}
+
+fn _element_trans(a as *Anim, n as *dom.Node, pseudo as i64, ns as *style.Style, os as *style.Style) as void {
+    if (os == null) { return; }
+    let is i64 as p with mut = 0;
+    while (p < pr.P_COUNT) {
+        if (_animatable(p) == 1) {
+            let is i64 as i = _entry(ns, p);
+            let is f64 as dur with mut = 0.0;
+            let is f64 as delay with mut = 0.0;
+            if (i >= 0) {
+                dur = _time_at(ns, pr.P_TRANSITION_DURATION, i);
+                delay = _time_at(ns, pr.P_TRANSITION_DELAY, i);
+            }
+            let is *Trans as t with mut = _find(a, n, pseudo, p);
+            if (t != null && t.to_i == ns.v.i[p] && t.to_f == ns.v.f[p] && t.to_p == ns.v.p[p]) {
+                // On its way to where it is still going.
+                t.st = ns;
+                t.seen = a.round;
+            } else if (dur + delay > 0.0 &&
+                       (t != null || os.v.i[p] != ns.v.i[p] || os.v.f[p] != ns.v.f[p] || os.v.p[p] != ns.v.p[p])) {
+                // What it starts from is what was showing, a transition's or not.
+                if (t == null) { t = _add(a); }
+                if (t != null) {
+                    t.node = n;
+                    t.pseudo = pseudo;
+                    t.st = ns;
+                    t.prop = p;
+                    t.from_i = os.v.i[p];
+                    // What was showing may be between two others, and gone next frame.
+                    if (p == pr.P_TRANSFORM) { t.from_i = _kept(a, t.from_i); }
+                    t.from_f = os.v.f[p];
+                    t.from_p = os.v.p[p];
+                    t.to_i = ns.v.i[p];
+                    t.to_f = ns.v.f[p];
+                    t.to_p = ns.v.p[p];
+                    t.t0 = a.now + cast(i64, delay * 1000.0);
+                    t.dur = cast(i64, dur * 1000.0);
+                    t.ease = _ease_at(ns, pr.P_TRANSITION_TIMING_FUNCTION, i);
+                    t.seen = a.round;
+                    t.box = cast(*bx.Box, 0);
+                }
+            }
+        }
+        p = p + 1;
+    }
+}
+
+// --- Animations ---
+
+fn _element_run(a as *Anim, n as *dom.Node, ns as *style.Style, pseudo as i64) as void {
+    let is i64 as k = ns.v.i[pr.P_ANIMATION_NAME];
+    if (k == pr.K_NONE || k == 0) { return; }
+    let is *v.Name as name = cast(*v.Name, k);
+    let is *sh.Keyframes as kf = style.keyframes_of(a.e, name.s, name.n);
+    let is f64 as dur = ns.v.f[pr.P_ANIMATION_DURATION] * 1000.0;
+    if (kf == null || dur <= 0.0) { return; }
+    if (n.anim_name != cast(*u8, kf)) {
+        n.anim_name = cast(*u8, kf);
+        n.anim_t0 = a.now;
+    }
+    let is *Run as r = cast(*Run, arena.alloc(a.e.a, sizeof(Run)));
+    r.node = n;
+    r.st = ns;
+    r.base = cast(*pr.Values, arena.alloc(a.e.a, sizeof(pr.Values)));
+    *r.base = ns.v;
+    r.kf = kf;
+    r.t0 = n.anim_t0;
+    r.dur = dur;
+    r.delay = ns.v.f[pr.P_ANIMATION_DELAY] * 1000.0;
+    r.count = ns.v.f[pr.P_ANIMATION_ITERATION_COUNT];
+    if (ns.v.i[pr.P_ANIMATION_ITERATION_COUNT] == pr.K_INFINITE) { r.count = 0.0 - 1.0; }
+    r.dir = ns.v.i[pr.P_ANIMATION_DIRECTION];
+    r.fill = ns.v.i[pr.P_ANIMATION_FILL_MODE];
+    r.ease = _ease_at(ns, pr.P_ANIMATION_TIMING_FUNCTION, 0);
+    r.box = cast(*bx.Box, 0);
+    r.pseudo = pseudo;
+    r.done = 0;
+    r.next = a.runs;
+    a.runs = r;
+}
+
+fn _value_in(decls as *v.DeclList, p as i64) as *v.Value {
+    let is *v.Value as found with mut = cast(*v.Value, 0);
+    let is i64 as i with mut = 0;
+    while (i < decls.n) {
+        if (decls.d[i].prop == p) { found = &decls.d[i].val; }
+        i = i + 1;
+    }
+    return found;
+}
+
+let is style.Style as _scratch with mut;
+
+// Property p of a run at fraction tp of its keyframes, between the stops that speak of it,
+// or what it is underneath where none do.
+fn _keyframe_prop(a as *Anim, r as *Run, p as i64, tp as f64) as void {
+    let is *sh.Frame as lo with mut = cast(*sh.Frame, 0);
+    let is *sh.Frame as hi with mut = cast(*sh.Frame, 0);
+    let is *sh.Frame as f with mut = r.kf.first;
+    while (f != null) {
+        if (_value_in(f.decls, p) != null) {
+            if (f.at <= tp) { lo = f; }
+            else if (hi == null) { hi = f; }
+        }
+        f = f.next;
+    }
+    let is f64 as at_lo with mut = 0.0;
+    let is f64 as at_hi with mut = 1.0;
+    if (lo != null) { at_lo = lo.at; }
+    if (hi != null) { at_hi = hi.at; }
+    let is f64 as u with mut = 1.0;
+    if (at_hi > at_lo) { u = v.ease_at(r.ease, (tp - at_lo) / (at_hi - at_lo)); }
+    let is i64 as fi with mut = r.base.i[p];
+    let is f64 as ff with mut = r.base.f[p];
+    let is f64 as fp with mut = r.base.p[p];
+    let is i64 as ti with mut = fi;
+    let is f64 as tf with mut = ff;
+    let is f64 as tpc with mut = fp;
+    _scratch.v.f[pr.P_FONT_SIZE] = r.base.f[pr.P_FONT_SIZE];
+    _scratch.late = cast(*style.Late, 0);
+    if (lo != null) {
+        style.apply_decl(a.e, &_scratch, cast(*style.Style, 0), p, _value_in(lo.decls, p));
+        fi = _scratch.v.i[p];
+        ff = _scratch.v.f[p];
+        fp = _scratch.v.p[p];
+    }
+    if (hi != null) {
+        style.apply_decl(a.e, &_scratch, cast(*style.Style, 0), p, _value_in(hi.decls, p));
+        ti = _scratch.v.i[p];
+        tf = _scratch.v.f[p];
+        tpc = _scratch.v.p[p];
+    }
+    _write(a, r.st, p, fi, ff, fp, ti, tf, tpc, u);
+}
+
+// Which properties its keyframes name, each once.
+fn _keyframes_write(a as *Anim, r as *Run, tp as f64) as void {
+    let is [64]i64 as done with mut;
+    let is i64 as nd with mut = 0;
+    let is *sh.Frame as f with mut = r.kf.first;
+    while (f != null) {
+        let is i64 as i with mut = 0;
+        while (i < f.decls.n) {
+            let is i64 as p = f.decls.d[i].prop;
+            let is i64 as k with mut = 0;
+            while (k < nd && done[k] != p) { k = k + 1; }
+            if (k == nd && nd < 64 && _animatable(p) == 1) {
+                done[nd] = p;
+                nd = nd + 1;
+                _keyframe_prop(a, r, p, tp);
+            }
+            i = i + 1;
+        }
+        f = f.next;
+    }
+}
+
+fn _restore(r as *Run) as void {
+    let is *sh.Frame as f with mut = r.kf.first;
+    while (f != null) {
+        let is i64 as i with mut = 0;
+        while (i < f.decls.n) {
+            let is i64 as p = f.decls.d[i].prop;
+            r.st.v.i[p] = r.base.i[p];
+            r.st.v.f[p] = r.base.f[p];
+            r.st.v.p[p] = r.base.p[p];
+            i = i + 1;
+        }
+        f = f.next;
+    }
+}
+
+fn _floor(x as f64) as f64 {
+    let is f64 as t = cast(f64, cast(i64, x));
+    if (t > x) { return t - 1.0; }
+    return t;
+}
+
+fn _run_tick(a as *Anim, r as *Run) as void {
+    let is f64 as el = cast(f64, a.now - r.t0) - r.delay;
+    if (el < 0.0) {
+        if (r.fill == pr.K_BACKWARDS || r.fill == pr.K_BOTH) { _keyframes_write(a, r, _directed(r, 0.0, 0.0)); }
+        return;
+    }
+    let is f64 as iter with mut = el / r.dur;
+    if (r.count >= 0.0 && iter >= r.count) {
+        // Over. It stays at its end if it was asked to, and then has nothing more to do.
+        r.done = 1;
+        if (r.fill == pr.K_FORWARDS || r.fill == pr.K_BOTH) {
+            a.lasting = 1;
+            let is f64 as last with mut = r.count - 1.0;
+            let is f64 as frac with mut = 1.0;
+            if (r.count != _floor(r.count)) {
+                last = _floor(r.count);
+                frac = r.count - last;
+            }
+            _keyframes_write(a, r, _directed(r, last, frac));
+            a.lasting = 0;
+        } else {
+            _restore(r);
+        }
+        return;
+    }
+    let is f64 as whole = _floor(iter);
+    _keyframes_write(a, r, _directed(r, whole, iter - whole));
+}
+
+// A fraction of an iteration, as far through the keyframes as its direction says.
+fn _directed(r as *Run, whole as f64, frac as f64) as f64 {
+    let is i64 as odd = cast(i64, whole) & 1;
+    if (r.dir == pr.K_REVERSE) { return 1.0 - frac; }
+    if (r.dir == pr.K_ALTERNATE && odd == 1) { return 1.0 - frac; }
+    if (r.dir == pr.K_ALTERNATE_REVERSE && odd == 0) { return 1.0 - frac; }
+    return frac;
+}
+
+// --- After a restyle ---
+
+fn _walk(a as *Anim, first as *dom.Node, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *dom.Node as n with mut = first;
+    while (n != null) {
+        if (n.kind == dom.ELEMENT) {
+            let is *style.Style as ns = style.of(n);
+            let is *style.Style as os = cast(*style.Style, n.old_style);
+            n.old_style = cast(*u8, 0);
+            if (ns != null) {
+                let is i64 as has_run = cast(i64, ns.v.i[pr.P_ANIMATION_NAME] != pr.K_NONE);
+                if (has_run == 0) { n.anim_name = cast(*u8, 0); }
+                _element_run(a, n, ns, 0);
+                _element_trans(a, n, 0, ns, os);
+                if (ns.before != null) {
+                    _element_run(a, n, ns.before, 1);
+                    if (os != null) { _element_trans(a, n, 1, ns.before, os.before); }
+                }
+                if (ns.after != null) {
+                    _element_run(a, n, ns.after, 2);
+                    if (os != null) { _element_trans(a, n, 2, ns.after, os.after); }
+                }
+                _walk(a, n.first, depth + 1);
+            }
+        }
+        n = n.next;
+    }
+}
+
+// Everything has a new style: finds what runs on them, and starts what the change asks
+// for. Afterwards the old styles can go. The values showing are written at once, so that
+// the layout coming next does not see the end of a transition just begun.
+fn after_restyle(a as *Anim, d as *dom.Document, now as i64) as void {
+    a.now = now;
+    a.round = a.round + 1;
+    a.runs = cast(*Run, 0);
+    _walk(a, d.node.first, 0);
+    // A transition whose element has gone, or has stopped asking for it.
+    let is i64 as w with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        if (a.trans[i].seen == a.round) {
+            if (w != i) { a.trans[w] = a.trans[i]; }
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    a.n = w;
+    tick(a, now);
+}
+
+// The boxes have been made again.
+fn after_layout(a as *Anim, root as *bx.Box) as void {
+    let is *Run as r with mut = a.runs;
+    while (r != null) {
+        r.box = layout.box_of(root, r.node);
+        r = r.next;
+    }
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        a.trans[i].box = layout.box_of(root, a.trans[i].node);
+        i = i + 1;
+    }
+    // Everything has moved, as far as the last frame's area knows.
+    a.known = 0;
+}
+
+fn _min(x as f64, y as f64) as f64 { if (x < y) { return x; } return y; }
+fn _max(x as f64, y as f64) as f64 { if (x > y) { return x; } return y; }
+
+// How far past its box it draws: its shadows and its outline, and a pixel for the edge.
+fn _spill(a as *Anim, b as *bx.Box) as f64 {
+    let is *pr.Values as o = &b.st.v;
+    let is f64 as em = o.f[pr.P_FONT_SIZE];
+    let is f64 as out with mut = 2.0 + o.f[pr.P_OUTLINE_WIDTH] + o.f[pr.P_OUTLINE_OFFSET];
+    let is i64 as k = o.i[pr.P_BOX_SHADOW];
+    if (k != pr.K_NONE && k != 0) {
+        let is *v.Shadow as sh with mut = cast(*v.Shadow, k);
+        while (sh != null) {
+            let is f64 as dx = _abs(style.px_of(a.e, &sh.x, em));
+            let is f64 as dy = _abs(style.px_of(a.e, &sh.y, em));
+            let is f64 as far = _max(dx, dy) + style.px_of(a.e, &sh.blur, em) + style.px_of(a.e, &sh.spread, em) + 2.0;
+            if (far > out) { out = far; }
+            sh = sh.next;
+        }
+    }
+    return out;
+}
+
+fn _abs(x as f64) as f64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+// Adds what a box covers now to what this frame changed. A box whose place depends on
+// what is not known here, a transform further out or the window, makes it all of it.
+fn _area_add(a as *Anim, b as *bx.Box, pseudo as i64) as void {
+    if (b == null || pseudo != 0) {
+        a.full = 1;
+        return;
+    }
+    let is *bx.Box as up with mut = b;
+    while (up != null) {
+        if (up.is_fixed == 1 || (up != b && paint.has_transform(up) == 1)) {
+            a.full = 1;
+            return;
+        }
+        up = up.parent;
+    }
+    let is f64 as w = bx.border_w(b);
+    let is f64 as h = bx.border_h(b);
+    let is f64 as x0 with mut = b.ax;
+    let is f64 as y0 with mut = b.ay;
+    let is f64 as x1 with mut = b.ax + w;
+    let is f64 as y1 with mut = b.ay + h;
+    if (paint.has_transform(b) == 1) {
+        let is [6]f64 as m with mut;
+        paint.box_matrix(a.e, b, cast(*f64, &m));
+        let is f64 as ax = m[0] * x0;
+        let is f64 as bx1 = m[0] * x1;
+        let is f64 as cx = m[2] * y0;
+        let is f64 as dx = m[2] * y1;
+        let is f64 as ay = m[1] * x0;
+        let is f64 as by = m[1] * x1;
+        let is f64 as cy = m[3] * y0;
+        let is f64 as dy = m[3] * y1;
+        x0 = _min(ax, bx1) + _min(cx, dx) + m[4];
+        x1 = _max(ax, bx1) + _max(cx, dx) + m[4];
+        y0 = _min(ay, by) + _min(cy, dy) + m[5];
+        y1 = _max(ay, by) + _max(cy, dy) + m[5];
+    }
+    let is f64 as spill = _spill(a, b);
+    x0 = x0 - spill;
+    y0 = y0 - spill;
+    x1 = x1 + spill;
+    y1 = y1 + spill;
+    if (a.empty == 1) {
+        a.x0 = x0;
+        a.y0 = y0;
+        a.x1 = x1;
+        a.y1 = y1;
+        a.empty = 0;
+        return;
+    }
+    a.x0 = _min(a.x0, x0);
+    a.y0 = _min(a.y0, y0);
+    a.x1 = _max(a.x1, x1);
+    a.y1 = _max(a.y1, y1);
+}
+
+fn _visible(r as *Run, sy as f64, vh as f64) as i64 {
+    if (r.box == null) { return 0; }
+    if (r.box.ay > sy + vh + 64.0) { return 0; }
+    if (r.box.ay + bx.border_h(r.box) < sy - 64.0) { return 0; }
+    return 1;
+}
+
+// --- Each frame ---
+
+fn tick(a as *Anim, now as i64) as void {
+    a.now = now;
+    arena.free(&a.frame);
+    a.full = 0;
+    a.empty = 1;
+    // Everything is written before anything is measured: a style may still hold a value
+    // from the frame just freed until its own transition gets to it.
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        let is *Trans as t = &a.trans[i];
+        let is f64 as u with mut = 0.0;
+        if (now >= t.t0 + t.dur) { u = 1.0; }
+        else if (now > t.t0) { u = v.ease_at(t.ease, cast(f64, now - t.t0) / cast(f64, t.dur)); }
+        if (u >= 1.0) {
+            t.st.v.i[t.prop] = t.to_i;
+            t.st.v.f[t.prop] = t.to_f;
+            t.st.v.p[t.prop] = t.to_p;
+            t.dur = 0 - 1;
+        } else {
+            _write(a, t.st, t.prop, t.from_i, t.from_f, t.from_p, t.to_i, t.to_f, t.to_p, u);
+        }
+        i = i + 1;
+    }
+    let is *Run as r with mut = a.runs;
+    while (r != null) {
+        let is i64 as was_done = r.done;
+        if (was_done == 0) { _run_tick(a, r); }
+        r = r.next;
+    }
+    let is i64 as w with mut = 0;
+    i = 0;
+    while (i < a.n) {
+        let is *Trans as t = &a.trans[i];
+        _area_add(a, t.box, t.pseudo);
+        if (t.dur >= 0) {
+            if (w != i) { a.trans[w] = *t; }
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    a.n = w;
+    r = a.runs;
+    while (r != null) {
+        if (r.done == 0 || r.done == 1) { _area_add(a, r.box, r.pseudo); }
+        // It is over and has been painted that way once.
+        if (r.done == 1) { r.done = 2; }
+        r = r.next;
+    }
+    // What was covered and is not any more has to be painted over too, and with no frame
+    // before this one to go by, only painting everything is sure of that.
+    if (a.known == 0) { a.full = 1; }
+    a.prev_x0 = a.next_x0;
+    a.prev_y0 = a.next_y0;
+    a.prev_x1 = a.next_x1;
+    a.prev_y1 = a.next_y1;
+    if (a.empty == 0) {
+        a.next_x0 = a.x0;
+        a.next_y0 = a.y0;
+        a.next_x1 = a.x1;
+        a.next_y1 = a.y1;
+    }
+    a.known = cast(i64, a.empty == 0);
+}
+
+// What the last frame changed, in the page: 1, or 0 when that is all of it.
+fn area(a as *Anim, x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as i64 {
+    if (a.full == 1 || a.empty == 1) { return 0; }
+    *x0 = _min(a.x0, a.prev_x0);
+    *y0 = _min(a.y0, a.prev_y0);
+    *x1 = _max(a.x1, a.prev_x1);
+    *y1 = _max(a.y1, a.prev_y1);
+    return 1;
+}
+
+// Whether a frame now would look any different, with the page scrolled to sy.
+fn wants_frame(a as *Anim, sy as f64, vh as f64) as i64 {
+    if (a.n > 0) { return 1; }
+    let is *Run as r with mut = a.runs;
+    while (r != null) {
+        if (r.done == 0 && _visible(r, sy, vh) == 1) { return 1; }
+        r = r.next;
+    }
+    return 0;
+}
+
+// Whether anything is still to come, seen or not.
+fn active(a as *Anim) as i64 {
+    if (a.n > 0) { return 1; }
+    let is *Run as r with mut = a.runs;
+    while (r != null) {
+        if (r.done == 0) { return 1; }
+        r = r.next;
+    }
+    return 0;
+}

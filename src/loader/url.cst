@@ -1,0 +1,161 @@
+// loader/url.cst — one URL relative to another, RFC 3986 section 5.
+//
+// The network library resolves http and https, but a page here can as well be
+// file:// or about:, and CSS asks for this at parse time, so this one knows nothing
+// about schemes beyond their shape.
+
+fn len_of(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _is_alpha(c as i64) as i64 {
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) { return 1; }
+    return 0;
+}
+
+// How long the scheme at the start of s is, without its colon; 0 for none.
+fn scheme_len(s as *u8, n as i64) as i64 {
+    if (n == 0 || _is_alpha(cast(i64, s[0])) == 0) { return 0; }
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c == 58) { return i; }
+        if (_is_alpha(c) == 0 && !(c >= 48 && c <= 57) && c != 43 && c != 45 && c != 46) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _copy(out as *u8, at as i64, cap as i64, s as *u8, n as i64) as i64 {
+    if (at < 0 || at + n >= cap) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        out[at + i] = s[i];
+        i = i + 1;
+    }
+    return at + n;
+}
+
+// Removes . and .. from the path in p[0..n], in place. Its new length.
+fn _clean_path(p as *u8, n as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as w with mut = 0;
+    while (r < n) {
+        // One segment: its slash and what follows, up to the next slash.
+        let is i64 as e with mut = r + 1;
+        while (e < n && p[e] != 47) { e = e + 1; }
+        let is i64 as m = e - r - 1;
+        let is i64 as dot = cast(i64, m == 1 && p[r + 1] == 46);
+        let is i64 as dots = cast(i64, m == 2 && p[r + 1] == 46 && p[r + 2] == 46);
+        if (p[r] == 47 && (dot == 1 || dots == 1)) {
+            if (dots == 1) {
+                while (w > 0) {
+                    w = w - 1;
+                    if (p[w] == 47) { break; }
+                }
+            }
+            // A path ending in dots still ends in a directory.
+            if (e >= n) {
+                p[w] = cast(u8, 47);
+                w = w + 1;
+            }
+        } else {
+            let is i64 as k with mut = r;
+            while (k < e) {
+                p[w] = p[k];
+                w = w + 1;
+                k = k + 1;
+            }
+        }
+        r = e;
+    }
+    if (w == 0) {
+        p[0] = cast(u8, 47);
+        w = 1;
+    }
+    return w;
+}
+
+// rel[0..rn] resolved against base (terminated), into out: its length, or -1 when it
+// will not fit. The result is terminated.
+fn resolve(base as *u8, rel as *u8, rn0 as i64, out as *u8, cap as i64) as i64 {
+    let is *u8 as r with mut = rel;
+    let is i64 as rn with mut = rn0;
+    while (rn > 0 && (r[0] == 32 || r[0] == 9 || r[0] == 10 || r[0] == 13 || r[0] == 12)) {
+        r = &r[1];
+        rn = rn - 1;
+    }
+    while (rn > 0 && (r[rn - 1] == 32 || r[rn - 1] == 9 || r[rn - 1] == 10 || r[rn - 1] == 13 || r[rn - 1] == 12)) {
+        rn = rn - 1;
+    }
+    let is i64 as w with mut = 0;
+    if (scheme_len(r, rn) > 0) {
+        w = _copy(out, 0, cap, r, rn);
+        if (w < 0) { return w; }
+        out[w] = cast(u8, 0);
+        return w;
+    }
+    let is i64 as bn = len_of(base);
+    let is i64 as sl = scheme_len(base, bn);
+    let is i64 as i with mut = 0;
+    if (sl > 0) { i = sl + 1; }
+    let is i64 as auth_end with mut = i;
+    if (i + 1 < bn && base[i] == 47 && base[i + 1] == 47) {
+        auth_end = i + 2;
+        while (auth_end < bn && base[auth_end] != 47 && base[auth_end] != 63 && base[auth_end] != 35) {
+            auth_end = auth_end + 1;
+        }
+    }
+    let is i64 as path_end with mut = auth_end;
+    while (path_end < bn && base[path_end] != 63 && base[path_end] != 35) { path_end = path_end + 1; }
+    let is i64 as query_end with mut = path_end;
+    while (query_end < bn && base[query_end] != 35) { query_end = query_end + 1; }
+
+    if (rn >= 2 && r[0] == 47 && r[1] == 47) {
+        w = _copy(out, 0, cap, base, i);
+        w = _copy(out, w, cap, r, rn);
+        if (w < 0) { return w; }
+        out[w] = cast(u8, 0);
+        return w;
+    }
+    if (rn == 0 || r[0] == 35) {
+        w = _copy(out, 0, cap, base, query_end);
+        w = _copy(out, w, cap, r, rn);
+        if (w < 0) { return w; }
+        out[w] = cast(u8, 0);
+        return w;
+    }
+    if (r[0] == 63) {
+        w = _copy(out, 0, cap, base, path_end);
+        w = _copy(out, w, cap, r, rn);
+        if (w < 0) { return w; }
+        out[w] = cast(u8, 0);
+        return w;
+    }
+    w = _copy(out, 0, cap, base, auth_end);
+    if (w < 0) { return w; }
+    let is i64 as path_at = w;
+    // The reference's own path ends at its query or fragment, and only that is cleaned.
+    let is i64 as rp with mut = 0;
+    while (rp < rn && r[rp] != 63 && r[rp] != 35) { rp = rp + 1; }
+    if (r[0] == 47) {
+        w = _copy(out, w, cap, r, rp);
+    } else {
+        let is i64 as dir with mut = path_end;
+        while (dir > auth_end && base[dir - 1] != 47) { dir = dir - 1; }
+        if (dir == auth_end) {
+            w = _copy(out, w, cap, "/", 1);
+        } else {
+            w = _copy(out, w, cap, &base[auth_end], dir - auth_end);
+        }
+        w = _copy(out, w, cap, r, rp);
+    }
+    if (w < 0) { return w; }
+    w = path_at + _clean_path(&out[path_at], w - path_at);
+    w = _copy(out, w, cap, &r[rp], rn - rp);
+    if (w < 0) { return w; }
+    out[w] = cast(u8, 0);
+    return w;
+}

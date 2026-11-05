@@ -1,0 +1,1238 @@
+// paint/paint.cst — boxes into a display list, in CSS's painting order.
+//
+// Appendix E of CSS 2, cut down to what shows: in a stacking context, its own background
+// first, then what has a negative z-index, then blocks' backgrounds, then floats, then
+// inline content, then what is positioned, by z-index. Each of those parts walks the same
+// tree and looks for what is its turn.
+//
+// Opacity is multiplied into every colour under it rather than drawn as a group, so
+// overlapping children show through each other where a real group would not.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "../css/decl.cst" as decl;
+use "../css/values.cst" as v;
+use "../dom/tags.cst" as tg;
+use "../dom/dom.cst" as dom;
+use "../layout/box.cst" as bx;
+use "../layout/measure.cst" as m;
+use "../loader/url.cst" as url;
+use "../page/forms.cst" as forms;
+use "../css/transform.cst" as tr;
+use "./display_list.cst" as dl;
+use "std/math.cst" as fm;
+use "std/mem.cst" as mem;
+
+let is i64 as PHASE_BLOCKS with imut = 1;
+let is i64 as PHASE_FLOATS with imut = 2;
+let is i64 as PHASE_INLINE with imut = 3;
+
+let is i64 as MAX_TILES with imut = 4096;
+
+struct Painter {
+    c     as *bx.Ctx;
+    l     as *dl.List;
+    fixed as i64;      // the commands written now do not scroll
+    tmp   as *arena.Arena;
+    cx0   as f64;      // what is clipped to now, for what can be pointed at
+    cy0   as f64;
+    cx1   as f64;
+    cy1   as f64;
+    owner as *bx.Box;  // the box whose lines are being painted
+    inv   as *[6]f64;  // back out of the transform everything now is under
+    total as *f64;     // and that transform, null for none
+}
+
+struct StackItem {
+    b    as *bx.Box;
+    z    as f64;
+    next as *StackItem;
+}
+
+let is i64 as CHECKED with imut = 4278220287;   // #0075ff, what a checked control fills with
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _rgb(c as i64) as i64 { return c & 16777215; }
+fn _a(c as i64) as f64 { return cast(f64, (c >> 24) & 255) / 255.0; }
+
+fn _opacity(b as *bx.Box, alpha as f64) as f64 {
+    return alpha * b.st.v.f[pr.P_OPACITY];
+}
+
+fn _visible(b as *bx.Box) as i64 {
+    if (bx.prop(b, pr.P_VISIBILITY) == pr.K_VISIBLE) { return 1; }
+    return 0;
+}
+
+fn _is_positioned(b as *bx.Box) as i64 {
+    if (bx.prop(b, pr.P_POSITION) != pr.K_STATIC) { return 1; }
+    return 0;
+}
+
+fn has_transform(b as *bx.Box) as i64 { return _has_transform(b); }
+
+fn _has_transform(b as *bx.Box) as i64 {
+    if (b.kind == bx.B_INLINE || b.kind == bx.B_TEXT) { return 0; }
+    let is i64 as k = b.st.v.i[pr.P_TRANSFORM];
+    if (k == pr.K_NONE || k == 0) { return 0; }
+    return 1;
+}
+
+fn _starts_context(b as *bx.Box) as i64 {
+    if (_is_positioned(b) == 1) { return 1; }
+    if (b.st.v.f[pr.P_OPACITY] < 1.0) { return 1; }
+    if (_has_transform(b) == 1) { return 1; }
+    // What it clips has to be painted while the clip is on, positioned or not.
+    if (b.kind != bx.B_INLINE && b.kind != bx.B_TEXT && _clip_of(b) == 1) { return 1; }
+    // z-index counts on what a flex or grid container holds, positioned or not.
+    if (b.flex_item == 1 && bx.prop(b, pr.P_Z_INDEX) != pr.K_AUTO) { return 1; }
+    return 0;
+}
+
+fn _rect(p as *Painter, x as f64, y as f64, w as f64, h as f64, col as i64, alpha as f64) as *dl.Cmd {
+    let is f64 as a = _a(col) * alpha;
+    if (a <= 0.0 || w <= 0.0 || h <= 0.0) { return cast(*dl.Cmd, 0); }
+    let is *dl.Cmd as c = dl.box(p.l, x, y, w, h, _rgb(col), a);
+    if (c != null) { c.fixed = p.fixed; }
+    return c;
+}
+
+fn _radii(b as *bx.Box, c as *dl.Cmd, w as f64, h as f64) as void {
+    if (c == null) { return; }
+    let is f64 as base = _min(w, h);
+    c.radius = bx.resolve(b, pr.P_BORDER_TOP_LEFT_RADIUS, base);
+    c.r2 = bx.resolve(b, pr.P_BORDER_TOP_RIGHT_RADIUS, base);
+    c.r3 = bx.resolve(b, pr.P_BORDER_BOTTOM_RIGHT_RADIUS, base);
+    c.r4 = bx.resolve(b, pr.P_BORDER_BOTTOM_LEFT_RADIUS, base);
+}
+
+fn _has_radius(b as *bx.Box) as i64 {
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        if (s.f[pr.P_BORDER_TOP_LEFT_RADIUS + k] > 0.0 || s.p[pr.P_BORDER_TOP_LEFT_RADIUS + k] > 0.0) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// --- What can be pointed at ---
+
+fn _elem_of(b0 as *bx.Box) as *dom.Node {
+    let is *bx.Box as b with mut = b0;
+    while (b != null) {
+        if (b.node != null) { return b.node; }
+        b = b.parent;
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _hit_add(p as *Painter, b as *bx.Box, owner as *bx.Box, x as f64, y as f64, w as f64, h as f64, text as i64) as void {
+    if (w <= 0.0 || h <= 0.0) { return; }
+    if (bx.prop(b, pr.P_POINTER_EVENTS) == pr.K_NONE || bx.prop(b, pr.P_VISIBILITY) != pr.K_VISIBLE) { return; }
+    let is *dom.Node as n = _elem_of(b);
+    if (n == null) { return; }
+    let is *bx.Ctx as c = p.c;
+    if (c.nhits == c.caphits) {
+        let is i64 as nc with mut = c.caphits * 2;
+        if (nc == 0) { nc = 1024; }
+        let is *bx.HitItem as nh = cast(*bx.HitItem, arena.alloc(c.a, nc * sizeof(bx.HitItem)));
+        if (c.nhits > 0) { mem.core.memcpy(cast(*u8, nh), cast(*u8, c.hits), c.nhits * sizeof(bx.HitItem)); }
+        c.hits = nh;
+        c.caphits = nc;
+    }
+    let is *bx.HitItem as e = cast(*bx.HitItem, cast(i64, c.hits) + c.nhits * sizeof(bx.HitItem));
+    c.nhits = c.nhits + 1;
+    e.x = x;
+    e.y = y;
+    e.w = w;
+    e.h = h;
+    e.cx0 = p.cx0;
+    e.cy0 = p.cy0;
+    e.cx1 = p.cx1;
+    e.cy1 = p.cy1;
+    e.node = n;
+    e.box = owner;
+    e.text = text;
+    e.fixed = p.fixed;
+    e.inv = p.inv;
+}
+
+// What was painted last at a point. (x, y) is in the page and (sx, sy) how far it is scrolled.
+fn hit(c as *bx.Ctx, x as f64, y as f64, sx as f64, sy as f64, node as **dom.Node, box as **bx.Box, text as *i64) as void {
+    let is i64 as i with mut = c.nhits - 1;
+    while (i >= 0) {
+        let is *bx.HitItem as e = cast(*bx.HitItem, cast(i64, c.hits) + i * sizeof(bx.HitItem));
+        let is f64 as px0 with mut = x;
+        let is f64 as py0 with mut = y;
+        if (e.fixed == 1) {
+            px0 = x - sx;
+            py0 = y - sy;
+        }
+        let is f64 as px with mut = px0;
+        let is f64 as py with mut = py0;
+        if (e.inv != null) {
+            let is *[6]f64 as m = e.inv;
+            px = (*m)[0] * px0 + (*m)[2] * py0 + (*m)[4];
+            py = (*m)[1] * px0 + (*m)[3] * py0 + (*m)[5];
+        }
+        if (px >= e.x && py >= e.y && px < e.x + e.w && py < e.y + e.h &&
+            px >= e.cx0 && py >= e.cy0 && px < e.cx1 && py < e.cy1) {
+            *node = e.node;
+            *box = e.box;
+            *text = e.text;
+            return;
+        }
+        i = i - 1;
+    }
+}
+
+// --- Backgrounds and borders ---
+
+fn _bg_tiles(p as *Painter, b as *bx.Box, im as *dl.Image, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is f64 as iw with mut = cast(f64, im.width);
+    let is f64 as ih with mut = cast(f64, im.height);
+    if (iw <= 0.0 || ih <= 0.0) { return; }
+    let is i64 as kw = s.i[pr.P_BACKGROUND_SIZE_W];
+    if (kw == pr.K_COVER || kw == pr.K_CONTAIN) {
+        let is f64 as sx = w / iw;
+        let is f64 as sy = h / ih;
+        let is f64 as k with mut = _max(sx, sy);
+        if (kw == pr.K_CONTAIN) { k = _min(sx, sy); }
+        iw = iw * k;
+        ih = ih * k;
+    } else {
+        let is i64 as has_w = cast(i64, kw == 0);
+        let is i64 as has_h = cast(i64, s.i[pr.P_BACKGROUND_SIZE_H] == 0);
+        let is f64 as ow = iw;
+        let is f64 as oh = ih;
+        if (has_w == 1) { iw = bx.resolve(b, pr.P_BACKGROUND_SIZE_W, w); }
+        if (has_h == 1) { ih = bx.resolve(b, pr.P_BACKGROUND_SIZE_H, h); }
+        if (has_w == 1 && has_h == 0) { ih = oh * iw / ow; }
+        if (has_w == 0 && has_h == 1) { iw = ow * ih / oh; }
+    }
+    if (iw <= 0.0 || ih <= 0.0) { return; }
+    let is f64 as px = s.f[pr.P_BACKGROUND_POSITION_X] + s.p[pr.P_BACKGROUND_POSITION_X] * (w - iw) / 100.0;
+    let is f64 as py = s.f[pr.P_BACKGROUND_POSITION_Y] + s.p[pr.P_BACKGROUND_POSITION_Y] * (h - ih) / 100.0;
+    let is i64 as rep = s.i[pr.P_BACKGROUND_REPEAT];
+    let is i64 as rep_x = cast(i64, rep == pr.K_REPEAT || rep == pr.K_REPEAT_X || rep == pr.K_SPACE || rep == pr.K_ROUND);
+    let is i64 as rep_y = cast(i64, rep == pr.K_REPEAT || rep == pr.K_REPEAT_Y || rep == pr.K_SPACE || rep == pr.K_ROUND);
+    let is f64 as first_x with mut = px;
+    let is f64 as first_y with mut = py;
+    if (rep_x == 1) {
+        while (first_x > 0.0) { first_x = first_x - iw; }
+        while (first_x + iw <= 0.0) { first_x = first_x + iw; }
+    }
+    if (rep_y == 1) {
+        while (first_y > 0.0) { first_y = first_y - ih; }
+        while (first_y + ih <= 0.0) { first_y = first_y + ih; }
+    }
+    let is *dl.Cmd as cl = dl.clip(p.l, x, y, w, h);
+    if (cl != null) { cl.fixed = p.fixed; }
+    let is i64 as tiles with mut = 0;
+    let is f64 as ty with mut = first_y;
+    while (ty < h && tiles < MAX_TILES) {
+        let is f64 as tx with mut = first_x;
+        while (tx < w && tiles < MAX_TILES) {
+            let is *dl.Cmd as c = dl.image(p.l, x + tx, y + ty, iw, ih, im, alpha);
+            if (c != null) { c.fixed = p.fixed; }
+            tiles = tiles + 1;
+            if (rep_x == 0) { break; }
+            tx = tx + iw;
+        }
+        if (rep_y == 0) { break; }
+        ty = ty + ih;
+    }
+    dl.unclip(p.l);
+}
+
+fn _len(p as *Painter, b as *bx.Box, l as *v.Len, base as f64) as f64 {
+    return style.px_of(p.c.e, l, b.st.v.f[pr.P_FONT_SIZE]) + l.pct * base / 100.0;
+}
+
+fn _hypot(x as f64, y as f64) as f64 { return fm.sqrt(x * x + y * y); }
+
+fn _abs(x as f64) as f64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+// The gradient for a box of this size: lengths into pixels, places into parts of the line,
+// and the keywords for how big a radial one is into its two radii.
+fn _grad_paint(p as *Painter, b as *bx.Box, g as *v.Gradient, w as f64, h as f64) as *dl.GradPaint {
+    if (g.nstops < 1) { return cast(*dl.GradPaint, 0); }
+    let is *dl.GradPaint as o = cast(*dl.GradPaint, arena.alloc(p.c.a, sizeof(dl.GradPaint)));
+    o.kind = g.kind;
+    o.repeating = g.repeating;
+    o.cx = _len(p, b, &g.at_x, w);
+    o.cy = _len(p, b, &g.at_y, h);
+    let is f64 as along with mut = 1.0;
+    if (g.kind == v.GRAD_LINEAR) {
+        let is f64 as pi = 3.14159265358979;
+        o.dx = fm.sin(g.angle * pi / 180.0);
+        o.dy = 0.0 - fm.cos(g.angle * pi / 180.0);
+        if (g.corner > 0) {
+            // To a corner, the middle colour runs through the other two.
+            let is f64 as sx with mut = 0.0 - 1.0;
+            let is f64 as sy with mut = 0.0 - 1.0;
+            if (((g.corner - 1) & 1) != 0) { sx = 1.0; }
+            if (((g.corner - 1) & 2) != 0) { sy = 1.0; }
+            let is f64 as d = _max(_hypot(w, h), 0.001);
+            o.dx = sx * h / d;
+            o.dy = sy * w / d;
+        }
+        o.len = _max(_abs(w * o.dx) + _abs(h * o.dy), 0.001);
+        along = o.len;
+    } else if (g.kind == v.GRAD_RADIAL) {
+        let is f64 as near_x = _min(_abs(o.cx), _abs(w - o.cx));
+        let is f64 as far_x = _max(_abs(o.cx), _abs(w - o.cx));
+        let is f64 as near_y = _min(_abs(o.cy), _abs(h - o.cy));
+        let is f64 as far_y = _max(_abs(o.cy), _abs(h - o.cy));
+        let is f64 as rx with mut = far_x;
+        let is f64 as ry with mut = far_y;
+        if (g.extent == v.EXTENT_SIZE) {
+            rx = _len(p, b, &g.rx, w);
+            ry = _len(p, b, &g.ry, h);
+            if (g.circle == 1) { ry = rx; }
+        } else if (g.circle == 1) {
+            if (g.extent == v.EXTENT_CLOSEST_SIDE) { rx = _min(near_x, near_y); }
+            else if (g.extent == v.EXTENT_FARTHEST_SIDE) { rx = _max(far_x, far_y); }
+            else if (g.extent == v.EXTENT_CLOSEST_CORNER) { rx = _hypot(near_x, near_y); }
+            else { rx = _hypot(far_x, far_y); }
+            ry = rx;
+        } else if (g.extent == v.EXTENT_CLOSEST_SIDE) {
+            rx = near_x;
+            ry = near_y;
+        } else if (g.extent == v.EXTENT_CLOSEST_CORNER) {
+            rx = near_x * 1.4142135623731;
+            ry = near_y * 1.4142135623731;
+        } else if (g.extent == v.EXTENT_FARTHEST_CORNER) {
+            rx = far_x * 1.4142135623731;
+            ry = far_y * 1.4142135623731;
+        }
+        o.rx = _max(rx, 0.001);
+        o.ry = _max(ry, 0.001);
+        along = o.rx;
+    } else {
+        o.from = g.angle / 360.0;
+    }
+    o.n = g.nstops;
+    o.pos = cast(*f64, arena.alloc(p.c.a, o.n * 8));
+    o.cols = cast(*i64, arena.alloc(p.c.a, o.n * 8));
+    // Places left out are shared evenly between the ones around them.
+    let is i64 as i with mut = 0;
+    let is f64 as last with mut = 0.0 - 1000000000.0;
+    while (i < o.n) {
+        let is *v.GradStop as st = &g.stops[i];
+        let is i64 as col with mut = st.color;
+        if (col == v.COLOR_CURRENT) { col = b.st.v.i[pr.P_COLOR]; }
+        o.cols[i] = col;
+        let is f64 as at with mut = last;
+        if (st.has_pos == 1) {
+            at = style.px_of(p.c.e, &st.pos, b.st.v.f[pr.P_FONT_SIZE]) / along + st.pos.pct / 100.0;
+        } else if (i == 0) {
+            at = 0.0;
+        } else if (i == o.n - 1) {
+            at = 1.0;
+        } else {
+            let is i64 as j with mut = i + 1;
+            while (j < o.n && g.stops[j].has_pos == 0) { j = j + 1; }
+            let is f64 as end with mut = 1.0;
+            if (j < o.n) { end = style.px_of(p.c.e, &g.stops[j].pos, b.st.v.f[pr.P_FONT_SIZE]) / along + g.stops[j].pos.pct / 100.0; }
+            else { j = o.n - 1; }
+            at = last + (end - last) / cast(f64, j - i + 1);
+        }
+        if (at < last) { at = last; }
+        o.pos[i] = at;
+        last = at;
+        i = i + 1;
+    }
+    return o;
+}
+
+fn _grad_tiles(p as *Painter, b as *bx.Box, g as *v.Gradient, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as kw = s.i[pr.P_BACKGROUND_SIZE_W];
+    let is i64 as kh = s.i[pr.P_BACKGROUND_SIZE_H];
+    let is f64 as iw with mut = w;
+    let is f64 as ih with mut = h;
+    if (kw == 0) { iw = bx.resolve(b, pr.P_BACKGROUND_SIZE_W, w); }
+    if (kh == 0) { ih = bx.resolve(b, pr.P_BACKGROUND_SIZE_H, h); }
+    if (iw <= 0.0 || ih <= 0.0) { return; }
+    let is *dl.GradPaint as gp = _grad_paint(p, b, g, iw, ih);
+    if (gp == null) { return; }
+    // The whole box, the usual case, takes its corners with it.
+    if (iw == w && ih == h) {
+        let is *dl.Cmd as c = dl.gradient(p.l, x, y, w, h, gp, alpha);
+        if (c != null) {
+            c.fixed = p.fixed;
+            if (_has_radius(b) == 1) { _radii(b, c, w, h); }
+        }
+        return;
+    }
+    let is f64 as px = s.f[pr.P_BACKGROUND_POSITION_X] + s.p[pr.P_BACKGROUND_POSITION_X] * (w - iw) / 100.0;
+    let is f64 as py = s.f[pr.P_BACKGROUND_POSITION_Y] + s.p[pr.P_BACKGROUND_POSITION_Y] * (h - ih) / 100.0;
+    let is i64 as rep = s.i[pr.P_BACKGROUND_REPEAT];
+    let is i64 as rep_x = cast(i64, rep != pr.K_NO_REPEAT && rep != pr.K_REPEAT_Y);
+    let is i64 as rep_y = cast(i64, rep != pr.K_NO_REPEAT && rep != pr.K_REPEAT_X);
+    let is f64 as first_x with mut = px;
+    let is f64 as first_y with mut = py;
+    if (rep_x == 1) {
+        first_x = px - fm.ceil(px / iw) * iw;
+    }
+    if (rep_y == 1) {
+        first_y = py - fm.ceil(py / ih) * ih;
+    }
+    let is *dl.Cmd as cl = dl.clip(p.l, x, y, w, h);
+    if (cl != null) { cl.fixed = p.fixed; }
+    let is i64 as tiles with mut = 0;
+    let is f64 as ty with mut = first_y;
+    while (ty < h && tiles < MAX_TILES) {
+        let is f64 as tx with mut = first_x;
+        while (tx < w && tiles < MAX_TILES) {
+            let is *dl.Cmd as c = dl.gradient(p.l, x + tx, y + ty, iw, ih, gp, alpha);
+            if (c != null) { c.fixed = p.fixed; }
+            tiles = tiles + 1;
+            if (rep_x == 0) { break; }
+            tx = tx + iw;
+        }
+        if (rep_y == 0) { break; }
+        ty = ty + ih;
+    }
+    dl.unclip(p.l);
+}
+
+// Layers bottom first, and the list holds them top first.
+fn _grad_layers(p as *Painter, b as *bx.Box, g as *v.Gradient, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    if (g == null) { return; }
+    _grad_layers(p, b, g.next, x, y, w, h, alpha);
+    _grad_tiles(p, b, g, x, y, w, h, alpha);
+}
+
+fn _background(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is *dl.Cmd as c = _rect(p, x, y, w, h, s.i[pr.P_BACKGROUND_COLOR], alpha);
+    if (c != null && _has_radius(b) == 1) { _radii(b, c, w, h); }
+    if (s.i[pr.P_BACKGROUND_IMAGE] != pr.K_NONE && cast(i64, p.c.images) != 0) {
+        let is *u8 as u = cast(*u8, s.i[pr.P_BACKGROUND_IMAGE]);
+        let is *dl.Image as im = call(p.c.images, p.c.user, u, url.len_of(u));
+        if (im != null) { _bg_tiles(p, b, im, x, y, w, h, alpha); }
+    }
+    if (s.i[pr.P_X_GRADIENT] != pr.K_NONE) {
+        _grad_layers(p, b, cast(*v.Gradient, s.i[pr.P_X_GRADIENT]), x, y, w, h, alpha);
+    }
+}
+
+// What is outside the box goes under it, last of the list first. An inset one is left out:
+// the list has nothing that darkens only the inside of an edge.
+fn _shadows_of(p as *Painter, b as *bx.Box, x0 as *v.Shadow, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    if (x0 == null) { return; }
+    _shadows_of(p, b, x0.next, x, y, w, h, alpha);
+    if (x0.inset == 1) { return; }
+    let is f64 as dx = _len(p, b, &x0.x, 0.0);
+    let is f64 as dy = _len(p, b, &x0.y, 0.0);
+    let is f64 as blur = _max(_len(p, b, &x0.blur, 0.0), 0.0);
+    let is f64 as sp = _len(p, b, &x0.spread, 0.0);
+    let is i64 as col with mut = x0.color;
+    if (col == v.COLOR_CURRENT) { col = b.st.v.i[pr.P_COLOR]; }
+    let is f64 as a = _a(col) * alpha;
+    let is f64 as sw = w + sp * 2.0;
+    let is f64 as sh = h + sp * 2.0;
+    if (a <= 0.0 || sw <= 0.0 || sh <= 0.0) { return; }
+    let is f64 as base = _min(w, h);
+    let is f64 as r with mut = 0.0;
+    if (_has_radius(b) == 1) {
+        r = _max(bx.resolve(b, pr.P_BORDER_TOP_LEFT_RADIUS, base), bx.resolve(b, pr.P_BORDER_TOP_RIGHT_RADIUS, base));
+        r = _max(r, _max(bx.resolve(b, pr.P_BORDER_BOTTOM_RIGHT_RADIUS, base), bx.resolve(b, pr.P_BORDER_BOTTOM_LEFT_RADIUS, base)));
+        r = _max(r + sp, 0.0);
+    }
+    // The toolkit rounds a shadow's corners by at least its blur, and on a box narrower than
+    // twice that the fade folds over itself, in spikes.
+    let is f64 as soft = _min(blur, _min(sw, sh) / 2.0);
+    let is *dl.Cmd as c = dl.shadow(p.l, x + dx - sp, y + dy - sp, sw, sh, _min(r, _min(sw, sh) / 2.0), soft, _rgb(col), a);
+    if (c != null) { c.fixed = p.fixed; }
+}
+
+fn _shadows(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    let is i64 as k = b.st.v.i[pr.P_BOX_SHADOW];
+    if (k == pr.K_NONE) { return; }
+    _shadows_of(p, b, cast(*v.Shadow, k), x, y, w, h, alpha);
+}
+
+// groove, ridge, inset and outset darken one or two sides so the box looks lit from the
+// top left.
+fn _shade(col as i64, kind as i64, side as i64) as i64 {
+    let is i64 as dark with mut = 0;
+    if (kind == pr.K_INSET) { dark = cast(i64, side == bx.TOP || side == bx.LEFT); }
+    if (kind == pr.K_OUTSET) { dark = cast(i64, side == bx.RIGHT || side == bx.BOTTOM); }
+    if (kind == pr.K_GROOVE) { dark = cast(i64, side == bx.TOP || side == bx.LEFT); }
+    if (kind == pr.K_RIDGE) { dark = cast(i64, side == bx.RIGHT || side == bx.BOTTOM); }
+    if (dark == 0) { return col; }
+    let is i64 as a = col & 4278190080;
+    let is i64 as r = ((col >> 16) & 255) * 2 / 3;
+    let is i64 as g = ((col >> 8) & 255) * 2 / 3;
+    let is i64 as bl = (col & 255) * 2 / 3;
+    return a | (r << 16) | (g << 8) | bl;
+}
+
+fn _side(p as *Painter, x as f64, y as f64, w as f64, h as f64, kind as i64, col as i64, alpha as f64, along_x as i64) as void {
+    if (kind != pr.K_DOTTED && kind != pr.K_DASHED) {
+        if (kind == pr.K_DOUBLE) {
+            if (along_x == 1 && h >= 3.0) {
+                let is f64 as t = h / 3.0;
+                _rect(p, x, y, w, t, col, alpha);
+                _rect(p, x, y + h - t, w, t, col, alpha);
+                return;
+            }
+            if (along_x == 0 && w >= 3.0) {
+                let is f64 as t = w / 3.0;
+                _rect(p, x, y, t, h, col, alpha);
+                _rect(p, x + w - t, y, t, h, col, alpha);
+                return;
+            }
+        }
+        _rect(p, x, y, w, h, col, alpha);
+        return;
+    }
+    let is f64 as thick with mut = h;
+    let is f64 as long with mut = w;
+    if (along_x == 0) {
+        thick = w;
+        long = h;
+    }
+    if (thick <= 0.0) { return; }
+    let is f64 as dash with mut = thick;
+    if (kind == pr.K_DASHED) { dash = thick * 3.0; }
+    let is f64 as at with mut = 0.0;
+    let is i64 as count with mut = 0;
+    while (at < long && count < MAX_TILES) {
+        let is f64 as n = _min(dash, long - at);
+        if (along_x == 1) { _rect(p, x + at, y, n, h, col, alpha); }
+        else { _rect(p, x, y + at, w, n, col, alpha); }
+        at = at + dash * 2.0;
+        count = count + 1;
+    }
+}
+
+fn _border(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is f64 as tw = b.b[bx.TOP];
+    let is f64 as rw = b.b[bx.RIGHT];
+    let is f64 as bw = b.b[bx.BOTTOM];
+    let is f64 as lw = b.b[bx.LEFT];
+    if (tw + rw + bw + lw <= 0.0) { return; }
+    let is i64 as ct = s.i[pr.P_BORDER_TOP_COLOR];
+    if (_has_radius(b) == 1 && tw == rw && rw == bw && bw == lw &&
+        ct == s.i[pr.P_BORDER_RIGHT_COLOR] && ct == s.i[pr.P_BORDER_BOTTOM_COLOR] && ct == s.i[pr.P_BORDER_LEFT_COLOR]) {
+        let is *dl.Cmd as c = dl.stroke(p.l, x, y, w, h, tw, _rgb(ct), _a(ct) * alpha);
+        if (c != null) {
+            c.fixed = p.fixed;
+            _radii(b, c, w, h);
+        }
+        return;
+    }
+    if (_has_radius(b) == 1) {
+        let is *dl.Cmd as c = dl.ring(p.l, x, y, w, h, alpha);
+        if (c != null) {
+            c.fixed = p.fixed;
+            _radii(b, c, w, h);
+            let is i64 as k with mut = 0;
+            while (k < 4) {
+                c.bw[k] = b.b[k];
+                c.bc[k] = _shade(s.i[pr.P_BORDER_TOP_COLOR + k], s.i[pr.P_BORDER_TOP_STYLE + k], k);
+                k = k + 1;
+            }
+        }
+        return;
+    }
+    if (tw > 0.0) { _side(p, x, y, w, tw, s.i[pr.P_BORDER_TOP_STYLE], _shade(s.i[pr.P_BORDER_TOP_COLOR], s.i[pr.P_BORDER_TOP_STYLE], bx.TOP), alpha, 1); }
+    if (bw > 0.0) { _side(p, x, y + h - bw, w, bw, s.i[pr.P_BORDER_BOTTOM_STYLE], _shade(s.i[pr.P_BORDER_BOTTOM_COLOR], s.i[pr.P_BORDER_BOTTOM_STYLE], bx.BOTTOM), alpha, 1); }
+    if (lw > 0.0) { _side(p, x, y + tw, lw, h - tw - bw, s.i[pr.P_BORDER_LEFT_STYLE], _shade(s.i[pr.P_BORDER_LEFT_COLOR], s.i[pr.P_BORDER_LEFT_STYLE], bx.LEFT), alpha, 0); }
+    if (rw > 0.0) { _side(p, x + w - rw, y + tw, rw, h - tw - bw, s.i[pr.P_BORDER_RIGHT_STYLE], _shade(s.i[pr.P_BORDER_RIGHT_COLOR], s.i[pr.P_BORDER_RIGHT_STYLE], bx.RIGHT), alpha, 0); }
+}
+
+fn _box_decorations(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (b.kind == bx.B_COL || b.kind == bx.B_TEXT || b.kind == bx.B_BR || b.kind == bx.B_INLINE) { return; }
+    if (_visible(b) == 0) { return; }
+    let is f64 as w = bx.border_w(b);
+    let is f64 as h = bx.border_h(b);
+    if (b.kind != bx.B_ROW && b.kind != bx.B_ROWGROUP) { _hit_add(p, b, b, b.ax, b.ay, w, h, 0); }
+    _shadows(p, b, b.ax, b.ay, w, h, alpha);
+    _background(p, b, b.ax, b.ay, w, h, alpha);
+    _border(p, b, b.ax, b.ay, w, h, alpha);
+    if (b.control == bx.CTL_SELECT) { _select_arrow(p, b, alpha); }
+    if (b.control == bx.CTL_DATE) { _date_icon(p, b, alpha); }
+    _outline(p, b, b.ax, b.ay, w, h, alpha);
+}
+
+// A line outside the border, which takes up no room. It marks what has the focus.
+fn _outline(p as *Painter, b as *bx.Box, x0 as f64, y0 as f64, w0 as f64, h0 as f64, alpha as f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as kind = s.i[pr.P_OUTLINE_STYLE];
+    if (kind == pr.K_NONE || kind == pr.K_HIDDEN) { return; }
+    let is f64 as t = s.f[pr.P_OUTLINE_WIDTH];
+    if (t <= 0.0) { return; }
+    let is f64 as off = s.f[pr.P_OUTLINE_OFFSET];
+    let is f64 as x = x0 - off - t;
+    let is f64 as y = y0 - off - t;
+    let is f64 as w = w0 + (off + t) * 2.0;
+    let is f64 as h = h0 + (off + t) * 2.0;
+    let is i64 as col = s.i[pr.P_OUTLINE_COLOR];
+    if (_has_radius(b) == 1) {
+        let is *dl.Cmd as c = dl.stroke(p.l, x, y, w, h, t, _rgb(col), _a(col) * alpha);
+        if (c != null) {
+            c.fixed = p.fixed;
+            _radii(b, c, w0, h0);
+            c.radius = c.radius + off + t;
+            c.r2 = c.r2 + off + t;
+            c.r3 = c.r3 + off + t;
+            c.r4 = c.r4 + off + t;
+        }
+        return;
+    }
+    _rect(p, x, y, w, t, col, alpha);
+    _rect(p, x, y + h - t, w, t, col, alpha);
+    _rect(p, x, y + t, t, h - t * 2.0, col, alpha);
+    _rect(p, x + w - t, y + t, t, h - t * 2.0, col, alpha);
+}
+
+// A thumb for a box that scrolls. It only says how far: the wheel is what moves it.
+fn _box_scrollbar(p as *Painter, b as *bx.Box) as void {
+    if (layout_scrolls(b) == 0) { return; }
+    let is f64 as x = b.ax + b.b[bx.LEFT];
+    let is f64 as y = b.ay + b.b[bx.TOP];
+    let is f64 as w = b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];
+    let is f64 as h = b.p[bx.TOP] + b.h + b.p[bx.BOTTOM];
+    if (b.max_sy > 0.0 && h > 0.0) {
+        let is f64 as bh = _max(h * h / (h + b.max_sy), 16.0);
+        let is f64 as top = y + (h - bh) * b.node.scroll_y / b.max_sy;
+        let is *dl.Cmd as c = dl.box(p.l, x + w - 6.0, top, 4.0, bh, 5855580, 0.6);
+        if (c != null) {
+            c.fixed = p.fixed;
+            c.radius = 2.0;
+            c.r2 = 2.0;
+            c.r3 = 2.0;
+            c.r4 = 2.0;
+        }
+    }
+    if (b.max_sx > 0.0 && w > 0.0) {
+        let is f64 as bw = _max(w * w / (w + b.max_sx), 16.0);
+        let is f64 as left = x + (w - bw) * b.node.scroll_x / b.max_sx;
+        let is *dl.Cmd as c = dl.box(p.l, left, y + h - 6.0, bw, 4.0, 5855580, 0.6);
+        if (c != null) {
+            c.fixed = p.fixed;
+            c.radius = 2.0;
+            c.r2 = 2.0;
+            c.r3 = 2.0;
+            c.r4 = 2.0;
+        }
+    }
+}
+
+fn layout_scrolls(b as *bx.Box) as i64 {
+    if (b.node == null) { return 0; }
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as ox = s.i[pr.P_OVERFLOW_X];
+    let is i64 as oy = s.i[pr.P_OVERFLOW_Y];
+    if (ox == pr.K_AUTO || ox == pr.K_SCROLL || oy == pr.K_AUTO || oy == pr.K_SCROLL) { return _clip_of(b); }
+    return 0;
+}
+
+// --- Replaced content and markers ---
+
+fn _replaced(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (_visible(b) == 0) { return; }
+    let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
+    if (b.img != null) {
+        let is *dl.Cmd as c = dl.image(p.l, x, y, b.w, b.h, b.img, alpha);
+        if (c != null) { c.fixed = p.fixed; }
+        return;
+    }
+    if (b.node != null && b.node.ns == dom.NS_SVG && b.w > 0.0 && b.h > 0.0) {
+        let is i64 as col = b.st.v.i[pr.P_COLOR];
+        let is *dl.Cmd as c = dl.svg(p.l, x, y, b.w, b.h, cast(*u8, b.node), col, alpha);
+        if (c != null) { c.fixed = p.fixed; }
+        return;
+    }
+    if (b.control == bx.CTL_RANGE) { _range(p, b, alpha); return; }
+    if (b.control == bx.CTL_COLOR) { _color_well(p, b, alpha); return; }
+    if (b.control != 0 && b.checked == 1) { _checked(p, b, alpha); }
+}
+
+fn _disc(p as *Painter, x as f64, y as f64, s as f64, col as i64, alpha as f64) as void {
+    let is *dl.Cmd as c = _rect(p, x, y, s, s, col, alpha);
+    if (c == null) { return; }
+    c.radius = s;
+    c.r2 = s;
+    c.r3 = s;
+    c.r4 = s;
+}
+
+fn _line(p as *Painter, x0 as f64, y0 as f64, x1 as f64, y1 as f64, width as f64, col as i64, alpha as f64) as void {
+    let is f64 as a = _a(col) * alpha;
+    if (a <= 0.0) { return; }
+    let is *dl.Cmd as c = dl.line(p.l, x0, y0, x1, y1, width, _rgb(col), a);
+    if (c != null) { c.fixed = p.fixed; }
+}
+
+// What a page chose for its controls, or the blue they have by themselves.
+fn _accent(b as *bx.Box) as i64 {
+    let is i64 as k = b.st.v.i[pr.P_ACCENT_COLOR];
+    if (k == pr.K_AUTO) { return CHECKED; }
+    if (k == v.COLOR_CURRENT) { return b.st.v.i[pr.P_COLOR]; }
+    return k;
+}
+
+fn _round(c as *dl.Cmd, r as f64) as void {
+    if (c == null) { return; }
+    c.radius = r;
+    c.r2 = r;
+    c.r3 = r;
+    c.r4 = r;
+}
+
+// Over the whole control, border and all, as the colour of a checked one covers it.
+fn _checked(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    let is f64 as x = b.ax;
+    let is f64 as y = b.ay;
+    let is f64 as s = bx.border_w(b);
+    let is i64 as col = _accent(b);
+    if (b.control == bx.CTL_RADIO) {
+        _disc(p, x, y, s, col, alpha);
+        _disc(p, x + s * 0.12, y + s * 0.12, s * 0.76, 4294967295, alpha);
+        _disc(p, x + s * 0.25, y + s * 0.25, s * 0.5, col, alpha);
+        return;
+    }
+    _round(_rect(p, x, y, s, s, col, alpha), 2.0);
+    let is f64 as t = s * 0.15;
+    _line(p, x + s * 0.22, y + s * 0.52, x + s * 0.42, y + s * 0.72, t, 4294967295, alpha);
+    _line(p, x + s * 0.42, y + s * 0.72, x + s * 0.80, y + s * 0.28, t, 4294967295, alpha);
+}
+
+fn _range(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (b.node == null || b.w <= 0.0 || b.h <= 0.0) { return; }
+    let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
+    let is f64 as lo = forms.range_min(b.node);
+    let is f64 as hi = forms.range_max(b.node);
+    let is f64 as val = forms.range_value(b.node);
+    let is f64 as frac with mut = 0.0;
+    if (hi > lo) { frac = (val - lo) / (hi - lo); }
+    let is f64 as thumb = _min(16.0, _min(b.w, b.h));
+    let is f64 as bar = 8.0;
+    let is f64 as cy = y + b.h / 2.0;
+    let is f64 as cx = x + thumb / 2.0 + frac * (b.w - thumb);
+    let is i64 as col = _accent(b);
+    _round(_rect(p, x, cy - bar / 2.0, b.w, bar, 4294112231, alpha), bar / 2.0);
+    let is *dl.Cmd as e = dl.stroke(p.l, x, cy - bar / 2.0, b.w, bar, 1.0, 11711154, alpha);
+    if (e != null) {
+        e.fixed = p.fixed;
+        _round(e, bar / 2.0);
+    }
+    _round(_rect(p, x, cy - bar / 2.0, cx - x, bar, col, alpha), bar / 2.0);
+    _disc(p, cx - thumb / 2.0, cy - thumb / 2.0, thumb, col, alpha);
+}
+
+fn _hex_digit(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn _color_well(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (b.node == null) { return; }
+    let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
+    let is i64 as col with mut = 4278190080;
+    let is *dom.Attr as a = dom.find_attr(b.node, "value", 5);
+    if (a != null && a.value_len == 7 && a.value[0] == 35) {
+        let is i64 as k with mut = 1;
+        let is i64 as rgb with mut = 0;
+        while (k < 7) {
+            rgb = rgb * 16 + _hex_digit(cast(i64, a.value[k]));
+            k = k + 1;
+        }
+        col = 4278190080 | rgb;
+    }
+    _rect(p, x, y, b.w, b.h, col, alpha);
+    _rect(p, x, y, b.w, 1.0, 4286019447, alpha);
+    _rect(p, x, y + b.h - 1.0, b.w, 1.0, 4286019447, alpha);
+    _rect(p, x, y, 1.0, b.h, 4286019447, alpha);
+    _rect(p, x + b.w - 1.0, y, 1.0, b.h, 4286019447, alpha);
+}
+
+fn _select_arrow(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    let is f64 as cx = b.ax + bx.border_w(b) - b.b[bx.RIGHT] - 12.0;
+    let is f64 as cy = b.ay + bx.border_h(b) / 2.0;
+    let is i64 as col = b.st.v.i[pr.P_COLOR];
+    _line(p, cx - 4.0, cy - 2.0, cx, cy + 2.0, 1.5, col, alpha);
+    _line(p, cx, cy + 2.0, cx + 4.0, cy - 2.0, 1.5, col, alpha);
+}
+
+fn _date_icon(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    let is f64 as x = b.ax + bx.border_w(b) - b.b[bx.RIGHT] - 22.0;
+    let is f64 as y = b.ay + bx.border_h(b) / 2.0 - 6.0;
+    let is i64 as col = b.st.v.i[pr.P_COLOR];
+    let is *dl.Cmd as e = dl.stroke(p.l, x, y + 1.0, 12.0, 11.0, 1.2, _rgb(col), _a(col) * alpha);
+    if (e != null) {
+        e.fixed = p.fixed;
+        _round(e, 1.5);
+    }
+    _rect(p, x, y + 1.0, 12.0, 3.0, col, alpha);
+    _rect(p, x + 2.5, y - 0.5, 1.5, 3.0, col, alpha);
+    _rect(p, x + 8.0, y - 0.5, 1.5, 3.0, col, alpha);
+}
+
+fn _marker(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    if (b.marker == bx.MARK_NONE || _visible(b) == 0) { return; }
+    let is *style.Style as st = b.st;
+    let is f64 as em = st.v.f[pr.P_FONT_SIZE];
+    let is f64 as base with mut = b.oy + b.first_base;
+    if (b.first_base == bx.NO_BASE) { base = b.ay + b.b[bx.TOP] + b.p[bx.TOP] + m.ascent(st); }
+    let is f64 as right = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is i64 as col = st.v.i[pr.P_COLOR];
+    if (b.marker == bx.MARK_IMAGE && b.mimg != null) {
+        let is f64 as w = cast(f64, b.mimg.width);
+        let is f64 as h = cast(f64, b.mimg.height);
+        let is *dl.Cmd as c = dl.image(p.l, right - w - em * 0.4, base - h, w, h, b.mimg, alpha);
+        if (c != null) { c.fixed = p.fixed; }
+        return;
+    }
+    if (b.marker == bx.MARK_TEXT) {
+        let is f64 as w = m.width(st, b.mtext, b.mlen) + em * 0.4;
+        let is *dl.Cmd as c = dl.run(p.l, right - w, base - m.ascent(st), b.mtext, b.mlen,
+                                     cast(*u8, st.v.i[pr.P_FONT_FAMILY]), em, cast(i64, st.v.f[pr.P_FONT_WEIGHT]), 0, 0, _rgb(col), _a(col) * alpha);
+        if (c != null) { c.fixed = p.fixed; }
+        return;
+    }
+    let is f64 as size = em * 0.35;
+    let is f64 as x = right - em * 0.6 - size;
+    let is f64 as y = base - em * 0.3 - size / 2.0;
+    if (b.marker == bx.MARK_SQUARE) {
+        _rect(p, x, y, size, size, col, alpha);
+        return;
+    }
+    if (b.marker == bx.MARK_DISC) {
+        let is *dl.Cmd as c = _rect(p, x, y, size, size, col, alpha);
+        if (c != null) {
+            c.radius = size;
+            c.r2 = size;
+            c.r3 = size;
+            c.r4 = size;
+        }
+        return;
+    }
+    let is *dl.Cmd as c = dl.stroke(p.l, x, y, size, size, 1.0, _rgb(col), _a(col) * alpha);
+    if (c != null) {
+        c.fixed = p.fixed;
+        c.radius = size;
+        c.r2 = size;
+        c.r3 = size;
+        c.r4 = size;
+    }
+}
+
+// --- Lines ---
+
+fn _inline_box(p as *Painter, f as *bx.Frag, ox as f64, oy as f64, alpha as f64) as void {
+    let is *bx.Box as x = f.box;
+    if (_visible(x) == 0 || f.w <= 0.0) { return; }
+    _hit_add(p, x, p.owner, ox + f.x, oy + f.y, f.w, f.h, 0);
+    _shadows(p, x, ox + f.x, oy + f.y, f.w, f.h, alpha);
+    _background(p, x, ox + f.x, oy + f.y, f.w, f.h, alpha);
+    _border(p, x, ox + f.x, oy + f.y, f.w, f.h, alpha);
+    _outline(p, x, ox + f.x, oy + f.y, f.w, f.h, alpha);
+}
+
+fn _text(p as *Painter, f as *bx.Frag, ox as f64, oy as f64, alpha as f64) as void {
+    let is *style.Style as st = f.box.st;
+    if (_visible(f.box) == 0) { return; }
+    _hit_add(p, f.box, p.owner, ox + f.x, oy + f.y, f.w, f.h, 1);
+    let is i64 as col = st.v.i[pr.P_COLOR];
+    let is f64 as a = _a(col) * alpha;
+    if (a <= 0.0) { return; }
+    let is i64 as deco = cast(i64, st.v.f[pr.P_X_DECORATIONS]);
+    let is i64 as italic with mut = 0;
+    if (st.v.i[pr.P_FONT_STYLE] != pr.K_NORMAL) { italic = 1; }
+    let is *dl.Cmd as c = dl.run(p.l, ox + f.x, oy + f.y, f.text, f.len,
+                                 cast(*u8, st.v.i[pr.P_FONT_FAMILY]), st.v.f[pr.P_FONT_SIZE],
+                                 cast(i64, st.v.f[pr.P_FONT_WEIGHT]), italic, deco, _rgb(col), a);
+    if (c != null) {
+        c.fixed = p.fixed;
+        c.rw = f.w;
+        c.rh = f.h;
+        c.ls = st.v.f[pr.P_LETTER_SPACING];
+    }
+}
+
+// The lines of b, and the inline-blocks in them, each painted whole where the text is.
+fn _lines(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    let is f64 as ox = b.kx;
+    let is f64 as oy = b.ky;
+    let is *bx.Frag as f with mut = b.frags;
+    let is *bx.Box as was = p.owner;
+    p.owner = b;
+    while (f != null) {
+        if (f.kind == bx.FRAG_BOX) { _inline_box(p, f, ox, oy, alpha); }
+        else if (f.kind == bx.FRAG_TEXT) { _text(p, f, ox, oy, alpha); }
+        else if (f.kind == bx.FRAG_ATOMIC) {
+            let is *bx.Box as x = f.box;
+            if (_is_positioned(x) == 0 && _starts_context(x) == 0) { _unit(p, x, alpha); }
+        }
+        f = f.next;
+    }
+    p.owner = was;
+}
+
+// --- The order ---
+
+fn _clip_of(b as *bx.Box) as i64 {
+    let is *pr.Values as s = &b.st.v;
+    if (s.i[pr.P_OVERFLOW_X] == pr.K_VISIBLE && s.i[pr.P_OVERFLOW_Y] == pr.K_VISIBLE) { return 0; }
+    // On the root and the body this means the window, which is already a clip.
+    if (b.node != null && (b.node.tag == tg.HTML || b.node.tag == tg.BODY)) { return 0; }
+    return 1;
+}
+
+struct _Clip {
+    x0 as f64;
+    y0 as f64;
+    x1 as f64;
+    y1 as f64;
+}
+
+struct _Moved {
+    inv   as *[6]f64;
+    total as *f64;
+    clip  as _Clip;
+}
+
+fn _push_clip(p as *Painter, b as *bx.Box, was as *_Clip) as void {
+    let is f64 as x = b.ax + b.b[bx.LEFT];
+    let is f64 as y = b.ay + b.b[bx.TOP];
+    let is f64 as w = b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];
+    let is f64 as h = b.p[bx.TOP] + b.h + b.p[bx.BOTTOM];
+    let is *dl.Cmd as c = dl.clip(p.l, x, y, w, h);
+    if (c != null) {
+        c.fixed = p.fixed;
+        // Its corners are the border's, as far in as the border is thick.
+        _radii(b, c, bx.border_w(b), bx.border_h(b));
+        c.radius = _max(c.radius - _max(b.b[bx.TOP], b.b[bx.LEFT]), 0.0);
+        c.r2 = _max(c.r2 - _max(b.b[bx.TOP], b.b[bx.RIGHT]), 0.0);
+        c.r3 = _max(c.r3 - _max(b.b[bx.BOTTOM], b.b[bx.RIGHT]), 0.0);
+        c.r4 = _max(c.r4 - _max(b.b[bx.BOTTOM], b.b[bx.LEFT]), 0.0);
+    }
+    was.x0 = p.cx0;
+    was.y0 = p.cy0;
+    was.x1 = p.cx1;
+    was.y1 = p.cy1;
+    p.cx0 = _max(p.cx0, x);
+    p.cy0 = _max(p.cy0, y);
+    p.cx1 = _min(p.cx1, x + w);
+    p.cy1 = _min(p.cy1, y + h);
+}
+
+fn _pop_clip(p as *Painter, was as *_Clip) as void {
+    dl.unclip(p.l);
+    p.cx0 = was.x0;
+    p.cy0 = was.y0;
+    p.cx1 = was.x1;
+    p.cy1 = was.y1;
+}
+
+// Whether this box takes its own turn, instead of being painted as part of the flow.
+fn _own_layer(b as *bx.Box) as i64 {
+    if (_starts_context(b) == 1) { return 1; }
+    return 0;
+}
+
+fn _phase_walk(p as *Painter, b as *bx.Box, phase as i64, alpha as f64) as void {
+    if (b.kind == bx.B_TEXT || b.kind == bx.B_BR || b.kind == bx.B_COL) { return; }
+    let is i64 as clip = _clip_of(b);
+    if (phase == PHASE_INLINE && b.kind == bx.B_REPLACED && b.atomic == 0) { _replaced(p, b, alpha); }
+    let is _Clip as was with mut;
+    if (clip == 1) { _push_clip(p, b, &was); }
+    if (phase == PHASE_INLINE) {
+        _marker(p, b, alpha);
+        if (b.inline_ctx == 1) { _lines(p, b, alpha); }
+    }
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        _visit(p, x, phase, alpha);
+        x = x.next;
+    }
+    if (clip == 1) { _pop_clip(p, &was); }
+    if (phase == PHASE_INLINE) { _box_scrollbar(p, b); }
+}
+
+fn _visit(p as *Painter, x as *bx.Box, phase as i64, alpha as f64) as void {
+    if (x.kind == bx.B_TEXT || x.kind == bx.B_BR || x.kind == bx.B_COL) { return; }
+    if (x.kind == bx.B_INLINE) {
+        // Its fragments belong to its container; only what is out of flow in it is left.
+        let is *bx.Box as k with mut = x.first;
+        while (k != null) {
+            if (k.is_float == 1 || k.is_abs == 1 || k.kind == bx.B_INLINE) { _visit(p, k, phase, alpha); }
+            k = k.next;
+        }
+        return;
+    }
+    if (_own_layer(x) == 1) { return; }
+    if (x.atomic == 1) { return; }
+    if (x.is_float == 1) {
+        if (phase == PHASE_FLOATS) { _unit(p, x, alpha); }
+        return;
+    }
+    if (phase == PHASE_BLOCKS) { _box_decorations(p, x, alpha); }
+    _phase_walk(p, x, phase, alpha);
+}
+
+// A float or inline-block paints as if it were a small context, without being one for
+// the positioned boxes in it.
+fn _unit(p as *Painter, b as *bx.Box, alpha as f64) as void {
+    _box_decorations(p, b, alpha);
+    if (b.kind == bx.B_REPLACED) {
+        _replaced(p, b, alpha);
+        return;
+    }
+    _phase_walk(p, b, PHASE_BLOCKS, alpha);
+    _phase_walk(p, b, PHASE_FLOATS, alpha);
+    _phase_walk(p, b, PHASE_INLINE, alpha);
+}
+
+fn _insert_sorted(p as *Painter, head as **StackItem, b as *bx.Box) as void {
+    let is *StackItem as e = cast(*StackItem, arena.alloc(p.tmp, sizeof(StackItem)));
+    e.b = b;
+    e.z = 0.0;
+    if (bx.prop(b, pr.P_Z_INDEX) != pr.K_AUTO) { e.z = b.st.v.f[pr.P_Z_INDEX]; }
+    if (*head == null || (*head).z > e.z) {
+        e.next = *head;
+        *head = e;
+        return;
+    }
+    let is *StackItem as q with mut = *head;
+    while (q.next != null && q.next.z <= e.z) { q = q.next; }
+    e.next = q.next;
+    q.next = e;
+}
+
+// Every box that takes its own turn in this context, not looking inside those.
+fn _collect(p as *Painter, b as *bx.Box, head as **StackItem) as void {
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.kind != bx.B_TEXT && x.kind != bx.B_BR && x.kind != bx.B_COL) {
+            if (_own_layer(x) == 1 && x.kind != bx.B_INLINE) { _insert_sorted(p, head, x); }
+            else { _collect(p, x, head); }
+        }
+        x = x.next;
+    }
+}
+
+// What a transform does to the box, about its origin, in the page's coordinates.
+fn _matrix(p as *Painter, b as *bx.Box, out as *f64) as void { box_matrix(p.c.e, b, out); }
+
+fn box_matrix(e as *style.Engine, b as *bx.Box, out as *f64) as void {
+    let is *pr.Values as s = &b.st.v;
+    let is f64 as w = bx.border_w(b);
+    let is f64 as h = bx.border_h(b);
+    let is f64 as ox with mut = w / 2.0;
+    let is f64 as oy with mut = h / 2.0;
+    if (s.i[pr.P_TRANSFORM_ORIGIN_X] == 0) { ox = s.f[pr.P_TRANSFORM_ORIGIN_X] + s.p[pr.P_TRANSFORM_ORIGIN_X] * w / 100.0; }
+    if (s.i[pr.P_TRANSFORM_ORIGIN_Y] == 0) { oy = s.f[pr.P_TRANSFORM_ORIGIN_Y] + s.p[pr.P_TRANSFORM_ORIGIN_Y] * h / 100.0; }
+    let is [6]f64 as local with mut;
+    tr.matrix_of(e, cast(*v.Transform, s.i[pr.P_TRANSFORM]), w, h, s.f[pr.P_FONT_SIZE], cast(*f64, &local));
+    let is [6]f64 as to with mut;
+    tr.identity(cast(*f64, &to));
+    to[4] = b.ax + ox;
+    to[5] = b.ay + oy;
+    let is [6]f64 as back with mut;
+    tr.identity(cast(*f64, &back));
+    back[4] = 0.0 - to[4];
+    back[5] = 0.0 - to[5];
+    tr.mul(cast(*f64, &to), cast(*f64, &local), out);
+    tr.mul(out, cast(*f64, &back), out);
+}
+
+// A rectangle under a matrix: the box around where its corners land.
+fn _map_box(mx as *f64, x0 as f64, y0 as f64, x1 as f64, y1 as f64, out as *_Clip) as void {
+    let is f64 as ax = mx[0] * x0;
+    let is f64 as bx1 = mx[0] * x1;
+    let is f64 as cx = mx[2] * y0;
+    let is f64 as dx = mx[2] * y1;
+    let is f64 as ay = mx[1] * x0;
+    let is f64 as by = mx[1] * x1;
+    let is f64 as cy = mx[3] * y0;
+    let is f64 as dy = mx[3] * y1;
+    out.x0 = _min(ax, bx1) + _min(cx, dx) + mx[4];
+    out.x1 = _max(ax, bx1) + _max(cx, dx) + mx[4];
+    out.y0 = _min(ay, by) + _min(cy, dy) + mx[5];
+    out.y1 = _max(ay, by) + _max(cy, dy) + mx[5];
+}
+
+// Starts what a transform on the box does: what it draws, and where its parts are hit.
+fn _moved_on(p as *Painter, b as *bx.Box, saved as *_Moved) as void {
+    let is *f64 as mx = cast(*f64, arena.alloc(p.c.a, 48));
+    _matrix(p, b, mx);
+    let is *dl.Cmd as c = dl.moved(p.l, b.ax, b.ay, bx.border_w(b), bx.border_h(b), mx);
+    if (c != null) { c.fixed = p.fixed; }
+    saved.inv = p.inv;
+    saved.total = p.total;
+    saved.clip.x0 = p.cx0;
+    saved.clip.y0 = p.cy0;
+    saved.clip.x1 = p.cx1;
+    saved.clip.y1 = p.cy1;
+    let is *f64 as total = cast(*f64, arena.alloc(p.c.a, 48));
+    if (p.total == null) {
+        mem.core.memcpy(cast(*u8, total), cast(*u8, mx), 48);
+    } else {
+        tr.mul(p.total, mx, total);
+    }
+    p.total = total;
+    let is *f64 as inv = cast(*f64, arena.alloc(p.c.a, 48));
+    if (tr.invert(total, inv) == 0) {
+        // Nothing is left of it to be hit.
+        p.cx1 = p.cx0 - 1.0;
+        return;
+    }
+    p.inv = cast(*[6]f64, inv);
+    // A clip from outside it holds in the coordinates of the page, and from here the hit
+    // is tested in its own. The box around it is near enough, and far enough at a turn.
+    if (p.cx1 - p.cx0 < 1000000000.0) {
+        let is [6]f64 as here with mut;
+        tr.invert(mx, cast(*f64, &here));
+        let is _Clip as mapped with mut;
+        _map_box(cast(*f64, &here), p.cx0, p.cy0, p.cx1, p.cy1, &mapped);
+        p.cx0 = mapped.x0;
+        p.cy0 = mapped.y0;
+        p.cx1 = mapped.x1;
+        p.cy1 = mapped.y1;
+    }
+}
+
+fn _moved_off(p as *Painter, saved as *_Moved) as void {
+    dl.unmoved(p.l);
+    p.inv = saved.inv;
+    p.total = saved.total;
+    p.cx0 = saved.clip.x0;
+    p.cy0 = saved.clip.y0;
+    p.cx1 = saved.clip.x1;
+    p.cy1 = saved.clip.y1;
+}
+
+fn _escapes(b as *bx.Box, x as *bx.Box, clip as i64) as i64 {
+    if (clip == 0) { return 0; }
+    if (x.is_fixed == 1) { return 1; }
+    if (x.is_abs == 1 && _is_positioned(b) == 0 && _has_transform(b) == 0) { return 1; }
+    return 0;
+}
+
+fn _context(p as *Painter, b as *bx.Box, alpha0 as f64) as void {
+    let is f64 as alpha = _opacity(b, alpha0);
+    let is i64 as was_fixed = p.fixed;
+    if (b.is_fixed == 1) { p.fixed = 1; }
+    let is _Moved as mv with mut;
+    let is i64 as moves = _has_transform(b);
+    if (moves == 1) { _moved_on(p, b, &mv); }
+    if (b.parent != null || b.kind != bx.B_BLOCK || b.anon == 0) { _box_decorations(p, b, alpha); }
+    let is *StackItem as layers with mut = cast(*StackItem, 0);
+    _collect(p, b, &layers);
+    let is i64 as clip with mut = 0;
+    if (b.kind != bx.B_REPLACED) { clip = _clip_of(b); }
+    let is _Clip as was with mut;
+    if (clip == 1) { _push_clip(p, b, &was); }
+    let is *StackItem as e with mut = layers;
+    while (e != null && e.z < 0.0) {
+        if (_escapes(b, e.b, clip) == 0) { _context(p, e.b, alpha); }
+        e = e.next;
+    }
+    if (b.kind == bx.B_REPLACED) {
+        _replaced(p, b, alpha);
+    } else {
+        let is *bx.Box as x with mut = b.first;
+        while (x != null) {
+            _visit(p, x, PHASE_BLOCKS, alpha);
+            x = x.next;
+        }
+        x = b.first;
+        while (x != null) {
+            _visit(p, x, PHASE_FLOATS, alpha);
+            x = x.next;
+        }
+        _marker(p, b, alpha);
+        if (b.inline_ctx == 1) { _lines(p, b, alpha); }
+        x = b.first;
+        while (x != null) {
+            _visit(p, x, PHASE_INLINE, alpha);
+            x = x.next;
+        }
+    }
+    while (e != null) {
+        if (_escapes(b, e.b, clip) == 0) { _context(p, e.b, alpha); }
+        e = e.next;
+    }
+    if (clip == 1) { _pop_clip(p, &was); }
+    if (b.kind != bx.B_REPLACED) { _box_scrollbar(p, b); }
+    // What is placed against something further out is not what this box clips.
+    if (clip == 1) {
+        e = layers;
+        while (e != null) {
+            if (_escapes(b, e.b, 1) == 1) { _context(p, e.b, alpha); }
+            e = e.next;
+        }
+    }
+    if (moves == 1) { _moved_off(p, &mv); }
+    p.fixed = was_fixed;
+}
+
+// The canvas takes the root's background, or failing that the body's, so a page's colour
+// does not stop where its content does.
+fn _canvas(p as *Painter, root as *bx.Box, w as f64, h as f64) as void {
+    let is *bx.Box as html = root.first;
+    if (html == null || html.node == null) {
+        _rect(p, 0.0, 0.0, w, h, 4294967295, 1.0);
+        return;
+    }
+    let is *bx.Box as from with mut = html;
+    let is i64 as empty = cast(i64, (bx.prop(html, pr.P_BACKGROUND_COLOR) >> 24) == 0 && bx.prop(html, pr.P_BACKGROUND_IMAGE) == pr.K_NONE && bx.prop(html, pr.P_X_GRADIENT) == pr.K_NONE);
+    if (empty == 1) {
+        let is *bx.Box as x with mut = html.first;
+        while (x != null) {
+            if (x.node != null && x.node.tag == tg.BODY) { from = x; break; }
+            x = x.next;
+        }
+    }
+    _rect(p, 0.0, 0.0, w, h, 4294967295, 1.0);
+    let is i64 as col = bx.prop(from, pr.P_BACKGROUND_COLOR);
+    _rect(p, 0.0, 0.0, w, h, col, 1.0);
+    if (bx.prop(from, pr.P_BACKGROUND_IMAGE) != pr.K_NONE && cast(i64, p.c.images) != 0) {
+        let is *u8 as u = cast(*u8, bx.prop(from, pr.P_BACKGROUND_IMAGE));
+        let is *dl.Image as im = call(p.c.images, p.c.user, u, url.len_of(u));
+        if (im != null) { _bg_tiles(p, from, im, 0.0, 0.0, w, h, 1.0); }
+    }
+    if (bx.prop(from, pr.P_X_GRADIENT) != pr.K_NONE) {
+        _grad_layers(p, from, cast(*v.Gradient, bx.prop(from, pr.P_X_GRADIENT)), 0.0, 0.0, w, h, 1.0);
+    }
+}
+
+// The laid-out tree under root, into l. w and h are how big the page's canvas is, and
+// what gets its background. tmp is only needed until this returns.
+fn paint(c as *bx.Ctx, root as *bx.Box, l as *dl.List, w as f64, h as f64, tmp as *arena.Arena) as void {
+    let is Painter as pn with mut;
+    pn.c = c;
+    pn.l = l;
+    pn.fixed = 0;
+    pn.tmp = tmp;
+    pn.cx0 = 0.0 - 1000000000.0;
+    pn.cy0 = 0.0 - 1000000000.0;
+    pn.cx1 = 1000000000.0;
+    pn.cy1 = 1000000000.0;
+    pn.owner = root;
+    pn.inv = cast(*[6]f64, 0);
+    pn.total = cast(*f64, 0);
+    c.nhits = 0;
+    dl.clear(l);
+    _canvas(&pn, root, w, h);
+    _context(&pn, root, 1.0);
+}

@@ -1,0 +1,1303 @@
+// css/style.cst — the cascade: which declarations apply to an element, and the values
+// that come out.
+//
+// Every rule's rightmost compound names something an element can be looked up by, so
+// an element is only ever tested against the rules that could match it: its id's, its
+// classes', its tag's, and the few with nothing to go on.
+//
+// A style is written in three passes, because each needs the one before: custom
+// properties, as anything can read them; font-size, as em means it; then the rest.
+// Within a pass the declarations run from least to most important, so the last to
+// write a value is simply the winner.
+
+use "../base/arena.cst" as arena;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "./tokens.cst" as tok;
+use "./props.cst" as pr;
+use "./values.cst" as v;
+use "./decl.cst" as decl;
+use "./sheet.cst" as sh;
+use "std/mem.cst" as mem;
+
+let is i64 as BUCKETS with imut = 4096;
+let is i64 as MAX_MATCHES with imut = 4096;
+// Nothing bounds how deep a page can nest, and everything from here to painting recurses.
+// Past this, as in other browsers' parsers, elements simply do not show.
+let is i64 as MAX_DEPTH with imut = 512;
+
+let is i64 as TIER_UA          with imut = 0;
+let is i64 as TIER_HINTS       with imut = 1;
+let is i64 as TIER_AUTHOR      with imut = 2;
+let is i64 as TIER_INLINE      with imut = 3;
+let is i64 as TIER_AUTHOR_IMP  with imut = 4;
+let is i64 as TIER_INLINE_IMP  with imut = 5;
+let is i64 as TIER_UA_IMP      with imut = 6;
+let is i64 as TIERS            with imut = 7;
+
+struct Var {
+    name  as *u8;
+    n     as i64;
+    toks  as *tok.Token;
+    ntoks as i64;
+    next  as *Var;
+}
+
+struct Style {
+    v      as pr.Values;
+    vars   as *Var;
+    before as *Style;     // null unless a rule gave it content
+    after  as *Style;
+    placeholder as *Style;   // a field's, only when a rule speaks of it
+    late   as *Late;
+}
+
+// A min(), max() or clamp() with a percentage in it, which its box settles.
+struct Late {
+    p    as i64;
+    e    as *Engine;
+    em   as f64;
+    len  as v.Len;
+    next as *Late;
+}
+
+struct Entry {
+    sel  as *sh.Selector;
+    rule as *sh.Rule;
+    seq  as i64;
+    next as *Entry;
+    dyn_next as *Entry;   // among those that ask what a person is doing
+}
+
+// All of a page's sheets, indexed. The index outlives the styles made from it.
+struct Engine {
+    a        as *arena.Arena;   // the styles
+    ia       as *arena.Arena;   // the index
+    buckets  as [BUCKETS]*Entry;
+    universal as *Entry;
+    dynamic  as *Entry;
+    seq      as i64;
+    viewport as i64;           // something depends on the window's size, so a new one means new styles
+    vw       as f64;
+    vh       as f64;
+    root_em  as f64;
+    base     as *u8;
+    keyframes as *sh.Keyframes;
+}
+
+let is pr.Values as _initial with mut;
+let is i64 as _initial_ready with mut = 0;
+let is [MAX_MATCHES]*Entry as _matches with mut;
+
+fn _hash(s as *u8, n as i64) as i64 {
+    let is i64 as h with mut = 2166136261;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = (h ^ cast(i64, s[i])) * 16777619;
+        h = h & 4294967295;
+        i = i + 1;
+    }
+    return h & (BUCKETS - 1);
+}
+
+fn init(e as *Engine, a as *arena.Arena, ia as *arena.Arena, base as *u8) as void {
+    e.a = a;
+    e.ia = ia;
+    let is i64 as i with mut = 0;
+    while (i < BUCKETS) {
+        e.buckets[i] = cast(*Entry, 0);
+        i = i + 1;
+    }
+    e.universal = cast(*Entry, 0);
+    e.dynamic = cast(*Entry, 0);
+    e.seq = 0;
+    e.keyframes = cast(*sh.Keyframes, 0);
+    e.viewport = 0;
+    e.vw = 0.0;
+    e.vh = 0.0;
+    e.root_em = 16.0;
+    e.base = base;
+    if (_initial_ready == 0) {
+        mem.memzero(cast(*u8, &_initial), sizeof(pr.Values));
+        pr.set_initial(&_initial);
+        _initial_ready = 1;
+    }
+}
+
+// The rules of a sheet, after those of any added before it.
+fn add_sheet(e as *Engine, s as *sh.Sheet) as void {
+    if (s.viewport == 1) { e.viewport = 1; }
+    // The last one of a name wins, so the newest go first.
+    let is *sh.Keyframes as k with mut = s.keyframes;
+    s.keyframes = cast(*sh.Keyframes, 0);
+    while (k != null) {
+        let is *sh.Keyframes as next = k.next;
+        k.next = e.keyframes;
+        e.keyframes = k;
+        k = next;
+    }
+    let is *sh.Rule as r with mut = s.first;
+    while (r != null) {
+        let is *sh.Selector as x with mut = r.selectors;
+        while (x != null) {
+            _index(e, x, r);
+            x = x.next;
+        }
+        r = r.next;
+    }
+}
+
+fn _index(e as *Engine, x as *sh.Selector, r as *sh.Rule) as void {
+    let is *Entry as en = cast(*Entry, arena.alloc(e.ia, sizeof(Entry)));
+    en.sel = x;
+    en.rule = r;
+    en.seq = e.seq;
+    e.seq = e.seq + 1;
+    if (_selector_asks(x) == 1) {
+        en.dyn_next = e.dynamic;
+        e.dynamic = en;
+    }
+    // The most selective name in the rightmost compound.
+    let is *sh.Simple as best with mut = cast(*sh.Simple, 0);
+    let is *sh.Simple as s with mut = x.right.first;
+    while (s != null) {
+        if (s.kind == sh.S_ID) { best = s; break; }
+        if (s.kind == sh.S_CLASS && (best == null || best.kind == sh.S_TYPE)) { best = s; }
+        if (s.kind == sh.S_TYPE && best == null) { best = s; }
+        s = s.next;
+    }
+    if (best == null) {
+        en.next = e.universal;
+        e.universal = en;
+        return;
+    }
+    let is i64 as h = _hash(best.s, best.n);
+    en.next = e.buckets[h];
+    e.buckets[h] = en;
+}
+
+// --- What a person is doing ---
+
+fn _is_state(s as *sh.Simple) as i64 {
+    let is i64 as k = s.kind;
+    if (k == sh.S_HOVER || k == sh.S_ACTIVE || k == sh.S_FOCUS || k == sh.S_FOCUS_WITHIN ||
+        k == sh.S_FOCUS_VISIBLE || k == sh.S_TARGET) { return 1; }
+    return 0;
+}
+
+// Whether this simple selector's answer can change while the page just sits there.
+fn _simple_asks(s as *sh.Simple) as i64 {
+    if (_is_state(s) == 1) { return 1; }
+    if (s.kind == sh.S_NOT || s.kind == sh.S_IS || s.kind == sh.S_HAS) {
+        let is *sh.Selector as x with mut = s.sub;
+        while (x != null) {
+            if (_selector_asks(x) == 1) { return 1; }
+            x = x.next;
+        }
+    }
+    return 0;
+}
+
+fn _compound_asks(c as *sh.Compound) as i64 {
+    let is *sh.Simple as s with mut = c.first;
+    while (s != null) {
+        if (_simple_asks(s) == 1) { return 1; }
+        s = s.next;
+    }
+    return 0;
+}
+
+fn _selector_asks(x as *sh.Selector) as i64 {
+    let is *sh.Compound as c with mut = x.right;
+    while (c != null) {
+        if (_compound_asks(c) == 1) { return 1; }
+        c = c.left;
+    }
+    return 0;
+}
+
+// n matches c, whatever is being done to it.
+fn _matches_but_for_state(n as *dom.Node, c as *sh.Compound) as i64 {
+    let is *sh.Simple as s with mut = c.first;
+    while (s != null) {
+        if (_simple_asks(s) == 0 && _match_simple(n, s) == 0) { return 0; }
+        s = s.next;
+    }
+    return 1;
+}
+
+// Whether a change in what is being done to n can change any style. Asking this for every
+// element the pointer crosses is what lets a page with no :hover rules cost nothing.
+fn state_matters(e as *Engine, n as *dom.Node) as i64 {
+    let is *Entry as en with mut = e.dynamic;
+    while (en != null) {
+        let is *sh.Compound as c with mut = en.sel.right;
+        while (c != null) {
+            if (_compound_asks(c) == 1 && _matches_but_for_state(n, c) == 1) { return 1; }
+            c = c.left;
+        }
+        en = en.dyn_next;
+    }
+    return 0;
+}
+
+// --- Selector matching ---
+
+fn _elem_parent(n as *dom.Node) as *dom.Node {
+    let is *dom.Node as p = n.parent;
+    if (p != null && p.kind == dom.ELEMENT) { return p; }
+    return cast(*dom.Node, 0);
+}
+
+fn _prev_elem(n as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = n.prev;
+    while (x != null && x.kind != dom.ELEMENT) { x = x.prev; }
+    return x;
+}
+
+fn _next_elem(n as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = n.next;
+    while (x != null && x.kind != dom.ELEMENT) { x = x.next; }
+    return x;
+}
+
+fn _same_name(a as *dom.Node, b as *dom.Node) as i64 {
+    if (a.name_len != b.name_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a.name_len) {
+        if (a.name[i] != b.name[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _bytes_eq(a as *u8, b as *u8, n as i64, ci as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as x with mut = cast(i64, a[i]);
+        let is i64 as y with mut = cast(i64, b[i]);
+        if (ci == 1) {
+            if (x >= 65 && x <= 90) { x = x + 32; }
+            if (y >= 65 && y <= 90) { y = y + 32; }
+        }
+        if (x != y) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _is_ws(c as i64) as i64 {
+    if (c == 32 || c == 9 || c == 10 || c == 12 || c == 13) { return 1; }
+    return 0;
+}
+
+fn _has_word(val as *u8, vn as i64, w as *u8, n as i64, ci as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < vn) {
+        while (i < vn && _is_ws(cast(i64, val[i])) == 1) { i = i + 1; }
+        let is i64 as st = i;
+        while (i < vn && _is_ws(cast(i64, val[i])) == 0) { i = i + 1; }
+        if (i - st == n && n > 0 && _bytes_eq(&val[st], w, n, ci) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn _match_attr(n as *dom.Node, s as *sh.Simple) as i64 {
+    let is *dom.Attr as at = dom.find_attr(n, s.s, s.n);
+    if (at == null) { return 0; }
+    if (s.op == sh.A_HAS) { return 1; }
+    let is *u8 as a = at.value;
+    let is i64 as an = at.value_len;
+    let is i64 as m = s.val_n;
+    if (s.op == sh.A_EQ) {
+        if (an == m && _bytes_eq(a, s.val, m, s.ci) == 1) { return 1; }
+        return 0;
+    }
+    if (s.op == sh.A_WORD) { return _has_word(a, an, s.val, m, s.ci); }
+    if (s.op == sh.A_DASH) {
+        if (an < m || _bytes_eq(a, s.val, m, s.ci) == 0) { return 0; }
+        if (an == m || a[m] == 45) { return 1; }
+        return 0;
+    }
+    if (m == 0) { return 0; }
+    if (s.op == sh.A_PREFIX) {
+        if (an >= m && _bytes_eq(a, s.val, m, s.ci) == 1) { return 1; }
+        return 0;
+    }
+    if (s.op == sh.A_SUFFIX) {
+        if (an >= m && _bytes_eq(&a[an - m], s.val, m, s.ci) == 1) { return 1; }
+        return 0;
+    }
+    let is i64 as i with mut = 0;
+    while (i + m <= an) {
+        if (_bytes_eq(&a[i], s.val, m, s.ci) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _nth_ok(k as i64, a as i64, b as i64) as i64 {
+    if (a == 0) {
+        if (k == b) { return 1; }
+        return 0;
+    }
+    let is i64 as d = k - b;
+    if (a > 0 && d < 0) { return 0; }
+    if (a < 0 && d > 0) { return 0; }
+    if (d % a == 0) { return 1; }
+    return 0;
+}
+
+fn _position(n as *dom.Node, from_end as i64, of_type as i64) as i64 {
+    let is i64 as k with mut = 1;
+    let is *dom.Node as x with mut = cast(*dom.Node, 0);
+    if (from_end == 1) { x = _next_elem(n); }
+    else { x = _prev_elem(n); }
+    while (x != null) {
+        if (of_type == 0 || _same_name(n, x) == 1) { k = k + 1; }
+        if (from_end == 1) { x = _next_elem(x); }
+        else { x = _prev_elem(x); }
+    }
+    return k;
+}
+
+fn _any_in_list(n as *dom.Node, l0 as *sh.Selector) as i64 {
+    let is *sh.Selector as x with mut = l0;
+    while (x != null) {
+        if (x.pseudo == sh.PSEUDO_NONE && _match_from(n, x.right) == 1) { return 1; }
+        x = x.next;
+    }
+    return 0;
+}
+
+fn _has_below(n as *dom.Node, l as *sh.Selector, depth as i64) as i64 {
+    if (depth > MAX_DEPTH) { return 0; }
+    let is *dom.Node as c with mut = n.first;
+    while (c != null) {
+        if (c.kind == dom.ELEMENT) {
+            if (_any_in_list(c, l) == 1 || _has_below(c, l, depth + 1) == 1) { return 1; }
+        }
+        c = c.next;
+    }
+    return 0;
+}
+
+fn _is_form_control(n as *dom.Node) as i64 {
+    if (n.tag == tg.INPUT || n.tag == tg.BUTTON || n.tag == tg.SELECT || n.tag == tg.TEXTAREA ||
+        n.tag == tg.OPTGROUP || n.tag == tg.OPTION || n.tag == tg.FIELDSET) { return 1; }
+    return 0;
+}
+
+fn _match_simple(n as *dom.Node, s as *sh.Simple) as i64 {
+    let is i64 as k = s.kind;
+    if (k == sh.S_ANY) { return 1; }
+    if (k == sh.S_TYPE) {
+        if (n.name_len == s.n && _bytes_eq(n.name, s.s, s.n, 1) == 1) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_CLASS) {
+        let is *dom.Attr as at = dom.find_attr(n, "class", 5);
+        if (at == null) { return 0; }
+        return _has_word(at.value, at.value_len, s.s, s.n, 0);
+    }
+    if (k == sh.S_ID) {
+        let is *dom.Attr as at = dom.find_attr(n, "id", 2);
+        if (at != null && at.value_len == s.n && _bytes_eq(at.value, s.s, s.n, 0) == 1) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_ATTR) { return _match_attr(n, s); }
+    if (k == sh.S_ROOT) {
+        if (n.parent != null && n.parent.kind == dom.DOCUMENT) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_EMPTY) {
+        let is *dom.Node as c with mut = n.first;
+        while (c != null) {
+            if (c.kind == dom.ELEMENT || (c.kind == dom.TEXT && c.text_len > 0)) { return 0; }
+            c = c.next;
+        }
+        return 1;
+    }
+    if (k == sh.S_LINK) {
+        if ((n.tag == tg.A || n.tag == tg.AREA) && dom.find_attr(n, "href", 4) != null) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_NEVER) { return 0; }
+    if (k == sh.S_HOVER) { return cast(i64, (n.flags & dom.FLAG_HOVER) != 0); }
+    if (k == sh.S_ACTIVE) { return cast(i64, (n.flags & dom.FLAG_ACTIVE) != 0); }
+    if (k == sh.S_FOCUS) { return cast(i64, (n.flags & dom.FLAG_FOCUS) != 0); }
+    if (k == sh.S_FOCUS_WITHIN) { return cast(i64, (n.flags & dom.FLAG_FOCUS_WITHIN) != 0); }
+    if (k == sh.S_FOCUS_VISIBLE) { return cast(i64, (n.flags & dom.FLAG_FOCUS_RING) != 0); }
+    if (k == sh.S_TARGET) { return cast(i64, (n.flags & dom.FLAG_TARGET) != 0); }
+    if (k == sh.S_NTH) { return _nth_ok(_position(n, 0, 0), s.a, s.b); }
+    if (k == sh.S_NTH_LAST) { return _nth_ok(_position(n, 1, 0), s.a, s.b); }
+    if (k == sh.S_NTH_TYPE) { return _nth_ok(_position(n, 0, 1), s.a, s.b); }
+    if (k == sh.S_NTH_LAST_TYPE) { return _nth_ok(_position(n, 1, 1), s.a, s.b); }
+    if (k == sh.S_ONLY) {
+        if (_prev_elem(n) == null && _next_elem(n) == null) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_ONLY_TYPE) {
+        if (_position(n, 0, 1) == 1 && _position(n, 1, 1) == 1) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_NOT) { return 1 - _any_in_list(n, s.sub); }
+    if (k == sh.S_IS) { return _any_in_list(n, s.sub); }
+    if (k == sh.S_HAS) { return _has_below(n, s.sub, 0); }
+    if (k == sh.S_CHECKED) {
+        if (n.tag == tg.INPUT && dom.find_attr(n, "checked", 7) != null) { return 1; }
+        if (n.tag == tg.OPTION && dom.find_attr(n, "selected", 8) != null) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_DISABLED) {
+        if (_is_form_control(n) == 1 && dom.find_attr(n, "disabled", 8) != null) { return 1; }
+        return 0;
+    }
+    if (k == sh.S_ENABLED) {
+        if (_is_form_control(n) == 1 && dom.find_attr(n, "disabled", 8) == null) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+fn _match_compound(n as *dom.Node, c as *sh.Compound) as i64 {
+    let is *sh.Simple as s with mut = c.first;
+    while (s != null) {
+        if (_match_simple(n, s) == 0) { return 0; }
+        s = s.next;
+    }
+    return 1;
+}
+
+// Whether n matches c and everything to its left.
+fn _match_from(n as *dom.Node, c as *sh.Compound) as i64 {
+    if (_match_compound(n, c) == 0) { return 0; }
+    if (c.left == null) { return 1; }
+    if (c.comb == sh.C_CHILD) {
+        let is *dom.Node as p = _elem_parent(n);
+        if (p != null) { return _match_from(p, c.left); }
+        return 0;
+    }
+    if (c.comb == sh.C_DESCENDANT) {
+        let is *dom.Node as p with mut = _elem_parent(n);
+        while (p != null) {
+            if (_match_from(p, c.left) == 1) { return 1; }
+            p = _elem_parent(p);
+        }
+        return 0;
+    }
+    if (c.comb == sh.C_ADJACENT) {
+        let is *dom.Node as p = _prev_elem(n);
+        if (p != null) { return _match_from(p, c.left); }
+        return 0;
+    }
+    if (c.comb == sh.C_SIBLING) {
+        let is *dom.Node as p with mut = _prev_elem(n);
+        while (p != null) {
+            if (_match_from(p, c.left) == 1) { return 1; }
+            p = _prev_elem(p);
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// --- Finding the rules ---
+
+struct _Found {
+    n as i64;
+}
+
+fn _try_list(e as *Engine, n as *dom.Node, pseudo as i64, l0 as *Entry, f as *_Found) as void {
+    let is *Entry as en with mut = l0;
+    while (en != null) {
+        if (en.sel.pseudo == pseudo && f.n < MAX_MATCHES &&
+            (en.rule.media == null || sh.media_holds(en.rule.media, e.vw, e.vh) == 1) &&
+            _match_from(n, en.sel.right) == 1) {
+            _matches[f.n] = en;
+            f.n = f.n + 1;
+        }
+        en = en.next;
+    }
+}
+
+fn _cascades_before(a as *Entry, b as *Entry) as i64 {
+    if (a.rule.origin != b.rule.origin) { return cast(i64, a.rule.origin < b.rule.origin); }
+    if (a.sel.spec != b.sel.spec) { return cast(i64, a.sel.spec < b.sel.spec); }
+    return cast(i64, a.seq < b.seq);
+}
+
+fn _collect(e as *Engine, n as *dom.Node, pseudo as i64) as i64 {
+    let is _Found as f with mut;
+    f.n = 0;
+    let is *dom.Attr as id = dom.find_attr(n, "id", 2);
+    if (id != null && id.value_len > 0) { _try_list(e, n, pseudo, e.buckets[_hash(id.value, id.value_len)], &f); }
+    let is *dom.Attr as cl = dom.find_attr(n, "class", 5);
+    if (cl != null) {
+        let is i64 as i with mut = 0;
+        while (i < cl.value_len) {
+            while (i < cl.value_len && _is_ws(cast(i64, cl.value[i])) == 1) { i = i + 1; }
+            let is i64 as st = i;
+            while (i < cl.value_len && _is_ws(cast(i64, cl.value[i])) == 0) { i = i + 1; }
+            if (i > st) { _try_list(e, n, pseudo, e.buckets[_hash(&cl.value[st], i - st)], &f); }
+        }
+    }
+    _try_list(e, n, pseudo, e.buckets[_hash(n.name, n.name_len)], &f);
+    _try_list(e, n, pseudo, e.universal, &f);
+    // Few enough that insertion sort is the fast one. The same selector can be found
+    // twice when two names share a bucket, and running it twice changes nothing.
+    let is i64 as i with mut = 1;
+    while (i < f.n) {
+        let is *Entry as x = _matches[i];
+        let is i64 as j with mut = i - 1;
+        while (j >= 0 && _cascades_before(x, _matches[j]) == 1) {
+            _matches[j + 1] = _matches[j];
+            j = j - 1;
+        }
+        _matches[j + 1] = x;
+        i = i + 1;
+    }
+    return f.n;
+}
+
+// --- Writing values ---
+
+fn _px(e as *Engine, l as *v.Len, em as f64) as f64 { return _full(e, l, em, 0.0); }
+
+// All of a length, with what a percentage of it means.
+fn _full(e as *Engine, l as *v.Len, em as f64, basis as f64) as f64 {
+    let is f64 as out with mut = l.px + l.em * em + l.rem * e.root_em + l.vw * e.vw / 100.0 + l.vh * e.vh / 100.0 + l.pct * basis / 100.0;
+    if (l.pick != null) {
+        let is [16]f64 as vals with mut;
+        let is i64 as i with mut = 0;
+        while (i < l.pick.n) {
+            vals[i] = _full(e, &l.pick.args[i], em, basis);
+            i = i + 1;
+        }
+        out = out + l.pick_k * v.pick_of(l.pick.kind, cast(*f64, &vals), l.pick.n);
+    }
+    return out;
+}
+
+fn _has_pct(l as *v.Len) as i64 {
+    if (l.pct != 0.0) { return 1; }
+    if (l.pick == null) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < l.pick.n) {
+        if (_has_pct(&l.pick.args[i]) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _late_drop(st as *Style, p as i64) as void {
+    let is **Late as at with mut = &st.late;
+    while (*at != null) {
+        if ((*at).p == p) {
+            *at = (*at).next;
+            return;
+        }
+        at = &(*at).next;
+    }
+}
+
+// The late length of a property, or null when it has none.
+fn late_of(st as *Style, p as i64) as *Late {
+    let is *Late as l with mut = st.late;
+    while (l != null) {
+        if (l.p == p) { return l; }
+        l = l.next;
+    }
+    return cast(*Late, 0);
+}
+
+fn late_value(l as *Late, basis as f64) as f64 { return _full(l.e, &l.len, l.em, basis); }
+
+fn _copy_prop(to as *pr.Values, from as *pr.Values, p as i64) as void {
+    to.i[p] = from.i[p];
+    to.f[p] = from.f[p];
+    to.p[p] = from.p[p];
+}
+
+fn _font_size_kw(kw as i64, parent as f64) as f64 {
+    if (kw == pr.K_XX_SMALL) { return 9.0; }
+    if (kw == pr.K_X_SMALL) { return 10.0; }
+    if (kw == pr.K_SMALL) { return 13.0; }
+    if (kw == pr.K_MEDIUM) { return 16.0; }
+    if (kw == pr.K_LARGE) { return 18.0; }
+    if (kw == pr.K_X_LARGE) { return 24.0; }
+    if (kw == pr.K_XX_LARGE) { return 32.0; }
+    if (kw == pr.K_XXX_LARGE) { return 48.0; }
+    if (kw == pr.K_SMALLER) { return parent / 1.2; }
+    if (kw == pr.K_LARGER) { return parent * 1.2; }
+    return parent;
+}
+
+fn _apply(e as *Engine, st as *Style, ps as *Style, p as i64, val as *v.Value) as void {
+    let is *pr.Values as o = &st.v;
+    if (st.late != null) { _late_drop(st, p); }
+    if (val.kind == v.V_GLOBAL) {
+        let is i64 as inherit with mut = cast(i64, val.kw == pr.K_INHERIT);
+        if (val.kw != pr.K_INHERIT && val.kw != pr.K_INITIAL && p >= pr.P_INHERITED) { inherit = 1; }
+        if (inherit == 1 && ps != null) { _copy_prop(o, &ps.v, p); }
+        else { _copy_prop(o, &_initial, p); }
+        return;
+    }
+    let is f64 as parent_em with mut = 16.0;
+    if (ps != null) { parent_em = ps.v.f[pr.P_FONT_SIZE]; }
+    if (p == pr.P_FONT_SIZE) {
+        if (val.kind == v.V_KW) { o.f[p] = _font_size_kw(val.kw, parent_em); }
+        if (val.kind == v.V_LEN) { o.f[p] = _full(e, &val.len, parent_em, parent_em); }
+        o.i[p] = 0;
+        o.p[p] = 0.0;
+        return;
+    }
+    if (p == pr.P_FONT_WEIGHT) {
+        let is f64 as parent_w with mut = 400.0;
+        if (ps != null) { parent_w = ps.v.f[p]; }
+        // System fonts rarely have a face at every weight. CSS's order goes up from 740, past
+        // Bold, to a Black nobody meant; other browsers ask the system for the nearest.
+        if (val.kind == v.V_NUM) {
+            o.f[p] = val.num;
+            if (val.num > 700.0 && val.num < 850.0) { o.f[p] = 700.0; }
+        }
+        if (val.kind == v.V_KW) {
+            if (val.kw == pr.K_NORMAL) { o.f[p] = 400.0; }
+            if (val.kw == pr.K_BOLD) { o.f[p] = 700.0; }
+            if (val.kw == pr.K_BOLDER) {
+                if (parent_w < 350.0) { o.f[p] = 400.0; }
+                else if (parent_w < 550.0) { o.f[p] = 700.0; }
+                else { o.f[p] = 900.0; }
+            }
+            if (val.kw == pr.K_LIGHTER) {
+                if (parent_w < 550.0) { o.f[p] = 100.0; }
+                else if (parent_w < 750.0) { o.f[p] = 400.0; }
+                else { o.f[p] = 700.0; }
+            }
+        }
+        return;
+    }
+    let is f64 as em = o.f[pr.P_FONT_SIZE];
+    if (val.kind == v.V_KW) {
+        let is i64 as kw = val.kw;
+        if ((p >= pr.P_BORDER_TOP_WIDTH && p <= pr.P_BORDER_LEFT_WIDTH) || p == pr.P_OUTLINE_WIDTH) {
+            o.i[p] = 0;
+            o.p[p] = 0.0;
+            if (kw == pr.K_THIN) { o.f[p] = 1.0; }
+            if (kw == pr.K_MEDIUM) { o.f[p] = 3.0; }
+            if (kw == pr.K_THICK) { o.f[p] = 5.0; }
+            return;
+        }
+        if (p == pr.P_BACKGROUND_POSITION_X || p == pr.P_BACKGROUND_POSITION_Y) {
+            o.i[p] = 0;
+            o.f[p] = 0.0;
+            o.p[p] = 0.0;
+            if (kw == pr.K_CENTER) { o.p[p] = 50.0; }
+            if (kw == pr.K_RIGHT || kw == pr.K_BOTTOM) { o.p[p] = 100.0; }
+            return;
+        }
+        o.i[p] = kw;
+        o.f[p] = 0.0;
+        o.p[p] = 0.0;
+        return;
+    }
+    if (val.kind == v.V_LEN) {
+        o.i[p] = 0;
+        o.f[p] = _px(e, &val.len, em);
+        o.p[p] = val.len.pct;
+        // A percentage of line-height means the font size here, and children inherit
+        // the pixels, unlike a plain number.
+        if (p == pr.P_LINE_HEIGHT) {
+            o.f[p] = _full(e, &val.len, em, em);
+            o.p[p] = 0.0;
+        } else if (val.len.pick != null && _has_pct(&val.len) == 1) {
+            // A percentage, as far as anyone asks before its box does.
+            let is *Late as l = cast(*Late, arena.alloc(e.a, sizeof(Late)));
+            l.p = p;
+            l.e = e;
+            l.em = em;
+            l.len = val.len;
+            l.next = st.late;
+            st.late = l;
+            o.f[p] = 0.0;
+            o.p[p] = 100.0;
+        }
+        return;
+    }
+    if (val.kind == v.V_NUM) {
+        o.i[p] = pr.K_NUMBER;
+        o.f[p] = val.num;
+        o.p[p] = 0.0;
+        return;
+    }
+    if (val.kind == v.V_COLOR) {
+        o.i[p] = val.color;
+        if (p == pr.P_COLOR && val.color == v.COLOR_CURRENT) {
+            if (ps != null) { o.i[p] = ps.v.i[p]; }
+            else { o.i[p] = _initial.i[p]; }
+        }
+        return;
+    }
+    if (val.kind == v.V_STR || val.kind == v.V_URL || val.kind == v.V_DATA) {
+        o.i[p] = cast(i64, val.s);
+        o.f[p] = cast(f64, val.kind);
+        return;
+    }
+}
+
+// A length written in a structure, against an element's font and the window.
+fn px_of(e as *Engine, l as *v.Len, em as f64) as f64 { return _px(e, l, em); }
+fn full_of(e as *Engine, l as *v.Len, em as f64, basis as f64) as f64 { return _full(e, l, em, basis); }
+
+// A declaration from an @keyframes, computed as a rule's would be.
+fn apply_decl(e as *Engine, st as *Style, ps as *Style, p as i64, val as *v.Value) as void { _apply(e, st, ps, p, val); }
+
+fn keyframes_of(e as *Engine, name as *u8, n as i64) as *sh.Keyframes {
+    let is *sh.Keyframes as k with mut = e.keyframes;
+    while (k != null) {
+        if (k.nlen == n) {
+            let is i64 as i with mut = 0;
+            while (i < n && k.name[i] == name[i]) { i = i + 1; }
+            if (i == n) { return k; }
+        }
+        k = k.next;
+    }
+    return cast(*sh.Keyframes, 0);
+}
+
+// --- var() ---
+
+struct _Toks {
+    t   as *tok.Token;
+    n   as i64;
+    cap as i64;
+}
+
+fn _emit_tok(e as *Engine, o as *_Toks, t as *tok.Token) as void {
+    if (o.n == o.cap) {
+        let is i64 as cap with mut = o.cap * 2;
+        if (cap == 0) { cap = 16; }
+        let is *tok.Token as x = cast(*tok.Token, arena.alloc(e.a, cap * sizeof(tok.Token)));
+        if (o.n > 0) { mem.core.memcpy(cast(*u8, x), cast(*u8, o.t), o.n * sizeof(tok.Token)); }
+        o.t = x;
+        o.cap = cap;
+    }
+    o.t[o.n] = *t;
+    o.n = o.n + 1;
+}
+
+fn _find_var(st as *Style, s as *u8, n as i64) as *Var {
+    let is *Var as x with mut = st.vars;
+    while (x != null) {
+        if (x.n == n && _bytes_eq(x.name, s, n, 0) == 1) { return x; }
+        x = x.next;
+    }
+    return cast(*Var, 0);
+}
+
+// The tokens of t with every var() replaced. 0 when one has no value and no fallback,
+// which makes the declaration invalid at this element.
+fn _expand(e as *Engine, st as *Style, t as *tok.Token, n as i64, o as *_Toks, depth as i64) as i64 {
+    if (depth > 16) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *tok.Token as x = &t[i];
+        if (x.kind != tok.T_FUNCTION || decl.eq(x.s, x.n, "var") == 0) {
+            _emit_tok(e, o, x);
+            i = i + 1;
+            continue;
+        }
+        let is i64 as d with mut = 1;
+        let is i64 as k with mut = i + 1;
+        let is i64 as comma with mut = 0 - 1;
+        while (k < n && d > 0) {
+            let is i64 as q = t[k].kind;
+            if (q == tok.T_FUNCTION || q == tok.T_LPAREN || q == tok.T_LBRACKET || q == tok.T_LBRACE) { d = d + 1; }
+            if (q == tok.T_RPAREN || q == tok.T_RBRACKET || q == tok.T_RBRACE) { d = d - 1; }
+            if (q == tok.T_COMMA && d == 1 && comma < 0) { comma = k; }
+            k = k + 1;
+        }
+        // The name is the first thing inside, after any space.
+        let is i64 as a with mut = i + 1;
+        while (a < n && t[a].kind == tok.T_WS) { a = a + 1; }
+        if (a >= n || t[a].kind != tok.T_IDENT) { return 0; }
+        let is *Var as found = _find_var(st, t[a].s, t[a].n);
+        if (found != null) {
+            if (_expand(e, st, found.toks, found.ntoks, o, depth + 1) == 0) { return 0; }
+        } else {
+            if (comma < 0) { return 0; }
+            let is i64 as fb_end with mut = k;
+            if (d == 0) { fb_end = k - 1; }
+            if (_expand(e, st, &t[comma + 1], fb_end - comma - 1, o, depth + 1) == 0) { return 0; }
+        }
+        i = k;
+    }
+    return 1;
+}
+
+fn _name_is_font(s as *u8, n as i64) as i64 {
+    if (n >= 4 && (s[0] | 32) == 102 && (s[1] | 32) == 111 && (s[2] | 32) == 110 && (s[3] | 32) == 116) { return 1; }
+    return 0;
+}
+
+fn _run_decl(e as *Engine, st as *Style, ps as *Style, d as *v.Decl, pass as i64) as void {
+    if (d.prop == v.D_CUSTOM) {
+        if (pass != 0) { return; }
+        let is *Var as x = cast(*Var, arena.alloc(e.a, sizeof(Var)));
+        x.name = d.name;
+        x.n = d.name_n;
+        x.toks = d.toks;
+        x.ntoks = d.ntoks;
+        x.next = st.vars;
+        st.vars = x;
+        return;
+    }
+    if (pass == 0) { return; }
+    if (d.prop == v.D_PENDING) {
+        if (pass == 1 && _name_is_font(d.name, d.name_n) == 0) { return; }
+        let is _Toks as o with mut;
+        o.t = cast(*tok.Token, 0);
+        o.n = 0;
+        o.cap = 0;
+        if (_expand(e, st, d.toks, d.ntoks, &o, 0) == 0) { return; }
+        let is v.DeclList as tmp with mut;
+        tmp.d = cast(*v.Decl, 0);
+        tmp.n = 0;
+        tmp.cap = 0;
+        // URLs in it are as relative as the page, wherever the rule came from.
+        decl.set_base(e.base);
+        if (decl.parse(e.a, &tmp, d.name, d.name_n, o.t, o.n, d.important) == 0) { return; }
+        let is i64 as k with mut = 0;
+        while (k < tmp.n) {
+            let is i64 as q = tmp.d[k].prop;
+            if ((pass == 1) == (q == pr.P_FONT_SIZE)) { _apply(e, st, ps, q, &tmp.d[k].val); }
+            k = k + 1;
+        }
+        return;
+    }
+    if ((pass == 1) != (d.prop == pr.P_FONT_SIZE)) { return; }
+    _apply(e, st, ps, d.prop, &d.val);
+}
+
+fn _run_list(e as *Engine, st as *Style, ps as *Style, l as *v.DeclList, want_important as i64, pass as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < l.n) {
+        let is *v.Decl as d = &l.d[k];
+        if (d.important == want_important) { _run_decl(e, st, ps, d, pass); }
+        k = k + 1;
+    }
+}
+
+// --- What HTML's old attributes mean ---
+
+fn _set_len(st as *Style, p as i64, px as f64, pct as f64) as void {
+    st.v.i[p] = 0;
+    st.v.f[p] = px;
+    st.v.p[p] = pct;
+}
+
+fn _attr_dimension(n as *dom.Node, name as *u8, nlen as i64, px as *f64, pct as *f64) as i64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a.value_len && _is_ws(cast(i64, a.value[i])) == 1) { i = i + 1; }
+    let is f64 as val with mut = 0.0;
+    let is i64 as digits with mut = 0;
+    while (i < a.value_len && a.value[i] >= 48 && a.value[i] <= 57) {
+        val = val * 10.0 + cast(f64, cast(i64, a.value[i]) - 48);
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if (i < a.value_len && a.value[i] == 46) {
+        i = i + 1;
+        let is f64 as place with mut = 0.1;
+        while (i < a.value_len && a.value[i] >= 48 && a.value[i] <= 57) {
+            val = val + cast(f64, cast(i64, a.value[i]) - 48) * place;
+            place = place * 0.1;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if (digits == 0) { return 0; }
+    *px = 0.0;
+    *pct = 0.0;
+    if (i < a.value_len && a.value[i] == 37) { *pct = val; }
+    else { *px = val; }
+    return 1;
+}
+
+fn _hint_len(st as *Style, n as *dom.Node, name as *u8, nlen as i64, p as i64) as void {
+    let is f64 as px with mut = 0.0;
+    let is f64 as pct with mut = 0.0;
+    if (_attr_dimension(n, name, nlen, &px, &pct) == 1) { _set_len(st, p, px, pct); }
+}
+
+fn _hint_color(st as *Style, n as *dom.Node, name as *u8, nlen as i64, p as i64) as void {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null || a.value_len == 0) { return; }
+    let is i64 as c with mut = 0;
+    let is *u8 as s with mut = a.value;
+    let is i64 as m with mut = a.value_len;
+    if (s[0] == 35) {
+        s = &s[1];
+        m = m - 1;
+    }
+    if (decl._hash_color(s, m, &c) == 1) { st.v.i[p] = c; return; }
+    if (decl._named_color(s, m, &c) == 1) { st.v.i[p] = c; }
+}
+
+fn _attr_is(a as *dom.Attr, w as *u8) as i64 {
+    if (a == null) { return 0; }
+    return decl.eq(a.value, a.value_len, w);
+}
+
+fn _hint_align(st as *Style, n as *dom.Node) as void {
+    let is *dom.Attr as a = dom.find_attr(n, "align", 5);
+    if (a == null) { return; }
+    if (_attr_is(a, "center") == 1 || _attr_is(a, "middle") == 1) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_WEBKIT_CENTER; }
+    if (_attr_is(a, "left") == 1) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_LEFT; }
+    if (_attr_is(a, "right") == 1) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_RIGHT; }
+    if (_attr_is(a, "justify") == 1) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_JUSTIFY; }
+}
+
+fn _set_all_borders(st as *Style, px as f64, kw as i64, col as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        _set_len(st, pr.P_BORDER_TOP_WIDTH + k, px, 0.0);
+        st.v.i[pr.P_BORDER_TOP_STYLE + k] = kw;
+        st.v.i[pr.P_BORDER_TOP_COLOR + k] = col;
+        k = k + 1;
+    }
+}
+
+fn _table_of(n as *dom.Node) as *dom.Node {
+    let is *dom.Node as p with mut = n.parent;
+    while (p != null) {
+        if (p.kind == dom.ELEMENT && p.tag == tg.TABLE) { return p; }
+        p = p.parent;
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _tag_is(n as *dom.Node, name as *u8) as i64 {
+    return decl.eq(n.name, n.name_len, name);
+}
+
+fn _hints_font_size(st as *Style, n as *dom.Node) as void {
+    if (n.tag != tg.FONT) { return; }
+    let is *dom.Attr as a = dom.find_attr(n, "size", 4);
+    if (a == null || a.value_len == 0) { return; }
+    let is i64 as i with mut = 0;
+    let is i64 as sign with mut = 0;
+    if (a.value[0] == 43) { sign = 1; i = 1; }
+    if (a.value[0] == 45) { sign = 0 - 1; i = 1; }
+    let is i64 as val with mut = 0;
+    while (i < a.value_len && a.value[i] >= 48 && a.value[i] <= 57) {
+        val = val * 10 + cast(i64, a.value[i]) - 48;
+        i = i + 1;
+    }
+    if (sign != 0) { val = 3 + sign * val; }
+    if (val < 1) { val = 1; }
+    if (val > 7) { val = 7; }
+    let is f64 as px with mut = 16.0;
+    if (val == 1) { px = 10.0; }
+    if (val == 2) { px = 13.0; }
+    if (val == 4) { px = 18.0; }
+    if (val == 5) { px = 24.0; }
+    if (val == 6) { px = 32.0; }
+    if (val == 7) { px = 48.0; }
+    st.v.f[pr.P_FONT_SIZE] = px;
+}
+
+fn _hints(st as *Style, n as *dom.Node) as void {
+    let is i64 as t = n.tag;
+    if (n.ns != dom.NS_HTML) { return; }
+    if (t == tg.BODY) {
+        _hint_color(st, n, "bgcolor", 7, pr.P_BACKGROUND_COLOR);
+        _hint_color(st, n, "text", 4, pr.P_COLOR);
+        _hint_len(st, n, "marginwidth", 11, pr.P_MARGIN_LEFT);
+        _hint_len(st, n, "marginwidth", 11, pr.P_MARGIN_RIGHT);
+        _hint_len(st, n, "marginheight", 12, pr.P_MARGIN_TOP);
+        _hint_len(st, n, "marginheight", 12, pr.P_MARGIN_BOTTOM);
+        _hint_len(st, n, "leftmargin", 10, pr.P_MARGIN_LEFT);
+        _hint_len(st, n, "topmargin", 9, pr.P_MARGIN_TOP);
+        return;
+    }
+    if (t == tg.FONT) {
+        _hint_color(st, n, "color", 5, pr.P_COLOR);
+        let is *dom.Attr as f = dom.find_attr(n, "face", 4);
+        if (f != null && f.value_len > 0) { st.v.i[pr.P_FONT_FAMILY] = cast(i64, f.value); }
+        return;
+    }
+    if (t == tg.TABLE) {
+        _hint_len(st, n, "width", 5, pr.P_WIDTH);
+        _hint_len(st, n, "height", 6, pr.P_HEIGHT);
+        _hint_color(st, n, "bgcolor", 7, pr.P_BACKGROUND_COLOR);
+        let is *dom.Attr as al = dom.find_attr(n, "align", 5);
+        if (_attr_is(al, "center") == 1) {
+            st.v.i[pr.P_MARGIN_LEFT] = pr.K_AUTO;
+            st.v.i[pr.P_MARGIN_RIGHT] = pr.K_AUTO;
+        }
+        if (_attr_is(al, "left") == 1) { st.v.i[pr.P_FLOAT] = pr.K_LEFT; }
+        if (_attr_is(al, "right") == 1) { st.v.i[pr.P_FLOAT] = pr.K_RIGHT; }
+        let is f64 as px with mut = 0.0;
+        let is f64 as pct with mut = 0.0;
+        if (_attr_dimension(n, "cellspacing", 11, &px, &pct) == 1) {
+            st.v.f[pr.P_BORDER_SPACING_H] = px;
+            st.v.f[pr.P_BORDER_SPACING_V] = px;
+        }
+        if (_attr_dimension(n, "border", 6, &px, &pct) == 1 && px > 0.0) {
+            _set_all_borders(st, px, pr.K_OUTSET, 4286611584);
+        }
+        return;
+    }
+    if (t == tg.TD || t == tg.TH) {
+        _hint_len(st, n, "width", 5, pr.P_WIDTH);
+        _hint_len(st, n, "height", 6, pr.P_HEIGHT);
+        _hint_color(st, n, "bgcolor", 7, pr.P_BACKGROUND_COLOR);
+        _hint_align(st, n);
+        _hint_valign(st, n);
+        if (dom.find_attr(n, "nowrap", 6) != null) { st.v.i[pr.P_WHITE_SPACE] = pr.K_NOWRAP; }
+        let is *dom.Node as table = _table_of(n);
+        if (table != null) {
+            let is f64 as px with mut = 0.0;
+            let is f64 as pct with mut = 0.0;
+            if (_attr_dimension(table, "cellpadding", 11, &px, &pct) == 1) {
+                let is i64 as k with mut = 0;
+                while (k < 4) {
+                    _set_len(st, pr.P_PADDING_TOP + k, px, pct);
+                    k = k + 1;
+                }
+            }
+            if (_attr_dimension(table, "border", 6, &px, &pct) == 1 && px > 0.0) {
+                _set_all_borders(st, 1.0, pr.K_INSET, 4286611584);
+            }
+        }
+        return;
+    }
+    if (t == tg.TR || t == tg.TBODY || t == tg.THEAD || t == tg.TFOOT) {
+        _hint_color(st, n, "bgcolor", 7, pr.P_BACKGROUND_COLOR);
+        _hint_align(st, n);
+        _hint_valign(st, n);
+        _hint_len(st, n, "height", 6, pr.P_HEIGHT);
+        return;
+    }
+    if (t == tg.COL || t == tg.COLGROUP) {
+        _hint_len(st, n, "width", 5, pr.P_WIDTH);
+        return;
+    }
+    if (t == tg.IMG) {
+        _hint_len(st, n, "width", 5, pr.P_WIDTH);
+        _hint_len(st, n, "height", 6, pr.P_HEIGHT);
+        _hint_len(st, n, "hspace", 6, pr.P_MARGIN_LEFT);
+        _hint_len(st, n, "hspace", 6, pr.P_MARGIN_RIGHT);
+        _hint_len(st, n, "vspace", 6, pr.P_MARGIN_TOP);
+        _hint_len(st, n, "vspace", 6, pr.P_MARGIN_BOTTOM);
+        let is f64 as px with mut = 0.0;
+        let is f64 as pct with mut = 0.0;
+        if (_attr_dimension(n, "border", 6, &px, &pct) == 1 && px > 0.0) {
+            _set_all_borders(st, px, pr.K_SOLID, v.COLOR_CURRENT);
+        }
+        let is *dom.Attr as al = dom.find_attr(n, "align", 5);
+        if (_attr_is(al, "left") == 1) { st.v.i[pr.P_FLOAT] = pr.K_LEFT; }
+        if (_attr_is(al, "right") == 1) { st.v.i[pr.P_FLOAT] = pr.K_RIGHT; }
+        if (_attr_is(al, "middle") == 1) { st.v.i[pr.P_VERTICAL_ALIGN] = pr.K_MIDDLE; }
+        if (_attr_is(al, "top") == 1) { st.v.i[pr.P_VERTICAL_ALIGN] = pr.K_TOP; }
+        return;
+    }
+    if (t == tg.HR) {
+        _hint_len(st, n, "width", 5, pr.P_WIDTH);
+        _hint_color(st, n, "color", 5, pr.P_COLOR);
+        return;
+    }
+    if (t == tg.INPUT || t == tg.TEXTAREA || t == tg.SELECT || t == tg.BUTTON) { return; }
+    if (t == tg.DIV || t == tg.P || t == tg.H1 || t == tg.H2 || t == tg.H3 || t == tg.H4 || t == tg.H5 || t == tg.H6 || t == tg.CAPTION) {
+        _hint_align(st, n);
+        return;
+    }
+    if (_tag_is(n, "canvas") == 1 || _tag_is(n, "video") == 1 || _tag_is(n, "iframe") == 1 || _tag_is(n, "embed") == 1 || _tag_is(n, "object") == 1) {
+        _hint_len(st, n, "width", 5, pr.P_WIDTH);
+        _hint_len(st, n, "height", 6, pr.P_HEIGHT);
+    }
+}
+
+fn _hint_valign(st as *Style, n as *dom.Node) as void {
+    let is *dom.Attr as a = dom.find_attr(n, "valign", 6);
+    if (a == null) { return; }
+    if (_attr_is(a, "top") == 1) { st.v.i[pr.P_VERTICAL_ALIGN] = pr.K_TOP; }
+    if (_attr_is(a, "middle") == 1 || _attr_is(a, "center") == 1) { st.v.i[pr.P_VERTICAL_ALIGN] = pr.K_MIDDLE; }
+    if (_attr_is(a, "bottom") == 1) { st.v.i[pr.P_VERTICAL_ALIGN] = pr.K_BOTTOM; }
+    if (_attr_is(a, "baseline") == 1) { st.v.i[pr.P_VERTICAL_ALIGN] = pr.K_BASELINE; }
+}
+
+// --- One element ---
+
+fn _run_matches(e as *Engine, st as *Style, ps as *Style, m as **Entry, nm as i64, origin as i64, important as i64, pass as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < nm) {
+        let is *sh.Rule as r = m[i].rule;
+        if (r.origin == origin) { _run_list(e, st, ps, &r.decls, important, pass); }
+        i = i + 1;
+    }
+}
+
+fn _blockify(st as *Style, root as i64) as void {
+    let is i64 as pos = st.v.i[pr.P_POSITION];
+    let is i64 as out = cast(i64, pos == pr.K_ABSOLUTE || pos == pr.K_FIXED);
+    if (out == 1) { st.v.i[pr.P_FLOAT] = pr.K_NONE; }
+    if (out == 0 && st.v.i[pr.P_FLOAT] == pr.K_NONE && root == 0) { return; }
+    let is i64 as d = st.v.i[pr.P_DISPLAY];
+    if (d == pr.K_NONE || d == pr.K_CONTENTS) {
+        if (d == pr.K_CONTENTS && root == 1) { st.v.i[pr.P_DISPLAY] = pr.K_BLOCK; }
+        return;
+    }
+    if (d == pr.K_INLINE_TABLE) { st.v.i[pr.P_DISPLAY] = pr.K_TABLE; return; }
+    if (d == pr.K_INLINE_FLEX) { st.v.i[pr.P_DISPLAY] = pr.K_FLEX; return; }
+    if (d == pr.K_INLINE_GRID) { st.v.i[pr.P_DISPLAY] = pr.K_GRID; return; }
+    if (d == pr.K_BLOCK || d == pr.K_TABLE || d == pr.K_FLEX || d == pr.K_GRID || d == pr.K_LIST_ITEM || d == pr.K_FLOW_ROOT) { return; }
+    st.v.i[pr.P_DISPLAY] = pr.K_BLOCK;
+}
+
+// Keywords with a synonym, and colours that mean this element's own.
+fn _settle(st as *Style, ps as *Style) as void {
+    let is i64 as ta = st.v.i[pr.P_TEXT_ALIGN];
+    // A header cell is centred unless something above it chose an alignment.
+    if (ta == pr.K_INTERNAL_CENTER) {
+        st.v.i[pr.P_TEXT_ALIGN] = pr.K_CENTER;
+        if (ps != null && ps.v.i[pr.P_TEXT_ALIGN] != pr.K_START) { st.v.i[pr.P_TEXT_ALIGN] = ps.v.i[pr.P_TEXT_ALIGN]; }
+    }
+    if (ta == pr.K_WEBKIT_LEFT || ta == pr.K_MOZ_LEFT) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_LEFT; }
+    if (ta == pr.K_END || ta == pr.K_WEBKIT_RIGHT || ta == pr.K_MOZ_RIGHT) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_RIGHT; }
+    if (ta == pr.K_MOZ_CENTER) { st.v.i[pr.P_TEXT_ALIGN] = pr.K_WEBKIT_CENTER; }
+    let is i64 as col = st.v.i[pr.P_COLOR];
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        if (st.v.i[pr.P_BORDER_TOP_COLOR + k] == v.COLOR_CURRENT) { st.v.i[pr.P_BORDER_TOP_COLOR + k] = col; }
+        k = k + 1;
+    }
+    if (st.v.i[pr.P_BACKGROUND_COLOR] == v.COLOR_CURRENT) { st.v.i[pr.P_BACKGROUND_COLOR] = col; }
+    if (st.v.i[pr.P_OUTLINE_COLOR] == v.COLOR_CURRENT) { st.v.i[pr.P_OUTLINE_COLOR] = col; }
+    // Decorations are drawn by whoever is under them, so they travel down like an
+    // inherited value, except into what leaves the flow of the text.
+    let is i64 as d = st.v.i[pr.P_DISPLAY];
+    let is i64 as own = cast(i64, st.v.f[pr.P_TEXT_DECORATION_LINE]);
+    let is i64 as acc with mut = own;
+    let is i64 as pos = st.v.i[pr.P_POSITION];
+    let is i64 as detached = cast(i64, d == pr.K_INLINE_BLOCK || d == pr.K_INLINE_FLEX || d == pr.K_INLINE_TABLE ||
+                                  st.v.i[pr.P_FLOAT] != pr.K_NONE || pos == pr.K_ABSOLUTE || pos == pr.K_FIXED);
+    if (ps != null && detached == 0) { acc = acc | cast(i64, ps.v.f[pr.P_X_DECORATIONS]); }
+    st.v.f[pr.P_X_DECORATIONS] = cast(f64, acc);
+}
+
+fn _fresh(a as *arena.Arena, ps as *Style) as *Style {
+    let is *Style as st = cast(*Style, arena.alloc(a, sizeof(Style)));
+    st.late = cast(*Late, 0);
+    st.placeholder = cast(*Style, 0);
+    st.v = _initial;
+    if (ps != null) {
+        let is i64 as p with mut = pr.P_INHERITED;
+        while (p < pr.P_COUNT) {
+            _copy_prop(&st.v, &ps.v, p);
+            p = p + 1;
+        }
+        st.vars = ps.vars;
+    }
+    return st;
+}
+
+// What an anonymous box inherits: everything its parent passes down, and initial values
+// for the rest. No rule can reach one.
+fn anonymous(a as *arena.Arena, ps as *Style, display as i64) as *Style {
+    let is *Style as st = _fresh(a, ps);
+    st.v.i[pr.P_DISPLAY] = display;
+    return st;
+}
+
+fn _compute(e as *Engine, n as *dom.Node, ps as *Style, pseudo as i64) as *Style {
+    let is i64 as nm = _collect(e, n, pseudo);
+    if (pseudo != sh.PSEUDO_NONE && nm == 0) { return cast(*Style, 0); }
+    // _matches is shared and the walk below can reach no other element, but styling
+    // needs no recursion back into here until this returns, so it can be used directly.
+    let is **Entry as m = &_matches[0];
+
+    let is *Style as st = _fresh(e.a, ps);
+    let is v.DeclList as inline with mut;
+    inline.d = cast(*v.Decl, 0);
+    inline.n = 0;
+    inline.cap = 0;
+    if (pseudo == sh.PSEUDO_NONE) {
+        let is *dom.Attr as at = dom.find_attr(n, "style", 5);
+        if (at != null && at.value_len > 0) { sh.parse_inline(e.a, at.value, at.value_len, &inline, e.base); }
+    }
+    let is i64 as pass with mut = 0;
+    while (pass < 3) {
+        _run_matches(e, st, ps, m, nm, sh.ORIGIN_UA, 0, pass);
+        if (pseudo == sh.PSEUDO_NONE) {
+            if (pass == 1) { _hints_font_size(st, n); }
+            if (pass == 2) { _hints(st, n); }
+        }
+        _run_matches(e, st, ps, m, nm, sh.ORIGIN_AUTHOR, 0, pass);
+        _run_list(e, st, ps, &inline, 0, pass);
+        _run_matches(e, st, ps, m, nm, sh.ORIGIN_AUTHOR, 1, pass);
+        _run_list(e, st, ps, &inline, 1, pass);
+        _run_matches(e, st, ps, m, nm, sh.ORIGIN_UA, 1, pass);
+        pass = pass + 1;
+    }
+    let is i64 as root = cast(i64, n.parent != null && n.parent.kind == dom.DOCUMENT && pseudo == sh.PSEUDO_NONE);
+    if (root == 1) { e.root_em = st.v.f[pr.P_FONT_SIZE]; }
+    _blockify(st, root);
+    _settle(st, ps);
+    if (pseudo == sh.PSEUDO_BEFORE || pseudo == sh.PSEUDO_AFTER) {
+        let is i64 as c = st.v.i[pr.P_CONTENT];
+        if (c == pr.K_NONE || c == pr.K_NORMAL) { return cast(*Style, 0); }
+        if (st.v.i[pr.P_DISPLAY] == pr.K_NONE) { return cast(*Style, 0); }
+    }
+    return st;
+}
+
+fn _walk(e as *Engine, n as *dom.Node, ps as *Style, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *Style as st = _compute(e, n, ps, sh.PSEUDO_NONE);
+    n.style = cast(*u8, st);
+    if (st.v.i[pr.P_DISPLAY] == pr.K_NONE) { return; }
+    st.before = _compute(e, n, st, sh.PSEUDO_BEFORE);
+    st.after = _compute(e, n, st, sh.PSEUDO_AFTER);
+    if (n.ns == dom.NS_HTML && (n.tag == tg.INPUT || n.tag == tg.TEXTAREA)) { st.placeholder = _compute(e, n, st, sh.PSEUDO_PLACEHOLDER); }
+    let is *dom.Node as c with mut = n.first;
+    while (c != null) {
+        if (c.kind == dom.ELEMENT) { _walk(e, c, st, depth + 1); }
+        c = c.next;
+    }
+}
+
+// Every element of the document gets its style, for a window this size. A pseudo-
+// element gets one only when a rule gives it content. Elements under a display: none
+// are skipped and keep null.
+fn style_document(e as *Engine, d as *dom.Document, vw as f64, vh as f64) as void {
+    e.vw = vw;
+    e.vh = vh;
+    e.root_em = 16.0;
+    _clear(d.node.first, 0);
+    let is *dom.Node as c with mut = d.node.first;
+    while (c != null) {
+        if (c.kind == dom.ELEMENT) { _walk(e, c, cast(*Style, 0), 0); }
+        c = c.next;
+    }
+}
+
+// Styles from before: a part of the tree that has become display: none must not keep
+// one from an arena that is gone.
+fn _clear(first as *dom.Node, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *dom.Node as c with mut = first;
+    while (c != null) {
+        if (c.kind == dom.ELEMENT) {
+            c.old_style = c.style;
+            c.style = cast(*u8, 0);
+            _clear(c.first, depth + 1);
+        }
+        c = c.next;
+    }
+}
+
+fn of(n as *dom.Node) as *Style { return cast(*Style, n.style); }

@@ -1,0 +1,327 @@
+// layout/layout.cst — the whole of layout, from a styled document to boxes on the page.
+//
+// Out-of-flow boxes wait until the end. Nothing else's position depends on them, while
+// they need to know where their containing block ended up, so they are laid out on the
+// way down the finished tree, in the same pass that works out where everything is.
+
+use "../css/props.cst" as pr;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "./box.cst" as bx;
+use "./build.cst" as build;
+use "./flow.cst" as flow;
+use "./table.cst" as table;
+use "./flex.cst" as flex;
+use "./grid.cst" as grid;
+
+struct Rect {
+    x as f64;
+    y as f64;
+    w as f64;
+    h as f64;
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+// How far there is to scroll. What sums wrong by less than a pixel is not somewhere to go.
+fn _past(over as f64) as f64 {
+    if (over < 0.5) { return 0.0; }
+    return over;
+}
+
+fn _reach(c as *bx.Ctx, x as f64, y as f64) as void {
+    if (x > c.ext_r) { c.ext_r = x; }
+    if (y > c.ext_b) { c.ext_b = y; }
+}
+
+// How far a relatively positioned box moves from where flow put it.
+fn _relative(b as *bx.Box, cw as f64, dx as *f64, dy as *f64) as void {
+    *dx = 0.0;
+    *dy = 0.0;
+    if (bx.prop(b, pr.P_POSITION) != pr.K_RELATIVE) { return; }
+    if (bx.is_len(b, pr.P_LEFT) == 1) { *dx = bx.resolve(b, pr.P_LEFT, cw); }
+    else if (bx.is_len(b, pr.P_RIGHT) == 1) { *dx = 0.0 - bx.resolve(b, pr.P_RIGHT, cw); }
+    if (bx.is_definite(b, pr.P_TOP, 0.0 - 1.0) == 1) { *dy = bx.resolve(b, pr.P_TOP, 0.0 - 1.0); }
+    else if (bx.is_definite(b, pr.P_BOTTOM, 0.0 - 1.0) == 1) { *dy = 0.0 - bx.resolve(b, pr.P_BOTTOM, 0.0 - 1.0); }
+}
+
+// An absolutely positioned box, given the padding box it answers to and where flow
+// would have put it, CSS 2 sections 10.3.7 and 10.6.4.
+fn _absolute(c as *bx.Ctx, b as *bx.Box, cb as *Rect, static_x as f64, static_y as f64) as void {
+    let is f64 as cw = cb.w;
+    let is f64 as ch = cb.h;
+    flow.edges(b, cw);
+    let is i64 as has_l = bx.is_len(b, pr.P_LEFT);
+    let is i64 as has_r = bx.is_len(b, pr.P_RIGHT);
+    let is i64 as has_t = bx.is_len(b, pr.P_TOP);
+    let is i64 as has_b = bx.is_len(b, pr.P_BOTTOM);
+    let is f64 as l = bx.resolve(b, pr.P_LEFT, cw);
+    let is f64 as r = bx.resolve(b, pr.P_RIGHT, cw);
+    let is f64 as t = bx.resolve(b, pr.P_TOP, ch);
+    let is f64 as bt = bx.resolve(b, pr.P_BOTTOM, ch);
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as ml_auto = cast(i64, s.i[pr.P_MARGIN_LEFT] == pr.K_AUTO);
+    let is i64 as mr_auto = cast(i64, s.i[pr.P_MARGIN_RIGHT] == pr.K_AUTO);
+    let is i64 as mt_auto = cast(i64, s.i[pr.P_MARGIN_TOP] == pr.K_AUTO);
+    let is i64 as mb_auto = cast(i64, s.i[pr.P_MARGIN_BOTTOM] == pr.K_AUTO);
+    if (b.kind == bx.B_REPLACED) {
+        flow.replaced_size(b, cw, ch);
+    } else {
+        let is f64 as w with mut = 0.0;
+        if (flow.specified_w(b, cw, &w) == 0) {
+            let is f64 as room = cw - b.m[bx.LEFT] - b.m[bx.RIGHT] - bx.edges_w(b);
+            if (has_l == 1 && has_r == 1) {
+                w = room - l - r;
+            } else {
+                let is f64 as avail with mut = room;
+                if (has_l == 1) { avail = avail - l; }
+                if (has_r == 1) { avail = avail - r; }
+                flow.intrinsic(c, b);
+                w = b.max_cw;
+                if (w > avail) { w = _max(b.min_cw, avail); }
+            }
+        }
+        b.w = flow.clamp_w(b, _max(w, 0.0), cw);
+        b.def_h = flow.specified_h(b, ch);
+        if (b.def_h < 0.0 && has_t == 1 && has_b == 1) {
+            b.def_h = _max(ch - t - bt - b.m[bx.TOP] - b.m[bx.BOTTOM] - bx.edges_h(b), 0.0);
+        }
+        flow.contents(c, b, ch);
+    }
+    let is f64 as fw = bx.border_w(b);
+    let is f64 as fh = bx.border_h(b);
+    if (has_l == 1 && has_r == 1 && (ml_auto == 1 || mr_auto == 1)) {
+        let is f64 as free = cw - l - r - fw - b.m[bx.LEFT] - b.m[bx.RIGHT];
+        if (ml_auto == 1 && mr_auto == 1 && free > 0.0) {
+            b.m[bx.LEFT] = free / 2.0;
+            b.m[bx.RIGHT] = free / 2.0;
+        } else if (ml_auto == 1) {
+            b.m[bx.LEFT] = free;
+        } else if (mr_auto == 1) {
+            b.m[bx.RIGHT] = free;
+        }
+    }
+    if (has_t == 1 && has_b == 1 && (mt_auto == 1 || mb_auto == 1)) {
+        let is f64 as free = ch - t - bt - fh - b.m[bx.TOP] - b.m[bx.BOTTOM];
+        if (mt_auto == 1 && mb_auto == 1 && free > 0.0) {
+            b.m[bx.TOP] = free / 2.0;
+            b.m[bx.BOTTOM] = free / 2.0;
+        } else if (mt_auto == 1) {
+            b.m[bx.TOP] = free;
+        } else if (mb_auto == 1) {
+            b.m[bx.BOTTOM] = free;
+        }
+    }
+    if (has_l == 1) { b.ax = cb.x + l + b.m[bx.LEFT]; }
+    else if (has_r == 1) { b.ax = cb.x + cw - r - b.m[bx.RIGHT] - fw; }
+    else { b.ax = static_x + b.m[bx.LEFT]; }
+    if (has_t == 1) { b.ay = cb.y + t + b.m[bx.TOP]; }
+    else if (has_b == 1) { b.ay = cb.y + ch - bt - b.m[bx.BOTTOM] - fh; }
+    else { b.ay = static_y + b.m[bx.TOP]; }
+}
+
+// Every box's place on the page. (ox, oy) is where the box's context starts, and cb is
+// the padding box that anything absolutely positioned below answers to.
+fn _place(c as *bx.Ctx, b as *bx.Box, ox as f64, oy as f64, parent_w as f64, cb as *Rect, view as *Rect) as void {
+    let is f64 as dx with mut = 0.0;
+    let is f64 as dy with mut = 0.0;
+    b.ox = ox;
+    b.oy = oy;
+    if (b.is_abs == 1) {
+        let is *Rect as own with mut = cb;
+        if (b.is_fixed == 1) { own = view; }
+        _absolute(c, b, own, ox + b.sx, oy + b.sy);
+    } else {
+        _relative(b, parent_w, &dx, &dy);
+        b.ax = ox + b.x + dx;
+        b.ay = oy + b.y + dy;
+    }
+    // A fixed box stays in the window, so nothing in it adds to the page.
+    if (b.is_fixed == 0) { _reach(c, b.ax + bx.border_w(b), b.ay + bx.border_h(b)); }
+
+    let is f64 as kid_x with mut = ox + dx;
+    let is f64 as kid_y with mut = oy + dy;
+    if (flow.is_context_root(b) == 1) {
+        kid_x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+        kid_y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
+    }
+    // What a box clips counts towards how far it scrolls and nothing further out.
+    let is i64 as clips = clips_content(b);
+    let is f64 as sx with mut = 0.0;
+    let is f64 as sy with mut = 0.0;
+    if (scrolls(b) == 1) {
+        sx = b.node.scroll_x;
+        sy = b.node.scroll_y;
+        kid_x = kid_x - sx;
+        kid_y = kid_y - sy;
+    }
+    let is f64 as saved_r = c.ext_r;
+    let is f64 as saved_b = c.ext_b;
+    if (clips == 1 || b.is_fixed == 1) {
+        c.ext_r = 0.0;
+        c.ext_b = 0.0;
+    }
+    b.kx = kid_x;
+    b.ky = kid_y;
+
+    let is Rect as here with mut;
+    let is *Rect as next_cb with mut = cb;
+    if ((bx.prop(b, pr.P_POSITION) != pr.K_STATIC || b.st.v.i[pr.P_TRANSFORM] != pr.K_NONE) && b.kind != bx.B_INLINE && b.kind != bx.B_TEXT) {
+        here.x = b.ax + b.b[bx.LEFT];
+        here.y = b.ay + b.b[bx.TOP];
+        here.w = b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];
+        here.h = b.p[bx.TOP] + b.h + b.p[bx.BOTTOM];
+        next_cb = &here;
+    }
+    if (b.inline_ctx == 1) {
+        let is *bx.Frag as f with mut = b.frags;
+        while (f != null) {
+            _reach(c, kid_x + f.x + f.w, kid_y + f.y + f.h);
+            f = f.next;
+        }
+    }
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.kind != bx.B_TEXT && x.kind != bx.B_BR && x.kind != bx.B_COL) {
+            if (x.kind == bx.B_INLINE) {
+                // It has no place of its own beyond its fragments, but what it holds does.
+                _place_inline(c, x, kid_x, kid_y, b.w, next_cb, view);
+            } else {
+                _place(c, x, kid_x, kid_y, b.w, next_cb, view);
+            }
+        }
+        x = x.next;
+    }
+    if (clips == 1) {
+        let is f64 as pad_r = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];
+        let is f64 as pad_b = b.ay + b.b[bx.TOP] + b.p[bx.TOP] + b.h + b.p[bx.BOTTOM];
+        b.max_sx = _past(c.ext_r + sx - pad_r);
+        b.max_sy = _past(c.ext_b + sy - pad_b);
+    }
+    if (clips == 1 || b.is_fixed == 1) {
+        c.ext_r = saved_r;
+        c.ext_b = saved_b;
+    }
+}
+
+// Whether what is inside this box stays inside it. On the root and the body, overflow
+// means the window, which scrolls anyway.
+fn clips_content(b as *bx.Box) as i64 {
+    if (b.node != null && (b.node.tag == tg.HTML || b.node.tag == tg.BODY)) { return 0; }
+    let is *pr.Values as s = &b.st.v;
+    if (s.i[pr.P_OVERFLOW_X] != pr.K_VISIBLE || s.i[pr.P_OVERFLOW_Y] != pr.K_VISIBLE) { return 1; }
+    return 0;
+}
+
+// Whether a person can move what is inside it. overflow: hidden clips but does not.
+fn scrolls(b as *bx.Box) as i64 {
+    if (b.node == null || clips_content(b) == 0) { return 0; }
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as ox = s.i[pr.P_OVERFLOW_X];
+    let is i64 as oy = s.i[pr.P_OVERFLOW_Y];
+    if (ox == pr.K_AUTO || ox == pr.K_SCROLL || oy == pr.K_AUTO || oy == pr.K_SCROLL) { return 1; }
+    return 0;
+}
+
+fn _place_inline(c as *bx.Ctx, b as *bx.Box, ox as f64, oy as f64, parent_w as f64, cb as *Rect, view as *Rect) as void {
+    b.ox = ox;
+    b.oy = oy;
+    b.kx = ox;
+    b.ky = oy;
+    let is *bx.Box as x with mut = b.first;
+    while (x != null) {
+        if (x.kind == bx.B_INLINE) { _place_inline(c, x, ox, oy, parent_w, cb, view); }
+        else if (x.kind != bx.B_TEXT && x.kind != bx.B_BR) { _place(c, x, ox, oy, parent_w, cb, view); }
+        x = x.next;
+    }
+}
+
+// Everything's place again, with nothing about its size changed: a box scrolled.
+fn place_again(c as *bx.Ctx, root as *bx.Box) as void {
+    let is Rect as view with mut;
+    view.x = 0.0;
+    view.y = 0.0;
+    view.w = c.vw;
+    view.h = c.vh;
+    c.ext_r = 0.0;
+    c.ext_b = 0.0;
+    _place(c, root, 0.0, 0.0, c.vw, &view, &view);
+    c.doc_w = c.ext_r;
+    c.doc_h = c.ext_b;
+}
+
+// Styles are already on the document. Boxes and everything else come from c.a.
+fn run(c as *bx.Ctx, d as *dom.Document) as *bx.Box {
+    table.install();
+    flex.install();
+    grid.install();
+    let is *bx.Box as root = build.build(c, d);
+    flow.root_layout(c, root);
+    place_again(c, root);
+    return root;
+}
+
+// --- Asking where things are ---
+
+struct Hit {
+    node as *dom.Node;
+    box  as *bx.Box;
+    over_text as i64;
+}
+
+// The box of an element, if it has one of its own.
+fn box_of(b as *bx.Box, n as *dom.Node) as *bx.Box {
+    if (b.node == n) { return b; }
+    let is *bx.Box as k with mut = b.first;
+    while (k != null) {
+        let is *bx.Box as r = box_of(k, n);
+        if (r != null) { return r; }
+        k = k.next;
+    }
+    return cast(*bx.Box, 0);
+}
+
+// Moves what is inside the nearest box under the point that still can, from what the hit
+// found. 1 if something moved; 0 leaves the wheel for the page.
+fn scroll_boxes(from as *bx.Box, dx as f64, dy as f64) as i64 {
+    let is *bx.Box as b with mut = from;
+    while (b != null) {
+        if (scrolls(b) == 1) {
+            let is f64 as nx = _clamp(b.node.scroll_x + dx, b.max_sx);
+            let is f64 as ny = _clamp(b.node.scroll_y + dy, b.max_sy);
+            if (nx != b.node.scroll_x || ny != b.node.scroll_y) {
+                b.node.scroll_x = nx;
+                b.node.scroll_y = ny;
+                return 1;
+            }
+        }
+        b = b.parent;
+    }
+    return 0;
+}
+
+fn _clamp(v as f64, hi as f64) as f64 {
+    if (v > hi) { return hi; }
+    if (v < 0.0) { return 0.0; }
+    return v;
+}
+
+// How far down the page the first box of an element starts, or -1 without one.
+fn y_of(b as *bx.Box, n as *dom.Node) as f64 {
+    if (b.node == n && b.kind != bx.B_INLINE) { return b.ay; }
+    let is *bx.Box as k with mut = b.first;
+    while (k != null) {
+        let is f64 as y = y_of(k, n);
+        if (y >= 0.0) { return y; }
+        k = k.next;
+    }
+    // An inline box's fragments are its container's, so look for one there.
+    if (b.inline_ctx == 1) {
+        let is *bx.Frag as f with mut = b.frags;
+        while (f != null) {
+            if (f.box.node == n) { return b.sy + f.y; }
+            f = f.next;
+        }
+    }
+    return 0.0 - 1.0;
+}

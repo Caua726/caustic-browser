@@ -1,0 +1,549 @@
+// layout/table.cst — tables, the automatic algorithm CSS 2 section 17.5.2 suggests.
+//
+// Columns come from the cells: each has a narrowest and a widest it would like, a table
+// that has room gives them their widest, and one that does not shares out what it has
+// above the narrowest. Rows then are as tall as their tallest cell.
+//
+// Collapsed borders are kept simple: the spacing goes, and each cell gives up its top and
+// left border to the neighbour it would have shared them with.
+
+use "../base/arena.cst" as arena;
+use "../css/props.cst" as pr;
+use "../dom/dom.cst" as dom;
+use "./box.cst" as bx;
+use "./flow.cst" as flow;
+use "std/mem.cst" as mem;
+
+struct Col {
+    lo    as f64;
+    hi    as f64;
+    w     as f64;
+    pct   as f64;
+    fixed as f64;   // a width the page gave in pixels, else negative
+}
+
+struct Grid {
+    rows  as **bx.Box;
+    nrows as i64;
+    cols  as *Col;
+    ncols as i64;
+    collapse as i64;
+    sh    as f64;
+    sv    as f64;
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _group_rank(g as *bx.Box) as i64 {
+    let is i64 as d = bx.prop(g, pr.P_DISPLAY);
+    if (d == pr.K_TABLE_HEADER_GROUP) { return 0; }
+    if (d == pr.K_TABLE_FOOTER_GROUP) { return 2; }
+    return 1;
+}
+
+// Rows from header to footer, and which columns each cell covers.
+fn _scan(c as *bx.Ctx, t as *bx.Box, gr as *Grid) as void {
+    let is i64 as nrows with mut = 0;
+    let is *bx.Box as g with mut = t.first;
+    while (g != null) {
+        if (g.kind == bx.B_ROWGROUP) {
+            let is *bx.Box as r with mut = g.first;
+            while (r != null) {
+                if (r.kind == bx.B_ROW) { nrows = nrows + 1; }
+                r = r.next;
+            }
+        }
+        g = g.next;
+    }
+    gr.rows = cast(**bx.Box, arena.alloc(c.a, (nrows + 1) * 8));
+    gr.nrows = 0;
+    let is i64 as rank with mut = 0;
+    while (rank < 3) {
+        g = t.first;
+        while (g != null) {
+            if (g.kind == bx.B_ROWGROUP && _group_rank(g) == rank) {
+                let is *bx.Box as r with mut = g.first;
+                while (r != null) {
+                    if (r.kind == bx.B_ROW) {
+                        gr.rows[gr.nrows] = r;
+                        gr.nrows = gr.nrows + 1;
+                    }
+                    r = r.next;
+                }
+            }
+            g = g.next;
+        }
+        rank = rank + 1;
+    }
+    // How long rowspans hold a column down. A span past the end of the table stops
+    // there, and rowspan=0 means to the end of its group, which here is the same.
+    let is i64 as ncols with mut = 0;
+    let is i64 as cap with mut = 64;
+    let is *i64 as held with mut = cast(*i64, arena.alloc(c.a, cap * 8));
+    let is i64 as y with mut = 0;
+    while (y < gr.nrows) {
+        let is i64 as x with mut = 0;
+        let is *bx.Box as cell with mut = gr.rows[y].first;
+        while (cell != null) {
+            if (cell.kind == bx.B_CELL) {
+                while (x < cap && held[x] > y) { x = x + 1; }
+                let is i64 as need = x + cell.colspan;
+                if (need > cap) {
+                    let is i64 as nc with mut = cap * 2;
+                    while (nc < need) { nc = nc * 2; }
+                    let is *i64 as more = cast(*i64, arena.alloc(c.a, nc * 8));
+                    mem.core.memcpy(cast(*u8, more), cast(*u8, held), cap * 8);
+                    held = more;
+                    cap = nc;
+                }
+                cell.col = x;
+                cell.row = y;
+                let is i64 as span with mut = cell.rowspan;
+                if (span == 0 || y + span > gr.nrows) { span = gr.nrows - y; }
+                cell.rowspan = span;
+                let is i64 as k with mut = 0;
+                while (k < cell.colspan) {
+                    held[x + k] = y + span;
+                    k = k + 1;
+                }
+                x = x + cell.colspan;
+                if (x > ncols) { ncols = x; }
+            }
+            cell = cell.next;
+        }
+        y = y + 1;
+    }
+    gr.ncols = ncols;
+    gr.cols = cast(*Col, arena.alloc(c.a, (ncols + 1) * sizeof(Col)));
+    let is i64 as k with mut = 0;
+    while (k < ncols) {
+        gr.cols[k].fixed = 0.0 - 1.0;
+        k = k + 1;
+    }
+    gr.collapse = cast(i64, bx.prop(t, pr.P_BORDER_COLLAPSE) == pr.K_COLLAPSE);
+    gr.sh = t.st.v.f[pr.P_BORDER_SPACING_H];
+    gr.sv = t.st.v.f[pr.P_BORDER_SPACING_V];
+    if (gr.collapse == 1) {
+        gr.sh = 0.0;
+        gr.sv = 0.0;
+    }
+}
+
+fn _cell_widths(c as *bx.Ctx, cell as *bx.Box, lo as *f64, hi as *f64) as void {
+    flow.edges(cell, 0.0 - 1.0);
+    *lo = flow.outer_min(c, cell);
+    *hi = flow.outer_max(c, cell);
+}
+
+// Each column's narrowest and widest, from its cells: single columns first, then what
+// spanning cells need on top of them.
+fn _column_widths(c as *bx.Ctx, t as *bx.Box, gr as *Grid) as void {
+    let is i64 as y with mut = 0;
+    while (y < gr.nrows) {
+        let is *bx.Box as cell with mut = gr.rows[y].first;
+        while (cell != null) {
+            if (cell.kind == bx.B_CELL && cell.colspan == 1) {
+                let is f64 as lo with mut = 0.0;
+                let is f64 as hi with mut = 0.0;
+                _cell_widths(c, cell, &lo, &hi);
+                let is *Col as col = &gr.cols[cell.col];
+                col.lo = _max(col.lo, lo);
+                col.hi = _max(col.hi, hi);
+                if (bx.is_len(cell, pr.P_WIDTH) == 1) {
+                    if (cell.st.v.p[pr.P_WIDTH] > 0.0) { col.pct = _max(col.pct, cell.st.v.p[pr.P_WIDTH]); }
+                    else if (cell.st.v.f[pr.P_WIDTH] > 0.0) { col.fixed = _max(col.fixed, hi); }
+                }
+            }
+            cell = cell.next;
+        }
+        y = y + 1;
+    }
+    _column_elements(t, gr);
+    y = 0;
+    while (y < gr.nrows) {
+        let is *bx.Box as cell with mut = gr.rows[y].first;
+        while (cell != null) {
+            if (cell.kind == bx.B_CELL && cell.colspan > 1) {
+                let is f64 as lo with mut = 0.0;
+                let is f64 as hi with mut = 0.0;
+                _cell_widths(c, cell, &lo, &hi);
+                let is f64 as have_lo with mut = gr.sh * cast(f64, cell.colspan - 1);
+                let is f64 as have_hi with mut = have_lo;
+                let is i64 as k with mut = 0;
+                while (k < cell.colspan) {
+                    have_lo = have_lo + gr.cols[cell.col + k].lo;
+                    have_hi = have_hi + gr.cols[cell.col + k].hi;
+                    k = k + 1;
+                }
+                let is f64 as add_lo with mut = 0.0;
+                let is f64 as add_hi with mut = 0.0;
+                if (lo > have_lo) { add_lo = (lo - have_lo) / cast(f64, cell.colspan); }
+                if (hi > have_hi) { add_hi = (hi - have_hi) / cast(f64, cell.colspan); }
+                k = 0;
+                while (k < cell.colspan) {
+                    gr.cols[cell.col + k].lo = gr.cols[cell.col + k].lo + add_lo;
+                    gr.cols[cell.col + k].hi = gr.cols[cell.col + k].hi + add_hi;
+                    k = k + 1;
+                }
+            }
+            cell = cell.next;
+        }
+        y = y + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < gr.ncols) {
+        if (gr.cols[k].hi < gr.cols[k].lo) { gr.cols[k].hi = gr.cols[k].lo; }
+        k = k + 1;
+    }
+}
+
+// <col> and <colgroup> widths, for the columns they stand over.
+fn _column_elements(t as *bx.Box, gr as *Grid) as void {
+    let is i64 as at with mut = 0;
+    let is *bx.Box as g with mut = t.first;
+    while (g != null) {
+        if (g.kind == bx.B_COL) {
+            if (g.first == null) {
+                at = _one_column(g, gr, at);
+            } else {
+                let is *bx.Box as k with mut = g.first;
+                while (k != null) {
+                    if (k.kind == bx.B_COL) { at = _one_column(k, gr, at); }
+                    k = k.next;
+                }
+            }
+        }
+        g = g.next;
+    }
+}
+
+fn _one_column(g as *bx.Box, gr as *Grid, at0 as i64) as i64 {
+    let is i64 as at with mut = at0;
+    let is i64 as span with mut = 1;
+    if (g.node != null) {
+        let is *dom.Attr as a = dom.find_attr(g.node, "span", 4);
+        if (a != null && a.value_len > 0 && a.value[0] >= 49 && a.value[0] <= 57) { span = cast(i64, a.value[0]) - 48; }
+    }
+    while (span > 0 && at < gr.ncols) {
+        if (bx.is_len(g, pr.P_WIDTH) == 1) {
+            if (g.st.v.p[pr.P_WIDTH] > 0.0) { gr.cols[at].pct = g.st.v.p[pr.P_WIDTH]; }
+            else if (g.st.v.f[pr.P_WIDTH] > 0.0) {
+                gr.cols[at].fixed = g.st.v.f[pr.P_WIDTH];
+                gr.cols[at].hi = _max(gr.cols[at].hi, g.st.v.f[pr.P_WIDTH]);
+            }
+        }
+        at = at + 1;
+        span = span - 1;
+    }
+    return at;
+}
+
+fn _spacing_total(gr as *Grid) as f64 {
+    if (gr.ncols == 0) { return 0.0; }
+    return gr.sh * cast(f64, gr.ncols + 1);
+}
+
+fn _widths(c as *bx.Ctx, t as *bx.Box) as void {
+    let is Grid as g with mut;
+    _scan(c, t, &g);
+    _column_widths(c, t, &g);
+    let is f64 as lo with mut = _spacing_total(&g);
+    let is f64 as hi with mut = lo;
+    let is i64 as k with mut = 0;
+    while (k < g.ncols) {
+        lo = lo + g.cols[k].lo;
+        hi = hi + g.cols[k].hi;
+        k = k + 1;
+    }
+    let is *bx.Box as x with mut = t.first;
+    while (x != null) {
+        if (x.kind == bx.B_CAPTION) { lo = _max(lo, flow.outer_min(c, x)); }
+        x = x.next;
+    }
+    t.min_cw = lo;
+    t.max_cw = _max(hi, lo);
+}
+
+// Shares out the table's width among its columns.
+fn _distribute(t as *bx.Box, gr as *Grid) as void {
+    let is f64 as room with mut = t.w - _spacing_total(gr);
+    if (room < 0.0) { room = 0.0; }
+    let is f64 as lo_sum with mut = 0.0;
+    let is f64 as hi_sum with mut = 0.0;
+    let is f64 as pct_sum with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < gr.ncols) {
+        let is *Col as col = &gr.cols[k];
+        // A column's own percentage or pixels are the most it wants, however wide its
+        // cells could be, but never less than they must be.
+        if (col.pct > 0.0) {
+            let is f64 as wanted = room * col.pct / 100.0;
+            col.hi = _max(col.lo, wanted);
+        } else if (col.fixed >= 0.0) {
+            col.hi = _max(col.lo, col.fixed);
+        }
+        lo_sum = lo_sum + col.lo;
+        hi_sum = hi_sum + col.hi;
+        pct_sum = pct_sum + col.pct;
+        k = k + 1;
+    }
+    k = 0;
+    while (k < gr.ncols) {
+        let is *Col as col = &gr.cols[k];
+        if (room >= hi_sum) {
+            col.w = col.hi;
+        } else if (hi_sum > lo_sum) {
+            col.w = col.lo + (col.hi - col.lo) * (room - lo_sum) / (hi_sum - lo_sum);
+            if (room < lo_sum) { col.w = col.lo; }
+        } else {
+            col.w = col.lo;
+        }
+        k = k + 1;
+    }
+    // More room than anyone asked for goes first to the columns that named no size,
+    // or to all when every one did.
+    if (room > hi_sum && gr.ncols > 0) {
+        let is f64 as extra = room - hi_sum;
+        let is f64 as flexible with mut = 0.0;
+        k = 0;
+        while (k < gr.ncols) {
+            if (gr.cols[k].pct == 0.0 && gr.cols[k].fixed < 0.0) { flexible = flexible + gr.cols[k].hi; }
+            k = k + 1;
+        }
+        let is i64 as any_flexible = cast(i64, flexible > 0.0);
+        let is f64 as total with mut = flexible;
+        if (any_flexible == 0) {
+            k = 0;
+            while (k < gr.ncols) {
+                total = total + gr.cols[k].hi;
+                k = k + 1;
+            }
+        }
+        k = 0;
+        while (k < gr.ncols) {
+            let is *Col as col = &gr.cols[k];
+            let is i64 as takes = cast(i64, any_flexible == 0 || (col.pct == 0.0 && col.fixed < 0.0));
+            if (takes == 1) {
+                if (total > 0.0) { col.w = col.w + extra * col.hi / total; }
+                else { col.w = col.w + extra / cast(f64, gr.ncols); }
+            }
+            k = k + 1;
+        }
+    }
+}
+
+// The first row sets the widths and cell contents never change them.
+fn _distribute_fixed(t as *bx.Box, gr as *Grid) as void {
+    let is f64 as room = _max(t.w - _spacing_total(gr), 0.0);
+    let is f64 as used with mut = 0.0;
+    let is i64 as open with mut = gr.ncols;
+    let is i64 as k with mut = 0;
+    while (k < gr.ncols) {
+        gr.cols[k].w = 0.0 - 1.0;
+        if (gr.cols[k].fixed >= 0.0) {
+            gr.cols[k].w = gr.cols[k].fixed;
+        } else if (gr.cols[k].pct > 0.0) {
+            gr.cols[k].w = room * gr.cols[k].pct / 100.0;
+        }
+        if (gr.cols[k].w >= 0.0) {
+            used = used + gr.cols[k].w;
+            open = open - 1;
+        }
+        k = k + 1;
+    }
+    let is f64 as share with mut = 0.0;
+    if (open > 0) { share = _max(room - used, 0.0) / cast(f64, open); }
+    k = 0;
+    while (k < gr.ncols) {
+        if (gr.cols[k].w < 0.0) { gr.cols[k].w = share; }
+        k = k + 1;
+    }
+}
+
+fn _collapse_cell(gr as *Grid, cell as *bx.Box) as void {
+    if (gr.collapse == 0) { return; }
+    if (cell.col > 0) { cell.b[bx.LEFT] = 0.0; }
+    if (cell.row > 0) { cell.b[bx.TOP] = 0.0; }
+}
+
+fn _layout(c as *bx.Ctx, t as *bx.Box) as void {
+    let is Grid as g with mut;
+    _scan(c, t, &g);
+    _column_widths(c, t, &g);
+    if (bx.prop(t, pr.P_TABLE_LAYOUT) == pr.K_FIXED && bx.is_len(t, pr.P_WIDTH) == 1) { _distribute_fixed(t, &g); }
+    else { _distribute(t, &g); }
+
+    // Captions on top, in the table's width.
+    let is f64 as top with mut = 0.0;
+    let is *bx.Box as x with mut = t.first;
+    while (x != null) {
+        if (x.kind == bx.B_CAPTION && bx.prop(x, pr.P_CAPTION_SIDE) == pr.K_TOP) { top = _caption(c, t, x, top); }
+        x = x.next;
+    }
+
+    // Where each column starts.
+    let is *f64 as cx = cast(*f64, arena.alloc(c.a, (g.ncols + 2) * 8));
+    let is f64 as at with mut = g.sh;
+    let is i64 as k with mut = 0;
+    while (k < g.ncols) {
+        cx[k] = at;
+        at = at + g.cols[k].w + g.sh;
+        k = k + 1;
+    }
+    cx[g.ncols] = at;
+
+    let is *f64 as rh = cast(*f64, arena.alloc(c.a, (g.nrows + 1) * 8));
+
+    // Every cell at its width, and how tall that makes it.
+    let is i64 as y with mut = 0;
+    while (y < g.nrows) {
+        let is *bx.Box as row = g.rows[y];
+        let is f64 as row_h with mut = 0.0;
+        if (bx.is_definite(row, pr.P_HEIGHT, 0.0 - 1.0) == 1) { row_h = bx.resolve(row, pr.P_HEIGHT, 0.0 - 1.0); }
+        let is *bx.Box as cell with mut = row.first;
+        while (cell != null) {
+            if (cell.kind == bx.B_CELL) {
+                flow.edges(cell, t.w);
+                _collapse_cell(&g, cell);
+                let is f64 as w with mut = 0.0 - g.sh;
+                k = 0;
+                while (k < cell.colspan) {
+                    w = w + g.cols[cell.col + k].w + g.sh;
+                    k = k + 1;
+                }
+                cell.w = _max(w - bx.edges_w(cell), 0.0);
+                cell.def_h = 0.0 - 1.0;
+                flow.contents(c, cell, 0.0 - 1.0);
+                let is f64 as spec = flow.specified_h(cell, 0.0 - 1.0);
+                if (spec > cell.h) { cell.h = spec; }
+                if (cell.rowspan == 1) { row_h = _max(row_h, bx.border_h(cell)); }
+            }
+            cell = cell.next;
+        }
+        rh[y] = row_h;
+        y = y + 1;
+    }
+    // A spanning cell taller than its rows spreads what is missing over them.
+    y = 0;
+    while (y < g.nrows) {
+        let is *bx.Box as cell with mut = g.rows[y].first;
+        while (cell != null) {
+            if (cell.kind == bx.B_CELL && cell.rowspan > 1) {
+                let is f64 as have with mut = g.sv * cast(f64, cell.rowspan - 1);
+                k = 0;
+                while (k < cell.rowspan) {
+                    have = have + rh[y + k];
+                    k = k + 1;
+                }
+                let is f64 as need = bx.border_h(cell);
+                if (need > have) {
+                    let is f64 as add = (need - have) / cast(f64, cell.rowspan);
+                    k = 0;
+                    while (k < cell.rowspan) {
+                        rh[y + k] = rh[y + k] + add;
+                        k = k + 1;
+                    }
+                }
+            }
+            cell = cell.next;
+        }
+        y = y + 1;
+    }
+    // A height set on the table itself is shared over its rows.
+    let is f64 as grid_h with mut = g.sv;
+    y = 0;
+    while (y < g.nrows) {
+        grid_h = grid_h + rh[y] + g.sv;
+        y = y + 1;
+    }
+    if (g.nrows == 0) { grid_h = 0.0; }
+    if (t.def_h > grid_h && g.nrows > 0) {
+        let is f64 as add = (t.def_h - grid_h) / cast(f64, g.nrows);
+        y = 0;
+        while (y < g.nrows) {
+            rh[y] = rh[y] + add;
+            y = y + 1;
+        }
+        grid_h = t.def_h;
+    }
+
+    // Now everything has a place.
+    let is f64 as ry with mut = top + g.sv;
+    y = 0;
+    while (y < g.nrows) {
+        let is *bx.Box as row = g.rows[y];
+        row.x = 0.0;
+        row.y = ry;
+        row.w = t.w;
+        row.h = rh[y];
+        let is *bx.Box as cell with mut = row.first;
+        while (cell != null) {
+            if (cell.kind == bx.B_CELL) {
+                let is f64 as span_h with mut = g.sv * cast(f64, cell.rowspan - 1);
+                k = 0;
+                while (k < cell.rowspan) {
+                    span_h = span_h + rh[y + k];
+                    k = k + 1;
+                }
+                cell.x = cx[cell.col];
+                cell.y = ry;
+                let is f64 as inner = span_h - bx.edges_h(cell);
+                let is f64 as free = inner - cell.h;
+                let is i64 as va = bx.prop(cell, pr.P_VERTICAL_ALIGN);
+                // A cell's height is the row's. The content moves inside it, which is
+                // the padding growing, since everything in it hangs off its content box.
+                if (free > 0.0) {
+                    if (va == pr.K_MIDDLE) {
+                        cell.p[bx.TOP] = cell.p[bx.TOP] + free / 2.0;
+                        cell.p[bx.BOTTOM] = cell.p[bx.BOTTOM] + free / 2.0;
+                    } else if (va == pr.K_BOTTOM) {
+                        cell.p[bx.TOP] = cell.p[bx.TOP] + free;
+                    } else {
+                        cell.p[bx.BOTTOM] = cell.p[bx.BOTTOM] + free;
+                    }
+                }
+            }
+            cell = cell.next;
+        }
+        ry = ry + rh[y] + g.sv;
+        y = y + 1;
+    }
+    _place_groups(t);
+    if (g.nrows == 0) { ry = top; }
+
+    x = t.first;
+    while (x != null) {
+        if (x.kind == bx.B_CAPTION && bx.prop(x, pr.P_CAPTION_SIDE) == pr.K_BOTTOM) { ry = _caption(c, t, x, ry); }
+        x = x.next;
+    }
+    t.h = ry;
+}
+
+// A group's box, drawn behind its rows, reaches around them.
+fn _place_groups(t as *bx.Box) as void {
+    let is *bx.Box as g with mut = t.first;
+    while (g != null) {
+        if (g.kind == bx.B_ROWGROUP && g.first != null) {
+            g.x = 0.0;
+            g.w = t.w;
+            g.y = g.first.y;
+            g.h = g.last.y + g.last.h - g.first.y;
+        }
+        g = g.next;
+    }
+}
+
+fn _caption(c as *bx.Ctx, t as *bx.Box, x as *bx.Box, y as f64) as f64 {
+    flow.block_width(c, x, t.w);
+    x.def_h = 0.0 - 1.0;
+    x.x = x.m[bx.LEFT];
+    x.y = y + x.m[bx.TOP];
+    flow.contents(c, x, 0.0 - 1.0);
+    return y + bx.margin_h(x);
+}
+
+fn install() as void {
+    bx.table_layout = fn_ptr(_layout);
+    bx.table_widths = fn_ptr(_widths);
+}

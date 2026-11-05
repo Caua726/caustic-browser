@@ -1,0 +1,128 @@
+// dom/dump.cst — a tree as text, in the layout html5lib's tree tests are written in:
+// a line per node, two spaces a level, attributes one level under their element.
+//
+// A loop over parent links instead of recursion: nothing bounds how deep a page can
+// nest, and running out of stack on a hostile page must not be how it ends.
+
+use "std/io.cst" as io;
+use "./dom.cst" as dom;
+
+let is i64 as BUF with imut = 65536;
+let is [BUF]u8 as _buf with mut;
+
+fn _str(w as *io.Writer, s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        io.put(w, s[i]);
+        i = i + 1;
+    }
+}
+
+fn _bytes(w as *io.Writer, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        io.put(w, s[i]);
+        i = i + 1;
+    }
+}
+
+fn _lead(w as *io.Writer, depth as i64) as void {
+    _str(w, "| ");
+    let is i64 as i with mut = 0;
+    while (i < depth) {
+        _str(w, "  ");
+        i = i + 1;
+    }
+}
+
+fn _quoted(w as *io.Writer, s as *u8, n as i64) as void {
+    _str(w, "\"");
+    _bytes(w, s, n);
+    _str(w, "\"");
+}
+
+fn _attrs(w as *io.Writer, n as *dom.Node, depth as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n.nattr) {
+        let is *dom.Attr as a = dom.attr_at(n, i);
+        _lead(w, depth);
+        if (a.ns == dom.ATTR_XLINK) { _str(w, "xlink "); }
+        if (a.ns == dom.ATTR_XML) { _str(w, "xml "); }
+        if (a.ns == dom.ATTR_XMLNS) { _str(w, "xmlns "); }
+        _bytes(w, a.name, a.name_len);
+        _str(w, "=");
+        _quoted(w, a.value, a.value_len);
+        _str(w, "\n");
+        i = i + 1;
+    }
+}
+
+fn _line(w as *io.Writer, n as *dom.Node, depth as i64) as void {
+    _lead(w, depth);
+    if (n.kind == dom.DOCTYPE) {
+        _str(w, "<!DOCTYPE ");
+        _bytes(w, n.name, n.name_len);
+        if (n.text_len > 0 || n.sys_len > 0) {
+            _str(w, " ");
+            _quoted(w, n.text, n.text_len);
+            _str(w, " ");
+            _quoted(w, n.sys, n.sys_len);
+        }
+        _str(w, ">\n");
+        return;
+    }
+    if (n.kind == dom.COMMENT) {
+        _str(w, "<!-- ");
+        _bytes(w, n.text, n.text_len);
+        _str(w, " -->\n");
+        return;
+    }
+    if (n.kind == dom.TEXT) {
+        _quoted(w, n.text, n.text_len);
+        _str(w, "\n");
+        return;
+    }
+    _str(w, "<");
+    if (n.ns == dom.NS_SVG) { _str(w, "svg "); }
+    if (n.ns == dom.NS_MATHML) { _str(w, "math "); }
+    _bytes(w, n.name, n.name_len);
+    _str(w, ">\n");
+    _attrs(w, n, depth + 1);
+}
+
+fn dump(d as *dom.Document, fd as i64) as void {
+    let is io.Writer as w with mut = io.Writer(fd, cast(*u8, &_buf), BUF);
+    let is *dom.Node as n with mut = d.node.first;
+    let is i64 as depth with mut = 0;
+    while (n != null) {
+        _line(&w, n, depth);
+        let is *dom.Node as inner with mut = n.first;
+        let is i64 as step with mut = 1;
+        if (n.kind == dom.ELEMENT && n.content != null) {
+            _lead(&w, depth + 1);
+            _str(&w, "content\n");
+            inner = n.content.first;
+            step = 2;
+        }
+        if (inner != null) {
+            n = inner;
+            depth = depth + step;
+            continue;
+        }
+        // Nothing under it: up until there is a next sibling, or the document.
+        while (n != null && n.next == null) {
+            let is *dom.Node as up = n.parent;
+            if (up == null || up.kind == dom.DOCUMENT) {
+                n = cast(*dom.Node, 0);
+            } else if (up.kind == dom.FRAGMENT) {
+                n = up.content;
+                depth = depth - 2;
+            } else {
+                n = up;
+                depth = depth - 1;
+            }
+        }
+        if (n != null) { n = n.next; }
+    }
+    io.flush(&w);
+}

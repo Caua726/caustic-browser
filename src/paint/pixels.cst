@@ -1,0 +1,248 @@
+// paint/pixels.cst — what the list asks for and the toolkit has no shape for, as pixels.
+//
+// A gradient of any kind and a rounded edge whose sides differ are worked out here, once,
+// into an image the view keeps and draws from. Pixels come out premultiplied. Nothing here
+// knows about a window, so it can be tested on its own.
+
+use "std/math.cst" as fm;
+use "std/mem.cst" as mem;
+use "../css/values.cst" as v;
+use "./display_list.cst" as dl;
+
+let is i64 as RAMP with imut = 1024;
+let is i64 as MAX_STOPS with imut = 64;
+
+fn _maxf(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _minf(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _to_byte(x as f64) as i64 {
+    let is i64 as k = cast(i64, x * 255.0 + 0.5);
+    if (k < 0) { return 0; }
+    if (k > 255) { return 255; }
+    return k;
+}
+
+// A corner's part of the square coverage of a pixel at (x, y): how much of it is inside the
+// rounded box. One pixel of softness along the curve, and 1 for whatever is not in a corner.
+fn _corners(x as f64, y as f64, w as f64, h as f64, r1 as f64, r2 as f64, r3 as f64, r4 as f64, px as f64) as f64 {
+    let is f64 as dx with mut = 0.0;
+    let is f64 as dy with mut = 0.0;
+    let is f64 as r with mut = 0.0;
+    if (x < r1 && y < r1) { dx = r1 - x; dy = r1 - y; r = r1; }
+    else if (x > w - r2 && y < r2) { dx = x - (w - r2); dy = r2 - y; r = r2; }
+    else if (x > w - r3 && y > h - r3) { dx = x - (w - r3); dy = y - (h - r3); r = r3; }
+    else if (x < r4 && y > h - r4) { dx = r4 - x; dy = y - (h - r4); r = r4; }
+    if (r <= 0.0) { return 1.0; }
+    let is f64 as d = (fm.sqrt(dx * dx + dy * dy) - r) / px;
+    if (d <= 0.0 - 0.5) { return 1.0; }
+    if (d >= 0.5) { return 0.0; }
+    return 0.5 - d;
+}
+
+// The colours along the gradient, premultiplied, so that a stop that fades to nothing keeps
+// its hue on the way as CSS asks.
+fn _ramp(g as *dl.GradPaint, lo as f64, hi as f64, out as *f64) as void {
+    let is i64 as k with mut = 0;
+    let is i64 as seg with mut = 0;
+    let is i64 as n = g.n;
+    while (k < RAMP) {
+        let is f64 as t = lo + (hi - lo) * cast(f64, k) / cast(f64, RAMP - 1);
+        while (seg + 1 < n && t > g.pos[seg + 1]) { seg = seg + 1; }
+        let is i64 as a = g.cols[seg];
+        let is i64 as b with mut = a;
+        let is f64 as f with mut = 0.0;
+        if (seg + 1 < n && t >= g.pos[seg]) {
+            b = g.cols[seg + 1];
+            let is f64 as span = g.pos[seg + 1] - g.pos[seg];
+            if (span > 0.0) { f = (t - g.pos[seg]) / span; }
+            else { f = 1.0; }
+        }
+        let is f64 as aa = cast(f64, (a >> 24) & 255) / 255.0;
+        let is f64 as ba = cast(f64, (b >> 24) & 255) / 255.0;
+        let is f64 as ar = cast(f64, (a >> 16) & 255) / 255.0 * aa;
+        let is f64 as ag = cast(f64, (a >> 8) & 255) / 255.0 * aa;
+        let is f64 as ab = cast(f64, a & 255) / 255.0 * aa;
+        let is f64 as br = cast(f64, (b >> 16) & 255) / 255.0 * ba;
+        let is f64 as bg = cast(f64, (b >> 8) & 255) / 255.0 * ba;
+        let is f64 as bb = cast(f64, b & 255) / 255.0 * ba;
+        out[k * 4] = ar + (br - ar) * f;
+        out[k * 4 + 1] = ag + (bg - ag) * f;
+        out[k * 4 + 2] = ab + (bb - ab) * f;
+        out[k * 4 + 3] = aa + (ba - aa) * f;
+        k = k + 1;
+    }
+}
+
+// g over a w by h box of logical pixels, into wp by hp RGBA pixels. r1 to r4 round its corners.
+fn gradient(g as *dl.GradPaint, w as f64, h as f64, r1 as f64, r2 as f64, r3 as f64, r4 as f64, wp as i64, hp as i64, out as *u8) as void {
+    if (g.n < 1 || wp <= 0 || hp <= 0) { return; }
+    let is [4096]f64 as ramp with mut;
+    let is f64 as lo = g.pos[0];
+    let is f64 as hi with mut = g.pos[g.n - 1];
+    let is f64 as span with mut = hi - lo;
+    // One colour to the end of the ramp's range, whatever the places were.
+    if (g.repeating == 0) {
+        _ramp(g, _minf(lo, 0.0), _maxf(hi, 1.0), &ramp[0]);
+    } else {
+        _ramp(g, lo, hi, &ramp[0]);
+    }
+    let is f64 as ramp_lo with mut = lo;
+    let is f64 as ramp_span with mut = span;
+    if (g.repeating == 0) {
+        ramp_lo = _minf(lo, 0.0);
+        ramp_span = _maxf(hi, 1.0) - ramp_lo;
+    }
+    if (ramp_span <= 0.0) { ramp_span = 1.0; }
+    let is f64 as sx = w / cast(f64, wp);
+    let is f64 as sy = h / cast(f64, hp);
+    let is f64 as px = _maxf(sx, sy);
+    let is i64 as rounded = cast(i64, r1 > 0.0 || r2 > 0.0 || r3 > 0.0 || r4 > 0.0);
+    let is f64 as tau = 6.283185307179586;
+    let is i64 as yi with mut = 0;
+    while (yi < hp) {
+        let is f64 as y = (cast(f64, yi) + 0.5) * sy;
+        let is i64 as xi with mut = 0;
+        let is *u8 as row = &out[yi * wp * 4];
+        while (xi < wp) {
+            let is f64 as x = (cast(f64, xi) + 0.5) * sx;
+            let is f64 as t with mut = 0.0;
+            if (g.kind == v.GRAD_LINEAR) {
+                t = ((x - w / 2.0) * g.dx + (y - h / 2.0) * g.dy) / g.len + 0.5;
+            } else if (g.kind == v.GRAD_RADIAL) {
+                let is f64 as ddx = (x - g.cx) / g.rx;
+                let is f64 as ddy = (y - g.cy) / g.ry;
+                t = fm.sqrt(ddx * ddx + ddy * ddy);
+            } else {
+                t = fm.atan2(x - g.cx, g.cy - y) / tau - g.from;
+                t = t - fm.floor(t);
+            }
+            if (g.repeating == 1 && span > 0.0) {
+                t = t - lo;
+                t = t - fm.floor(t / span) * span;
+                t = t + lo;
+            }
+            let is f64 as along = (t - ramp_lo) / ramp_span * cast(f64, RAMP - 1);
+            let is i64 as at with mut = cast(i64, along + 0.5);
+            if (along < 0.0) { at = 0; }
+            if (at >= RAMP) { at = RAMP - 1; }
+            let is f64 as cov with mut = 1.0;
+            if (rounded == 1) { cov = _corners(x, y, w, h, r1, r2, r3, r4, px); }
+            row[xi * 4] = cast(u8, _to_byte(ramp[at * 4] * cov));
+            row[xi * 4 + 1] = cast(u8, _to_byte(ramp[at * 4 + 1] * cov));
+            row[xi * 4 + 2] = cast(u8, _to_byte(ramp[at * 4 + 2] * cov));
+            row[xi * 4 + 3] = cast(u8, _to_byte(ramp[at * 4 + 3] * cov));
+            xi = xi + 1;
+        }
+        yi = yi + 1;
+    }
+}
+
+// Whether a point is in a box whose corners are quarter ellipses.
+fn _in_rounded(x as f64, y as f64, w as f64, h as f64, c as *f64) as i64 {
+    if (x < 0.0 || y < 0.0 || x > w || y > h) { return 0; }
+    let is f64 as dx with mut = 0.0;
+    let is f64 as dy with mut = 0.0;
+    let is f64 as rx with mut = 0.0;
+    let is f64 as ry with mut = 0.0;
+    if (x < c[0] && y < c[1]) { rx = c[0]; ry = c[1]; dx = rx - x; dy = ry - y; }
+    else if (x > w - c[2] && y < c[3]) { rx = c[2]; ry = c[3]; dx = x - (w - rx); dy = ry - y; }
+    else if (x > w - c[4] && y > h - c[5]) { rx = c[4]; ry = c[5]; dx = x - (w - rx); dy = y - (h - ry); }
+    else if (x < c[6] && y > h - c[7]) { rx = c[6]; ry = c[7]; dx = rx - x; dy = y - (h - ry); }
+    if (rx <= 0.0 || ry <= 0.0) { return 1; }
+    let is f64 as ex = dx / rx;
+    let is f64 as ey = dy / ry;
+    if (ex * ex + ey * ey <= 1.0) { return 1; }
+    return 0;
+}
+
+// Which side a point of the edge belongs to: the lines from each outer corner to the inner
+// one divide them, so a side's colour stops on the diagonal.
+fn _side_of(x as f64, y as f64, w as f64, h as f64, c as *dl.Cmd) as i64 {
+    let is f64 as tw = c.bw[0];
+    let is f64 as rw = c.bw[1];
+    let is f64 as bw = c.bw[2];
+    let is f64 as lw = c.bw[3];
+    let is i64 as left = cast(i64, x < w / 2.0);
+    let is i64 as top = cast(i64, y < h / 2.0);
+    if (top == 1 && left == 1) {
+        if (y * lw < x * tw) { return 0; }
+        return 3;
+    }
+    if (top == 1) {
+        if (y * rw < (w - x) * tw) { return 0; }
+        return 1;
+    }
+    if (left == 1) {
+        if ((h - y) * lw < x * bw) { return 2; }
+        return 3;
+    }
+    if ((h - y) * rw < (w - x) * bw) { return 2; }
+    return 1;
+}
+
+// A RING command's edge into wp by hp RGBA pixels, sampled four times each way near the edge.
+fn ring(c as *dl.Cmd, wp as i64, hp as i64, out as *u8) as void {
+    let is f64 as w = c.w;
+    let is f64 as h = c.h;
+    let is f64 as tw = c.bw[0];
+    let is f64 as rw = c.bw[1];
+    let is f64 as bw = c.bw[2];
+    let is f64 as lw = c.bw[3];
+    let is [8]f64 as outer with mut;
+    outer[0] = c.radius; outer[1] = c.radius;
+    outer[2] = c.r2; outer[3] = c.r2;
+    outer[4] = c.r3; outer[5] = c.r3;
+    outer[6] = c.r4; outer[7] = c.r4;
+    let is [8]f64 as inner with mut;
+    inner[0] = _maxf(c.radius - lw, 0.0); inner[1] = _maxf(c.radius - tw, 0.0);
+    inner[2] = _maxf(c.r2 - rw, 0.0); inner[3] = _maxf(c.r2 - tw, 0.0);
+    inner[4] = _maxf(c.r3 - rw, 0.0); inner[5] = _maxf(c.r3 - bw, 0.0);
+    inner[6] = _maxf(c.r4 - lw, 0.0); inner[7] = _maxf(c.r4 - bw, 0.0);
+    let is f64 as iw = w - lw - rw;
+    let is f64 as ih = h - tw - bw;
+    let is f64 as sx = w / cast(f64, wp);
+    let is f64 as sy = h / cast(f64, hp);
+    let is f64 as maxr = _maxf(c.radius, _maxf(c.r2, _maxf(c.r3, c.r4)));
+    let is i64 as yi with mut = 0;
+    while (yi < hp) {
+        let is i64 as xi with mut = 0;
+        while (xi < wp) {
+            let is f64 as x0 = cast(f64, xi) * sx;
+            let is f64 as y0 = cast(f64, yi) * sy;
+            // The middle of the box has no edge in it, and is most of it.
+            let is i64 as middle = cast(i64, x0 > lw + maxr && x0 + sx < w - rw - maxr && y0 > tw + maxr && y0 + sy < h - bw - maxr);
+            if (middle == 0) {
+                let is f64 as ar with mut = 0.0;
+                let is f64 as ag with mut = 0.0;
+                let is f64 as ab with mut = 0.0;
+                let is f64 as aa with mut = 0.0;
+                let is i64 as sj with mut = 0;
+                while (sj < 4) {
+                    let is i64 as si with mut = 0;
+                    while (si < 4) {
+                        let is f64 as x = x0 + (cast(f64, si) + 0.5) * sx / 4.0;
+                        let is f64 as y = y0 + (cast(f64, sj) + 0.5) * sy / 4.0;
+                        if (_in_rounded(x, y, w, h, &outer[0]) == 1 &&
+                            (iw <= 0.0 || ih <= 0.0 || _in_rounded(x - lw, y - tw, iw, ih, &inner[0]) == 0)) {
+                            let is i64 as col = c.bc[_side_of(x, y, w, h, c)];
+                            let is f64 as a = cast(f64, (col >> 24) & 255) / 255.0;
+                            ar = ar + cast(f64, (col >> 16) & 255) / 255.0 * a;
+                            ag = ag + cast(f64, (col >> 8) & 255) / 255.0 * a;
+                            ab = ab + cast(f64, col & 255) / 255.0 * a;
+                            aa = aa + a;
+                        }
+                        si = si + 1;
+                    }
+                    sj = sj + 1;
+                }
+                let is *u8 as o = &out[(yi * wp + xi) * 4];
+                o[0] = cast(u8, _to_byte(ar / 16.0));
+                o[1] = cast(u8, _to_byte(ag / 16.0));
+                o[2] = cast(u8, _to_byte(ab / 16.0));
+                o[3] = cast(u8, _to_byte(aa / 16.0));
+            }
+            xi = xi + 1;
+        }
+        yi = yi + 1;
+    }
+}

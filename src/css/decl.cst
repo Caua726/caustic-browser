@@ -1,0 +1,2437 @@
+// css/decl.cst — one declaration's tokens into longhands.
+//
+// A shorthand is parsed here, once, so nothing later has to know shorthands exist.
+// What a longhand accepts comes from props.cst, so most of them need no code at all:
+// only colours, lengths with calc(), and the shorthands themselves are written out.
+//
+// The value is invalid if anything is left over, and then the whole declaration is
+// dropped, as the spec asks. That is what lets a page write a fallback line before a
+// value this browser does not understand.
+
+use "../base/arena.cst" as arena;
+use "../loader/url.cst" as url;
+use "./tokens.cst" as tok;
+use "./props.cst" as pr;
+use "./values.cst" as v;
+use "std/mem.cst" as mem;
+
+let is *u8 as _COLORS with imut = "aliceblue=f0f8ff antiquewhite=faebd7 aqua=00ffff aquamarine=7fffd4 azure=f0ffff beige=f5f5dc bisque=ffe4c4 black=000000 blanchedalmond=ffebcd blue=0000ff blueviolet=8a2be2 brown=a52a2a burlywood=deb887 cadetblue=5f9ea0 chartreuse=7fff00 chocolate=d2691e coral=ff7f50 cornflowerblue=6495ed cornsilk=fff8dc crimson=dc143c cyan=00ffff darkblue=00008b darkcyan=008b8b darkgoldenrod=b8860b darkgray=a9a9a9 darkgreen=006400 darkgrey=a9a9a9 darkkhaki=bdb76b darkmagenta=8b008b darkolivegreen=556b2f darkorange=ff8c00 darkorchid=9932cc darkred=8b0000 darksalmon=e9967a darkseagreen=8fbc8f darkslateblue=483d8b darkslategray=2f4f4f darkslategrey=2f4f4f darkturquoise=00ced1 darkviolet=9400d3 deeppink=ff1493 deepskyblue=00bfff dimgray=696969 dimgrey=696969 dodgerblue=1e90ff firebrick=b22222 floralwhite=fffaf0 forestgreen=228b22 fuchsia=ff00ff gainsboro=dcdcdc ghostwhite=f8f8ff gold=ffd700 goldenrod=daa520 gray=808080 green=008000 greenyellow=adff2f grey=808080 honeydew=f0fff0 hotpink=ff69b4 indianred=cd5c5c indigo=4b0082 ivory=fffff0 khaki=f0e68c lavender=e6e6fa lavenderblush=fff0f5 lawngreen=7cfc00 lemonchiffon=fffacd lightblue=add8e6 lightcoral=f08080 lightcyan=e0ffff lightgoldenrodyellow=fafad2 lightgray=d3d3d3 lightgreen=90ee90 lightgrey=d3d3d3 lightpink=ffb6c1 lightsalmon=ffa07a lightseagreen=20b2aa lightskyblue=87cefa lightslategray=778899 lightslategrey=778899 lightsteelblue=b0c4de lightyellow=ffffe0 lime=00ff00 limegreen=32cd32 linen=faf0e6 magenta=ff00ff maroon=800000 mediumaquamarine=66cdaa mediumblue=0000cd mediumorchid=ba55d3 mediumpurple=9370db mediumseagreen=3cb371 mediumslateblue=7b68ee mediumspringgreen=00fa9a mediumturquoise=48d1cc mediumvioletred=c71585 midnightblue=191970 mintcream=f5fffa mistyrose=ffe4e1 moccasin=ffe4b5 navajowhite=ffdead navy=000080 oldlace=fdf5e6 olive=808000 olivedrab=6b8e23 orange=ffa500 orangered=ff4500 orchid=da70d6 palegoldenrod=eee8aa palegreen=98fb98 paleturquoise=afeeee palevioletred=db7093 papayawhip=ffefd5 peachpuff=ffdab9 peru=cd853f pink=ffc0cb plum=dda0dd powderblue=b0e0e6 purple=800080 rebeccapurple=663399 red=ff0000 rosybrown=bc8f8f royalblue=4169e1 saddlebrown=8b4513 salmon=fa8072 sandybrown=f4a460 seagreen=2e8b57 seashell=fff5ee sienna=a0522d silver=c0c0c0 skyblue=87ceeb slateblue=6a5acd slategray=708090 slategrey=708090 snow=fffafa springgreen=00ff7f steelblue=4682b4 tan=d2b48c teal=008080 thistle=d8bfd8 tomato=ff6347 turquoise=40e0d0 violet=ee82ee wheat=f5deb3 white=ffffff whitesmoke=f5f5f5 yellow=ffff00 yellowgreen=9acd32 ";
+
+// Set when a value uses the window's size, which means a new size needs new styles.
+let is i64 as saw_viewport with mut = 0;
+
+// What relative URLs in the sheet being parsed are relative to.
+let is *u8 as _base with mut = cast(*u8, 0);
+
+fn set_base(b as *u8) as void { _base = b; }
+
+struct Cur {
+    a as *arena.Arena;
+    t as *tok.Token;
+    n as i64;
+    i as i64;
+}
+
+// --- Tokens ---
+
+fn _skip_ws(c as *Cur) as void {
+    while (c.i < c.n && c.t[c.i].kind == tok.T_WS) { c.i = c.i + 1; }
+}
+
+fn _peek(c as *Cur) as *tok.Token {
+    _skip_ws(c);
+    if (c.i >= c.n) { return null; }
+    return &c.t[c.i];
+}
+
+fn _done(c as *Cur) as i64 {
+    _skip_ws(c);
+    if (c.i >= c.n) { return 1; }
+    return 0;
+}
+
+fn _lower(x as i64) as i64 {
+    if (x >= 65 && x <= 90) { return x + 32; }
+    return x;
+}
+
+fn eq(s as *u8, n as i64, w as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (w[i] == 0 || _lower(cast(i64, s[i])) != cast(i64, w[i])) { return 0; }
+        i = i + 1;
+    }
+    if (w[n] != 0) { return 0; }
+    return 1;
+}
+
+fn _is_ident(t as *tok.Token, w as *u8) as i64 {
+    if (t != null && t.kind == tok.T_IDENT && eq(t.s, t.n, w) == 1) { return 1; }
+    return 0;
+}
+
+fn _is_delim(t as *tok.Token, d as i64) as i64 {
+    if (t != null && t.kind == tok.T_DELIM && t.delim == d) { return 1; }
+    return 0;
+}
+
+// Past the function or bracket the cursor is on, and everything inside it.
+fn _skip_group(c as *Cur) as void {
+    let is i64 as depth with mut = 0;
+    while (c.i < c.n) {
+        let is i64 as k = c.t[c.i].kind;
+        c.i = c.i + 1;
+        if (k == tok.T_FUNCTION || k == tok.T_LPAREN || k == tok.T_LBRACKET || k == tok.T_LBRACE) {
+            depth = depth + 1;
+        }
+        if (k == tok.T_RPAREN || k == tok.T_RBRACKET || k == tok.T_RBRACE) {
+            depth = depth - 1;
+            if (depth <= 0) { return; }
+        }
+        if (depth == 0) { return; }
+    }
+}
+
+// The function under the cursor: a cursor over what is between its parentheses,
+// and the outer one moved past it.
+fn _args(c as *Cur, out as *Cur) as void {
+    let is i64 as start = c.i + 1;
+    _skip_group(c);
+    out.a = c.a;
+    out.t = c.t;
+    out.i = start;
+    out.n = c.i;
+    if (out.n > start && c.t[out.n - 1].kind == tok.T_RPAREN) { out.n = out.n - 1; }
+}
+
+// --- Lengths and calc() ---
+
+fn _zero_len(l as *v.Len) as void {
+    l.px = 0.0;
+    l.pct = 0.0;
+    l.em = 0.0;
+    l.rem = 0.0;
+    l.vw = 0.0;
+    l.vh = 0.0;
+    l.pick = cast(*v.Pick, 0);
+    l.pick_k = 0.0;
+}
+
+fn _unit(l as *v.Len, num as f64, u as *u8, n as i64) as i64 {
+    _zero_len(l);
+    if (eq(u, n, "px") == 1) { l.px = num; return 1; }
+    if (eq(u, n, "em") == 1) { l.em = num; return 1; }
+    if (eq(u, n, "rem") == 1) { l.rem = num; return 1; }
+    if (eq(u, n, "vw") == 1 || eq(u, n, "svw") == 1 || eq(u, n, "lvw") == 1 || eq(u, n, "dvw") == 1 ||
+        eq(u, n, "vmin") == 1 || eq(u, n, "vmax") == 1) {
+        saw_viewport = 1;
+        l.vw = num;
+        return 1;
+    }
+    if (eq(u, n, "vh") == 1 || eq(u, n, "svh") == 1 || eq(u, n, "lvh") == 1 || eq(u, n, "dvh") == 1) {
+        saw_viewport = 1;
+        l.vh = num;
+        return 1;
+    }
+    if (eq(u, n, "pt") == 1) { l.px = num * 96.0 / 72.0; return 1; }
+    if (eq(u, n, "pc") == 1) { l.px = num * 16.0; return 1; }
+    if (eq(u, n, "in") == 1) { l.px = num * 96.0; return 1; }
+    if (eq(u, n, "cm") == 1) { l.px = num * 96.0 / 2.54; return 1; }
+    if (eq(u, n, "mm") == 1) { l.px = num * 96.0 / 25.4; return 1; }
+    if (eq(u, n, "q") == 1) { l.px = num * 96.0 / 101.6; return 1; }
+    if (eq(u, n, "ex") == 1) { l.em = num * 0.5; return 1; }
+    if (eq(u, n, "ch") == 1) { l.em = num * 0.5; return 1; }
+    return 0;
+}
+
+// One term of calc(): a sum of lengths in l, or a plain number when isnum says so.
+struct _Term {
+    l     as v.Len;
+    num   as f64;
+    isnum as i64;
+}
+
+fn _scale(l as *v.Len, k as f64) as void {
+    l.px = l.px * k;
+    l.pct = l.pct * k;
+    l.em = l.em * k;
+    l.rem = l.rem * k;
+    l.vw = l.vw * k;
+    l.vh = l.vh * k;
+    l.pick_k = l.pick_k * k;
+}
+
+fn _calc_atom(c as *Cur, out as *_Term) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    _zero_len(&out.l);
+    out.num = 0.0;
+    out.isnum = 0;
+    if (t.kind == tok.T_NUMBER) {
+        c.i = c.i + 1;
+        out.num = t.num;
+        out.isnum = 1;
+        return 1;
+    }
+    if (t.kind == tok.T_PERCENT) {
+        c.i = c.i + 1;
+        out.l.pct = t.num;
+        return 1;
+    }
+    if (t.kind == tok.T_DIMENSION) {
+        c.i = c.i + 1;
+        return _unit(&out.l, t.num, t.s, t.n);
+    }
+    if (t.kind == tok.T_LPAREN || t.kind == tok.T_FUNCTION) {
+        let is i64 as fn_min = cast(i64, t.kind == tok.T_FUNCTION && eq(t.s, t.n, "min") == 1);
+        let is i64 as fn_max = cast(i64, t.kind == tok.T_FUNCTION && eq(t.s, t.n, "max") == 1);
+        let is i64 as fn_clamp = cast(i64, t.kind == tok.T_FUNCTION && eq(t.s, t.n, "clamp") == 1);
+        if (t.kind == tok.T_FUNCTION && fn_min == 0 && fn_max == 0 && fn_clamp == 0 && eq(t.s, t.n, "calc") == 0) {
+            return 0;
+        }
+        let is Cur as in with mut;
+        _args(c, &in);
+        if (fn_min == 0 && fn_max == 0 && fn_clamp == 0) {
+            if (_calc_sum(&in, out) == 0) { return 0; }
+            return _done(&in);
+        }
+        return _calc_pick(&in, out, fn_min, fn_clamp);
+    }
+    return 0;
+}
+
+// min(), max() and clamp(). Numbers and plain pixels are settled here; the rest wait for
+// the element, or for its box when a percentage is among them.
+fn _calc_pick(c as *Cur, out as *_Term, is_min as i64, is_clamp as i64) as i64 {
+    let is [16]_Term as args with mut;
+    let is i64 as n with mut = 0;
+    let is i64 as nums with mut = 0;
+    let is i64 as plain with mut = 1;
+    while (1 == 1) {
+        if (n == 16 || _calc_sum(c, &args[n]) == 0) { return 0; }
+        if (args[n].isnum == 1) { nums = nums + 1; }
+        else if (_plain_px(&args[n].l) == 0) { plain = 0; }
+        n = n + 1;
+        if (_done(c) == 1) { break; }
+        if (c.t[c.i].kind != tok.T_COMMA) { return 0; }
+        c.i = c.i + 1;
+    }
+    if (nums != 0 && nums != n) { return 0; }
+    if (is_clamp == 1 && n != 3) { return 0; }
+    let is i64 as kind with mut = v.PICK_MAX;
+    if (is_min == 1) { kind = v.PICK_MIN; }
+    if (is_clamp == 1) { kind = v.PICK_CLAMP; }
+    if (nums == n || plain == 1) {
+        let is [16]f64 as vals with mut;
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (nums == n) { vals[i] = args[i].num; }
+            else { vals[i] = args[i].l.px; }
+            i = i + 1;
+        }
+        let is f64 as won = v.pick_of(kind, cast(*f64, &vals), n);
+        out.isnum = 0;
+        _zero_len(&out.l);
+        if (nums == n) {
+            out.isnum = 1;
+            out.num = won;
+        } else {
+            out.l.px = won;
+        }
+        return 1;
+    }
+    let is *v.Pick as pk = cast(*v.Pick, arena.alloc(c.a, sizeof(v.Pick)));
+    pk.kind = kind;
+    pk.n = n;
+    pk.args = cast(*v.Len, arena.alloc(c.a, n * sizeof(v.Len)));
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        pk.args[i] = args[i].l;
+        i = i + 1;
+    }
+    out.isnum = 0;
+    _zero_len(&out.l);
+    out.l.pick = pk;
+    out.l.pick_k = 1.0;
+    return 1;
+}
+
+fn _plain_px(l as *v.Len) as i64 {
+    if (l.pct == 0.0 && l.em == 0.0 && l.rem == 0.0 && l.vw == 0.0 && l.vh == 0.0 && l.pick == null) { return 1; }
+    return 0;
+}
+
+fn _calc_product(c as *Cur, out as *_Term) as i64 {
+    if (_calc_atom(c, out) == 0) { return 0; }
+    while (1 == 1) {
+        let is *tok.Token as t = _peek(c);
+        if (_is_delim(t, 42) == 1) {
+            c.i = c.i + 1;
+            let is _Term as r with mut;
+            if (_calc_atom(c, &r) == 0) { return 0; }
+            if (r.isnum == 1) {
+                if (out.isnum == 1) { out.num = out.num * r.num; }
+                else { _scale(&out.l, r.num); }
+            } else {
+                if (out.isnum == 0) { return 0; }
+                let is f64 as k = out.num;
+                out.l = r.l;
+                _scale(&out.l, k);
+                out.isnum = 0;
+            }
+            continue;
+        }
+        if (_is_delim(t, 47) == 1) {
+            c.i = c.i + 1;
+            let is _Term as r with mut;
+            if (_calc_atom(c, &r) == 0 || r.isnum == 0 || r.num == 0.0) { return 0; }
+            if (out.isnum == 1) { out.num = out.num / r.num; }
+            else { _scale(&out.l, 1.0 / r.num); }
+            continue;
+        }
+        return 1;
+    }
+    return 1;
+}
+
+fn _calc_sum(c as *Cur, out as *_Term) as i64 {
+    if (_calc_product(c, out) == 0) { return 0; }
+    while (1 == 1) {
+        let is *tok.Token as t = _peek(c);
+        let is i64 as plus = _is_delim(t, 43);
+        let is i64 as minus = _is_delim(t, 45);
+        if (plus == 0 && minus == 0) { return 1; }
+        c.i = c.i + 1;
+        let is _Term as r with mut;
+        if (_calc_product(c, &r) == 0) { return 0; }
+        let is f64 as k with mut = 1.0;
+        if (minus == 1) { k = 0.0 - 1.0; }
+        if (out.isnum == 1 && r.isnum == 1) {
+            out.num = out.num + r.num * k;
+            continue;
+        }
+        if (out.isnum != r.isnum) {
+            // A number can only sum with a length when it is a bare zero.
+            if ((out.isnum == 1 && out.num != 0.0) || (r.isnum == 1 && r.num != 0.0)) { return 0; }
+            if (out.isnum == 1) { _zero_len(&out.l); out.isnum = 0; }
+            continue;
+        }
+        out.l.px = out.l.px + r.l.px * k;
+        out.l.pct = out.l.pct + r.l.pct * k;
+        out.l.em = out.l.em + r.l.em * k;
+        out.l.rem = out.l.rem + r.l.rem * k;
+        out.l.vw = out.l.vw + r.l.vw * k;
+        out.l.vh = out.l.vh + r.l.vh * k;
+        if (r.l.pick != null) {
+            if (out.l.pick != null) { return 0; }
+            out.l.pick = r.l.pick;
+            out.l.pick_k = r.l.pick_k * k;
+        }
+    }
+    return 1;
+}
+
+fn _calc(c as *Cur, val as *v.Value) as i64 {
+    let is _Term as t with mut;
+    if (_calc_atom(c, &t) == 0) { return 0; }
+    if (t.isnum == 1) {
+        val.kind = v.V_NUM;
+        val.num = t.num;
+        return 1;
+    }
+    val.kind = v.V_LEN;
+    val.len = t.l;
+    return 1;
+}
+
+fn _is_math(t as *tok.Token) as i64 {
+    if (t.kind != tok.T_FUNCTION) { return 0; }
+    if (eq(t.s, t.n, "calc") == 1 || eq(t.s, t.n, "min") == 1 || eq(t.s, t.n, "max") == 1 || eq(t.s, t.n, "clamp") == 1) {
+        return 1;
+    }
+    return 0;
+}
+
+// --- Colours ---
+
+fn _hexv(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+fn _argb(a as i64, r as i64, g as i64, b as i64) as i64 {
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+fn _hash_color(s as *u8, n as i64, out as *i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (_hexv(cast(i64, s[k])) < 0) { return 0; }
+        k = k + 1;
+    }
+    let is i64 as a with mut = 255;
+    if (n == 3 || n == 4) {
+        let is i64 as r = _hexv(cast(i64, s[0]));
+        let is i64 as g = _hexv(cast(i64, s[1]));
+        let is i64 as b = _hexv(cast(i64, s[2]));
+        if (n == 4) { a = _hexv(cast(i64, s[3])) * 17; }
+        *out = _argb(a, r * 17, g * 17, b * 17);
+        return 1;
+    }
+    if (n == 6 || n == 8) {
+        let is i64 as r = _hexv(cast(i64, s[0])) * 16 + _hexv(cast(i64, s[1]));
+        let is i64 as g = _hexv(cast(i64, s[2])) * 16 + _hexv(cast(i64, s[3]));
+        let is i64 as b = _hexv(cast(i64, s[4])) * 16 + _hexv(cast(i64, s[5]));
+        if (n == 8) { a = _hexv(cast(i64, s[6])) * 16 + _hexv(cast(i64, s[7])); }
+        *out = _argb(a, r, g, b);
+        return 1;
+    }
+    return 0;
+}
+
+fn _named_color(s as *u8, n as i64, out as *i64) as i64 {
+    let is i64 as at with mut = 0;
+    while (_COLORS[at] != 0) {
+        let is i64 as i with mut = 0;
+        while (i < n && _lower(cast(i64, s[i])) == cast(i64, _COLORS[at + i])) { i = i + 1; }
+        if (i == n && _COLORS[at + i] == 61) {
+            return _hash_color(&_COLORS[at + i + 1], 6, out);
+        }
+        while (_COLORS[at] != 32) { at = at + 1; }
+        at = at + 1;
+    }
+    return 0;
+}
+
+fn _clamp255(x as f64) as i64 {
+    if (x <= 0.0) { return 0; }
+    if (x >= 255.0) { return 255; }
+    return cast(i64, x + 0.5);
+}
+
+// One colour component: a number on 0..scale, or a percentage of it. none is 0.
+fn _comp(c as *Cur, scale as f64, out as *f64) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_NUMBER) { *out = t.num; c.i = c.i + 1; return 1; }
+    if (t.kind == tok.T_PERCENT) { *out = t.num * scale / 100.0; c.i = c.i + 1; return 1; }
+    if (t.kind == tok.T_DIMENSION) { *out = t.num; c.i = c.i + 1; return 1; }
+    if (_is_ident(t, "none") == 1) { *out = 0.0; c.i = c.i + 1; return 1; }
+    return 0;
+}
+
+fn _sep(c as *Cur) as void {
+    let is *tok.Token as t = _peek(c);
+    if (t != null && t.kind == tok.T_COMMA) { c.i = c.i + 1; }
+}
+
+// The alpha of a colour function, after a comma or a slash, or 1 when it has none.
+fn _alpha(c as *Cur, out as *f64) as i64 {
+    *out = 1.0;
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 1; }
+    if (t.kind == tok.T_COMMA || _is_delim(t, 47) == 1) {
+        c.i = c.i + 1;
+        return _comp(c, 1.0, out);
+    }
+    return 1;
+}
+
+fn _hue(p as f64, q as f64, h0 as f64) as f64 {
+    let is f64 as h with mut = h0;
+    if (h < 0.0) { h = h + 1.0; }
+    if (h > 1.0) { h = h - 1.0; }
+    if (h * 6.0 < 1.0) { return p + (q - p) * 6.0 * h; }
+    if (h * 2.0 < 1.0) { return q; }
+    if (h * 3.0 < 2.0) { return p + (q - p) * (2.0 / 3.0 - h) * 6.0; }
+    return p;
+}
+
+fn _color_fn(c as *Cur, t as *tok.Token, out as *i64) as i64 {
+    let is i64 as is_rgb = cast(i64, eq(t.s, t.n, "rgb") == 1 || eq(t.s, t.n, "rgba") == 1);
+    let is i64 as is_hsl = cast(i64, eq(t.s, t.n, "hsl") == 1 || eq(t.s, t.n, "hsla") == 1);
+    if (is_rgb == 0 && is_hsl == 0) { return 0; }
+    let is Cur as in with mut;
+    _args(c, &in);
+    let is f64 as a with mut = 0.0;
+    let is f64 as b with mut = 0.0;
+    let is f64 as d with mut = 0.0;
+    let is f64 as al with mut = 1.0;
+    if (is_rgb == 1) {
+        if (_comp(&in, 255.0, &a) == 0) { return 0; }
+        _sep(&in);
+        if (_comp(&in, 255.0, &b) == 0) { return 0; }
+        _sep(&in);
+        if (_comp(&in, 255.0, &d) == 0) { return 0; }
+    } else {
+        if (_comp(&in, 360.0, &a) == 0) { return 0; }
+        _sep(&in);
+        if (_comp(&in, 1.0, &b) == 0) { return 0; }
+        _sep(&in);
+        if (_comp(&in, 1.0, &d) == 0) { return 0; }
+    }
+    if (_alpha(&in, &al) == 0 || _done(&in) == 0) { return 0; }
+    if (is_rgb == 1) {
+        *out = _argb(_clamp255(al * 255.0), _clamp255(a), _clamp255(b), _clamp255(d));
+        return 1;
+    }
+    let is f64 as h with mut = a / 360.0;
+    while (h < 0.0) { h = h + 1.0; }
+    while (h >= 1.0) { h = h - 1.0; }
+    let is f64 as q with mut = d * (1.0 + b);
+    if (d >= 0.5) { q = d + b - d * b; }
+    let is f64 as p = 2.0 * d - q;
+    *out = _argb(_clamp255(al * 255.0),
+                 _clamp255(_hue(p, q, h + 1.0 / 3.0) * 255.0),
+                 _clamp255(_hue(p, q, h) * 255.0),
+                 _clamp255(_hue(p, q, h - 1.0 / 3.0) * 255.0));
+    return 1;
+}
+
+// A colour under the cursor: 1 and past it, or 0 with the cursor where it was.
+fn _color(c as *Cur, out as *i64) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_HASH) {
+        if (_hash_color(t.s, t.n, out) == 0) { return 0; }
+        c.i = c.i + 1;
+        return 1;
+    }
+    if (t.kind == tok.T_IDENT) {
+        if (eq(t.s, t.n, "currentcolor") == 1) { *out = v.COLOR_CURRENT; c.i = c.i + 1; return 1; }
+        if (eq(t.s, t.n, "transparent") == 1) { *out = 0; c.i = c.i + 1; return 1; }
+        if (_named_color(t.s, t.n, out) == 0) { return 0; }
+        c.i = c.i + 1;
+        return 1;
+    }
+    if (t.kind == tok.T_FUNCTION) {
+        let is i64 as at = c.i;
+        // Pages here are always in the light scheme, so the first of the two.
+        if (eq(t.s, t.n, "light-dark") == 1) {
+            let is Cur as in with mut;
+            _args(c, &in);
+            if (_color(&in, out) == 1) { return 1; }
+        } else if (_color_fn(c, t, out) == 1) {
+            return 1;
+        }
+        c.i = at;
+    }
+    return 0;
+}
+
+// --- One longhand ---
+
+fn _make_url(c as *Cur, s as *u8, n as i64, val as *v.Value) as void {
+    val.kind = v.V_URL;
+    val.s = s;
+    val.n = n;
+    if (_base == null) { return; }
+    let is i64 as cap = n + url.len_of(_base) + 16;
+    let is *u8 as out = arena.alloc(c.a, cap);
+    let is i64 as m = url.resolve(_base, s, n, out, cap);
+    if (m >= 0) {
+        val.s = out;
+        val.n = m;
+    }
+}
+
+// One value of property p under the cursor, by what props.cst says it takes.
+// 1 and past it, or 0 with the cursor where it was.
+fn parse_one(c as *Cur, p as i64, val as *v.Value) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    let is i64 as fl = pr.flags_of(p);
+    let is *u8 as kws = pr.keywords_of(p);
+    val.kind = v.V_NONE;
+    if (t.kind == tok.T_IDENT && kws != null && pr.in_list(kws, t.s, t.n) == 1) {
+        val.kind = v.V_KW;
+        val.kw = pr.kw_lookup(t.s, t.n);
+        c.i = c.i + 1;
+        return 1;
+    }
+    if ((fl & pr.F_COLOR) != 0) {
+        if (_color(c, &val.color) == 1) {
+            val.kind = v.V_COLOR;
+            return 1;
+        }
+    }
+    if ((fl & pr.F_URL) != 0) {
+        if (t.kind == tok.T_URL) {
+            _make_url(c, t.s, t.n, val);
+            c.i = c.i + 1;
+            return 1;
+        }
+        if (t.kind == tok.T_FUNCTION && eq(t.s, t.n, "url") == 1) {
+            let is Cur as in with mut;
+            _args(c, &in);
+            let is *tok.Token as u = _peek(&in);
+            if (u != null && u.kind == tok.T_STRING) {
+                _make_url(c, u.s, u.n, val);
+                return 1;
+            }
+            return 0;
+        }
+    }
+    if ((fl & (pr.F_LEN | pr.F_PCT | pr.F_NUM | pr.F_INT)) != 0) {
+        if (t.kind == tok.T_NUMBER) {
+            if ((fl & (pr.F_NUM | pr.F_INT)) != 0) {
+                val.kind = v.V_NUM;
+                val.num = t.num;
+                c.i = c.i + 1;
+                return 1;
+            }
+            // Only a zero can go without a unit.
+            if (t.num == 0.0 && (fl & pr.F_LEN) != 0) {
+                val.kind = v.V_LEN;
+                _zero_len(&val.len);
+                c.i = c.i + 1;
+                return 1;
+            }
+            return 0;
+        }
+        if (t.kind == tok.T_PERCENT) {
+            if ((fl & pr.F_PCT) == 0) { return 0; }
+            if (p == pr.P_OPACITY) {
+                val.kind = v.V_NUM;
+                val.num = t.num / 100.0;
+            } else {
+                val.kind = v.V_LEN;
+                _zero_len(&val.len);
+                val.len.pct = t.num;
+            }
+            c.i = c.i + 1;
+            return 1;
+        }
+        if (t.kind == tok.T_DIMENSION && (fl & pr.F_LEN) != 0) {
+            if (_unit(&val.len, t.num, t.s, t.n) == 0) { return 0; }
+            val.kind = v.V_LEN;
+            c.i = c.i + 1;
+            return 1;
+        }
+        if (_is_math(t) == 1) {
+            let is i64 as at = c.i;
+            if (_calc(c, val) == 0) { c.i = at; return 0; }
+            if (val.kind == v.V_NUM && (fl & (pr.F_NUM | pr.F_INT)) == 0) {
+                if (val.num != 0.0) { c.i = at; return 0; }
+                val.kind = v.V_LEN;
+                _zero_len(&val.len);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn _push(out as *v.DeclList, a as *arena.Arena, prop as i64, val as *v.Value, important as i64) as void {
+    if (out.n == out.cap) {
+        let is i64 as cap with mut = out.cap * 2;
+        if (cap == 0) { cap = 8; }
+        let is *v.Decl as d = cast(*v.Decl, arena.alloc(a, cap * sizeof(v.Decl)));
+        if (out.n > 0) { mem.core.memcpy(cast(*u8, d), cast(*u8, out.d), out.n * sizeof(v.Decl)); }
+        out.d = d;
+        out.cap = cap;
+    }
+    let is *v.Decl as e = &out.d[out.n];
+    out.n = out.n + 1;
+    e.prop = prop;
+    e.important = important;
+    e.val = *val;
+    e.name = cast(*u8, 0);
+    e.name_n = 0;
+    e.toks = cast(*tok.Token, 0);
+    e.ntoks = 0;
+}
+
+// --- Shorthands ---
+
+struct _Sh {
+    c   as *Cur;
+    out as *v.DeclList;
+    imp as i64;
+}
+
+fn _emit(s as *_Sh, prop as i64, val as *v.Value) as void {
+    _push(s.out, s.c.a, prop, val, s.imp);
+}
+
+fn _emit_kw(s as *_Sh, prop as i64, kw as i64) as void {
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_KW;
+    val.kw = kw;
+    _emit(s, prop, &val);
+}
+
+fn _emit_px(s as *_Sh, prop as i64, px as f64) as void {
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_LEN;
+    val.len.px = px;
+    _emit(s, prop, &val);
+}
+
+fn _emit_num(s as *_Sh, prop as i64, n as f64) as void {
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_NUM;
+    val.num = n;
+    _emit(s, prop, &val);
+}
+
+fn _emit_color(s as *_Sh, prop as i64, col as i64) as void {
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_COLOR;
+    val.color = col;
+    _emit(s, prop, &val);
+}
+
+// margin, padding and the like: one to four values, around from the top.
+fn _four(s as *_Sh, first as i64) as i64 {
+    let is [4]v.Value as val with mut;
+    mem.memzero(cast(*u8, &val[0]), 4 * sizeof(v.Value));
+    let is i64 as k with mut = 0;
+    while (k < 4 && _done(s.c) == 0) {
+        if (parse_one(s.c, first + k, &val[k]) == 0) { return 0; }
+        k = k + 1;
+    }
+    if (k == 0 || _done(s.c) == 0) { return 0; }
+    if (k == 1) { val[1] = val[0]; }
+    if (k <= 2) { val[2] = val[0]; }
+    if (k <= 3) { val[3] = val[1]; }
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        _emit(s, first + i, &val[i]);
+        i = i + 1;
+    }
+    return 1;
+}
+
+// border and one of its sides: a width, a style and a colour, in any order.
+// The three longhands of each side are at the same distance from the first.
+fn _border_side(s as *_Sh, w as i64, st as i64, col as i64) as i64 {
+    let is v.Value as vw with mut;
+    let is v.Value as vs with mut;
+    let is v.Value as vc with mut;
+    let is i64 as have_w with mut = 0;
+    let is i64 as have_s with mut = 0;
+    let is i64 as have_c with mut = 0;
+    while (_done(s.c) == 0) {
+        if (have_w == 0 && parse_one(s.c, pr.P_BORDER_TOP_WIDTH, &vw) == 1) { have_w = 1; continue; }
+        if (have_s == 0 && parse_one(s.c, pr.P_BORDER_TOP_STYLE, &vs) == 1) { have_s = 1; continue; }
+        if (have_c == 0 && parse_one(s.c, pr.P_BORDER_TOP_COLOR, &vc) == 1) { have_c = 1; continue; }
+        return 0;
+    }
+    if (have_w == 0 && have_s == 0 && have_c == 0) { return 0; }
+    if (have_w == 1) { _emit(s, w, &vw); } else { _emit_kw(s, w, pr.K_MEDIUM); }
+    if (have_s == 1) { _emit(s, st, &vs); } else { _emit_kw(s, st, pr.K_NONE); }
+    if (have_c == 1) { _emit(s, col, &vc); } else { _emit_color(s, col, v.COLOR_CURRENT); }
+    return 1;
+}
+
+fn _border_all(s as *_Sh) as i64 {
+    let is i64 as at = s.c.i;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        s.c.i = at;
+        if (_border_side(s, pr.P_BORDER_TOP_WIDTH + k, pr.P_BORDER_TOP_STYLE + k, pr.P_BORDER_TOP_COLOR + k) == 0) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _outline(s as *_Sh) as i64 {
+    let is v.Value as vw with mut;
+    let is v.Value as vs with mut;
+    let is v.Value as vc with mut;
+    let is i64 as have_w with mut = 0;
+    let is i64 as have_s with mut = 0;
+    let is i64 as have_c with mut = 0;
+    while (_done(s.c) == 0) {
+        if (have_w == 0 && parse_one(s.c, pr.P_OUTLINE_WIDTH, &vw) == 1) { have_w = 1; continue; }
+        if (have_s == 0 && parse_one(s.c, pr.P_OUTLINE_STYLE, &vs) == 1) { have_s = 1; continue; }
+        if (have_c == 0 && parse_one(s.c, pr.P_OUTLINE_COLOR, &vc) == 1) { have_c = 1; continue; }
+        return 0;
+    }
+    if (have_w == 0 && have_s == 0 && have_c == 0) { return 0; }
+    if (have_w == 1) { _emit(s, pr.P_OUTLINE_WIDTH, &vw); } else { _emit_kw(s, pr.P_OUTLINE_WIDTH, pr.K_MEDIUM); }
+    if (have_s == 1) { _emit(s, pr.P_OUTLINE_STYLE, &vs); } else { _emit_kw(s, pr.P_OUTLINE_STYLE, pr.K_NONE); }
+    if (have_c == 1) { _emit(s, pr.P_OUTLINE_COLOR, &vc); } else { _emit_color(s, pr.P_OUTLINE_COLOR, v.COLOR_CURRENT); }
+    return 1;
+}
+
+fn _radius(s as *_Sh) as i64 {
+    // Elliptical corners are not drawn: what follows the slash is read and dropped.
+    let is i64 as end with mut = s.c.i;
+    while (end < s.c.n && _is_delim(&s.c.t[end], 47) == 0) { end = end + 1; }
+    s.c.n = end;
+    return _four(s, pr.P_BORDER_TOP_LEFT_RADIUS);
+}
+
+fn _bg_pos_kw_x(kw as i64) as i64 {
+    if (kw == pr.K_LEFT || kw == pr.K_RIGHT) { return 1; }
+    return 0;
+}
+
+fn _bg_position(s as *_Sh) as i64 {
+    let is v.Value as x with mut;
+    let is v.Value as y with mut;
+    mem.memzero(cast(*u8, &x), sizeof(v.Value));
+    mem.memzero(cast(*u8, &y), sizeof(v.Value));
+    x.kind = v.V_LEN;
+    x.len.pct = 50.0;
+    y.kind = v.V_LEN;
+    y.len.pct = 50.0;
+    let is v.Value as a with mut;
+    let is v.Value as b with mut;
+    let is i64 as have_b with mut = 0;
+    if (_pos_value(s.c, &a) == 0) { return 0; }
+    if (_pos_value(s.c, &b) == 1) { have_b = 1; }
+    // Keywords can come in either order; plain lengths are x then y.
+    if (a.kind == v.V_KW && (a.kw == pr.K_TOP || a.kw == pr.K_BOTTOM)) {
+        y = a;
+        if (have_b == 1) { x = b; }
+    } else {
+        x = a;
+        if (have_b == 1) { y = b; }
+    }
+    _emit(s, pr.P_BACKGROUND_POSITION_X, &x);
+    _emit(s, pr.P_BACKGROUND_POSITION_Y, &y);
+    return 1;
+}
+
+fn _pos_value(c as *Cur, out as *v.Value) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_IDENT) {
+        let is i64 as k = pr.kw_lookup(t.s, t.n);
+        if (k == pr.K_LEFT || k == pr.K_RIGHT || k == pr.K_TOP || k == pr.K_BOTTOM || k == pr.K_CENTER) {
+            mem.memzero(cast(*u8, out), sizeof(v.Value));
+            out.kind = v.V_KW;
+            out.kw = k;
+            c.i = c.i + 1;
+            return 1;
+        }
+        return 0;
+    }
+    return parse_one(c, pr.P_BACKGROUND_SIZE_H, out);
+}
+
+fn _bg_size(s as *_Sh) as i64 {
+    let is v.Value as w with mut;
+    let is v.Value as h with mut;
+    if (parse_one(s.c, pr.P_BACKGROUND_SIZE_W, &w) == 0) { return 0; }
+    if (parse_one(s.c, pr.P_BACKGROUND_SIZE_H, &h) == 0) {
+        mem.memzero(cast(*u8, &h), sizeof(v.Value));
+        h.kind = v.V_KW;
+        h.kw = pr.K_AUTO;
+    }
+    _emit(s, pr.P_BACKGROUND_SIZE_W, &w);
+    _emit(s, pr.P_BACKGROUND_SIZE_H, &h);
+    return 1;
+}
+
+// Every layer is read, because the colour belongs to the last and the first image is
+// the one on top. Only that one image is drawn.
+fn _background(s as *_Sh) as i64 {
+    let is i64 as color with mut = 0;
+    let is i64 as have_image with mut = 0;
+    let is v.Value as image with mut;
+    let is v.Value as repeat with mut;
+    let is i64 as have_repeat with mut = 0;
+    let is i64 as have_pos with mut = 0;
+    let is i64 as have_size with mut = 0;
+    let is i64 as layer with mut = 0;
+    let is v.Value as px with mut;
+    let is v.Value as py with mut;
+    let is v.Value as sw with mut;
+    let is v.Value as sh with mut;
+    let is *v.Gradient as grad_head with mut = cast(*v.Gradient, 0);
+    let is *v.Gradient as grad_tail with mut = cast(*v.Gradient, 0);
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind == tok.T_COMMA) {
+            s.c.i = s.c.i + 1;
+            layer = layer + 1;
+            continue;
+        }
+        if (t.kind == tok.T_FUNCTION) {
+            let is i64 as at = s.c.i;
+            let is *v.Gradient as g = _gradient(s.c, t);
+            if (g != null) {
+                if (grad_head == null) { grad_head = g; }
+                else { grad_tail.next = g; }
+                grad_tail = g;
+                continue;
+            }
+            s.c.i = at;
+        }
+        if (_is_ident(t, "none") == 1) { s.c.i = s.c.i + 1; continue; }
+        let is v.Value as tmp with mut;
+        if (parse_one(s.c, pr.P_BACKGROUND_IMAGE, &tmp) == 1) {
+            if (have_image == 0 && tmp.kind == v.V_URL) {
+                image = tmp;
+                have_image = 1;
+            }
+            continue;
+        }
+        if (parse_one(s.c, pr.P_BACKGROUND_REPEAT, &tmp) == 1) {
+            if (layer == 0) { repeat = tmp; have_repeat = 1; }
+            continue;
+        }
+        let is i64 as col with mut = 0;
+        if (_color(s.c, &col) == 1) { color = col; continue; }
+        if (t.kind == tok.T_IDENT &&
+            (eq(t.s, t.n, "scroll") == 1 || eq(t.s, t.n, "fixed") == 1 || eq(t.s, t.n, "local") == 1 ||
+             eq(t.s, t.n, "border-box") == 1 || eq(t.s, t.n, "padding-box") == 1 ||
+             eq(t.s, t.n, "content-box") == 1 || eq(t.s, t.n, "text") == 1)) {
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        let is v.Value as a with mut;
+        if (_pos_value(s.c, &a) == 1) {
+            let is v.Value as b with mut;
+            let is i64 as two = _pos_value(s.c, &b);
+            if (layer == 0) {
+                have_pos = 1;
+                mem.memzero(cast(*u8, &px), sizeof(v.Value));
+                mem.memzero(cast(*u8, &py), sizeof(v.Value));
+                px.kind = v.V_LEN;
+                px.len.pct = 50.0;
+                py.kind = v.V_LEN;
+                py.len.pct = 50.0;
+                if (a.kind == v.V_KW && (a.kw == pr.K_TOP || a.kw == pr.K_BOTTOM)) {
+                    py = a;
+                    if (two == 1) { px = b; }
+                } else {
+                    px = a;
+                    if (two == 1) { py = b; }
+                }
+            }
+            if (_is_delim(_peek(s.c), 47) == 1) {
+                s.c.i = s.c.i + 1;
+                if (parse_one(s.c, pr.P_BACKGROUND_SIZE_W, &tmp) == 0) { return 0; }
+                let is v.Value as tmp2 with mut;
+                let is i64 as has2 = parse_one(s.c, pr.P_BACKGROUND_SIZE_H, &tmp2);
+                if (layer == 0) {
+                    sw = tmp;
+                    have_size = 1;
+                    if (has2 == 1) { sh = tmp2; }
+                    else {
+                        mem.memzero(cast(*u8, &sh), sizeof(v.Value));
+                        sh.kind = v.V_KW;
+                        sh.kw = pr.K_AUTO;
+                    }
+                }
+            }
+            continue;
+        }
+        return 0;
+    }
+    _emit_color(s, pr.P_BACKGROUND_COLOR, color);
+    if (have_image == 1) { _emit(s, pr.P_BACKGROUND_IMAGE, &image); }
+    else { _emit_kw(s, pr.P_BACKGROUND_IMAGE, pr.K_NONE); }
+    if (grad_head != null) { _emit_data(s, pr.P_X_GRADIENT, cast(*u8, grad_head)); }
+    else { _emit_kw(s, pr.P_X_GRADIENT, pr.K_NONE); }
+    if (have_repeat == 1) { _emit(s, pr.P_BACKGROUND_REPEAT, &repeat); }
+    else { _emit_kw(s, pr.P_BACKGROUND_REPEAT, pr.K_REPEAT); }
+    if (have_pos == 1) {
+        _emit(s, pr.P_BACKGROUND_POSITION_X, &px);
+        _emit(s, pr.P_BACKGROUND_POSITION_Y, &py);
+    } else {
+        _emit_px(s, pr.P_BACKGROUND_POSITION_X, 0.0);
+        _emit_px(s, pr.P_BACKGROUND_POSITION_Y, 0.0);
+    }
+    if (have_size == 1) {
+        _emit(s, pr.P_BACKGROUND_SIZE_W, &sw);
+        _emit(s, pr.P_BACKGROUND_SIZE_H, &sh);
+    } else {
+        _emit_kw(s, pr.P_BACKGROUND_SIZE_W, pr.K_AUTO);
+        _emit_kw(s, pr.P_BACKGROUND_SIZE_H, pr.K_AUTO);
+    }
+    return 1;
+}
+
+// A list of families, quotes gone, as one string for the font service to split.
+fn _family(s as *_Sh) as i64 {
+    let is i64 as cap with mut = 1;
+    let is i64 as k with mut = s.c.i;
+    while (k < s.c.n) {
+        cap = cap + s.c.t[k].n + 2;
+        k = k + 1;
+    }
+    let is *u8 as buf = arena.alloc(s.c.a, cap);
+    let is i64 as n with mut = 0;
+    while (s.c.i < s.c.n) {
+        let is *tok.Token as t = &s.c.t[s.c.i];
+        s.c.i = s.c.i + 1;
+        if (t.kind == tok.T_WS) {
+            if (n > 0 && buf[n - 1] != 44 && buf[n - 1] != 32) { buf[n] = cast(u8, 32); n = n + 1; }
+            continue;
+        }
+        if (t.kind == tok.T_COMMA) {
+            if (n > 0 && buf[n - 1] == 32) { n = n - 1; }
+            buf[n] = cast(u8, 44);
+            n = n + 1;
+            continue;
+        }
+        if (t.kind != tok.T_IDENT && t.kind != tok.T_STRING) { return 0; }
+        mem.core.memcpy(&buf[n], t.s, t.n);
+        n = n + t.n;
+    }
+    while (n > 0 && buf[n - 1] == 32) { n = n - 1; }
+    if (n == 0) { return 0; }
+    buf[n] = cast(u8, 0);
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_STR;
+    val.s = buf;
+    val.n = n;
+    _emit(s, pr.P_FONT_FAMILY, &val);
+    return 1;
+}
+
+fn _font(s as *_Sh) as i64 {
+    let is *tok.Token as first = _peek(s.c);
+    if (first == null) { return 0; }
+    // caption, menu and the rest name the system's own font, which is whatever the
+    // page would have had anyway.
+    if (first.kind == tok.T_IDENT && s.c.i + 1 >= s.c.n &&
+        (eq(first.s, first.n, "caption") == 1 || eq(first.s, first.n, "icon") == 1 || eq(first.s, first.n, "menu") == 1 ||
+         eq(first.s, first.n, "message-box") == 1 || eq(first.s, first.n, "small-caption") == 1 || eq(first.s, first.n, "status-bar") == 1)) {
+        s.c.i = s.c.i + 1;
+        return 1;
+    }
+    let is v.Value as size with mut;
+    let is v.Value as lh with mut;
+    let is i64 as style with mut = pr.K_NORMAL;
+    let is v.Value as weight with mut;
+    mem.memzero(cast(*u8, &weight), sizeof(v.Value));
+    weight.kind = v.V_KW;
+    weight.kw = pr.K_NORMAL;
+    let is i64 as have_size with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (_is_ident(t, "normal") == 1) { s.c.i = s.c.i + 1; continue; }
+        if (_is_ident(t, "small-caps") == 1) { s.c.i = s.c.i + 1; continue; }
+        if (t.kind == tok.T_IDENT && pr.in_list(pr.keywords_of(pr.P_FONT_STYLE), t.s, t.n) == 1) {
+            style = pr.kw_lookup(t.s, t.n);
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (t.kind == tok.T_NUMBER) {
+            weight.kind = v.V_NUM;
+            weight.num = t.num;
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (t.kind == tok.T_IDENT && pr.in_list(pr.keywords_of(pr.P_FONT_WEIGHT), t.s, t.n) == 1) {
+            parse_one(s.c, pr.P_FONT_WEIGHT, &weight);
+            continue;
+        }
+        if (parse_one(s.c, pr.P_FONT_SIZE, &size) == 1) {
+            have_size = 1;
+            break;
+        }
+        return 0;
+    }
+    if (have_size == 0) { return 0; }
+    let is i64 as have_lh with mut = 0;
+    if (_is_delim(_peek(s.c), 47) == 1) {
+        s.c.i = s.c.i + 1;
+        if (parse_one(s.c, pr.P_LINE_HEIGHT, &lh) == 0) { return 0; }
+        have_lh = 1;
+    }
+    _skip_ws(s.c);
+    if (_family(s) == 0) { return 0; }
+    _emit(s, pr.P_FONT_SIZE, &size);
+    _emit_kw(s, pr.P_FONT_STYLE, style);
+    _emit(s, pr.P_FONT_WEIGHT, &weight);
+    if (have_lh == 1) { _emit(s, pr.P_LINE_HEIGHT, &lh); }
+    else { _emit_kw(s, pr.P_LINE_HEIGHT, pr.K_NORMAL); }
+    return 1;
+}
+
+fn _flex(s as *_Sh) as i64 {
+    let is *tok.Token as t = _peek(s.c);
+    if (_is_ident(t, "none") == 1) {
+        s.c.i = s.c.i + 1;
+        _emit_num(s, pr.P_FLEX_GROW, 0.0);
+        _emit_num(s, pr.P_FLEX_SHRINK, 0.0);
+        _emit_kw(s, pr.P_FLEX_BASIS, pr.K_AUTO);
+        return _done(s.c);
+    }
+    let is f64 as grow with mut = 1.0;
+    let is f64 as shrink with mut = 1.0;
+    let is v.Value as basis with mut;
+    mem.memzero(cast(*u8, &basis), sizeof(v.Value));
+    basis.kind = v.V_LEN;
+    let is i64 as seen_num with mut = 0;
+    let is i64 as seen_basis with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as u = _peek(s.c);
+        if (u.kind == tok.T_NUMBER && seen_num < 2) {
+            if (seen_num == 0) { grow = u.num; }
+            else { shrink = u.num; }
+            seen_num = seen_num + 1;
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (seen_basis == 0 && parse_one(s.c, pr.P_FLEX_BASIS, &basis) == 1) {
+            seen_basis = 1;
+            continue;
+        }
+        return 0;
+    }
+    if (seen_num == 0 && seen_basis == 1) {
+        grow = 1.0;
+    }
+    _emit_num(s, pr.P_FLEX_GROW, grow);
+    _emit_num(s, pr.P_FLEX_SHRINK, shrink);
+    _emit(s, pr.P_FLEX_BASIS, &basis);
+    return 1;
+}
+
+fn _flex_flow(s as *_Sh) as i64 {
+    let is v.Value as tmp with mut;
+    let is i64 as k with mut = 0;
+    while (_done(s.c) == 0) {
+        if (parse_one(s.c, pr.P_FLEX_DIRECTION, &tmp) == 1) { _emit(s, pr.P_FLEX_DIRECTION, &tmp); k = k + 1; continue; }
+        if (parse_one(s.c, pr.P_FLEX_WRAP, &tmp) == 1) { _emit(s, pr.P_FLEX_WRAP, &tmp); k = k + 1; continue; }
+        return 0;
+    }
+    if (k == 0) { return 0; }
+    return 1;
+}
+
+fn _pair(s as *_Sh, a as i64, b as i64) as i64 {
+    let is v.Value as x with mut;
+    let is v.Value as y with mut;
+    if (parse_one(s.c, a, &x) == 0) { return 0; }
+    if (parse_one(s.c, b, &y) == 0) { y = x; }
+    _emit(s, a, &x);
+    _emit(s, b, &y);
+    return 1;
+}
+
+fn _list_style(s as *_Sh) as i64 {
+    let is v.Value as tmp with mut;
+    let is i64 as have_type with mut = 0;
+    let is i64 as have_pos with mut = 0;
+    let is i64 as have_img with mut = 0;
+    let is i64 as nones with mut = 0;
+    while (_done(s.c) == 0) {
+        if (_is_ident(_peek(s.c), "none") == 1) { s.c.i = s.c.i + 1; nones = nones + 1; continue; }
+        if (parse_one(s.c, pr.P_LIST_STYLE_POSITION, &tmp) == 1) { _emit(s, pr.P_LIST_STYLE_POSITION, &tmp); have_pos = 1; continue; }
+        if (parse_one(s.c, pr.P_LIST_STYLE_TYPE, &tmp) == 1) { _emit(s, pr.P_LIST_STYLE_TYPE, &tmp); have_type = 1; continue; }
+        if (parse_one(s.c, pr.P_LIST_STYLE_IMAGE, &tmp) == 1) { _emit(s, pr.P_LIST_STYLE_IMAGE, &tmp); have_img = 1; continue; }
+        return 0;
+    }
+    if (have_pos == 0) { _emit_kw(s, pr.P_LIST_STYLE_POSITION, pr.K_OUTSIDE); }
+    if (have_type == 0) {
+        if (nones > 0) { _emit_kw(s, pr.P_LIST_STYLE_TYPE, pr.K_NONE); }
+        else { _emit_kw(s, pr.P_LIST_STYLE_TYPE, pr.K_DISC); }
+    }
+    if (have_img == 0) { _emit_kw(s, pr.P_LIST_STYLE_IMAGE, pr.K_NONE); }
+    return 1;
+}
+
+// A bit each, because these combine: 1 underline, 2 overline, 4 line-through.
+fn _deco_line(s as *_Sh) as i64 {
+    let is i64 as bits with mut = 0;
+    let is i64 as seen with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (_is_ident(t, "none") == 1) { seen = 1; s.c.i = s.c.i + 1; continue; }
+        if (_is_ident(t, "underline") == 1) { bits = bits | 1; seen = 1; s.c.i = s.c.i + 1; continue; }
+        if (_is_ident(t, "overline") == 1) { bits = bits | 2; seen = 1; s.c.i = s.c.i + 1; continue; }
+        if (_is_ident(t, "line-through") == 1) { bits = bits | 4; seen = 1; s.c.i = s.c.i + 1; continue; }
+        if (t.kind == tok.T_IDENT && (eq(t.s, t.n, "solid") == 1 || eq(t.s, t.n, "double") == 1 || eq(t.s, t.n, "dotted") == 1 ||
+            eq(t.s, t.n, "dashed") == 1 || eq(t.s, t.n, "wavy") == 1 || eq(t.s, t.n, "blink") == 1)) {
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        let is i64 as col with mut = 0;
+        if (_color(s.c, &col) == 1) { continue; }
+        if (t.kind == tok.T_DIMENSION || t.kind == tok.T_NUMBER || t.kind == tok.T_PERCENT) { s.c.i = s.c.i + 1; continue; }
+        if (t.kind == tok.T_IDENT && (eq(t.s, t.n, "auto") == 1 || eq(t.s, t.n, "from-font") == 1)) { s.c.i = s.c.i + 1; continue; }
+        return 0;
+    }
+    if (seen == 0) { return 0; }
+    _emit_num(s, pr.P_TEXT_DECORATION_LINE, cast(f64, bits));
+    return 1;
+}
+
+fn _border_spacing(s as *_Sh) as i64 {
+    return _pair(s, pr.P_BORDER_SPACING_H, pr.P_BORDER_SPACING_V);
+}
+
+fn _overflow(s as *_Sh) as i64 { return _pair(s, pr.P_OVERFLOW_X, pr.P_OVERFLOW_Y); }
+
+fn _gap(s as *_Sh) as i64 { return _pair(s, pr.P_ROW_GAP, pr.P_COLUMN_GAP); }
+
+// content: strings and attr(), run together. An attr() stays in the string between
+// two control bytes, for the element to fill in when its box is made.
+fn _content(s as *_Sh) as i64 {
+    let is *tok.Token as t = _peek(s.c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_IDENT && (eq(t.s, t.n, "none") == 1 || eq(t.s, t.n, "normal") == 1)) {
+        s.c.i = s.c.i + 1;
+        _emit_kw(s, pr.P_CONTENT, pr.kw_lookup(t.s, t.n));
+        return _done(s.c);
+    }
+    let is i64 as cap with mut = 1;
+    let is i64 as k with mut = s.c.i;
+    while (k < s.c.n) {
+        cap = cap + s.c.t[k].n + 2;
+        k = k + 1;
+    }
+    let is *u8 as buf = arena.alloc(s.c.a, cap);
+    let is i64 as n with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as u = _peek(s.c);
+        if (u.kind == tok.T_STRING) {
+            mem.core.memcpy(&buf[n], u.s, u.n);
+            n = n + u.n;
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (u.kind == tok.T_FUNCTION && eq(u.s, u.n, "attr") == 1) {
+            let is Cur as in with mut;
+            _args(s.c, &in);
+            let is *tok.Token as name = _peek(&in);
+            if (name != null && name.kind == tok.T_IDENT) {
+                buf[n] = cast(u8, 1);
+                n = n + 1;
+                mem.core.memcpy(&buf[n], name.s, name.n);
+                n = n + name.n;
+                buf[n] = cast(u8, 2);
+                n = n + 1;
+            }
+            continue;
+        }
+        // counters, quotes and images have no text to give.
+        if (u.kind == tok.T_FUNCTION || u.kind == tok.T_LPAREN) { _skip_group(s.c); continue; }
+        s.c.i = s.c.i + 1;
+    }
+    buf[n] = cast(u8, 0);
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_STR;
+    val.s = buf;
+    val.n = n;
+    _emit(s, pr.P_CONTENT, &val);
+    return 1;
+}
+
+// For what writes colours outside a stylesheet: an <svg>'s attributes.
+fn hash_color(s as *u8, n as i64, out as *i64) as i64 { return _hash_color(s, n, out); }
+fn named_color(s as *u8, n as i64, out as *i64) as i64 { return _named_color(s, n, out); }
+
+// --- Things with a structure of their own ---
+
+fn _emit_data(s as *_Sh, prop as i64, data as *u8) as void {
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    val.kind = v.V_DATA;
+    val.s = data;
+    _emit(s, prop, &val);
+}
+
+// A length or percentage on its own. Padding takes those and no keyword.
+fn _any_len(c as *Cur, out as *v.Len) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null || t.kind == tok.T_IDENT) { return 0; }
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    let is i64 as at = c.i;
+    if (parse_one(c, pr.P_PADDING_TOP, &val) == 0) { return 0; }
+    if (val.kind != v.V_LEN) { c.i = at; return 0; }
+    *out = val.len;
+    return 1;
+}
+
+fn _track_size(c as *Cur, out as *v.TrackSize) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    mem.memzero(cast(*u8, out), sizeof(v.TrackSize));
+    if (t.kind == tok.T_IDENT) {
+        if (eq(t.s, t.n, "auto") == 1) { out.kind = v.TRACK_AUTO; }
+        else if (eq(t.s, t.n, "min-content") == 1) { out.kind = v.TRACK_MIN; }
+        else if (eq(t.s, t.n, "max-content") == 1) { out.kind = v.TRACK_MAX; }
+        else { return 0; }
+        c.i = c.i + 1;
+        return 1;
+    }
+    if (t.kind == tok.T_DIMENSION && eq(t.s, t.n, "fr") == 1) {
+        out.kind = v.TRACK_FR;
+        out.fr = t.num;
+        c.i = c.i + 1;
+        return 1;
+    }
+    out.kind = v.TRACK_LEN;
+    return _any_len(c, &out.len);
+}
+
+fn _track(c as *Cur, out as *v.Track) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_FUNCTION && eq(t.s, t.n, "minmax") == 1) {
+        let is Cur as in with mut;
+        _args(c, &in);
+        if (_track_size(&in, &out.lo) == 0) { return 0; }
+        let is *tok.Token as sep = _peek(&in);
+        if (sep != null && sep.kind == tok.T_COMMA) { in.i = in.i + 1; }
+        if (_track_size(&in, &out.hi) == 0) { return 0; }
+        // A fraction of nothing cannot be a minimum.
+        if (out.lo.kind == v.TRACK_FR) { out.lo.kind = v.TRACK_AUTO; }
+        return 1;
+    }
+    if (t.kind == tok.T_FUNCTION && eq(t.s, t.n, "fit-content") == 1) {
+        _skip_group(c);
+        mem.memzero(cast(*u8, out), sizeof(v.Track));
+        out.lo.kind = v.TRACK_AUTO;
+        out.hi.kind = v.TRACK_AUTO;
+        return 1;
+    }
+    if (_track_size(c, &out.lo) == 0) { return 0; }
+    out.hi = out.lo;
+    if (out.lo.kind == v.TRACK_FR) {
+        out.lo.kind = v.TRACK_AUTO;
+        out.lo.fr = 0.0;
+    }
+    return 1;
+}
+
+let is i64 as MAX_TRACKS with imut = 1024;
+
+fn _list_add(c as *Cur, l as *v.TrackList, cap as *i64, x as *v.Track) as void {
+    if (l.n >= MAX_TRACKS) { return; }
+    if (l.n == *cap) {
+        let is i64 as nc with mut = *cap * 2;
+        if (nc == 0) { nc = 8; }
+        let is *v.Track as nt = cast(*v.Track, arena.alloc(c.a, nc * sizeof(v.Track)));
+        if (l.n > 0) { mem.core.memcpy(cast(*u8, nt), cast(*u8, l.t), l.n * sizeof(v.Track)); }
+        l.t = nt;
+        *cap = nc;
+    }
+    l.t[l.n] = *x;
+    l.n = l.n + 1;
+}
+
+// Tracks up to the end of c, with names between them passed over.
+fn _tracks_into(c as *Cur, l as *v.TrackList, cap as *i64) as i64 {
+    while (_done(c) == 0) {
+        let is *tok.Token as t = _peek(c);
+        if (t.kind == tok.T_LBRACKET) { _skip_group(c); continue; }
+        if (t.kind == tok.T_FUNCTION && eq(t.s, t.n, "repeat") == 1) {
+            let is Cur as in with mut;
+            _args(c, &in);
+            let is *tok.Token as how = _peek(&in);
+            if (how == null) { return 0; }
+            let is i64 as times with mut = 0;
+            let is i64 as rep with mut = v.REPEAT_NONE;
+            if (how.kind == tok.T_NUMBER) { times = cast(i64, how.num); }
+            else if (how.kind == tok.T_IDENT && eq(how.s, how.n, "auto-fill") == 1) { rep = v.REPEAT_FILL; }
+            else if (how.kind == tok.T_IDENT && eq(how.s, how.n, "auto-fit") == 1) { rep = v.REPEAT_FIT; }
+            else { return 0; }
+            in.i = in.i + 1;
+            let is *tok.Token as sep = _peek(&in);
+            if (sep == null || sep.kind != tok.T_COMMA) { return 0; }
+            in.i = in.i + 1;
+            let is v.TrackList as one with mut;
+            mem.memzero(cast(*u8, &one), sizeof(v.TrackList));
+            let is i64 as onecap with mut = 0;
+            if (_tracks_into(&in, &one, &onecap) == 0 || one.n == 0) { return 0; }
+            if (rep != v.REPEAT_NONE) {
+                if (l.rep != v.REPEAT_NONE) { return 0; }
+                l.rep = rep;
+                l.rep_at = l.n;
+                l.rep_n = one.n;
+                times = 1;
+            }
+            let is i64 as k with mut = 0;
+            while (k < times && l.n < MAX_TRACKS) {
+                let is i64 as j with mut = 0;
+                while (j < one.n) {
+                    _list_add(c, l, cap, &one.t[j]);
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+            continue;
+        }
+        let is v.Track as x with mut;
+        mem.memzero(cast(*u8, &x), sizeof(v.Track));
+        if (_track(c, &x) == 0) { return 0; }
+        _list_add(c, l, cap, &x);
+    }
+    return 1;
+}
+
+fn _track_list(s as *_Sh, prop as i64) as i64 {
+    let is *tok.Token as t = _peek(s.c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_IDENT && eq(t.s, t.n, "none") == 1) {
+        s.c.i = s.c.i + 1;
+        _emit_kw(s, prop, pr.K_NONE);
+        return 1;
+    }
+    let is *v.TrackList as l = cast(*v.TrackList, arena.alloc(s.c.a, sizeof(v.TrackList)));
+    mem.memzero(cast(*u8, l), sizeof(v.TrackList));
+    let is i64 as cap with mut = 0;
+    if (_tracks_into(s.c, l, &cap) == 0 || l.n == 0) { return 0; }
+    _emit_data(s, prop, cast(*u8, l));
+    return 1;
+}
+
+// A grid line: auto, a number, or span and a number. A name means nothing without
+// grid-template-areas, so it counts as auto.
+fn _grid_line_val(c as *Cur, out as *v.Value) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    mem.memzero(cast(*u8, out), sizeof(v.Value));
+    if (t.kind == tok.T_NUMBER) {
+        out.kind = v.V_NUM;
+        out.num = t.num;
+        c.i = c.i + 1;
+        return 1;
+    }
+    if (t.kind != tok.T_IDENT) { return 0; }
+    c.i = c.i + 1;
+    if (eq(t.s, t.n, "span") == 1) {
+        out.kind = v.V_NUM;
+        out.num = v.GRID_SPAN + 1.0;
+        let is *tok.Token as u = _peek(c);
+        if (u != null && u.kind == tok.T_NUMBER) {
+            out.num = v.GRID_SPAN + u.num;
+            c.i = c.i + 1;
+        } else if (u != null && u.kind == tok.T_IDENT) {
+            c.i = c.i + 1;
+        }
+        return 1;
+    }
+    out.kind = v.V_KW;
+    out.kw = pr.K_AUTO;
+    return 1;
+}
+
+fn _grid_line_one(s as *_Sh, prop as i64) as i64 {
+    let is v.Value as val with mut;
+    if (_grid_line_val(s.c, &val) == 0) { return 0; }
+    _emit(s, prop, &val);
+    return 1;
+}
+
+// grid-row or grid-column: a start, and after a slash an end.
+fn _grid_line_pair(s as *_Sh, start as i64, end as i64) as i64 {
+    let is v.Value as a with mut;
+    if (_grid_line_val(s.c, &a) == 0) { return 0; }
+    let is v.Value as b with mut;
+    mem.memzero(cast(*u8, &b), sizeof(v.Value));
+    b.kind = v.V_KW;
+    b.kw = pr.K_AUTO;
+    if (_is_delim(_peek(s.c), 47) == 1) {
+        s.c.i = s.c.i + 1;
+        if (_grid_line_val(s.c, &b) == 0) { return 0; }
+    }
+    _emit(s, start, &a);
+    _emit(s, end, &b);
+    return 1;
+}
+
+// grid-area: row start, column start, row end, column end.
+fn _grid_area(s as *_Sh) as i64 {
+    let is [4]v.Value as x with mut;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        mem.memzero(cast(*u8, &x[k]), sizeof(v.Value));
+        x[k].kind = v.V_KW;
+        x[k].kw = pr.K_AUTO;
+        k = k + 1;
+    }
+    k = 0;
+    while (k < 4 && _done(s.c) == 0) {
+        if (k > 0) {
+            if (_is_delim(_peek(s.c), 47) == 0) { return 0; }
+            s.c.i = s.c.i + 1;
+        }
+        if (_grid_line_val(s.c, &x[k]) == 0) { return 0; }
+        k = k + 1;
+    }
+    _emit(s, pr.P_GRID_ROW_START, &x[0]);
+    _emit(s, pr.P_GRID_COLUMN_START, &x[1]);
+    _emit(s, pr.P_GRID_ROW_END, &x[2]);
+    _emit(s, pr.P_GRID_COLUMN_END, &x[3]);
+    return 1;
+}
+
+fn _grid_flow(s as *_Sh) as i64 {
+    let is i64 as kw with mut = pr.K_ROW;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind != tok.T_IDENT) { return 0; }
+        if (eq(t.s, t.n, "column") == 1) { kw = pr.K_COLUMN; }
+        else if (eq(t.s, t.n, "row") == 0 && eq(t.s, t.n, "dense") == 0) { return 0; }
+        s.c.i = s.c.i + 1;
+    }
+    _emit_kw(s, pr.P_GRID_AUTO_FLOW, kw);
+    return 1;
+}
+
+// columns: a count, a width, or both, in either order.
+fn _columns(s as *_Sh) as i64 {
+    let is i64 as have_n with mut = 0;
+    let is f64 as n with mut = 0.0;
+    let is i64 as have_w with mut = 0;
+    let is v.Value as w with mut;
+    mem.memzero(cast(*u8, &w), sizeof(v.Value));
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind == tok.T_IDENT && eq(t.s, t.n, "auto") == 1) { s.c.i = s.c.i + 1; continue; }
+        if (t.kind == tok.T_NUMBER && t.num > 0.0) {
+            have_n = 1;
+            n = t.num;
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (parse_one(s.c, pr.P_COLUMN_WIDTH, &w) == 0) { return 0; }
+        have_w = 1;
+    }
+    if (have_n == 1) { _emit_num(s, pr.P_COLUMN_COUNT, n); }
+    else { _emit_kw(s, pr.P_COLUMN_COUNT, pr.K_AUTO); }
+    if (have_w == 1) { _emit(s, pr.P_COLUMN_WIDTH, &w); }
+    else { _emit_kw(s, pr.P_COLUMN_WIDTH, pr.K_AUTO); }
+    return 1;
+}
+
+fn _box_shadow(s as *_Sh) as i64 {
+    let is *tok.Token as t0 = _peek(s.c);
+    if (t0 == null) { return 0; }
+    if (t0.kind == tok.T_IDENT && eq(t0.s, t0.n, "none") == 1) {
+        s.c.i = s.c.i + 1;
+        _emit_kw(s, pr.P_BOX_SHADOW, pr.K_NONE);
+        return 1;
+    }
+    let is *v.Shadow as head with mut = cast(*v.Shadow, 0);
+    let is *v.Shadow as tail with mut = cast(*v.Shadow, 0);
+    while (_done(s.c) == 0) {
+        let is *v.Shadow as x = cast(*v.Shadow, arena.alloc(s.c.a, sizeof(v.Shadow)));
+        mem.memzero(cast(*u8, x), sizeof(v.Shadow));
+        x.color = v.COLOR_CURRENT;
+        let is i64 as lens with mut = 0;
+        while (_done(s.c) == 0) {
+            let is *tok.Token as t = _peek(s.c);
+            if (t.kind == tok.T_COMMA) {
+                s.c.i = s.c.i + 1;
+                break;
+            }
+            if (t.kind == tok.T_IDENT && eq(t.s, t.n, "inset") == 1) {
+                x.inset = 1;
+                s.c.i = s.c.i + 1;
+                continue;
+            }
+            let is v.Len as l with mut;
+            if (_any_len(s.c, &l) == 1) {
+                if (lens == 0) { x.x = l; }
+                if (lens == 1) { x.y = l; }
+                if (lens == 2) { x.blur = l; }
+                if (lens == 3) { x.spread = l; }
+                lens = lens + 1;
+                continue;
+            }
+            if (_color(s.c, &x.color) == 0) { return 0; }
+        }
+        if (lens < 2 || lens > 4) { return 0; }
+        if (head == null) { head = x; }
+        else { tail.next = x; }
+        tail = x;
+    }
+    if (head == null) { return 0; }
+    _emit_data(s, pr.P_BOX_SHADOW, cast(*u8, head));
+    return 1;
+}
+
+// An angle as degrees: deg, rad, grad, turn or a bare zero.
+fn _angle(c as *Cur, out as *f64) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_NUMBER && t.num == 0.0) { *out = 0.0; c.i = c.i + 1; return 1; }
+    if (t.kind != tok.T_DIMENSION) { return 0; }
+    if (eq(t.s, t.n, "deg") == 1) { *out = t.num; }
+    else if (eq(t.s, t.n, "turn") == 1) { *out = t.num * 360.0; }
+    else if (eq(t.s, t.n, "rad") == 1) { *out = t.num * 180.0 / 3.14159265358979; }
+    else if (eq(t.s, t.n, "grad") == 1) { *out = t.num * 0.9; }
+    else { return 0; }
+    c.i = c.i + 1;
+    return 1;
+}
+
+fn _pct_len(out as *v.Len, pct as f64) as void {
+    _zero_len(out);
+    out.pct = pct;
+}
+
+// After `at`: one or two of a keyword or a length, the rest centred.
+fn _grad_at(c as *Cur, x as *v.Len, y as *v.Len) as i64 {
+    _pct_len(x, 50.0);
+    _pct_len(y, 50.0);
+    let is i64 as k with mut = 0;
+    while (k < 2 && _done(c) == 0) {
+        let is *tok.Token as t = _peek(c);
+        if (t.kind == tok.T_COMMA) { break; }
+        if (t.kind == tok.T_IDENT) {
+            if (eq(t.s, t.n, "left") == 1) { _pct_len(x, 0.0); }
+            else if (eq(t.s, t.n, "right") == 1) { _pct_len(x, 100.0); }
+            else if (eq(t.s, t.n, "top") == 1) { _pct_len(y, 0.0); }
+            else if (eq(t.s, t.n, "bottom") == 1) { _pct_len(y, 100.0); }
+            else if (eq(t.s, t.n, "center") == 0) { return 0; }
+            c.i = c.i + 1;
+        } else {
+            let is v.Len as l with mut;
+            if (_any_len(c, &l) == 0) { return 0; }
+            if (k == 0) { *x = l; }
+            else { *y = l; }
+        }
+        k = k + 1;
+    }
+    return cast(i64, k > 0);
+}
+
+fn _radial_head(c as *Cur, g as *v.Gradient) as i64 {
+    let is i64 as lens with mut = 0;
+    let is i64 as said_shape with mut = 0;
+    while (_done(c) == 0) {
+        let is *tok.Token as t = _peek(c);
+        if (t.kind == tok.T_COMMA) { break; }
+        if (t.kind == tok.T_IDENT) {
+            let is i64 as known with mut = 1;
+            if (eq(t.s, t.n, "circle") == 1) { g.circle = 1; said_shape = 1; }
+            else if (eq(t.s, t.n, "ellipse") == 1) { g.circle = 0; said_shape = 1; }
+            else if (eq(t.s, t.n, "closest-side") == 1) { g.extent = v.EXTENT_CLOSEST_SIDE; }
+            else if (eq(t.s, t.n, "closest-corner") == 1) { g.extent = v.EXTENT_CLOSEST_CORNER; }
+            else if (eq(t.s, t.n, "farthest-side") == 1) { g.extent = v.EXTENT_FARTHEST_SIDE; }
+            else if (eq(t.s, t.n, "farthest-corner") == 1) { g.extent = v.EXTENT_FARTHEST_CORNER; }
+            else if (eq(t.s, t.n, "at") == 1) {
+                c.i = c.i + 1;
+                if (_grad_at(c, &g.at_x, &g.at_y) == 0) { return 0; }
+                continue;
+            } else {
+                known = 0;
+            }
+            if (known == 0) { return 0; }
+            c.i = c.i + 1;
+            continue;
+        }
+        let is v.Len as l with mut;
+        if (_any_len(c, &l) == 0) { return 0; }
+        if (lens == 0) { g.rx = l; g.ry = l; }
+        if (lens == 1) { g.ry = l; }
+        lens = lens + 1;
+        g.extent = v.EXTENT_SIZE;
+    }
+    // One length can only mean a circle.
+    if (lens == 1 && said_shape == 0) { g.circle = 1; }
+    return 1;
+}
+
+fn _grad_add_stop(g as *v.Gradient, col as i64, has as i64, pos as *v.Len) as void {
+    let is *v.GradStop as st = &g.stops[g.nstops];
+    g.nstops = g.nstops + 1;
+    st.color = col;
+    st.has_pos = has;
+    if (has == 1) { st.pos = *pos; }
+}
+
+// Colours, each with up to two places. A place alone is a colour hint, which is left out:
+// the two colours around it meet evenly instead.
+fn _grad_stops(c as *Cur, g as *v.Gradient) as i64 {
+    let is i64 as commas with mut = 0;
+    let is i64 as k with mut = c.i;
+    while (k < c.n) {
+        if (c.t[k].kind == tok.T_COMMA) { commas = commas + 1; }
+        k = k + 1;
+    }
+    g.stops = cast(*v.GradStop, arena.alloc(c.a, (commas + 1) * 2 * sizeof(v.GradStop)));
+    mem.memzero(cast(*u8, g.stops), (commas + 1) * 2 * sizeof(v.GradStop));
+    while (_done(c) == 0) {
+        let is *tok.Token as t = _peek(c);
+        if (t.kind == tok.T_COMMA) {
+            c.i = c.i + 1;
+            continue;
+        }
+        let is i64 as col with mut = 0;
+        let is v.Len as a with mut;
+        let is v.Len as b with mut;
+        let is i64 as places with mut = 0;
+        let is i64 as saw_color = _color(c, &col);
+        if (_any_len(c, &a) == 1) { places = 1; }
+        if (places == 1 && _any_len(c, &b) == 1) { places = 2; }
+        if (saw_color == 0) {
+            // A hint, or a place written before its colour.
+            if (_color(c, &col) == 0) {
+                if (places == 0) { return 0; }
+                continue;
+            }
+        }
+        _grad_add_stop(g, col, cast(i64, places >= 1), &a);
+        if (places == 2) { _grad_add_stop(g, col, 1, &b); }
+    }
+    return cast(i64, g.nstops >= 1);
+}
+
+// --- Transforms ---
+
+fn _comma(c as *Cur) as void {
+    let is *tok.Token as t = _peek(c);
+    if (t != null && t.kind == tok.T_COMMA) { c.i = c.i + 1; }
+}
+
+fn _num_arg(c as *Cur, out as *f64) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_NUMBER) {
+        *out = t.num;
+        c.i = c.i + 1;
+        _comma(c);
+        return 1;
+    }
+    if (t.kind == tok.T_PERCENT) {
+        *out = t.num / 100.0;
+        c.i = c.i + 1;
+        _comma(c);
+        return 1;
+    }
+    return 0;
+}
+
+fn _angle_arg(c as *Cur, out as *f64) as i64 {
+    let is f64 as deg with mut = 0.0;
+    if (_angle(c, &deg) == 0) { return 0; }
+    *out = deg * 3.14159265358979 / 180.0;
+    _comma(c);
+    return 1;
+}
+
+fn _len_arg(c as *Cur, out as *v.Len) as i64 {
+    if (_any_len(c, out) == 0) { return 0; }
+    _comma(c);
+    return 1;
+}
+
+fn _top(c as *Cur, name as *u8, n as i64, o as *v.TOp) as i64 {
+    let is Cur as in with mut;
+    _args(c, &in);
+    mem.memzero(cast(*u8, o), sizeof(v.TOp));
+    if (eq(name, n, "translate") == 1 || eq(name, n, "translate3d") == 1) {
+        o.kind = v.TOP_TRANSLATE;
+        _zero_len(&o.y);
+        if (_len_arg(&in, &o.x) == 0) { return 0; }
+        if (_done(&in) == 0 && _len_arg(&in, &o.y) == 0) { return 0; }
+        return 1;
+    }
+    if (eq(name, n, "translatex") == 1) {
+        o.kind = v.TOP_TRANSLATE;
+        _zero_len(&o.y);
+        return _len_arg(&in, &o.x);
+    }
+    if (eq(name, n, "translatey") == 1) {
+        o.kind = v.TOP_TRANSLATE;
+        _zero_len(&o.x);
+        return _len_arg(&in, &o.y);
+    }
+    if (eq(name, n, "scale") == 1 || eq(name, n, "scale3d") == 1) {
+        o.kind = v.TOP_SCALE;
+        if (_num_arg(&in, &o.a) == 0) { return 0; }
+        o.b = o.a;
+        if (_done(&in) == 0 && _num_arg(&in, &o.b) == 0) { return 0; }
+        return 1;
+    }
+    if (eq(name, n, "scalex") == 1) {
+        o.kind = v.TOP_SCALE;
+        o.b = 1.0;
+        return _num_arg(&in, &o.a);
+    }
+    if (eq(name, n, "scaley") == 1) {
+        o.kind = v.TOP_SCALE;
+        o.a = 1.0;
+        return _num_arg(&in, &o.b);
+    }
+    if (eq(name, n, "rotate") == 1 || eq(name, n, "rotatez") == 1) {
+        o.kind = v.TOP_ROTATE;
+        return _angle_arg(&in, &o.a);
+    }
+    if (eq(name, n, "skew") == 1) {
+        o.kind = v.TOP_SKEW;
+        if (_angle_arg(&in, &o.a) == 0) { return 0; }
+        if (_done(&in) == 0 && _angle_arg(&in, &o.b) == 0) { return 0; }
+        return 1;
+    }
+    if (eq(name, n, "skewx") == 1) {
+        o.kind = v.TOP_SKEW;
+        return _angle_arg(&in, &o.a);
+    }
+    if (eq(name, n, "skewy") == 1) {
+        o.kind = v.TOP_SKEW;
+        return _angle_arg(&in, &o.b);
+    }
+    if (eq(name, n, "matrix") == 1) {
+        o.kind = v.TOP_MATRIX;
+        if (_num_arg(&in, &o.a) == 0 || _num_arg(&in, &o.b) == 0 || _num_arg(&in, &o.c) == 0 ||
+            _num_arg(&in, &o.d) == 0 || _num_arg(&in, &o.e) == 0 || _num_arg(&in, &o.f) == 0) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+fn _transform(s as *_Sh) as i64 {
+    let is *tok.Token as t0 = _peek(s.c);
+    if (t0 == null) { return 0; }
+    if (t0.kind == tok.T_IDENT && eq(t0.s, t0.n, "none") == 1) {
+        s.c.i = s.c.i + 1;
+        _emit_kw(s, pr.P_TRANSFORM, pr.K_NONE);
+        return 1;
+    }
+    let is [16]v.TOp as ops with mut;
+    let is i64 as n with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind != tok.T_FUNCTION || n == 16) { return 0; }
+        if (_top(s.c, t.s, t.n, &ops[n]) == 0) { return 0; }
+        n = n + 1;
+    }
+    if (n == 0) { return 0; }
+    let is *v.Transform as out = cast(*v.Transform, arena.alloc(s.c.a, sizeof(v.Transform)));
+    out.n = n;
+    out.ops = cast(*v.TOp, arena.alloc(s.c.a, n * sizeof(v.TOp)));
+    mem.core.memcpy(cast(*u8, out.ops), cast(*u8, &ops), n * sizeof(v.TOp));
+    _emit_data(s, pr.P_TRANSFORM, cast(*u8, out));
+    return 1;
+}
+
+fn _origin_val(c as *Cur, val as *v.Value, is_y as *i64) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    mem.memzero(cast(*u8, val), sizeof(v.Value));
+    val.kind = v.V_LEN;
+    if (t.kind == tok.T_IDENT) {
+        if (eq(t.s, t.n, "left") == 1) { val.len.pct = 0.0; }
+        else if (eq(t.s, t.n, "right") == 1) { val.len.pct = 100.0; }
+        else if (eq(t.s, t.n, "center") == 1) { val.len.pct = 50.0; }
+        else if (eq(t.s, t.n, "top") == 1) { val.len.pct = 0.0; *is_y = 1; }
+        else if (eq(t.s, t.n, "bottom") == 1) { val.len.pct = 100.0; *is_y = 1; }
+        else { return 0; }
+        c.i = c.i + 1;
+        return 1;
+    }
+    return _any_len(c, &val.len);
+}
+
+fn _transform_origin(s as *_Sh) as i64 {
+    let is v.Value as a with mut;
+    let is v.Value as b with mut;
+    let is i64 as a_y with mut = 0;
+    let is i64 as b_y with mut = 0;
+    if (_origin_val(s.c, &a, &a_y) == 0) { return 0; }
+    mem.memzero(cast(*u8, &b), sizeof(v.Value));
+    b.kind = v.V_LEN;
+    b.len.pct = 50.0;
+    if (_done(s.c) == 0 && _origin_val(s.c, &b, &b_y) == 0) { return 0; }
+    // A third value is how far towards the viewer, and nothing here has that.
+    if (_done(s.c) == 0) {
+        let is v.Len as z with mut;
+        if (_any_len(s.c, &z) == 0) { return 0; }
+    }
+    if (a_y == 1) {
+        _emit(s, pr.P_TRANSFORM_ORIGIN_X, &b);
+        _emit(s, pr.P_TRANSFORM_ORIGIN_Y, &a);
+    } else {
+        _emit(s, pr.P_TRANSFORM_ORIGIN_X, &a);
+        _emit(s, pr.P_TRANSFORM_ORIGIN_Y, &b);
+    }
+    return 1;
+}
+
+// --- Time: transitions and animations ---
+
+// A time in seconds. 1 and past it, or 0 with the cursor where it was.
+fn _time(c as *Cur, out as *f64) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_NUMBER && t.num == 0.0) {
+        *out = 0.0;
+        c.i = c.i + 1;
+        return 1;
+    }
+    if (t.kind != tok.T_DIMENSION) { return 0; }
+    if (eq(t.s, t.n, "s") == 1) { *out = t.num; }
+    else if (eq(t.s, t.n, "ms") == 1) { *out = t.num / 1000.0; }
+    else { return 0; }
+    c.i = c.i + 1;
+    return 1;
+}
+
+fn _bez(e as *v.Ease, x1 as f64, y1 as f64, x2 as f64, y2 as f64) as void {
+    e.kind = v.EASE_BEZIER;
+    e.x1 = x1;
+    e.y1 = y1;
+    e.x2 = x2;
+    e.y2 = y2;
+}
+
+fn _ease(c as *Cur, e as *v.Ease) as i64 {
+    let is *tok.Token as t = _peek(c);
+    if (t == null) { return 0; }
+    mem.memzero(cast(*u8, e), sizeof(v.Ease));
+    if (t.kind == tok.T_IDENT) {
+        if (eq(t.s, t.n, "linear") == 1) { e.kind = v.EASE_LINEAR; }
+        else if (eq(t.s, t.n, "ease") == 1) { _bez(e, 0.25, 0.1, 0.25, 1.0); }
+        else if (eq(t.s, t.n, "ease-in") == 1) { _bez(e, 0.42, 0.0, 1.0, 1.0); }
+        else if (eq(t.s, t.n, "ease-out") == 1) { _bez(e, 0.0, 0.0, 0.58, 1.0); }
+        else if (eq(t.s, t.n, "ease-in-out") == 1) { _bez(e, 0.42, 0.0, 0.58, 1.0); }
+        else if (eq(t.s, t.n, "step-start") == 1) { e.kind = v.EASE_STEPS; e.steps = 1; e.start = 1; }
+        else if (eq(t.s, t.n, "step-end") == 1) { e.kind = v.EASE_STEPS; e.steps = 1; }
+        else { return 0; }
+        c.i = c.i + 1;
+        return 1;
+    }
+    if (t.kind != tok.T_FUNCTION) { return 0; }
+    let is i64 as is_bez = eq(t.s, t.n, "cubic-bezier");
+    let is i64 as is_steps = eq(t.s, t.n, "steps");
+    if (is_bez == 0 && is_steps == 0) { return 0; }
+    let is Cur as in with mut;
+    _args(c, &in);
+    if (is_bez == 1) {
+        e.kind = v.EASE_BEZIER;
+        if (_num_arg(&in, &e.x1) == 0 || _num_arg(&in, &e.y1) == 0 ||
+            _num_arg(&in, &e.x2) == 0 || _num_arg(&in, &e.y2) == 0) { return 0; }
+        return 1;
+    }
+    let is f64 as k with mut = 0.0;
+    if (_num_arg(&in, &k) == 0 || k < 1.0) { return 0; }
+    e.kind = v.EASE_STEPS;
+    e.steps = cast(i64, k);
+    let is *tok.Token as pos = _peek(&in);
+    if (pos != null && pos.kind == tok.T_IDENT &&
+        (eq(pos.s, pos.n, "start") == 1 || eq(pos.s, pos.n, "jump-start") == 1)) { e.start = 1; }
+    return 1;
+}
+
+fn _tp_code(s as *u8, n as i64) as i64 {
+    if (eq(s, n, "all") == 1) { return v.TP_ALL; }
+    if (eq(s, n, "none") == 1) { return v.TP_NONE; }
+    if (eq(s, n, "background") == 1) { return v.TP_BG; }
+    if (eq(s, n, "border-color") == 1) { return v.TP_BORDER_COLOR; }
+    if (eq(s, n, "border-radius") == 1) { return v.TP_BORDER_RADIUS; }
+    let is i64 as p = pr.prop_lookup(s, n);
+    if (p < 0) { return v.TP_UNKNOWN; }
+    return p;
+}
+
+let is i64 as _MAX_TRANS with imut = 16;
+
+fn _emit_props(s as *_Sh, list as *i64, n as i64) as void {
+    let is *v.PropList as o = cast(*v.PropList, arena.alloc(s.c.a, sizeof(v.PropList)));
+    o.n = n;
+    o.p = cast(*i64, arena.alloc(s.c.a, (n + 1) * 8));
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        o.p[i] = list[i];
+        i = i + 1;
+    }
+    _emit_data(s, pr.P_TRANSITION_PROPERTY, cast(*u8, o));
+}
+
+fn _emit_times(s as *_Sh, prop as i64, list as *f64, n as i64) as void {
+    let is *v.Times as o = cast(*v.Times, arena.alloc(s.c.a, sizeof(v.Times)));
+    o.n = n;
+    o.t = cast(*f64, arena.alloc(s.c.a, (n + 1) * 8));
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        o.t[i] = list[i];
+        i = i + 1;
+    }
+    _emit_data(s, prop, cast(*u8, o));
+}
+
+fn _emit_eases(s as *_Sh, prop as i64, list as *v.Ease, n as i64) as void {
+    let is *v.Eases as o = cast(*v.Eases, arena.alloc(s.c.a, sizeof(v.Eases)));
+    o.n = n;
+    o.e = cast(*v.Ease, arena.alloc(s.c.a, (n + 1) * sizeof(v.Ease)));
+    mem.core.memcpy(cast(*u8, o.e), cast(*u8, list), n * sizeof(v.Ease));
+    _emit_data(s, prop, cast(*u8, o));
+}
+
+fn _is_ease_word(s as *u8, n as i64) as i64 {
+    if (eq(s, n, "linear") == 1 || eq(s, n, "ease") == 1 || eq(s, n, "ease-in") == 1 || eq(s, n, "ease-out") == 1 ||
+        eq(s, n, "ease-in-out") == 1 || eq(s, n, "step-start") == 1 || eq(s, n, "step-end") == 1) { return 1; }
+    return 0;
+}
+
+// transition: each comma's worth names a property and its times, in any order.
+fn _transition(s as *_Sh) as i64 {
+    let is [16]i64 as props with mut;
+    let is [16]f64 as durs with mut;
+    let is [16]f64 as delays with mut;
+    let is [16]v.Ease as eases with mut;
+    let is i64 as n with mut = 0;
+    while (_done(s.c) == 0) {
+        if (n == _MAX_TRANS) { return 0; }
+        props[n] = v.TP_ALL;
+        durs[n] = 0.0;
+        delays[n] = 0.0;
+        _bez(&eases[n], 0.25, 0.1, 0.25, 1.0);
+        let is i64 as times with mut = 0;
+        while (_done(s.c) == 0 && _peek(s.c).kind != tok.T_COMMA) {
+            let is *tok.Token as t = _peek(s.c);
+            let is f64 as sec with mut = 0.0;
+            if (_time(s.c, &sec) == 1) {
+                if (times == 0) { durs[n] = sec; }
+                else { delays[n] = sec; }
+                times = times + 1;
+            } else if (t.kind == tok.T_FUNCTION || (t.kind == tok.T_IDENT && _is_ease_word(t.s, t.n) == 1)) {
+                if (_ease(s.c, &eases[n]) == 0) { return 0; }
+            } else if (t.kind == tok.T_IDENT) {
+                props[n] = _tp_code(t.s, t.n);
+                s.c.i = s.c.i + 1;
+            } else {
+                return 0;
+            }
+        }
+        n = n + 1;
+        _comma(s.c);
+    }
+    if (n == 0) { return 0; }
+    _emit_props(s, cast(*i64, &props), n);
+    _emit_times(s, pr.P_TRANSITION_DURATION, cast(*f64, &durs), n);
+    _emit_times(s, pr.P_TRANSITION_DELAY, cast(*f64, &delays), n);
+    _emit_eases(s, pr.P_TRANSITION_TIMING_FUNCTION, cast(*v.Ease, &eases), n);
+    return 1;
+}
+
+fn _transition_property(s as *_Sh) as i64 {
+    let is [16]i64 as props with mut;
+    let is i64 as n with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind != tok.T_IDENT || n == _MAX_TRANS) { return 0; }
+        props[n] = _tp_code(t.s, t.n);
+        n = n + 1;
+        s.c.i = s.c.i + 1;
+        _comma(s.c);
+    }
+    if (n == 0) { return 0; }
+    _emit_props(s, cast(*i64, &props), n);
+    return 1;
+}
+
+fn _times_prop(s as *_Sh, prop as i64) as i64 {
+    let is [16]f64 as list with mut;
+    let is i64 as n with mut = 0;
+    while (_done(s.c) == 0) {
+        if (n == _MAX_TRANS || _time(s.c, &list[n]) == 0) { return 0; }
+        n = n + 1;
+        _comma(s.c);
+    }
+    if (n == 0) { return 0; }
+    _emit_times(s, prop, cast(*f64, &list), n);
+    return 1;
+}
+
+fn _eases_prop(s as *_Sh, prop as i64) as i64 {
+    let is [16]v.Ease as list with mut;
+    let is i64 as n with mut = 0;
+    while (_done(s.c) == 0) {
+        if (n == _MAX_TRANS || _ease(s.c, &list[n]) == 0) { return 0; }
+        n = n + 1;
+        _comma(s.c);
+    }
+    if (n == 0) { return 0; }
+    _emit_eases(s, prop, cast(*v.Ease, &list), n);
+    return 1;
+}
+
+fn _emit_name(s as *_Sh, p as *u8, n as i64) as void {
+    let is *v.Name as o = cast(*v.Name, arena.alloc(s.c.a, sizeof(v.Name)));
+    o.s = p;
+    o.n = n;
+    _emit_data(s, pr.P_ANIMATION_NAME, cast(*u8, o));
+}
+
+fn _animation_name(s as *_Sh) as i64 {
+    let is *tok.Token as t = _peek(s.c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_IDENT && eq(t.s, t.n, "none") == 1) {
+        _emit_kw(s, pr.P_ANIMATION_NAME, pr.K_NONE);
+        s.c.i = s.c.i + 1;
+        return 1;
+    }
+    if (t.kind != tok.T_IDENT && t.kind != tok.T_STRING) { return 0; }
+    _emit_name(s, t.s, t.n);
+    s.c.i = s.c.i + 1;
+    return 1;
+}
+
+fn _time_prop(s as *_Sh, prop as i64) as i64 {
+    let is f64 as sec with mut = 0.0;
+    if (_time(s.c, &sec) == 0) { return 0; }
+    _emit_num(s, prop, sec);
+    // A list gives each animation its own, and only the first one runs here.
+    return 1;
+}
+
+// animation: the first of a list, since one element runs one here.
+fn _animation(s as *_Sh) as i64 {
+    let is f64 as dur with mut = 0.0;
+    let is f64 as delay with mut = 0.0;
+    let is f64 as count with mut = 1.0;
+    let is i64 as dir with mut = pr.K_NORMAL;
+    let is i64 as fill with mut = pr.K_NONE;
+    let is v.Ease as ease with mut;
+    _bez(&ease, 0.25, 0.1, 0.25, 1.0);
+    let is *tok.Token as name with mut = cast(*tok.Token, 0);
+    let is i64 as infinite with mut = 0;
+    let is i64 as times with mut = 0;
+    while (_done(s.c) == 0 && _peek(s.c).kind != tok.T_COMMA) {
+        let is *tok.Token as t = _peek(s.c);
+        let is f64 as sec with mut = 0.0;
+        if (_time(s.c, &sec) == 1) {
+            if (times == 0) { dur = sec; }
+            else { delay = sec; }
+            times = times + 1;
+            continue;
+        }
+        if (t.kind == tok.T_NUMBER) {
+            count = t.num;
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (t.kind == tok.T_FUNCTION || (t.kind == tok.T_IDENT && _is_ease_word(t.s, t.n) == 1)) {
+            if (_ease(s.c, &ease) == 0) { return 0; }
+            continue;
+        }
+        if (t.kind == tok.T_STRING) {
+            name = t;
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        if (t.kind != tok.T_IDENT) { return 0; }
+        s.c.i = s.c.i + 1;
+        if (eq(t.s, t.n, "infinite") == 1) { infinite = 1; }
+        else if (eq(t.s, t.n, "normal") == 1) { dir = pr.K_NORMAL; }
+        else if (eq(t.s, t.n, "reverse") == 1) { dir = pr.K_REVERSE; }
+        else if (eq(t.s, t.n, "alternate") == 1) { dir = pr.K_ALTERNATE; }
+        else if (eq(t.s, t.n, "alternate-reverse") == 1) { dir = pr.K_ALTERNATE_REVERSE; }
+        else if (eq(t.s, t.n, "forwards") == 1) { fill = pr.K_FORWARDS; }
+        else if (eq(t.s, t.n, "backwards") == 1) { fill = pr.K_BACKWARDS; }
+        else if (eq(t.s, t.n, "both") == 1) { fill = pr.K_BOTH; }
+        else if (eq(t.s, t.n, "running") == 1 || eq(t.s, t.n, "paused") == 1) { continue; }
+        else if (eq(t.s, t.n, "none") == 1 && name != null) { fill = pr.K_NONE; }
+        else if (eq(t.s, t.n, "none") == 1) { continue; }
+        else { name = t; }
+    }
+    // The rest of a list is parsed by nobody.
+    s.c.i = s.c.n;
+    if (name == null) { _emit_kw(s, pr.P_ANIMATION_NAME, pr.K_NONE); }
+    else { _emit_name(s, name.s, name.n); }
+    _emit_num(s, pr.P_ANIMATION_DURATION, dur);
+    _emit_num(s, pr.P_ANIMATION_DELAY, delay);
+    if (infinite == 1) { _emit_kw(s, pr.P_ANIMATION_ITERATION_COUNT, pr.K_INFINITE); }
+    else { _emit_num(s, pr.P_ANIMATION_ITERATION_COUNT, count); }
+    _emit_kw(s, pr.P_ANIMATION_DIRECTION, dir);
+    _emit_kw(s, pr.P_ANIMATION_FILL_MODE, fill);
+    _emit_eases(s, pr.P_ANIMATION_TIMING_FUNCTION, &ease, 1);
+    return 1;
+}
+
+// The gradient function under the cursor, past it. Null when it is not one.
+fn _gradient(c as *Cur, t as *tok.Token) as *v.Gradient {
+    let is i64 as kind with mut = 0;
+    let is i64 as rep with mut = 0;
+    if (eq(t.s, t.n, "linear-gradient") == 1) { kind = v.GRAD_LINEAR; }
+    else if (eq(t.s, t.n, "radial-gradient") == 1) { kind = v.GRAD_RADIAL; }
+    else if (eq(t.s, t.n, "conic-gradient") == 1) { kind = v.GRAD_CONIC; }
+    else if (eq(t.s, t.n, "repeating-linear-gradient") == 1) { kind = v.GRAD_LINEAR; rep = 1; }
+    else if (eq(t.s, t.n, "repeating-radial-gradient") == 1) { kind = v.GRAD_RADIAL; rep = 1; }
+    else if (eq(t.s, t.n, "repeating-conic-gradient") == 1) { kind = v.GRAD_CONIC; rep = 1; }
+    else { return cast(*v.Gradient, 0); }
+    let is Cur as in with mut;
+    _args(c, &in);
+    let is *v.Gradient as g = cast(*v.Gradient, arena.alloc(c.a, sizeof(v.Gradient)));
+    mem.memzero(cast(*u8, g), sizeof(v.Gradient));
+    g.kind = kind;
+    g.repeating = rep;
+    g.angle = 180.0;
+    _pct_len(&g.at_x, 50.0);
+    _pct_len(&g.at_y, 50.0);
+    let is *tok.Token as f = _peek(&in);
+    if (f == null) { return cast(*v.Gradient, 0); }
+    if (kind == v.GRAD_LINEAR) {
+        if (f.kind == tok.T_IDENT && eq(f.s, f.n, "to") == 1) {
+            in.i = in.i + 1;
+            let is i64 as right with mut = 0 - 1;
+            let is i64 as bottom with mut = 0 - 1;
+            while (_done(&in) == 0 && _peek(&in).kind == tok.T_IDENT) {
+                let is *tok.Token as w = _peek(&in);
+                if (eq(w.s, w.n, "left") == 1) { right = 0; }
+                else if (eq(w.s, w.n, "right") == 1) { right = 1; }
+                else if (eq(w.s, w.n, "top") == 1) { bottom = 0; }
+                else if (eq(w.s, w.n, "bottom") == 1) { bottom = 1; }
+                else { return cast(*v.Gradient, 0); }
+                in.i = in.i + 1;
+            }
+            if (right >= 0 && bottom >= 0) { g.corner = 1 + right + bottom * 2; }
+            else if (right == 1) { g.angle = 90.0; }
+            else if (right == 0) { g.angle = 270.0; }
+            else if (bottom == 0) { g.angle = 0.0; }
+            else if (bottom == 1) { g.angle = 180.0; }
+            else { return cast(*v.Gradient, 0); }
+        } else if (f.kind == tok.T_DIMENSION || (f.kind == tok.T_NUMBER && f.num == 0.0)) {
+            if (_angle(&in, &g.angle) == 0) { return cast(*v.Gradient, 0); }
+        }
+    } else if (kind == v.GRAD_RADIAL) {
+        let is i64 as at = in.i;
+        let is i64 as probe with mut = 0;
+        // Whatever comes first is a colour, unless it reads as the shape's description.
+        if (_color(&in, &probe) == 1) { in.i = at; }
+        else if (_radial_head(&in, g) == 0) { return cast(*v.Gradient, 0); }
+    } else {
+        g.angle = 0.0;
+        if (f.kind == tok.T_IDENT && eq(f.s, f.n, "from") == 1) {
+            in.i = in.i + 1;
+            if (_angle(&in, &g.angle) == 0) { return cast(*v.Gradient, 0); }
+        }
+        let is *tok.Token as w = _peek(&in);
+        if (w != null && w.kind == tok.T_IDENT && eq(w.s, w.n, "at") == 1) {
+            in.i = in.i + 1;
+            if (_grad_at(&in, &g.at_x, &g.at_y) == 0) { return cast(*v.Gradient, 0); }
+        }
+    }
+    if (_grad_stops(&in, g) == 0) { return cast(*v.Gradient, 0); }
+    return g;
+}
+
+// background-image: urls and gradients in layers, of which the first url and every gradient
+// are kept. A gradient that cannot be read makes the whole declaration invalid.
+fn _bg_image(s as *_Sh) as i64 {
+    let is i64 as have_url with mut = 0;
+    let is v.Value as image with mut;
+    mem.memzero(cast(*u8, &image), sizeof(v.Value));
+    let is *v.Gradient as head with mut = cast(*v.Gradient, 0);
+    let is *v.Gradient as tail with mut = cast(*v.Gradient, 0);
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind == tok.T_COMMA) { s.c.i = s.c.i + 1; continue; }
+        if (t.kind == tok.T_IDENT && eq(t.s, t.n, "none") == 1) { s.c.i = s.c.i + 1; continue; }
+        if (t.kind == tok.T_FUNCTION && eq(t.s, t.n, "url") == 0) {
+            let is *v.Gradient as g = _gradient(s.c, t);
+            if (g == null) { return 0; }
+            if (head == null) { head = g; }
+            else { tail.next = g; }
+            tail = g;
+            continue;
+        }
+        let is v.Value as tmp with mut;
+        mem.memzero(cast(*u8, &tmp), sizeof(v.Value));
+        if (parse_one(s.c, pr.P_BACKGROUND_IMAGE, &tmp) == 0) { return 0; }
+        if (have_url == 0 && tmp.kind == v.V_URL) {
+            image = tmp;
+            have_url = 1;
+        }
+    }
+    if (have_url == 1) { _emit(s, pr.P_BACKGROUND_IMAGE, &image); }
+    else { _emit_kw(s, pr.P_BACKGROUND_IMAGE, pr.K_NONE); }
+    if (head != null) { _emit_data(s, pr.P_X_GRADIENT, cast(*u8, head)); }
+    else { _emit_kw(s, pr.P_X_GRADIENT, pr.K_NONE); }
+    return 1;
+}
+
+// --- Whole declarations ---
+
+// The longhands a shorthand sets, in a row, for inherit and its kin. 0 when the
+// name is not a shorthand.
+fn _range(name as *u8, n as i64, first as *i64) as i64 {
+    if (eq(name, n, "margin") == 1) { *first = pr.P_MARGIN_TOP; return 4; }
+    if (eq(name, n, "padding") == 1) { *first = pr.P_PADDING_TOP; return 4; }
+    if (eq(name, n, "inset") == 1) { *first = pr.P_TOP; return 4; }
+    if (eq(name, n, "border") == 1) { *first = pr.P_BORDER_TOP_WIDTH; return 12; }
+    if (eq(name, n, "border-width") == 1) { *first = pr.P_BORDER_TOP_WIDTH; return 4; }
+    if (eq(name, n, "border-style") == 1) { *first = pr.P_BORDER_TOP_STYLE; return 4; }
+    if (eq(name, n, "border-color") == 1) { *first = pr.P_BORDER_TOP_COLOR; return 4; }
+    if (eq(name, n, "border-radius") == 1) { *first = pr.P_BORDER_TOP_LEFT_RADIUS; return 4; }
+    if (eq(name, n, "background") == 1) { *first = pr.P_BACKGROUND_COLOR; return 8; }
+    if (eq(name, n, "background-position") == 1) { *first = pr.P_BACKGROUND_POSITION_X; return 2; }
+    if (eq(name, n, "background-size") == 1) { *first = pr.P_BACKGROUND_SIZE_W; return 2; }
+    if (eq(name, n, "overflow") == 1) { *first = pr.P_OVERFLOW_X; return 2; }
+    if (eq(name, n, "flex") == 1) { *first = pr.P_FLEX_GROW; return 3; }
+    if (eq(name, n, "flex-flow") == 1) { *first = pr.P_FLEX_DIRECTION; return 2; }
+    if (eq(name, n, "gap") == 1) { *first = pr.P_ROW_GAP; return 2; }
+    if (eq(name, n, "columns") == 1) { *first = pr.P_COLUMN_COUNT; return 2; }
+    if (eq(name, n, "list-style") == 1) { *first = pr.P_LIST_STYLE_TYPE; return 3; }
+    if (eq(name, n, "border-spacing") == 1) { *first = pr.P_BORDER_SPACING_H; return 2; }
+    if (eq(name, n, "font") == 1) { *first = pr.P_FONT_FAMILY; return 5; }
+    if (eq(name, n, "text-decoration") == 1) { *first = pr.P_TEXT_DECORATION_LINE; return 1; }
+    if (eq(name, n, "outline") == 1) { *first = pr.P_OUTLINE_WIDTH; return 3; }
+    return 0;
+}
+
+fn _side_index(name as *u8, n as i64, prefix as *u8, plen as i64, out as *i64) as i64 {
+    if (n <= plen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < plen) {
+        if (_lower(cast(i64, name[i])) != cast(i64, prefix[i])) { return 0; }
+        i = i + 1;
+    }
+    let is *u8 as rest = &name[plen];
+    let is i64 as m = n - plen;
+    if (eq(rest, m, "top") == 1) { *out = 0; return 1; }
+    if (eq(rest, m, "right") == 1) { *out = 1; return 1; }
+    if (eq(rest, m, "bottom") == 1) { *out = 2; return 1; }
+    if (eq(rest, m, "left") == 1) { *out = 3; return 1; }
+    return 0;
+}
+
+// The tokens of one declaration's value into longhands, appended to out. 0 when it is
+// invalid or unknown, and then nothing was appended.
+fn parse(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *tok.Token, n as i64, important as i64) as i64 {
+    let is Cur as cur with mut;
+    cur.a = a;
+    cur.t = t;
+    cur.n = n;
+    cur.i = 0;
+    let is _Sh as sh with mut;
+    sh.c = &cur;
+    sh.out = out;
+    sh.imp = important;
+    let is i64 as start = out.n;
+    let is *_Sh as s = &sh;
+
+    let is *tok.Token as first = _peek(&cur);
+    if (first == null) { return 0; }
+
+    // inherit and its kin, for a longhand and for all a shorthand sets.
+    if (first.kind == tok.T_IDENT &&
+        (eq(first.s, first.n, "inherit") == 1 || eq(first.s, first.n, "initial") == 1 ||
+         eq(first.s, first.n, "unset") == 1 || eq(first.s, first.n, "revert") == 1 || eq(first.s, first.n, "revert-layer") == 1)) {
+        cur.i = cur.i + 1;
+        if (_done(&cur) == 0) { return 0; }
+        let is v.Value as g with mut;
+        mem.memzero(cast(*u8, &g), sizeof(v.Value));
+        g.kind = v.V_GLOBAL;
+        g.kw = pr.kw_lookup(first.s, first.n);
+        let is i64 as lo with mut = 0;
+        let is i64 as count = _range(name, nlen, &lo);
+        if (count > 0) {
+            let is i64 as k with mut = 0;
+            while (k < count) {
+                _emit(s, lo + k, &g);
+                k = k + 1;
+            }
+            return 1;
+        }
+        let is i64 as p = pr.prop_lookup(name, nlen);
+        if (p < 0) {
+            let is i64 as side with mut = 0;
+            if (_side_index(name, nlen, "border-", 7, &side) == 1) {
+                _emit(s, pr.P_BORDER_TOP_WIDTH + side, &g);
+                _emit(s, pr.P_BORDER_TOP_STYLE + side, &g);
+                _emit(s, pr.P_BORDER_TOP_COLOR + side, &g);
+                return 1;
+            }
+            return 0;
+        }
+        _emit(s, p, &g);
+        return 1;
+    }
+
+    let is i64 as ok with mut = 0 - 1;
+    if (eq(name, nlen, "margin") == 1) { ok = _four(s, pr.P_MARGIN_TOP); }
+    else if (eq(name, nlen, "padding") == 1) { ok = _four(s, pr.P_PADDING_TOP); }
+    else if (eq(name, nlen, "inset") == 1) { ok = _four(s, pr.P_TOP); }
+    else if (eq(name, nlen, "border") == 1) { ok = _border_all(s); }
+    else if (eq(name, nlen, "border-width") == 1) { ok = _four(s, pr.P_BORDER_TOP_WIDTH); }
+    else if (eq(name, nlen, "border-style") == 1) { ok = _four(s, pr.P_BORDER_TOP_STYLE); }
+    else if (eq(name, nlen, "border-color") == 1) { ok = _four(s, pr.P_BORDER_TOP_COLOR); }
+    else if (eq(name, nlen, "border-radius") == 1) { ok = _radius(s); }
+    else if (eq(name, nlen, "outline") == 1) { ok = _outline(s); }
+    else if (eq(name, nlen, "background") == 1) { ok = _background(s); }
+    else if (eq(name, nlen, "background-image") == 1) { ok = _bg_image(s); }
+    else if (eq(name, nlen, "box-shadow") == 1) { ok = _box_shadow(s); }
+    else if (eq(name, nlen, "transform") == 1) { ok = _transform(s); }
+    else if (eq(name, nlen, "transform-origin") == 1) { ok = _transform_origin(s); }
+    else if (eq(name, nlen, "transition") == 1) { ok = _transition(s); }
+    else if (eq(name, nlen, "transition-property") == 1) { ok = _transition_property(s); }
+    else if (eq(name, nlen, "transition-duration") == 1) { ok = _times_prop(s, pr.P_TRANSITION_DURATION); }
+    else if (eq(name, nlen, "transition-delay") == 1) { ok = _times_prop(s, pr.P_TRANSITION_DELAY); }
+    else if (eq(name, nlen, "transition-timing-function") == 1) { ok = _eases_prop(s, pr.P_TRANSITION_TIMING_FUNCTION); }
+    else if (eq(name, nlen, "animation") == 1) { ok = _animation(s); }
+    else if (eq(name, nlen, "animation-name") == 1) { ok = _animation_name(s); }
+    else if (eq(name, nlen, "animation-duration") == 1) { ok = _time_prop(s, pr.P_ANIMATION_DURATION); }
+    else if (eq(name, nlen, "animation-delay") == 1) { ok = _time_prop(s, pr.P_ANIMATION_DELAY); }
+    else if (eq(name, nlen, "animation-timing-function") == 1) { ok = _eases_prop(s, pr.P_ANIMATION_TIMING_FUNCTION); }
+    else if (eq(name, nlen, "columns") == 1) { ok = _columns(s); }
+    else if (eq(name, nlen, "grid-template-columns") == 1) { ok = _track_list(s, pr.P_GRID_TEMPLATE_COLUMNS); }
+    else if (eq(name, nlen, "grid-template-rows") == 1) { ok = _track_list(s, pr.P_GRID_TEMPLATE_ROWS); }
+    else if (eq(name, nlen, "grid-auto-columns") == 1) { ok = _track_list(s, pr.P_GRID_AUTO_COLUMNS); }
+    else if (eq(name, nlen, "grid-auto-rows") == 1) { ok = _track_list(s, pr.P_GRID_AUTO_ROWS); }
+    else if (eq(name, nlen, "grid-auto-flow") == 1) { ok = _grid_flow(s); }
+    else if (eq(name, nlen, "grid-column") == 1) { ok = _grid_line_pair(s, pr.P_GRID_COLUMN_START, pr.P_GRID_COLUMN_END); }
+    else if (eq(name, nlen, "grid-row") == 1) { ok = _grid_line_pair(s, pr.P_GRID_ROW_START, pr.P_GRID_ROW_END); }
+    else if (eq(name, nlen, "grid-area") == 1) { ok = _grid_area(s); }
+    else if (eq(name, nlen, "grid-column-start") == 1) { ok = _grid_line_one(s, pr.P_GRID_COLUMN_START); }
+    else if (eq(name, nlen, "grid-column-end") == 1) { ok = _grid_line_one(s, pr.P_GRID_COLUMN_END); }
+    else if (eq(name, nlen, "grid-row-start") == 1) { ok = _grid_line_one(s, pr.P_GRID_ROW_START); }
+    else if (eq(name, nlen, "grid-row-end") == 1) { ok = _grid_line_one(s, pr.P_GRID_ROW_END); }
+    else if (eq(name, nlen, "place-items") == 1) { ok = _pair(s, pr.P_ALIGN_ITEMS, pr.P_JUSTIFY_ITEMS); }
+    else if (eq(name, nlen, "place-self") == 1) { ok = _pair(s, pr.P_ALIGN_SELF, pr.P_JUSTIFY_SELF); }
+    else if (eq(name, nlen, "place-content") == 1) { ok = _pair(s, pr.P_ALIGN_CONTENT, pr.P_JUSTIFY_CONTENT); }
+    else if (eq(name, nlen, "background-position") == 1) { ok = _bg_position(s); }
+    else if (eq(name, nlen, "background-size") == 1) { ok = _bg_size(s); }
+    else if (eq(name, nlen, "font") == 1) { ok = _font(s); }
+    else if (eq(name, nlen, "font-family") == 1) { ok = _family(s); }
+    else if (eq(name, nlen, "flex") == 1) { ok = _flex(s); }
+    else if (eq(name, nlen, "flex-flow") == 1) { ok = _flex_flow(s); }
+    else if (eq(name, nlen, "gap") == 1 || eq(name, nlen, "grid-gap") == 1) { ok = _gap(s); }
+    else if (eq(name, nlen, "overflow") == 1) { ok = _overflow(s); }
+    else if (eq(name, nlen, "list-style") == 1) { ok = _list_style(s); }
+    else if (eq(name, nlen, "text-decoration") == 1 || eq(name, nlen, "text-decoration-line") == 1) { ok = _deco_line(s); }
+    else if (eq(name, nlen, "border-spacing") == 1) { ok = _border_spacing(s); }
+    else if (eq(name, nlen, "content") == 1) { ok = _content(s); }
+    else if (eq(name, nlen, "word-wrap") == 1) { ok = _single(s, pr.P_OVERFLOW_WRAP); }
+    else if (eq(name, nlen, "grid-row-gap") == 1) { ok = _single(s, pr.P_ROW_GAP); }
+    else if (eq(name, nlen, "grid-column-gap") == 1) { ok = _single(s, pr.P_COLUMN_GAP); }
+    else {
+        let is i64 as side with mut = 0;
+        if (_side_index(name, nlen, "border-", 7, &side) == 1) {
+            ok = _border_side(s, pr.P_BORDER_TOP_WIDTH + side, pr.P_BORDER_TOP_STYLE + side, pr.P_BORDER_TOP_COLOR + side);
+        }
+    }
+    if (ok < 0) {
+        let is i64 as p = pr.prop_lookup(name, nlen);
+        // Names only this browser uses cannot be written by a page.
+        if (p < 0 || name[0] == 45) { return 0; }
+        ok = _single(s, p);
+    }
+    if (ok == 1 && _done(&cur) == 1) { return 1; }
+    out.n = start;
+    return 0;
+}
+
+fn _single(s as *_Sh, p as i64) as i64 {
+    let is v.Value as val with mut;
+    mem.memzero(cast(*u8, &val), sizeof(v.Value));
+    if (parse_one(s.c, p, &val) == 0) {
+        // cursor takes any name: an unknown one means nothing to this browser, but it
+        // should not bring the page's own default back.
+        if (p == pr.P_CURSOR) {
+            let is *tok.Token as t = _peek(s.c);
+            if (t != null && t.kind == tok.T_IDENT) { s.c.i = s.c.i + 1; return 1; }
+        }
+        return 0;
+    }
+    if (_done(s.c) == 0) { return 0; }
+    _emit(s, p, &val);
+    return 1;
+}

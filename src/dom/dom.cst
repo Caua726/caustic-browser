@@ -1,0 +1,410 @@
+// dom/dom.cst — the document as a tree of nodes.
+//
+// Everything a document owns comes from one bump allocator and goes when the
+// document does. A page is parsed once and dropped whole, so freeing a node on its
+// own would be a feature nothing asks for. Memory from mmap starts zeroed, which is
+// why a new node sets only the fields that are not zero.
+//
+// Children are a linked list because the parser moves them: the adoption agency
+// and foster parenting take a node out of one place and put it before a sibling in
+// another, and neither should cost anything for the size of the family.
+
+use "std/mem.cst" as mem;
+use "std/io.cst" as io;
+
+let is i64 as DOCUMENT with imut = 1;
+let is i64 as DOCTYPE  with imut = 2;
+let is i64 as ELEMENT  with imut = 3;
+let is i64 as TEXT     with imut = 4;
+let is i64 as COMMENT  with imut = 5;
+let is i64 as FRAGMENT with imut = 6;   // what a <template> holds its contents in
+
+let is i64 as NS_HTML   with imut = 0;
+let is i64 as NS_SVG    with imut = 1;
+let is i64 as NS_MATHML with imut = 2;
+
+// The only namespaces an HTML parser can give an attribute.
+let is i64 as ATTR_PLAIN with imut = 0;
+let is i64 as ATTR_XLINK with imut = 1;
+let is i64 as ATTR_XML   with imut = 2;
+let is i64 as ATTR_XMLNS with imut = 3;
+
+let is i64 as NO_QUIRKS      with imut = 0;
+let is i64 as QUIRKS         with imut = 1;
+let is i64 as LIMITED_QUIRKS with imut = 2;
+
+let is i64 as BLOCK with imut = 1048576;
+
+let is i64 as FLAG_HOVER        with imut = 1;
+let is i64 as FLAG_ACTIVE       with imut = 2;
+let is i64 as FLAG_FOCUS        with imut = 4;
+let is i64 as FLAG_FOCUS_WITHIN with imut = 8;
+let is i64 as FLAG_FOCUS_RING   with imut = 16;   // focused in a way that should show
+let is i64 as FLAG_TARGET       with imut = 32;   // what the URL's fragment names
+
+struct Attr {
+    ns        as i64;
+    name      as *u8;   // its local name when it has a namespace
+    name_len  as i64;
+    value     as *u8;
+    value_len as i64;
+}
+
+struct Node {
+    kind as i64;
+
+    parent as *Node;
+    first  as *Node;
+    last   as *Node;
+    prev   as *Node;
+    next   as *Node;
+
+    // ELEMENT.
+    ns       as i64;
+    tag      as i64;    // from dom/tags.cst, NONE when it has no number
+    attrs    as *Attr;
+    nattr    as i64;
+    attr_cap as i64;
+    // A MathML annotation-xml whose encoding says it holds HTML. The start tag is
+    // gone by the time the parser needs to know, and the answer must not change if
+    // the attribute later does, so it is decided once.
+    html_point as i64;
+    // A <template> holds its contents in a FRAGMENT here, and that fragment points
+    // back at its template here, because it has no parent to climb to.
+    content as *Node;
+
+    // ELEMENT and DOCTYPE: its name.
+    name     as *u8;
+    name_len as i64;
+
+    // TEXT and COMMENT: the data. DOCTYPE: the public identifier.
+    text     as *u8;
+    text_len as i64;
+    text_cap as i64;
+
+    // DOCTYPE: the system identifier.
+    sys     as *u8;
+    sys_len as i64;
+
+    // ELEMENT: what the cascade made of it. The DOM cannot name the type, because the
+    // cascade reads the DOM, so css/style.cst casts it. Null until styled.
+    style as *u8;
+
+    // ELEMENT: what the person is doing to it, which selectors can ask about: FLAG_*.
+    flags as i64;
+    // How far its own content has been scrolled, when it is a box that scrolls.
+    scroll_x as f64;
+    scroll_y as f64;
+    // The style from before the last restyle, for what changed to be noticed.
+    old_style as *u8;
+    // When the animation it is running began, and what it is called.
+    anim_t0   as i64;
+    anim_name as *u8;
+}
+
+struct Block {
+    next as *Block;
+    size as i64;
+}
+
+struct Document {
+    node   as *Node;
+    mode   as i64;      // NO_QUIRKS, QUIRKS or LIMITED_QUIRKS
+    blocks as *Block;
+    top    as *u8;
+    left   as i64;
+}
+
+// --- memory --------------------------------------------------------------
+
+// Out of address space there is no page to show and nothing useful left to do, and
+// every line of the parser would otherwise have to check.
+fn _out_of_memory() as void {
+    io.write_str(2, "caustic-browser: out of memory\n");
+    io.exit(1);
+}
+
+fn alloc(d as *Document, n as i64) as *u8 {
+    let is i64 as need = (n + 7) & (0 - 8);
+    if (need > d.left) {
+        let is i64 as head = sizeof(Block);
+        let is i64 as size with mut = BLOCK;
+        if (need + head > size) { size = need + head; }
+        let is *u8 as p = mem.core.mmap_anon(size);
+        if (cast(i64, p) == 0 || cast(i64, p) == 0 - 1) { _out_of_memory(); }
+        let is *Block as b = cast(*Block, p);
+        b.next = d.blocks;
+        b.size = size;
+        d.blocks = b;
+        d.top = cast(*u8, cast(i64, p) + head);
+        d.left = size - head;
+    }
+    let is *u8 as r = d.top;
+    d.top = cast(*u8, cast(i64, d.top) + need);
+    d.left = d.left - need;
+    return r;
+}
+
+// A copy with a terminator, so a name can also be handed to anything that wants one.
+fn _copy(d as *Document, s as *u8, n as i64) as *u8 {
+    let is *u8 as p = alloc(d, n + 1);
+    if (n > 0) { mem.core.memcpy(p, s, n); }
+    return p;
+}
+
+fn _node(d as *Document, kind as i64) as *Node {
+    let is *Node as n = cast(*Node, alloc(d, sizeof(Node)));
+    n.kind = kind;
+    return n;
+}
+
+fn init(d as *Document) as void {
+    d.mode = NO_QUIRKS;
+    d.blocks = cast(*Block, 0);
+    d.top = cast(*u8, 0);
+    d.left = 0;
+    d.node = _node(d, DOCUMENT);
+}
+
+fn free(d as *Document) as void {
+    let is *Block as b with mut = d.blocks;
+    while (b != null) {
+        let is *Block as next = b.next;
+        mem.core.munmap(cast(*u8, b), b.size);
+        b = next;
+    }
+    d.blocks = cast(*Block, 0);
+    d.node = cast(*Node, 0);
+    d.left = 0;
+}
+
+// --- making nodes --------------------------------------------------------
+
+fn element(d as *Document, ns as i64, tag as i64, name as *u8, len as i64) as *Node {
+    let is *Node as n = _node(d, ELEMENT);
+    n.ns = ns;
+    n.tag = tag;
+    n.name = _copy(d, name, len);
+    n.name_len = len;
+    return n;
+}
+
+fn fragment(d as *Document, host as *Node) as *Node {
+    let is *Node as n = _node(d, FRAGMENT);
+    n.content = host;
+    return n;
+}
+
+fn comment(d as *Document, s as *u8, len as i64) as *Node {
+    let is *Node as n = _node(d, COMMENT);
+    n.text = _copy(d, s, len);
+    n.text_len = len;
+    n.text_cap = len;
+    return n;
+}
+
+fn text(d as *Document, s as *u8, len as i64) as *Node {
+    let is *Node as n = _node(d, TEXT);
+    text_append(d, n, s, len);
+    return n;
+}
+
+fn doctype(d as *Document, name as *u8, nlen as i64, pub as *u8, plen as i64, sys as *u8, slen as i64) as *Node {
+    let is *Node as n = _node(d, DOCTYPE);
+    n.name = _copy(d, name, nlen);
+    n.name_len = nlen;
+    n.text = _copy(d, pub, plen);
+    n.text_len = plen;
+    n.sys = _copy(d, sys, slen);
+    n.sys_len = slen;
+    return n;
+}
+
+// The parser appends to the same text node a run at a time, so it doubles.
+fn text_append(d as *Document, n as *Node, s as *u8, len as i64) as void {
+    let is i64 as need = n.text_len + len;
+    if (need > n.text_cap) {
+        let is i64 as cap with mut = n.text_cap * 2;
+        if (cap < 32) { cap = 32; }
+        if (cap < need) { cap = need; }
+        let is *u8 as p = alloc(d, cap);
+        if (n.text_len > 0) { mem.core.memcpy(p, n.text, n.text_len); }
+        n.text = p;
+        n.text_cap = cap;
+    }
+    mem.core.memcpy(cast(*u8, cast(i64, n.text) + n.text_len), s, len);
+    n.text_len = need;
+}
+
+// --- attributes ----------------------------------------------------------
+
+fn attr_at(n as *Node, i as i64) as *Attr {
+    return cast(*Attr, cast(i64, n.attrs) + i * sizeof(Attr));
+}
+
+fn add_attr(d as *Document, n as *Node, ns as i64, name as *u8, nlen as i64, val as *u8, vlen as i64) as void {
+    if (n.nattr == n.attr_cap) {
+        let is i64 as cap with mut = n.attr_cap * 2;
+        if (cap < 4) { cap = 4; }
+        let is *u8 as p = alloc(d, cap * sizeof(Attr));
+        if (n.nattr > 0) { mem.core.memcpy(p, cast(*u8, n.attrs), n.nattr * sizeof(Attr)); }
+        n.attrs = cast(*Attr, p);
+        n.attr_cap = cap;
+    }
+    let is *Attr as a = attr_at(n, n.nattr);
+    a.ns = ns;
+    a.name = _copy(d, name, nlen);
+    a.name_len = nlen;
+    a.value = _copy(d, val, vlen);
+    a.value_len = vlen;
+    n.nattr = n.nattr + 1;
+}
+
+fn _same(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn find_attr(n as *Node, name as *u8, len as i64) as *Attr {
+    let is i64 as i with mut = 0;
+    while (i < n.nattr) {
+        let is *Attr as a = attr_at(n, i);
+        if (a.ns == ATTR_PLAIN && _same(a.name, a.name_len, name, len) == 1) { return a; }
+        i = i + 1;
+    }
+    return cast(*Attr, 0);
+}
+
+// In any order, as the spec compares them.
+// An attribute's new value, adding it if it has none. For what a person does to a page:
+// with no scripts the attribute and the property are never told apart.
+fn set_attr(d as *Document, n as *Node, name as *u8, nlen as i64, val as *u8, vlen as i64) as void {
+    let is *Attr as a = find_attr(n, name, nlen);
+    if (a == null) {
+        add_attr(d, n, ATTR_PLAIN, name, nlen, val, vlen);
+        return;
+    }
+    a.value = _copy(d, val, vlen);
+    a.value_len = vlen;
+}
+
+fn remove_attr(n as *Node, name as *u8, nlen as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n.nattr) {
+        let is *Attr as a = attr_at(n, i);
+        if (a.ns == ATTR_PLAIN && _same(a.name, a.name_len, name, nlen) == 1) {
+            let is i64 as k with mut = i;
+            while (k + 1 < n.nattr) {
+                *attr_at(n, k) = *attr_at(n, k + 1);
+                k = k + 1;
+            }
+            n.nattr = n.nattr - 1;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn same_attrs(x as *Node, y as *Node) as i64 {
+    if (x.nattr != y.nattr) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < x.nattr) {
+        let is *Attr as a = attr_at(x, i);
+        let is i64 as j with mut = 0;
+        let is i64 as found with mut = 0;
+        while (j < y.nattr) {
+            let is *Attr as b = attr_at(y, j);
+            if (a.ns == b.ns
+                && _same(a.name, a.name_len, b.name, b.name_len) == 1
+                && _same(a.value, a.value_len, b.value, b.value_len) == 1) { found = 1; }
+            j = j + 1;
+        }
+        if (found == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// A new element as this one came from its start tag: no parent, no children.
+fn clone(d as *Document, n as *Node) as *Node {
+    let is *Node as c = element(d, n.ns, n.tag, n.name, n.name_len);
+    c.html_point = n.html_point;
+    let is i64 as i with mut = 0;
+    while (i < n.nattr) {
+        let is *Attr as a = attr_at(n, i);
+        add_attr(d, c, a.ns, a.name, a.name_len, a.value, a.value_len);
+        i = i + 1;
+    }
+    return c;
+}
+
+// --- the tree ------------------------------------------------------------
+
+// `ref` null means at the end.
+fn insert_before(parent as *Node, child as *Node, ref as *Node) as void {
+    child.parent = parent;
+    if (ref == null) {
+        child.prev = parent.last;
+        child.next = cast(*Node, 0);
+        if (parent.last != null) { parent.last.next = child; }
+        else { parent.first = child; }
+        parent.last = child;
+        return;
+    }
+    child.next = ref;
+    child.prev = ref.prev;
+    if (ref.prev != null) { ref.prev.next = child; }
+    else { parent.first = child; }
+    ref.prev = child;
+}
+
+fn append(parent as *Node, child as *Node) as void {
+    insert_before(parent, child, cast(*Node, 0));
+}
+
+fn remove(child as *Node) as void {
+    let is *Node as parent = child.parent;
+    if (parent == null) { return; }
+    if (child.prev != null) { child.prev.next = child.next; }
+    else { parent.first = child.next; }
+    if (child.next != null) { child.next.prev = child.prev; }
+    else { parent.last = child.prev; }
+    child.parent = cast(*Node, 0);
+    child.prev = cast(*Node, 0);
+    child.next = cast(*Node, 0);
+}
+
+fn move_children(from as *Node, to as *Node) as void {
+    while (from.first != null) {
+        let is *Node as c = from.first;
+        remove(c);
+        append(to, c);
+    }
+}
+
+// Is `outer` this node or above it, across the edge from a template's contents to
+// the template? Moving a node under itself would make a loop nothing could walk.
+fn contains(outer as *Node, n as *Node) as i64 {
+    let is *Node as at with mut = n;
+    while (at != null) {
+        if (at == outer) { return 1; }
+        if (at.kind == FRAGMENT) { at = at.content; }
+        else { at = at.parent; }
+    }
+    return 0;
+}
+
+// Does the document already have its one element?
+fn has_element_child(n as *Node) as i64 {
+    let is *Node as c with mut = n.first;
+    while (c != null) {
+        if (c.kind == ELEMENT) { return 1; }
+        c = c.next;
+    }
+    return 0;
+}

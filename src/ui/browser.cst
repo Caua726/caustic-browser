@@ -1,14 +1,31 @@
 // ui/browser.cst — the window: tabs in the title bar and, under them, the page of
 // whichever one is current, with its toolbar and address.
 //
+// Pages load between events, on the thread that draws, so the window waits for them.
+//
 // The tabs are our own rather than the toolkit's tabs widget, which holds its strip
 // and its pages as one and so cannot put the strip in the title bar. A stack holds
 // the pages. What the toolbar shows belongs to the tab, so each page has its own.
 
 use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+if (__target_is_linux) use "std/os/linux.cst" as linux;
+use "caustic-media/math/math.cst" as math;
+use "caustic-media/text/fonts/chain.cst" as chain;
 use "caustic-media/ui/ui.cst" as ui;
 use "caustic-media/input/keys.cst" as keys;
 use "caustic-media/window/positioner.cst" as positioner;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "../layout/box.cst" as bx;
+use "../layout/layout.cst" as layout;
+use "../loader/url.cst" as url;
+use "../page/forms.cst" as forms;
+use "../page/page.cst" as pg;
 use "../paint/display_list.cst" as dl;
 use "../paint/placeholder.cst" as placeholder;
 use "./page_view.cst" as pv;
@@ -20,12 +37,23 @@ let is i64 as MAX_TABS with imut = 32;
 
 let is *u8 as NAME      with imut = "Caustic Browser";
 let is *u8 as NEW_TITLE with imut = "Nova aba";
-let is *u8 as NO_NAV    with imut = "A navegação ainda não existe";
+let is *u8 as LOADING   with imut = "Carregando…";
 let is *u8 as NO_ROOM   with imut = "Não foi possível abrir outra aba";
 
 let is i64 as NEW_TAB   with imut = 1;
 let is i64 as CLOSE_TAB with imut = 2;
 let is i64 as QUIT      with imut = 3;
+
+let is i64 as CTX_COPY      with imut = 10;
+let is i64 as CTX_COPY_LINK with imut = 11;
+let is i64 as CTX_OPEN_LINK with imut = 12;
+let is i64 as CTX_BACK      with imut = 13;
+let is i64 as CTX_FORWARD   with imut = 14;
+let is i64 as CTX_RELOAD    with imut = 15;
+
+let is i64 as MAX_URL   with imut = 4096;
+let is i64 as HISTORY   with imut = 64;
+let is i64 as TAB_TITLE with imut = 96;    // bytes of a page's title on its tab
 
 // One tab: its widgets, and the document it owns. A Doc stays in its slot for as long
 // as the tab lives, so a view can keep pointing at its list; `order` is what moves.
@@ -35,7 +63,20 @@ struct Doc {
     page  as i64;
     entry as i64;
     view  as i64;
+    back  as i64;
+    forward as i64;
     list  as dl.List;
+    hooks as pv.Hooks;
+    pg    as *pg.Page;   // null until the tab first goes somewhere
+    view_w as f64;       // what the page was last laid out for
+    view_h as f64;
+    hist   as *u8;       // HISTORY URLs of MAX_URL bytes, oldest first
+    hist_n as i64;
+    hist_at as i64;      // the one on the screen
+    hist_y as [HISTORY]f64;
+    title  as [TAB_TITLE]u8;
+    link   as [MAX_URL]u8;   // what the pointer is over
+    link_n as i64;
 }
 
 struct Browser {
@@ -49,6 +90,12 @@ struct Browser {
     pages  as i64;
     status as i64;
     menu   as i64;
+    ctx    as i64;    // what a right click on a page opens
+    ctx_copy as i64;
+    ctx_copy_link as i64;
+    ctx_open_link as i64;
+    ctx_back as i64;
+    ctx_forward as i64;
     n      as i64;
     cur    as i64;
     width  as f64;    // the window's, as of the last look
@@ -58,6 +105,18 @@ struct Browser {
 
 let is Browser as br with mut;
 let is i64 as _fails with mut = 0;
+
+let is i64 as GO_PLAIN   with imut = 0;
+let is i64 as GO_HISTORY with imut = 1;   // the same document is still the same one
+let is i64 as GO_RELOAD  with imut = 2;   // and for this it has to come again
+
+// A load asked for and not begun. The window has to finish what it is doing first, and
+// loading blocks, so it happens between events and not inside one.
+let is i64 as _pend_slot with mut = 0 - 1;
+let is i64 as _pend_push with mut = 0;
+let is i64 as _pend_mode with mut = 0;
+let is f64 as _pend_y with mut = 0.0;
+let is [MAX_URL]u8 as _pend_url with mut;
 
 fn _doc(i as i64) as *Doc { return &br.docs[br.order[i]]; }
 
@@ -97,6 +156,7 @@ fn select(i as i64) as void {
         k = k + 1;
     }
     br.cur = i;
+    _keep_moving(_doc(i));
     ui.stack.set_current(br.t, br.pages, _doc(i).page);
     chrome.reveal_tab(br.t, _doc(i).tab);
     _hush();
@@ -113,6 +173,19 @@ fn new_tab() as i32 {
     let is *Doc as d = &br.docs[slot];
     if (dl.init(&d.list) != 0) { _say(NO_ROOM); return 0; }
     placeholder.fill(&d.list);
+    d.view_w = 0.0;
+    d.view_h = 0.0;
+    d.hist_n = 0;
+    d.hist_at = 0;
+    d.link_n = 0;
+    d.hooks.user = cast(*u8, d);
+    d.hooks.pressed = fn_ptr(_page_pressed);
+    d.hooks.released = fn_ptr(_page_released);
+    d.hooks.clicked = fn_ptr(_page_clicked);
+    d.hooks.moved = fn_ptr(_page_moved);
+    d.hooks.wheel = fn_ptr(_page_wheel);
+    d.hooks.key = fn_ptr(_page_key);
+    d.hooks.menu = fn_ptr(_page_menu);
 
     d.tab = chrome.tab(t, br.strip, NEW_TITLE, ui.len(NEW_TITLE));
     if (d.tab == 0) { dl.free(&d.list); _say(NO_ROOM); return 0; }
@@ -126,9 +199,12 @@ fn new_tab() as i32 {
     ui.box.set_spacing(t, row, 4.0);
     // 42 with the line above: 32 for the address, 4 over it and 5 under.
     ui.layout.set_margin(t, row, 10.0, 4.0, 8.0, 5.0);
-    // Nothing to go back or forward to until there is navigation.
-    ui.tree.set_enabled(t, chrome.icon_button(t, row, chrome.BACK), 0);
-    ui.tree.set_enabled(t, chrome.icon_button(t, row, chrome.FORWARD), 0);
+    d.back = chrome.icon_button(t, row, chrome.BACK);
+    d.forward = chrome.icon_button(t, row, chrome.FORWARD);
+    ui.tree.set_enabled(t, d.back, 0);
+    ui.tree.set_enabled(t, d.forward, 0);
+    ui.on(t, d.back, ui.signal.CLICKED, fn_ptr(_back_clicked));
+    ui.on(t, d.forward, ui.signal.CLICKED, fn_ptr(_forward_clicked));
     ui.on(t, chrome.icon_button(t, row, chrome.RELOAD), ui.signal.CLICKED, fn_ptr(_reload_clicked));
     d.entry = ui.entry.create(t, row);
     ui.layout.set_stretch(t, d.entry, 1.0, 0.0);
@@ -138,7 +214,7 @@ fn new_tab() as i32 {
     ui.on(t, d.entry, ui.signal.ACTIVATED, fn_ptr(_address_typed));
     ui.on(t, chrome.icon_button(t, row, chrome.MORE), ui.signal.CLICKED, fn_ptr(_more_clicked));
 
-    d.view = pv.create(t, d.page, &d.list);
+    d.view = pv.create(t, d.page, &d.list, &d.hooks);
     ui.layout.set_stretch(t, d.view, 1.0, 1.0);
 
     d.used = 1;
@@ -152,10 +228,14 @@ fn new_tab() as i32 {
 fn close_tab(i as i64) as void {
     if (i < 0 || i >= br.n) { return; }
     if (br.n == 1) { ui.app.window_close(br.a, br.win); return; }
+    if (_ed_doc == _doc(i)) { _drop_editor(); }
+    if (_sel_doc == _doc(i)) { _sel_doc = cast(*Doc, 0); }
     ui.tree.destroy(br.t, _doc(i).tab);
     ui.tree.destroy(br.t, _doc(i).page);
+    _forget_page(_doc(i));
     dl.free(&_doc(i).list);
     _doc(i).used = 0;
+    if (_pend_slot >= 0 && &br.docs[_pend_slot] == _doc(i)) { _pend_slot = 0 - 1; }
     let is i64 as k with mut = i;
     while (k + 1 < br.n) {
         br.order[k] = br.order[k + 1];
@@ -181,15 +261,28 @@ fn _act(id as i64) as void {
 fn _tab_chosen(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { select(_index_of_tab(w)); }
 fn _tab_closed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { close_tab(_index_of_tab(w)); }
 fn _plus_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { new_tab(); }
-fn _address_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _say(NO_NAV); }
+fn _address_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is i64 as n = ui.entry.length(t, w);
+    if (n == 0) { return; }
+    go_typed(br.cur, ui.entry.text(t, w), n);
+}
 fn _menu_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void { _act(*cast(*i64, arg)); }
 
-// There is only the placeholder to load again, and it is the same one.
-fn _reload_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+fn _reload_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _reload(); }
+fn _back_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _history_step(0 - 1); }
+fn _forward_clicked(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _history_step(1); }
+
+// The same page again, from the network, or the placeholder if the tab has been nowhere.
+fn _reload() as void {
     let is *Doc as d = _doc(br.cur);
-    placeholder.fill(&d.list);
-    pv.set_list(t, d.view, &d.list);
-    _hush();
+    if (d.hist_n == 0) {
+        placeholder.fill(&d.list);
+        pv.set_list(br.t, d.view, &d.list);
+        _hush();
+        return;
+    }
+    _request(d, _hist_url(d, d.hist_at), 0, pv.scroll_y(br.t, d.view));
+    _pend_mode = GO_RELOAD;
 }
 
 // Opens down and to the left, so it stays inside the window at its right edge.
@@ -205,6 +298,9 @@ fn _key_address(user as *u8) as void {
     ui.entry.select(br.t, _doc(br.cur).entry, 0, ui.entry.length(br.t, _doc(br.cur).entry));
     ui.router.focus(br.t, br.r, _doc(br.cur).entry, 1);
 }
+fn _key_reload(user as *u8) as void { _reload(); }
+fn _key_back(user as *u8) as void { _history_step(0 - 1); }
+fn _key_forward(user as *u8) as void { _history_step(1); }
 fn _key_next(user as *u8) as void { _step_tab(1); }
 fn _key_prev(user as *u8) as void { _step_tab(0 - 1); }
 
@@ -218,6 +314,12 @@ fn _shortcut(k as i32, mods as i32, f as ui.router.ShortcutFn) as void {
 
 // The window, with one tab. 1, or 0 when it could not be opened.
 fn open(p as *ui.program.Program) as i32 {
+    // What a page means by serif and sans-serif, which is also what it gets with no font
+    // named at all. Pages are made to look right in these, with these lines' heights.
+    let is chain.Prefs as prefs with mut = chain.defaults();
+    prefs.serif = "Times New Roman, Liberation Serif, Tinos, Noto Serif, DejaVu Serif";
+    prefs.sans = "Arial, Liberation Sans, Arimo, Noto Sans, DejaVu Sans";
+    ui.system_fonts.set_prefs(ui.program.fonts(p), &prefs);
     br.a = ui.program.app(p);
     br.hs = ui.program.host(p);
     br.n = 0;
@@ -239,6 +341,16 @@ fn open(p as *ui.program.Program) as i32 {
     ui.menu.add_separator(t, br.menu);
     _item("_Sair", QUIT, keys.Q);
     ui.on(t, br.menu, ui.signal.ACTIVATED, fn_ptr(_menu_chosen));
+
+    br.ctx = ui.menu.create(t);
+    br.ctx_copy = ui.menu_item(t, br.ctx, "_Copiar", CTX_COPY);
+    br.ctx_copy_link = ui.menu_item(t, br.ctx, "Copiar _endereço do link", CTX_COPY_LINK);
+    br.ctx_open_link = ui.menu_item(t, br.ctx, "Abrir link em nova _aba", CTX_OPEN_LINK);
+    ui.menu.add_separator(t, br.ctx);
+    br.ctx_back = ui.menu_item(t, br.ctx, "_Voltar", CTX_BACK);
+    br.ctx_forward = ui.menu_item(t, br.ctx, "A_vançar", CTX_FORWARD);
+    ui.menu_item(t, br.ctx, "_Recarregar", CTX_RELOAD);
+    ui.on(t, br.ctx, ui.signal.ACTIVATED, fn_ptr(_ctx_chosen));
 
     // Our own frame, so the tabs can share a row with the window's buttons. The
     // title stays empty there: the window keeps its name for the desktop.
@@ -269,6 +381,10 @@ fn open(p as *ui.program.Program) as i32 {
     _shortcut(keys.W, keys.MOD_CONTROL, fn_ptr(_key_close));
     _shortcut(keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit));
     _shortcut(keys.L, keys.MOD_CONTROL, fn_ptr(_key_address));
+    _shortcut(keys.R, keys.MOD_CONTROL, fn_ptr(_key_reload));
+    _shortcut(keys.F5, 0, fn_ptr(_key_reload));
+    _shortcut(keys.LEFT, keys.MOD_ALT, fn_ptr(_key_back));
+    _shortcut(keys.RIGHT, keys.MOD_ALT, fn_ptr(_key_forward));
     _shortcut(keys.PAGE_DOWN, keys.MOD_CONTROL, fn_ptr(_key_next));
     _shortcut(keys.PAGE_UP, keys.MOD_CONTROL, fn_ptr(_key_prev));
     _shortcut(keys.TAB, keys.MOD_CONTROL, fn_ptr(_key_next));
@@ -289,15 +405,1117 @@ fn _follow_width() as void {
     chrome.reveal_tab(br.t, _doc(br.cur).tab);
 }
 
-// Until the last window closes.
-fn run() as void {
-    while (ui.host.step(br.hs, 0 - 1) == 1) { _follow_width(); }
+// --- Going somewhere ---
+
+fn _hist_url(d as *Doc, i as i64) as *u8 { return &d.hist[i * MAX_URL]; }
+
+fn _copy_cut(to as *u8, from as *u8, cap as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < cap - 1 && from[i] != 0) {
+        to[i] = from[i];
+        i = i + 1;
+    }
+    to[i] = cast(u8, 0);
+    return i;
 }
 
-// After the program closed: the views are gone, so the lists can go.
+fn _slot_of(d as *Doc) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < MAX_TABS) {
+        if (&br.docs[k] == d) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn _request(d as *Doc, u as *u8, push as i64, y as f64) as void {
+    _pend_slot = _slot_of(d);
+    _pend_push = push;
+    _pend_mode = GO_PLAIN;
+    _pend_y = y;
+    _copy_cut(cast(*u8, &_pend_url), u, MAX_URL);
+}
+
+fn _is_known_scheme(s as *u8, n as i64) as i64 {
+    if (n == 4 && s[0] == 104 && s[1] == 116 && s[2] == 116 && s[3] == 112) { return 1; }
+    if (n == 5 && s[0] == 104 && s[1] == 116 && s[2] == 116 && s[3] == 112 && s[4] == 115) { return 1; }
+    if (n == 4 && s[0] == 102 && s[1] == 105 && s[2] == 108 && s[3] == 101) { return 1; }
+    if (n == 4 && s[0] == 100 && s[1] == 97 && s[2] == 116 && s[3] == 97) { return 1; }
+    return 0;
+}
+
+// What was typed, as a URL. Paths become file:, a name with a scheme stays as it is, and
+// anything else is taken for a site.
+fn _to_url(s0 as *u8, n0 as i64, out as *u8) as void {
+    let is *u8 as s with mut = s0;
+    let is i64 as n with mut = n0;
+    while (n > 0 && (s[0] == 32 || s[0] == 9)) { s = &s[1]; n = n - 1; }
+    while (n > 0 && (s[n - 1] == 32 || s[n - 1] == 9)) { n = n - 1; }
+    let is i64 as w with mut = 0;
+    let is i64 as sl = url.scheme_len(s, n);
+    let is i64 as has_scheme = cast(i64, sl > 0 && (_is_known_scheme(s, sl) == 1 || (sl + 2 < n && s[sl + 1] == 47 && s[sl + 2] == 47)));
+    if (has_scheme == 0) {
+        let is i64 as is_path = cast(i64, n > 0 && (s[0] == 47 || s[0] == 46 || s[0] == 126));
+        if (is_path == 1) {
+            w = _copy_cut(out, "file://", 8);
+            if (s[0] == 126 && cast(i64, env.getenv("HOME")) != 0) {
+                w = w + _copy_cut(&out[w], env.getenv("HOME"), MAX_URL - w);
+                s = &s[1];
+                n = n - 1;
+            } else if (s[0] == 46) {
+                let is [2048]u8 as cwd with mut;
+                if (linux.getcwd(cast(*u8, &cwd), 2048) > 0) {
+                    w = w + _copy_cut(&out[w], cast(*u8, &cwd), MAX_URL - w);
+                    out[w] = cast(u8, 47);
+                    w = w + 1;
+                }
+            }
+        } else {
+            w = _copy_cut(out, "https://", 9);
+        }
+    }
+    let is i64 as k with mut = 0;
+    while (k < n && w < MAX_URL - 1) {
+        out[w] = s[k];
+        w = w + 1;
+        k = k + 1;
+    }
+    out[w] = cast(u8, 0);
+}
+
+// The current tab to what the command line said. A bare path means a file here, whether
+// or not it starts with a slash, as long as there is a file with that name.
+fn open_address(s as *u8, n as i64) as void {
+    let is i64 as sl = url.scheme_len(s, n);
+    if (sl == 0 && s[0] != 47 && s[0] != 46 && s[0] != 126) {
+        let is [MAX_URL]u8 as path with mut;
+        if (n + 3 < MAX_URL) {
+            path[0] = cast(u8, 46);
+            path[1] = cast(u8, 47);
+            mem.core.memcpy(&path[2], s, n);
+            path[n + 2] = cast(u8, 0);
+            let is i64 as fd = linux.open(cast(*u8, &path), 0, 0);
+            if (fd >= 0) {
+                linux.close(fd);
+                go_typed(br.cur, cast(*u8, &path), n + 2);
+                return;
+            }
+        }
+    }
+    go_typed(br.cur, s, n);
+}
+
+// Tab i to what someone typed.
+fn go_typed(i as i64, s as *u8, n as i64) as void {
+    let is [MAX_URL]u8 as u with mut;
+    _to_url(s, n, cast(*u8, &u));
+    _request(_doc(i), cast(*u8, &u), 1, 0.0);
+}
+
+fn _doc_url_len(s as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0 && s[k] != 35) { k = k + 1; }
+    return k;
+}
+
+// The same document as is on the screen, somewhere else in it: nothing to load.
+fn _is_same_document(d as *Doc, u as *u8) as i64 {
+    if (cast(i64, d.pg) == 0 || d.pg.loaded == 0) { return 0; }
+    let is *u8 as here = cast(*u8, &d.pg.url);
+    let is i64 as a = _doc_url_len(here);
+    let is i64 as b = _doc_url_len(u);
+    if (_pend_mode == GO_RELOAD || a != b) { return 0; }
+    // Going back to it, it need not name a place; asked for anew, it has to.
+    if (_pend_mode != GO_HISTORY && u[b] != 35) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < a) {
+        if (here[k] != u[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _push_history(d as *Doc, u as *u8) as void {
+    if (cast(i64, d.hist) == 0) { d.hist = mem.core.mmap_anon(HISTORY * MAX_URL); }
+    if (d.hist_n > 0) {
+        d.hist_y[d.hist_at] = pv.scroll_y(br.t, d.view);
+        d.hist_at = d.hist_at + 1;
+    }
+    // Going somewhere new forgets what was ahead.
+    d.hist_n = d.hist_at + 1;
+    if (d.hist_n > HISTORY) {
+        let is i64 as k with mut = 1;
+        while (k < HISTORY) {
+            _copy_cut(_hist_url(d, k - 1), _hist_url(d, k), MAX_URL);
+            d.hist_y[k - 1] = d.hist_y[k];
+            k = k + 1;
+        }
+        d.hist_n = HISTORY;
+        d.hist_at = HISTORY - 1;
+    }
+    _copy_cut(_hist_url(d, d.hist_at), u, MAX_URL);
+    d.hist_y[d.hist_at] = 0.0;
+}
+
+fn _nav_buttons(d as *Doc) as void {
+    ui.tree.set_enabled(br.t, d.back, cast(i32, d.hist_at > 0));
+    ui.tree.set_enabled(br.t, d.forward, cast(i32, d.hist_at + 1 < d.hist_n));
+}
+
+fn _history_step(by as i64) as void {
+    let is *Doc as d = _doc(br.cur);
+    let is i64 as at = d.hist_at + by;
+    if (d.hist_n == 0 || at < 0 || at >= d.hist_n) { return; }
+    d.hist_y[d.hist_at] = pv.scroll_y(br.t, d.view);
+    d.hist_at = at;
+    _request(d, _hist_url(d, at), 0, d.hist_y[at]);
+    _pend_mode = GO_HISTORY;
+}
+
+// The textures of what a tab shows: they have to go while there is still a device.
+fn _release_images(d as *Doc) as void {
+    if (cast(i64, d.pg) == 0) { return; }
+    let is *pg.Loaded as l with mut = pg.first_image(d.pg);
+    while (cast(i64, l) != 0) {
+        let is *dl.Image as im = pg.pixels_of(l);
+        if (cast(i64, im) != 0) { pv.release_image(br.t, im); }
+        l = pg.next_image(l);
+    }
+}
+
+fn _forget_page(d as *Doc) as void {
+    if (cast(i64, d.pg) == 0) { return; }
+    _release_images(d);
+    pg.unload(d.pg);
+    d.hist_n = 0;
+    d.hist_at = 0;
+}
+
+// What a tab is called: the page's title, cut to fit, or failing that its address.
+fn _name_tab(d as *Doc) as void {
+    let is *u8 as from with mut = cast(*u8, &d.pg.title);
+    if (d.pg.title_n == 0) { from = cast(*u8, &d.pg.url); }
+    let is i64 as n with mut = 0;
+    let is i64 as limit = TAB_TITLE - 8;
+    while (from[n] != 0 && n < limit) { n = n + 1; }
+    let is i64 as cut = cast(i64, from[n] != 0);
+    if (cut == 1) {
+        while (n > 0 && (cast(i64, from[n]) & 192) == 128) { n = n - 1; }
+    }
+    // A title of more than a few words makes a tab wider than a tab should be.
+    let is i64 as chars with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n && chars < 28) {
+        if ((cast(i64, from[k]) & 192) != 128) { chars = chars + 1; }
+        k = k + 1;
+    }
+    while (k < n && (cast(i64, from[k]) & 192) == 128) { k = k + 1; }
+    let is i64 as cut2 = cast(i64, k < n || cut == 1);
+    let is i64 as i with mut = 0;
+    while (i < k) {
+        d.title[i] = from[i];
+        i = i + 1;
+    }
+    if (cut2 == 1) {
+        d.title[i] = cast(u8, 226);
+        d.title[i + 1] = cast(u8, 128);
+        d.title[i + 2] = cast(u8, 166);
+        i = i + 3;
+    }
+    d.title[i] = cast(u8, 0);
+    chrome.set_tab_title(br.t, d.tab, cast(*u8, &d.title), i);
+}
+
+fn _view_size(d as *Doc, w as *f64, h as *f64) as void {
+    let is math.rect.Rect as r = ui.layout.rect(br.t, d.view);
+    *w = r.w;
+    *h = r.h;
+    if (*w <= 0.0) { *w = 980.0; }
+    if (*h <= 0.0) { *h = 640.0; }
+}
+
+fn _lay_out(d as *Doc) as void {
+    let is f64 as w with mut = 0.0;
+    let is f64 as h with mut = 0.0;
+    _view_size(d, &w, &h);
+    d.view_w = w;
+    d.view_h = h;
+    pv.clear_selection(br.t, d.view);
+    pg.relayout(d.pg, w, h, &d.list);
+    pv.set_list(br.t, d.view, &d.list);
+    pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
+    _place_editor(d);
+    _keep_moving(d);
+}
+
+fn _fragment_of(u as *u8) as *u8 {
+    let is i64 as k = _doc_url_len(u);
+    if (u[k] == 35) { return &u[k + 1]; }
+    return cast(*u8, 0);
+}
+
+fn _scroll_to_fragment(d as *Doc, u as *u8) as i64 {
+    let is *u8 as f = _fragment_of(u);
+    if (cast(i64, f) == 0) { return 0; }
+    let is f64 as y = pg.anchor_y(d.pg, f, url.len_of(f));
+    if (y < 0.0) { return 0; }
+    pv.scroll_to(br.t, d.view, 0.0, y);
+    return 1;
+}
+
+// The load that was asked for, if any.
+fn _service() as void {
+    if (_pend_slot < 0) { return; }
+    let is *Doc as d = &br.docs[_pend_slot];
+    _pend_slot = 0 - 1;
+    if (d.used == 0) { return; }
+    _hush();
+    if (_ed_doc == d) { _close_editor(); }
+    let is i64 as push = _pend_push;
+    let is f64 as y0 = _pend_y;
+    let is [MAX_URL]u8 as u with mut;
+    _copy_cut(cast(*u8, &u), cast(*u8, &_pend_url), MAX_URL);
+
+    if (_is_same_document(d, cast(*u8, &u)) == 1) {
+        if (push == 1) { _push_history(d, cast(*u8, &u)); }
+        _copy_cut(cast(*u8, &d.pg.url), cast(*u8, &u), pg.MAX_URL);
+        if (_scroll_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
+        ui.entry.set_text(br.t, d.entry, cast(*u8, &u), url.len_of(cast(*u8, &u)));
+        _nav_buttons(d);
+        return;
+    }
+    if (cast(i64, d.pg) == 0) {
+        d.pg = pg.create();
+        if (cast(i64, d.pg) == 0) {
+            _say(NO_ROOM);
+            return;
+        }
+    }
+    // Loading blocks the window, so what it says about that has to be drawn first.
+    pv.set_hint(br.t, d.view, LOADING, ui.len(LOADING));
+    ui.host.step(br.hs, 0);
+    if (d.used == 0) { return; }
+
+    let is f64 as w with mut = 0.0;
+    let is f64 as h with mut = 0.0;
+    _view_size(d, &w, &h);
+    _release_images(d);
+    // Nothing can be drawn from the old list while the new page replaces its memory.
+    dl.clear(&d.list);
+    pg.load(d.pg, cast(*u8, &u), w, h);
+    if (push == 1) { _push_history(d, cast(*u8, &d.pg.url)); }
+    _lay_out(d);
+    if (_scroll_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
+    _name_tab(d);
+    let is *u8 as shown = cast(*u8, &d.pg.url);
+    ui.entry.set_text(br.t, d.entry, shown, url.len_of(shown));
+    _nav_buttons(d);
+    pv.set_hint(br.t, d.view, cast(*u8, 0), 0);
+    if (&br.docs[br.order[br.cur]] == d) { ui.router.focus(br.t, br.r, d.view, 0); }
+}
+
+// A page laid out for another size is laid out again. Checked after events, not during
+// the toolkit's layout, because a page's layout is expensive and nothing depends on it.
+fn _follow_view() as void {
+    if (br.n == 0 || ui.app.window_valid(br.a, br.win) == 0) { return; }
+    let is *Doc as d = _doc(br.cur);
+    if (cast(i64, d.pg) == 0 || d.pg.loaded == 0) { return; }
+    let is f64 as w with mut = 0.0;
+    let is f64 as h with mut = 0.0;
+    _view_size(d, &w, &h);
+    if (w == d.view_w && h == d.view_h) {
+        // What a person did changed the document or what a rule sees in it.
+        if (d.pg.dirty == 1) { _restyle(d); }
+        return;
+    }
+    d.pg.dirty = 0;
+    _lay_out(d);
+}
+
+fn _restyle(d as *Doc) as void {
+    pg.refresh(d.pg, &d.list);
+    pv.set_list(br.t, d.view, &d.list);
+    pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
+    _place_editor(d);
+    _keep_moving(d);
+}
+
+// --- What moves on its own ---
+//
+// A timer runs for as long as the page showing has anything moving, and each time round
+// paints it as it is by then.
+
+let is i64 as _motion_id with mut = 0;
+
+fn _motion_due(user as *u8) as void {
+    let is i64 as still with mut = 0;
+    if (br.n > 0 && ui.app.window_valid(br.a, br.win) == 1) {
+        let is *Doc as d = _doc(br.cur);
+        if (_has_page(d) == 1 && pg.moving(d.pg) == 1) {
+            still = 1;
+            if (pg.tick(d.pg, &d.list, pv.scroll_y(br.t, d.view)) == 1) {
+                let is f64 as x0 with mut = 0.0;
+                let is f64 as y0 with mut = 0.0;
+                let is f64 as x1 with mut = 0.0;
+                let is f64 as y1 with mut = 0.0;
+                if (pg.moved_area(d.pg, &x0, &y0, &x1, &y1) == 1) { pv.set_list_part(br.t, d.view, &d.list, x0, y0, x1, y1); }
+                else { pv.set_list(br.t, d.view, &d.list); }
+            }
+        }
+    }
+    if (still == 0 && _motion_id != 0) {
+        ui.timer.cancel(ui.app.timers(br.a), _motion_id);
+        _motion_id = 0;
+    }
+}
+
+fn _keep_moving(d as *Doc) as void {
+    if (_motion_id != 0 || _has_page(d) == 0 || pg.moving(d.pg) == 0) { return; }
+    _motion_id = ui.timer.add(ui.app.timers(br.a), time.now_ms(), 16, 16, fn_ptr(_motion_due), cast(*u8, 0));
+}
+
+// --- A field being typed in ---
+//
+// The toolkit already has what typing takes: a caret, selection, the clipboard, undo. So
+// a text field of a page is one of its widgets, held over the box for as long as the field
+// has the focus. What was typed goes into the document when it loses it, and from then on
+// the page draws the value like any other text. Only one field has the focus at a time, so
+// there is only ever one of these.
+
+let is *Doc as _ed_doc with mut = cast(*Doc, 0);
+let is *dom.Node as _ed_node with mut = cast(*dom.Node, 0);
+let is i64 as _ed_widget with mut = 0;
+let is i64 as _ed_area with mut = 0;
+let is i64 as _ed_enter with mut = 0;
+let is ui.style.Overrides as _ed_over with mut;
+
+fn _ed_text(n as *i64) as *u8 {
+    if (_ed_area == 1) {
+        *n = ui.textview.length(br.t, _ed_widget);
+        return ui.textview.text(br.t, _ed_widget);
+    }
+    *n = ui.entry.length(br.t, _ed_widget);
+    return ui.entry.text(br.t, _ed_widget);
+}
+
+// The widget gone and what it held with it, when there is nothing left to put it back in.
+fn _drop_editor() as void {
+    if (_ed_widget == 0) { return; }
+    pv.close_field(br.t, _ed_doc.view);
+    _ed_widget = 0;
+    _ed_node = cast(*dom.Node, 0);
+    _ed_doc = cast(*Doc, 0);
+}
+
+fn _close_editor() as void {
+    if (_ed_widget == 0) { return; }
+    let is i64 as n with mut = 0;
+    let is *u8 as s = _ed_text(&n);
+    if (forms.is_date(_ed_node) == 1) {
+        // What is not a date leaves it empty, as a real date picker would never hold it.
+        let is [11]u8 as iso with mut;
+        forms.set_value(&_ed_doc.pg.doc, _ed_node, cast(*u8, &iso), forms.date_typed(s, n, cast(*u8, &iso)));
+    } else {
+        forms.set_value(&_ed_doc.pg.doc, _ed_node, s, n);
+    }
+    _ed_doc.pg.dirty = 1;
+    _drop_editor();
+}
+
+// Inside its border: the border is the page's, and so is the outline around it.
+fn _inner_rect(b as *bx.Box, x as *f64, y as *f64, w as *f64, h as *f64) as void {
+    *x = b.ax + b.b[bx.LEFT];
+    *y = b.ay + b.b[bx.TOP];
+    *w = b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];
+    *h = b.p[bx.TOP] + b.h + b.p[bx.BOTTOM];
+}
+
+fn _is_fixed(b0 as *bx.Box) as i64 {
+    let is *bx.Box as b with mut = b0;
+    while (b != null) {
+        if (b.is_fixed == 1) { return 1; }
+        b = b.parent;
+    }
+    return 0;
+}
+
+fn _place_editor(d as *Doc) as void {
+    if (_ed_doc != d || _ed_widget == 0) { return; }
+    let is *bx.Box as b = layout.box_of(d.pg.root, _ed_node);
+    if (b == null) {
+        _close_editor();
+        return;
+    }
+    let is f64 as x with mut = 0.0;
+    let is f64 as y with mut = 0.0;
+    let is f64 as w with mut = 0.0;
+    let is f64 as h with mut = 0.0;
+    _inner_rect(b, &x, &y, &w, &h);
+    pv.move_field(br.t, d.view, x, y, w, h);
+}
+
+fn _argb(v as i64) as math.color.Color {
+    let is math.color.Color as c with mut = math.color.hex(v & 16777215);
+    c.a = cast(f64, (v >> 24) & 255) / 255.0;
+    return c;
+}
+
+// The first run of text in a box, which is what a control shows.
+fn _text_box(b as *bx.Box) as *bx.Box {
+    if (b.kind == bx.B_TEXT) { return b; }
+    let is *bx.Box as k with mut = b.first;
+    while (k != null) {
+        let is *bx.Box as r = _text_box(k);
+        if (r != null) { return r; }
+        k = k.next;
+    }
+    return cast(*bx.Box, 0);
+}
+
+// The byte of a field's value under a point of the view, from the run the page drew there.
+// A dot of a password is three bytes for one character of any length.
+fn _caret_at(d as *Doc, n as *dom.Node, b as *bx.Box, p as *pv.Pointer) as i64 {
+    let is i64 as vn with mut = 0;
+    let is *u8 as v = forms.value_of(&d.pg.doc, n, &vn);
+    if (vn == 0) { return 0; }
+    let is *bx.Box as tb = _text_box(b);
+    let is *u8 as run with mut = cast(*u8, 0);
+    let is i64 as off = pv.text_at(br.t, d.view, p.x, p.y, &run);
+    if (off < 0 || tb == null) { return vn; }
+    let is i64 as at with mut = cast(i64, run) - cast(i64, tb.text);
+    if (at < 0 || at > tb.tlen) { return vn; }
+    at = at + off;
+    let is *dom.Attr as ty = dom.find_attr(n, "type", 4);
+    if (ty != null && _same_word(ty.value, ty.value_len, "password") == 1) {
+        let is i64 as chars with mut = at / 3;
+        let is i64 as i with mut = 0;
+        while (i < vn && chars > 0) {
+            i = i + 1;
+            while (i < vn && (cast(i64, v[i]) & 192) == 128) { i = i + 1; }
+            chars = chars - 1;
+        }
+        return i;
+    }
+    if (at > vn) { return vn; }
+    return at;
+}
+
+fn _same_word(s as *u8, n as i64, lit as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c with mut = cast(i64, s[i]);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (lit[i] == 0 || cast(i64, lit[i]) != c) { return 0; }
+        i = i + 1;
+    }
+    return cast(i64, lit[n] == 0);
+}
+
+fn _entered(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void { _ed_enter = 1; }
+
+// A field of the page ready for typing, with the caret at a byte, or all of it selected
+// for a negative one.
+fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
+    let is *ui.tree.Tree as t = br.t;
+    _close_editor();
+    // A rule for :focus may be about to change how it looks, and it takes that look on.
+    if (d.pg.dirty == 1) { _restyle(d); }
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    let is *style.Style as st = style.of(n);
+    if (b == null || st == null) { return; }
+    let is f64 as x with mut = 0.0;
+    let is f64 as y with mut = 0.0;
+    let is f64 as w with mut = 0.0;
+    let is f64 as h with mut = 0.0;
+    _inner_rect(b, &x, &y, &w, &h);
+    let is *ui.style.Theme as th = ui.tree.theme(t);
+    let is i64 as area = cast(i64, forms.kind_of(n) == forms.AREA);
+    let is f64 as ix with mut = b.p[bx.LEFT] - th.metrics.control_pad_x;
+    // Centred, in a widget surely taller than it needs: it centres its own text.
+    let is f64 as iy with mut = (h - 64.0) / 2.0;
+    if (area == 1) {
+        ix = b.p[bx.LEFT] - th.metrics.space_s;
+        iy = b.p[bx.TOP] - th.metrics.space_s;
+    }
+    let is i64 as holder = pv.open_field(t, d.view, x, y, w, h, _is_fixed(b), ix, iy);
+    if (holder == 0) { return; }
+    let is i64 as vn with mut = 0;
+    let is *u8 as v with mut = forms.value_of(&d.pg.doc, n, &vn);
+    // A date is typed as it is read, whatever it is kept as.
+    let is [11]u8 as shown with mut;
+    if (forms.is_date(n) == 1) {
+        vn = forms.date_shown(v, vn, cast(*u8, &shown));
+        v = cast(*u8, &shown);
+    }
+    let is i64 as readonly = cast(i64, dom.find_attr(n, "readonly", 8) != null);
+    let is i64 as ed with mut = 0;
+    if (area == 1) {
+        ed = ui.textview.create(t, holder);
+        ui.textview.set_accepts_tab(t, ed, 0);
+        ui.textview.set_text(t, ed, v, vn);
+        if (readonly == 1) { ui.textview.set_editable(t, ed, 0); }
+    } else {
+        ed = ui.entry.create(t, holder);
+        let is *dom.Attr as ty = dom.find_attr(n, "type", 4);
+        if (ty != null && _same_word(ty.value, ty.value_len, "password") == 1) { ui.entry.set_password(t, ed, 1); }
+        ui.entry.set_text(t, ed, v, vn);
+        if (readonly == 1) { ui.entry.set_editable(t, ed, 0); }
+        let is *dom.Attr as ph = dom.find_attr(n, "placeholder", 11);
+        if (ph != null) { ui.entry.set_placeholder(t, ed, ph.value, ph.value_len); }
+        ui.on(t, ed, ui.signal.ACTIVATED, fn_ptr(_entered));
+    }
+    // It should read as the page's field: the page's colours and size, and no frame.
+    _ed_over = ui.style.overrides();
+    let is i64 as bg = st.v.i[pr.P_BACKGROUND_COLOR];
+    if (((bg >> 24) & 255) == 255) { ui.style.override_color(&_ed_over, ui.style.ROLE_VIEW_BG, _argb(bg)); }
+    else { ui.style.override_color(&_ed_over, ui.style.ROLE_VIEW_BG, math.color.hex(16777215)); }
+    ui.style.override_color(&_ed_over, ui.style.ROLE_FG, _argb(st.v.i[pr.P_COLOR]));
+    let is math.color.Color as none with mut = math.color.hex(0);
+    none.a = 0.0;
+    ui.style.override_color(&_ed_over, ui.style.ROLE_BORDER, none);
+    _ed_over.radius = 0.0;
+    _ed_over.text_scale = st.v.f[pr.P_FONT_SIZE] / th.fonts.body.size;
+    ui.tree.set_overrides(t, ed, &_ed_over);
+    _ed_widget = ed;
+    _ed_node = n;
+    _ed_doc = d;
+    _ed_area = area;
+    _ed_enter = 0;
+    let is i64 as from with mut = caret;
+    let is i64 as to with mut = caret;
+    if (caret < 0) {
+        from = 0;
+        to = vn;
+    }
+    if (area == 1) { ui.textview.select(t, ed, from, to); }
+    else { ui.entry.select(t, ed, from, to); }
+    ui.router.focus(t, br.r, ed, 0);
+}
+
+// Between events: Enter submits, and a field the focus has left goes back to the page. A
+// menu holds the focus without the field having lost it, as its own right-click menu does.
+fn _follow_editor() as void {
+    if (_ed_widget == 0 || br.n == 0 || ui.app.window_valid(br.a, br.win) == 0) { return; }
+    let is *Doc as d = _ed_doc;
+    if (_ed_enter == 1) {
+        _ed_enter = 0;
+        let is *dom.Node as n = _ed_node;
+        let is *dom.Node as form = forms.form_of(&d.pg.doc, n);
+        if (form == null) { return; }
+        _close_editor();
+        pg.set_focus(d.pg, n, 0);
+        ui.router.focus(br.t, br.r, d.view, 0);
+        _submit(d, form, forms.default_button(&d.pg.doc, form));
+        return;
+    }
+    if (ui.router.scope(br.r) != 0) { return; }
+    if (ui.router.focused(br.t, br.r) == _ed_widget) { return; }
+    _close_editor();
+    pg.set_focus(d.pg, cast(*dom.Node, 0), 0);
+}
+
+// --- A form, a <select> ---
+
+fn _submit(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
+    let is [MAX_URL]u8 as to with mut;
+    let is i64 as n = forms.submit_url(&d.pg.doc, form, submitter, cast(*u8, &d.pg.base), cast(*u8, &to), MAX_URL);
+    if (n == forms.NEEDS_POST) {
+        _say("Este formulário usa POST, que o navegador ainda não envia");
+        return;
+    }
+    if (n > 0) { _request(d, cast(*u8, &to), 1, 0.0); }
+}
+
+let is i64 as _sel_menu with mut = 0;
+let is *Doc as _sel_doc with mut = cast(*Doc, 0);
+let is *dom.Node as _sel_node with mut = cast(*dom.Node, 0);
+
+// A menu's label marks a letter with an underscore, and an option's text marks nothing.
+fn _plain_label(s as *u8, n as i64, out as *u8, cap as i64) as i64 {
+    let is i64 as w with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n && w + 2 < cap) {
+        if (s[i] == 95) {
+            out[w] = cast(u8, 95);
+            w = w + 1;
+        }
+        out[w] = s[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    out[w] = cast(u8, 0);
+    return w;
+}
+
+fn _select_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void {
+    if (_sel_doc == null || _sel_doc.pg.loaded == 0) { return; }
+    let is *dom.Node as o = forms.nth_option(_sel_node, *cast(*i64, arg));
+    if (o == null) { return; }
+    forms.choose_option(&_sel_doc.pg.doc, _sel_node, o);
+    _sel_doc.pg.dirty = 1;
+}
+
+// The options under a <select>, against its box. Made each time, as they can only differ
+// by what is chosen but a list of them is only ever this long-lived.
+fn _open_select(d as *Doc, n as *dom.Node, by_keys as i64) as void {
+    let is *ui.tree.Tree as t = br.t;
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    if (b == null) { return; }
+    if (_sel_menu != 0) { ui.tree.destroy(t, _sel_menu); }
+    let is i64 as m = ui.menu.create(t);
+    _sel_menu = m;
+    _sel_doc = d;
+    _sel_node = n;
+    ui.on(t, m, ui.signal.ACTIVATED, fn_ptr(_select_chosen));
+    let is *dom.Node as chosen = forms.selected_option(n);
+    let is i64 as current with mut = 0;
+    let is [512]u8 as label with mut;
+    let is *dom.Node as group with mut = cast(*dom.Node, 0);
+    let is *dom.Node as o with mut = forms.next_option(n, cast(*dom.Node, 0));
+    let is i64 as i with mut = 0;
+    while (o != null) {
+        let is *dom.Node as up = o.parent;
+        if (up != group) {
+            let is i64 as is_group = cast(i64, up.ns == dom.NS_HTML && up.tag == tg.OPTGROUP);
+            if (i > 0 || is_group == 1) { ui.menu.add_separator(t, m); }
+            if (is_group == 1) {
+                let is *dom.Attr as gl = dom.find_attr(up, "label", 5);
+                if (gl != null) {
+                    let is i64 as w = _plain_label(gl.value, gl.value_len, cast(*u8, &label), 512);
+                    ui.tree.set_enabled(t, ui.menu.add_item(t, m, cast(*u8, &label), w, 0 - 1), 0);
+                }
+            }
+            group = up;
+        }
+        let is i64 as tn with mut = 0;
+        let is *u8 as text = forms.option_text(&d.pg.doc, o, &tn);
+        let is i64 as w = _plain_label(text, tn, cast(*u8, &label), 512);
+        let is i64 as item = ui.menu.add_radio(t, m, cast(*u8, &label), w, i, 1, cast(i32, o == chosen));
+        if (o == chosen) { current = item; }
+        if (forms.is_disabled(o) == 1) { ui.tree.set_enabled(t, item, 0); }
+        i = i + 1;
+        o = forms.next_option(n, o);
+    }
+    let is f64 as sy = pv.scroll_y(br.t, d.view);
+    let is f64 as sx = pv.scroll_x(br.t, d.view);
+    let is math.rect.Rect as vr = ui.layout.window_rect(t, d.view);
+    let is f64 as ax with mut = vr.x + b.ax;
+    let is f64 as ay with mut = vr.y + b.ay;
+    if (_is_fixed(b) == 0) {
+        ax = ax - sx;
+        ay = ay - sy;
+    }
+    ui.layout.set_min_size(t, m, bx.border_w(b), 0.0);
+    ui.menu.popup_from(t, br.r, m, d.view, math.rect.rect(ax, ay, bx.border_w(b), bx.border_h(b)),
+                       positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT, cast(i32, by_keys));
+    if (by_keys == 1 && current != 0) { ui.router.focus(t, br.r, current, 1); }
+}
+
+// Up and down on a <select> with the focus: the next option that can be chosen.
+fn _select_step(d as *Doc, n as *dom.Node, by as i64) as void {
+    let is *dom.Node as chosen = forms.selected_option(n);
+    let is *dom.Node as o with mut = forms.next_option(n, cast(*dom.Node, 0));
+    let is *dom.Node as last with mut = cast(*dom.Node, 0);
+    let is i64 as passed with mut = 0;
+    while (o != null) {
+        if (o == chosen) {
+            if (by < 0) { break; }
+            passed = 1;
+        } else if (forms.is_disabled(o) == 0) {
+            if (by < 0) { last = o; }
+            else if (passed == 1) {
+                last = o;
+                break;
+            }
+        }
+        o = forms.next_option(n, o);
+    }
+    if (last == null) { return; }
+    forms.choose_option(&d.pg.doc, n, last);
+    d.pg.dirty = 1;
+}
+
+// --- The focus inside a page ---
+
+fn _reveal(d as *Doc, b as *bx.Box) as void {
+    if (_is_fixed(b) == 1) { return; }
+    let is f64 as w with mut = 0.0;
+    let is f64 as h with mut = 0.0;
+    _view_size(d, &w, &h);
+    let is f64 as sy = pv.scroll_y(br.t, d.view);
+    let is f64 as sx = pv.scroll_x(br.t, d.view);
+    if (b.ay < sy) { pv.scroll_to(br.t, d.view, sx, b.ay - 24.0); }
+    else if (b.ay + bx.border_h(b) > sy + h) { pv.scroll_to(br.t, d.view, sx, b.ay + bx.border_h(b) - h + 24.0); }
+}
+
+fn _is_typed_in(n as *dom.Node) as i64 {
+    let is i64 as k = forms.kind_of(n);
+    return cast(i64, k == forms.TEXT || k == forms.AREA);
+}
+
+// The focus to an element of the page. Tab selects what a field holds, to type over it. A
+// label leaves it, with the caret at its end.
+fn _focus_element(d as *Doc, n as *dom.Node, select_all as i64) as void {
+    _close_editor();
+    pg.set_focus(d.pg, n, 1);
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    if (b != null) { _reveal(d, b); }
+    if (_is_typed_in(n) == 1) {
+        let is i64 as vn with mut = 0;
+        forms.value_of(&d.pg.doc, n, &vn);
+        if (select_all == 1 && forms.kind_of(n) == forms.TEXT) { vn = 0 - 1; }
+        _open_editor(d, n, vn);
+        return;
+    }
+    ui.router.focus(br.t, br.r, d.view, 0);
+}
+
+// The nearest thing at or above an element that takes the focus when pressed.
+fn _focus_target(n0 as *dom.Node) as *dom.Node {
+    let is *dom.Node as n with mut = n0;
+    while (n != null && n.kind == dom.ELEMENT) {
+        if (forms.is_focusable(n) == 1) { return n; }
+        // A control that cannot be used is as far as a press goes.
+        if (forms.kind_of(n) != forms.NONE) { return cast(*dom.Node, 0); }
+        n = n.parent;
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _can_follow(u as *u8, n as i64) as i64 {
+    let is i64 as sl = url.scheme_len(u, n);
+    return _is_known_scheme(u, sl);
+}
+
+// What a click on an element does, from it upward, to the first thing that does anything.
+fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
+    let is *dom.Document as doc = &d.pg.doc;
+    let is *dom.Node as x with mut = n0;
+    while (x != null && x.kind == dom.ELEMENT) {
+        let is i64 as k = forms.kind_of(x);
+        if (k != forms.NONE) {
+            if (forms.is_disabled(x) == 1) { return; }
+            if (k == forms.CHECK || k == forms.RADIO) {
+                forms.toggle(doc, x);
+                d.pg.dirty = 1;
+            }
+            if (k == forms.SUBMIT) {
+                let is *dom.Node as form = forms.form_of(doc, x);
+                if (form != null) { _submit(d, form, x); }
+            }
+            if (k == forms.RESET) {
+                let is *dom.Node as form = forms.form_of(doc, x);
+                if (form != null) {
+                    forms.reset(doc, form);
+                    d.pg.dirty = 1;
+                }
+            }
+            return;
+        }
+        if (forms.is_label(x) == 1) {
+            let is *dom.Node as target = forms.label_target(doc, x);
+            if (target == null || forms.is_disabled(target) == 1) { return; }
+            let is i64 as tk = forms.kind_of(target);
+            if (tk == forms.TEXT || tk == forms.AREA || tk == forms.SELECT || tk == forms.RANGE || tk == forms.COLOR) {
+                _focus_element(d, target, 0);
+                return;
+            }
+            _activate(d, target, mods);
+            return;
+        }
+        if (forms.is_summary(x) == 1 && x.parent != null && x.parent.ns == dom.NS_HTML && x.parent.tag == tg.DETAILS) {
+            if (dom.find_attr(x.parent, "open", 4) != null) { dom.remove_attr(x.parent, "open", 4); }
+            else { dom.add_attr(doc, x.parent, dom.ATTR_PLAIN, "open", 4, "", 0); }
+            d.pg.dirty = 1;
+            return;
+        }
+        if (forms.is_link(x) == 1) {
+            let is [MAX_URL]u8 as to with mut;
+            let is i64 as n = pg.link_from(d.pg, x, cast(*u8, &to), MAX_URL);
+            // Pages have javascript:, mailto: and tel: links, and none of them lead anywhere here.
+            if (n == 0 || _can_follow(cast(*u8, &to), n) == 0) { return; }
+            if ((mods & cast(i64, keys.MOD_CONTROL)) != 0) {
+                if (new_tab() == 1) { _request(_doc(br.cur), cast(*u8, &to), 1, 0.0); }
+                return;
+            }
+            _request(d, cast(*u8, &to), 1, 0.0);
+            return;
+        }
+        x = x.parent;
+    }
+}
+
+// --- The page's hooks ---
+
+fn _has_page(d as *Doc) as i64 {
+    return cast(i64, cast(i64, d.pg) != 0 && d.pg.loaded == 1 && d.pg.root != null);
+}
+
+fn _shape_of(k as i64) as i64 {
+    let is i32 as s with mut = ui.tree.SHAPE_DEFAULT;
+    if (k == pr.K_NONE) { s = ui.tree.SHAPE_NONE; }
+    if (k == pr.K_CONTEXT_MENU) { s = ui.tree.SHAPE_CONTEXT_MENU; }
+    if (k == pr.K_HELP) { s = ui.tree.SHAPE_HELP; }
+    if (k == pr.K_POINTER) { s = ui.tree.SHAPE_POINTER; }
+    if (k == pr.K_PROGRESS) { s = ui.tree.SHAPE_PROGRESS; }
+    if (k == pr.K_WAIT) { s = ui.tree.SHAPE_WAIT; }
+    if (k == pr.K_CELL) { s = ui.tree.SHAPE_CELL; }
+    if (k == pr.K_CROSSHAIR) { s = ui.tree.SHAPE_CROSSHAIR; }
+    if (k == pr.K_TEXT) { s = ui.tree.SHAPE_TEXT; }
+    if (k == pr.K_VERTICAL_TEXT) { s = ui.tree.SHAPE_VERTICAL_TEXT; }
+    if (k == pr.K_ALIAS) { s = ui.tree.SHAPE_ALIAS; }
+    if (k == pr.K_COPY) { s = ui.tree.SHAPE_COPY; }
+    if (k == pr.K_MOVE) { s = ui.tree.SHAPE_MOVE; }
+    if (k == pr.K_NO_DROP) { s = ui.tree.SHAPE_NO_DROP; }
+    if (k == pr.K_NOT_ALLOWED) { s = ui.tree.SHAPE_NOT_ALLOWED; }
+    if (k == pr.K_GRAB) { s = ui.tree.SHAPE_GRAB; }
+    if (k == pr.K_GRABBING) { s = ui.tree.SHAPE_GRABBING; }
+    if (k == pr.K_E_RESIZE) { s = ui.tree.SHAPE_E_RESIZE; }
+    if (k == pr.K_N_RESIZE) { s = ui.tree.SHAPE_N_RESIZE; }
+    if (k == pr.K_NE_RESIZE) { s = ui.tree.SHAPE_NE_RESIZE; }
+    if (k == pr.K_NW_RESIZE) { s = ui.tree.SHAPE_NW_RESIZE; }
+    if (k == pr.K_S_RESIZE) { s = ui.tree.SHAPE_S_RESIZE; }
+    if (k == pr.K_SE_RESIZE) { s = ui.tree.SHAPE_SE_RESIZE; }
+    if (k == pr.K_SW_RESIZE) { s = ui.tree.SHAPE_SW_RESIZE; }
+    if (k == pr.K_W_RESIZE) { s = ui.tree.SHAPE_W_RESIZE; }
+    if (k == pr.K_EW_RESIZE) { s = ui.tree.SHAPE_EW_RESIZE; }
+    if (k == pr.K_NS_RESIZE) { s = ui.tree.SHAPE_NS_RESIZE; }
+    if (k == pr.K_NESW_RESIZE) { s = ui.tree.SHAPE_NESW_RESIZE; }
+    if (k == pr.K_NWSE_RESIZE) { s = ui.tree.SHAPE_NWSE_RESIZE; }
+    if (k == pr.K_COL_RESIZE) { s = ui.tree.SHAPE_COL_RESIZE; }
+    if (k == pr.K_ROW_RESIZE) { s = ui.tree.SHAPE_ROW_RESIZE; }
+    if (k == pr.K_ALL_SCROLL) { s = ui.tree.SHAPE_ALL_SCROLL; }
+    if (k == pr.K_ZOOM_IN) { s = ui.tree.SHAPE_ZOOM_IN; }
+    if (k == pr.K_ZOOM_OUT) { s = ui.tree.SHAPE_ZOOM_OUT; }
+    return cast(i64, s);
+}
+
+fn _hit_of(d as *Doc, p as *pv.Pointer, h as *layout.Hit) as void {
+    pg.hit_at(d.pg, p.x + p.sx, p.y + p.sy, p.sx, p.sy, h);
+}
+
+// 1 when the press belongs to a control, and so selects no text.
+// A slider being dragged, and where its box is, for as long as the button is down.
+let is *Doc as _range_doc with mut = cast(*Doc, 0);
+let is *dom.Node as _range_node with mut = cast(*dom.Node, 0);
+
+fn _range_follow(d as *Doc, n as *dom.Node, p as *pv.Pointer) as void {
+    let is *bx.Box as b = layout.box_of(d.pg.root, n);
+    if (b == null || b.w <= 16.0) { return; }
+    let is f64 as x0 = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    let is f64 as frac with mut = (p.x + p.sx - x0 - 8.0) / (b.w - 16.0);
+    if (frac < 0.0) { frac = 0.0; }
+    if (frac > 1.0) { frac = 1.0; }
+    let is f64 as lo = forms.range_min(n);
+    let is f64 as hi = forms.range_max(n);
+    if (forms.range_set(&d.pg.doc, n, lo + frac * (hi - lo)) == 1) { d.pg.dirty = 1; }
+}
+
+fn _page_pressed(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0) {
+        ui.router.focus(br.t, br.r, d.view, 0);
+        return 0;
+    }
+    if (p.button != 1) { return 0; }
+    let is layout.Hit as h with mut;
+    _hit_of(d, p, &h);
+    pg.set_active(d.pg, h.node);
+    let is *dom.Node as f = _focus_target(h.node);
+    if (f != null && _is_typed_in(f) == 1) {
+        if (f == _ed_node) { return 1; }
+        pg.set_focus(d.pg, f, 1);
+        _open_editor(d, f, _caret_at(d, f, layout.box_of(d.pg.root, f), p));
+        return 1;
+    }
+    _close_editor();
+    pg.set_focus(d.pg, f, 0);
+    ui.router.focus(br.t, br.r, d.view, 0);
+    if (f == null) { return 0; }
+    let is i64 as k = forms.kind_of(f);
+    if (k == forms.SELECT) {
+        _open_select(d, f, 0);
+        return 1;
+    }
+    if (k == forms.RANGE && forms.is_disabled(f) == 0) {
+        _range_doc = d;
+        _range_node = f;
+        _range_follow(d, f, p);
+        return 1;
+    }
+    return cast(i64, k != forms.NONE);
+}
+
+fn _page_released(user as *u8, p as *pv.Pointer) as void {
+    let is *Doc as d = cast(*Doc, user);
+    _range_node = cast(*dom.Node, 0);
+    if (_has_page(d) == 1) { pg.set_active(d.pg, cast(*dom.Node, 0)); }
+}
+
+// What is under the pointer shows it: the rules for :hover, the link's address in the
+// corner, the shape the page asks for. Off the page, x is negative. The shape comes back.
+fn _page_moved(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0 || p.x < 0.0) {
+        if (_has_page(d) == 1) { pg.set_hover(d.pg, cast(*dom.Node, 0)); }
+        d.link_n = 0;
+        pv.set_hint(br.t, d.view, cast(*u8, 0), 0);
+        return cast(i64, ui.tree.SHAPE_DEFAULT);
+    }
+    if (_range_node != null && _range_doc == d) {
+        _range_follow(d, _range_node, p);
+        return cast(i64, ui.tree.SHAPE_DEFAULT);
+    }
+    let is layout.Hit as h with mut;
+    _hit_of(d, p, &h);
+    pg.set_hover(d.pg, h.node);
+    let is i64 as had = d.link_n;
+    d.link_n = pg.link_from(d.pg, h.node, cast(*u8, &d.link), MAX_URL);
+    if (d.link_n > 0) { pv.set_hint(br.t, d.view, cast(*u8, &d.link), d.link_n); }
+    else if (had > 0) { pv.set_hint(br.t, d.view, cast(*u8, 0), 0); }
+    return _shape_of(pg.cursor_of(&h));
+}
+
+// A click does what it does on what it landed on. The middle button only opens links.
+fn _page_clicked(user as *u8, p as *pv.Pointer) as void {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0 || (p.button != 1 && p.button != 2)) { return; }
+    let is layout.Hit as h with mut;
+    _hit_of(d, p, &h);
+    if (h.node == null) { return; }
+    if (p.button == 2) {
+        let is [MAX_URL]u8 as to with mut;
+        let is i64 as n = pg.link_from(d.pg, h.node, cast(*u8, &to), MAX_URL);
+        if (n > 0 && _can_follow(cast(*u8, &to), n) == 1 && new_tab() == 1) {
+            _request(_doc(br.cur), cast(*u8, &to), 1, 0.0);
+        }
+        return;
+    }
+    _activate(d, h.node, p.mods);
+}
+
+// The wheel goes to the nearest box under the pointer that can still scroll that way.
+fn _page_wheel(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0) { return 0; }
+    let is layout.Hit as h with mut;
+    _hit_of(d, p, &h);
+    if (h.box == null || layout.scroll_boxes(h.box, p.dx, p.dy) == 0) { return 0; }
+    pg.replace(d.pg, &d.list);
+    pv.set_list(br.t, d.view, &d.list);
+    pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
+    _place_editor(d);
+    return 1;
+}
+
+fn _page_key(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0) { return 0; }
+    let is i32 as k = cast(i32, p.key);
+    if (k == keys.TAB && (p.mods & cast(i64, keys.MOD_CONTROL | keys.MOD_ALT)) == 0) {
+        let is i64 as back = cast(i64, (p.mods & cast(i64, keys.MOD_SHIFT)) != 0);
+        let is *dom.Node as next = forms.next_focusable(&d.pg.doc, pg.focused(d.pg), back);
+        if (next != null) {
+            _focus_element(d, next, 1);
+            return 1;
+        }
+        // Past either end the focus leaves the page, for the toolkit to send on.
+        _close_editor();
+        pg.set_focus(d.pg, cast(*dom.Node, 0), 0);
+        return 0;
+    }
+    let is *dom.Node as f = pg.focused(d.pg);
+    if (f == null) { return 0; }
+    let is i64 as fk = forms.kind_of(f);
+    if (fk == forms.RANGE) {
+        let is i64 as moved with mut = 0;
+        if (k == keys.LEFT || k == keys.DOWN) { moved = forms.range_step(&d.pg.doc, f, 0 - 1); }
+        else if (k == keys.RIGHT || k == keys.UP) { moved = forms.range_step(&d.pg.doc, f, 1); }
+        else if (k == keys.HOME) { moved = forms.range_set(&d.pg.doc, f, forms.range_min(f)); }
+        else if (k == keys.END) { moved = forms.range_set(&d.pg.doc, f, forms.range_max(f)); }
+        else if (k != keys.RETURN && k != keys.SPACE) { return 0; }
+        if (moved == 1) { d.pg.dirty = 1; }
+        return 1;
+    }
+    if (fk == forms.SELECT) {
+        if (k == keys.RETURN || k == keys.SPACE) {
+            _open_select(d, f, 1);
+            return 1;
+        }
+        if (k == keys.UP || k == keys.LEFT) {
+            _select_step(d, f, 0 - 1);
+            return 1;
+        }
+        if (k == keys.DOWN || k == keys.RIGHT) {
+            _select_step(d, f, 1);
+            return 1;
+        }
+        return 0;
+    }
+    if (k == keys.RETURN && fk != forms.CHECK && fk != forms.RADIO && fk != forms.NONE) {
+        _activate(d, f, 0);
+        return 1;
+    }
+    if (k == keys.RETURN && (forms.is_link(f) == 1 || forms.is_summary(f) == 1)) {
+        _activate(d, f, p.mods);
+        return 1;
+    }
+    if (k == keys.SPACE && (fk != forms.NONE || forms.is_summary(f) == 1)) {
+        _activate(d, f, 0);
+        return 1;
+    }
+    return 0;
+}
+
+// The link a menu was opened over, and which page it is for.
+let is [MAX_URL]u8 as _ctx_link with mut;
+let is i64 as _ctx_link_n with mut = 0;
+
+fn _page_menu(user as *u8, p as *pv.Pointer) as void {
+    let is *Doc as d = cast(*Doc, user);
+    _ctx_link_n = 0;
+    if (_has_page(d) == 1) {
+        let is layout.Hit as h with mut;
+        _hit_of(d, p, &h);
+        _ctx_link_n = pg.link_from(d.pg, h.node, cast(*u8, &_ctx_link), MAX_URL);
+    }
+    ui.tree.set_enabled(br.t, br.ctx_copy, cast(i32, pv.has_selection(br.t, d.view)));
+    ui.tree.set_enabled(br.t, br.ctx_copy_link, cast(i32, _ctx_link_n > 0));
+    ui.tree.set_enabled(br.t, br.ctx_open_link, cast(i32, _ctx_link_n > 0));
+    ui.tree.set_enabled(br.t, br.ctx_back, cast(i32, d.hist_at > 0));
+    ui.tree.set_enabled(br.t, br.ctx_forward, cast(i32, d.hist_at + 1 < d.hist_n));
+    ui.menu.popup_at_pointer(br.t, br.r, br.ctx);
+}
+
+fn _ctx_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void {
+    let is i64 as id = *cast(*i64, arg);
+    let is *Doc as d = _doc(br.cur);
+    if (id == CTX_COPY) { pv.copy_selection(t, d.view); }
+    if (id == CTX_COPY_LINK) { ui.tree.copy(t, ui.tree.CLIPBOARD, cast(*u8, &_ctx_link), _ctx_link_n); }
+    if (id == CTX_OPEN_LINK && _can_follow(cast(*u8, &_ctx_link), _ctx_link_n) == 1 && new_tab() == 1) {
+        _request(_doc(br.cur), cast(*u8, &_ctx_link), 1, 0.0);
+    }
+    if (id == CTX_BACK) { _history_step(0 - 1); }
+    if (id == CTX_FORWARD) { _history_step(1); }
+    if (id == CTX_RELOAD) { _reload(); }
+}
+
+// Until the last window closes.
+fn run() as void {
+    while (ui.host.step(br.hs, 0 - 1) == 1) {
+        _follow_width();
+        _follow_editor();
+        _service();
+        _follow_view();
+    }
+}
+
+// After the program closed: the views are gone, so the lists can go. The textures went
+// with the device.
 fn free_docs() as void {
     let is i64 as i with mut = 0;
     while (i < br.n) {
+        if (cast(i64, _doc(i).pg) != 0) { pg.unload(_doc(i).pg); }
         dl.free(&_doc(i).list);
         _doc(i).used = 0;
         i = i + 1;
@@ -320,6 +1538,9 @@ fn _rounds(n as i64) as void {
     while (k < n) {
         ui.host.step(br.hs, 20);
         _follow_width();
+        _follow_editor();
+        _service();
+        _follow_view();
         k = k + 1;
     }
 }

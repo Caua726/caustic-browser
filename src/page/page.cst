@@ -1,0 +1,770 @@
+// page/page.cst — one page, from a URL to a display list.
+//
+//   load       fetch it, parse it, fetch what it needs, style it
+//   relayout   boxes and a display list for a window this size
+//   link_at    what a point in it leads to
+//
+// A page keeps its memory in arenas by how long things live: the document and its sheets
+// until the next page, styles until the window's size changes what they compute to, and
+// boxes until the next layout.
+
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "../base/arena.cst" as arena;
+use "../css/decl.cst" as decl;
+use "../css/props.cst" as pr;
+use "../css/sheet.cst" as sh;
+use "../css/style.cst" as style;
+use "../css/ua.cst" as ua;
+use "./anim.cst" as anim;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "../html/tree.cst" as tree;
+use "../layout/box.cst" as bx;
+use "../layout/layout.cst" as layout;
+use "../loader/image.cst" as image;
+use "../loader/net.cst" as net;
+use "../loader/url.cst" as url;
+use "../paint/display_list.cst" as dl;
+use "../paint/paint.cst" as paint;
+
+let is i64 as MAX_URL     with imut = 4096;
+let is i64 as MAX_TITLE   with imut = 256;
+let is i64 as MAX_IMPORT_DEPTH with imut = 4;
+let is i64 as MAX_IMAGES  with imut = 512;
+// A slow image must not hold a page up for ever: past this, the rest stay out.
+let is i64 as IMAGE_BUDGET_MS with imut = 20000;
+
+struct Loaded {
+    url  as *u8;
+    n    as i64;
+    ok   as i64;
+    img  as dl.Image;
+    next as *Loaded;
+}
+
+struct Page {
+    loaded as i64;          // has a document
+    url    as [MAX_URL]u8;  // where it came from, after redirects
+    base   as [MAX_URL]u8;  // what its relative URLs mean: the URL, or its <base>
+    title  as [MAX_TITLE]u8;
+    title_n as i64;
+
+    doc      as dom.Document;
+    docs_a   as arena.Arena;    // sheets, the index, image records
+    style_a  as arena.Arena;
+    box_a    as arena.Arena;
+    tmp_a    as arena.Arena;
+    paint_a  as arena.Arena;   // what a frame painted without a layout holds on to
+    motion   as anim.Anim;
+
+    engine as style.Engine;
+    c      as bx.Ctx;
+    root   as *bx.Box;
+    images as *Loaded;
+    nimages as i64;
+    budget_end as i64;
+
+    vw as f64;
+    vh as f64;
+    doc_w as f64;
+    doc_h as f64;
+
+    hover  as *dom.Node;
+    active as *dom.Node;
+    focus  as *dom.Node;
+    target as *dom.Node;
+    dirty  as i64;      // the styles no longer match what the document says
+}
+
+// A Page for the program to keep, or null when there is no memory for it.
+fn create() as *Page {
+    let is *u8 as m = mem.core.mmap_anon(sizeof(Page));
+    let is i64 as v = cast(i64, m);
+    if (v == 0 || v == 0 - 1) { return cast(*Page, 0); }
+    return cast(*Page, m);
+}
+
+fn _copy_url(to as *u8, from as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_URL - 1 && from[i] != 0) {
+        to[i] = from[i];
+        i = i + 1;
+    }
+    to[i] = cast(u8, 0);
+}
+
+// Everything a page holds, so it can be loaded again or thrown away. Its images' textures
+// have to be gone before this, by whoever made them.
+fn unload(p as *Page) as void {
+    if (p.loaded == 0) { return; }
+    let is *Loaded as l with mut = p.images;
+    while (l != null) {
+        if (l.ok == 1) { image.free(&l.img); }
+        l = l.next;
+    }
+    p.images = cast(*Loaded, 0);
+    p.nimages = 0;
+    p.root = cast(*bx.Box, 0);
+    p.hover = cast(*dom.Node, 0);
+    p.active = cast(*dom.Node, 0);
+    p.focus = cast(*dom.Node, 0);
+    p.target = cast(*dom.Node, 0);
+    p.dirty = 0;
+    dom.free(&p.doc);
+    arena.free(&p.docs_a);
+    arena.free(&p.style_a);
+    arena.free(&p.box_a);
+    arena.free(&p.tmp_a);
+    arena.free(&p.paint_a);
+    anim.free(&p.motion);
+    p.loaded = 0;
+    p.title_n = 0;
+}
+
+// --- Finding things in the document ---
+
+fn _is(n as *dom.Node, name as *u8) as i64 { return decl.eq(n.name, n.name_len, name); }
+
+fn _attr_is(n as *dom.Node, name as *u8, nlen as i64, val as *u8) as i64 {
+    let is *dom.Attr as a = dom.find_attr(n, name, nlen);
+    if (a == null) { return 0; }
+    return decl.eq(a.value, a.value_len, val);
+}
+
+// The next element after n in document order, inside root. Null when there is none. A
+// loop over links, so a deep page costs no stack. <template> contents are not children.
+fn _next_element(root as *dom.Node, n as *dom.Node) as *dom.Node {
+    let is *dom.Node as x with mut = n;
+    while (1 == 1) {
+        if (x.first != null) {
+            x = x.first;
+        } else {
+            while (x != root && x.next == null) { x = x.parent; }
+            if (x == root) { return cast(*dom.Node, 0); }
+            x = x.next;
+        }
+        if (x.kind == dom.ELEMENT) { return x; }
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _is_space(c as i64) as i64 {
+    if (c == 32 || c == 9 || c == 10 || c == 12 || c == 13) { return 1; }
+    return 0;
+}
+
+fn _set_title(p as *Page, s as *u8, n as i64) as void {
+    let is i64 as w with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as gap with mut = 0;
+    while (i < n && w < MAX_TITLE - 1) {
+        let is i64 as c = cast(i64, s[i]);
+        i = i + 1;
+        if (_is_space(c) == 1) {
+            gap = 1;
+            continue;
+        }
+        if (gap == 1 && w > 0 && w < MAX_TITLE - 1) {
+            p.title[w] = cast(u8, 32);
+            w = w + 1;
+        }
+        gap = 0;
+        if (w < MAX_TITLE - 1) {
+            p.title[w] = cast(u8, c);
+            w = w + 1;
+        }
+    }
+    // Cut off part way through a character, the rest of it goes too.
+    if (i < n) {
+        while (w > 0 && (cast(i64, p.title[w - 1]) & 192) == 128) { w = w - 1; }
+        if (w > 0 && cast(i64, p.title[w - 1]) >= 192) { w = w - 1; }
+    }
+    p.title[w] = cast(u8, 0);
+    p.title_n = w;
+}
+
+// --- Stylesheets ---
+
+fn _has_word_ci(val as *u8, n as i64, w as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as m = url.len_of(w);
+    while (i < n) {
+        while (i < n && _is_space(cast(i64, val[i])) == 1) { i = i + 1; }
+        let is i64 as st = i;
+        while (i < n && _is_space(cast(i64, val[i])) == 0) { i = i + 1; }
+        if (i - st == m && decl.eq(&val[st], m, w) == 1) { return 1; }
+    }
+    return 0;
+}
+
+// A stylesheet media attribute that plainly is not for a screen.
+fn _media_excludes(n as *dom.Node) as i64 {
+    let is *dom.Attr as a = dom.find_attr(n, "media", 5);
+    if (a == null) { return 0; }
+    if (decl.eq(a.value, a.value_len, "print") == 1 || decl.eq(a.value, a.value_len, "speech") == 1) { return 1; }
+    return 0;
+}
+
+fn _element_text(a as *arena.Arena, n as *dom.Node, out_n as *i64) as *u8 {
+    let is i64 as cap with mut = 1;
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT) { cap = cap + x.text_len; }
+        x = x.next;
+    }
+    let is *u8 as out = arena.alloc(a, cap);
+    let is i64 as w with mut = 0;
+    x = n.first;
+    while (x != null) {
+        if (x.kind == dom.TEXT) {
+            mem.core.memcpy(&out[w], x.text, x.text_len);
+            w = w + x.text_len;
+        }
+        x = x.next;
+    }
+    *out_n = w;
+    return out;
+}
+
+// One sheet's source, after the sheets it imports, whose rules come first.
+fn _add_source(p as *Page, src as *u8, n as i64, base as *u8, depth as i64) as void {
+    let is *sh.Sheet as s = cast(*sh.Sheet, arena.alloc(&p.docs_a, sizeof(sh.Sheet)));
+    sh.init(s, &p.docs_a);
+    let is *u8 as kept = arena.copy(&p.docs_a, base, url.len_of(base));
+    sh.parse(s, src, n, sh.ORIGIN_AUTHOR, kept);
+    if (depth < MAX_IMPORT_DEPTH) {
+        // Kept back to front as they were read, so reverse them to apply in order.
+        let is *sh.Import as rev with mut = cast(*sh.Import, 0);
+        let is *sh.Import as im with mut = s.imports;
+        while (im != null) {
+            let is *sh.Import as next = im.next;
+            im.next = rev;
+            rev = im;
+            im = next;
+        }
+        im = rev;
+        while (im != null) {
+            _fetch_sheet(p, im.url, im.n, kept, depth + 1);
+            im = im.next;
+        }
+    }
+    style.add_sheet(&p.engine, s);
+}
+
+fn _fetch_sheet(p as *Page, href as *u8, n as i64, base as *u8, depth as i64) as void {
+    let is [MAX_URL]u8 as abs with mut;
+    if (url.resolve(base, href, n, cast(*u8, &abs), MAX_URL) < 0) { return; }
+    let is net.Resource as r with mut;
+    if (net.get(cast(*u8, &abs), &r) != 0) { return; }
+    if (r.status >= 200 && r.status < 300) {
+        _add_source(p, r.data, r.len, cast(*u8, &r.final), depth);
+    }
+    net.free(&r);
+}
+
+// The page's own sheets, in document order, each with whatever it imports.
+fn _load_sheets(p as *Page) as void {
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        if (x.ns == dom.NS_HTML) {
+            if (x.tag == tg.STYLE && _media_excludes(x) == 0) {
+                let is i64 as n with mut = 0;
+                let is *u8 as text = _element_text(&p.docs_a, x, &n);
+                _add_source(p, text, n, cast(*u8, &p.base), 0);
+            }
+            if (x.tag == tg.LINK && _media_excludes(x) == 0) {
+                let is *dom.Attr as rel = dom.find_attr(x, "rel", 3);
+                let is *dom.Attr as href = dom.find_attr(x, "href", 4);
+                if (rel != null && href != null && _has_word_ci(rel.value, rel.value_len, "stylesheet") == 1 &&
+                    _has_word_ci(rel.value, rel.value_len, "alternate") == 0) {
+                    _fetch_sheet(p, href.value, href.value_len, cast(*u8, &p.base), 0);
+                }
+            }
+        }
+        x = _next_element(root, x);
+    }
+}
+
+// --- Images ---
+
+fn _find(p as *Page, u as *u8, n as i64) as *Loaded {
+    let is *Loaded as l with mut = p.images;
+    while (l != null) {
+        if (l.n == n) {
+            let is i64 as i with mut = 0;
+            while (i < n && l.url[i] == u[i]) { i = i + 1; }
+            if (i == n) { return l; }
+        }
+        l = l.next;
+    }
+    return cast(*Loaded, 0);
+}
+
+fn _fetch_image(p as *Page, u as *u8, n as i64) as void {
+    if (_find(p, u, n) != null || p.nimages >= MAX_IMAGES) { return; }
+    if (time.now_ms() > p.budget_end) { return; }
+    let is *Loaded as l = cast(*Loaded, arena.alloc(&p.docs_a, sizeof(Loaded)));
+    l.url = arena.copy(&p.docs_a, u, n);
+    l.n = n;
+    l.next = p.images;
+    p.images = l;
+    p.nimages = p.nimages + 1;
+    let is net.Resource as r with mut;
+    if (net.get(l.url, &r) != 0) { return; }
+    if (r.status >= 200 && r.status < 300 && r.len > 0) {
+        l.ok = image.decode(r.data, r.len, &l.img);
+    }
+    net.free(&r);
+}
+
+// What layout calls to find an image, by the URL it has.
+fn _image_for(user as *u8, u as *u8, n as i64) as *dl.Image {
+    let is *Loaded as l = _find(cast(*Page, user), u, n);
+    if (l == null || l.ok == 0) { return cast(*dl.Image, 0); }
+    return &l.img;
+}
+
+fn _value_url(st as *style.Style, prop as i64) as *u8 {
+    let is i64 as k = st.v.i[prop];
+    if (k == pr.K_NONE) { return null; }
+    return cast(*u8, k);
+}
+
+// Everything visible that names an image. Only after styling is it known what is visible.
+fn _load_images(p as *Page) as void {
+    p.budget_end = time.now_ms() + IMAGE_BUDGET_MS;
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        let is *style.Style as st = style.of(x);
+        if (st != null && st.v.i[pr.P_DISPLAY] != pr.K_NONE) {
+            let is *u8 as bg = _value_url(st, pr.P_BACKGROUND_IMAGE);
+            if (bg != null) { _fetch_image(p, bg, url.len_of(bg)); }
+            let is *u8 as li = _value_url(st, pr.P_LIST_STYLE_IMAGE);
+            if (li != null && st.v.i[pr.P_DISPLAY] == pr.K_LIST_ITEM) { _fetch_image(p, li, url.len_of(li)); }
+            if (x.ns == dom.NS_HTML && x.tag == tg.IMG) {
+                let is *dom.Attr as src = dom.find_attr(x, "src", 3);
+                if (src != null && src.value_len > 0) {
+                    let is [MAX_URL]u8 as abs with mut;
+                    let is i64 as m = url.resolve(cast(*u8, &p.base), src.value, src.value_len, cast(*u8, &abs), MAX_URL);
+                    if (m >= 0) { _fetch_image(p, cast(*u8, &abs), m); }
+                }
+            }
+        }
+        x = _next_element(root, x);
+    }
+}
+
+// --- Loading ---
+
+fn _append(a as *arena.Arena, out as *u8, at as i64, s as *u8, n as i64) as i64 {
+    if (n > 0) { mem.core.memcpy(&out[at], s, n); }
+    return at + n;
+}
+
+// Text as HTML, the angle brackets and ampersands no longer meaning anything.
+fn _escaped(a as *arena.Arena, s as *u8, n as i64, out_n as *i64) as *u8 {
+    let is *u8 as head = "<!doctype html><pre style=\"white-space:pre-wrap\">";
+    let is i64 as hn = url.len_of(head);
+    let is *u8 as out = arena.alloc(a, hn + n * 5 + 8);
+    let is i64 as w with mut = _append(a, out, 0, head, hn);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        i = i + 1;
+        if (c == 38) { w = _append(a, out, w, "&amp;", 5); continue; }
+        if (c == 60) { w = _append(a, out, w, "&lt;", 4); continue; }
+        out[w] = cast(u8, c);
+        w = w + 1;
+    }
+    *out_n = w;
+    return out;
+}
+
+// A page that says what went wrong, in the same machinery as any other.
+fn _error_page(p as *Page, why as *u8, n as *i64) as *u8 {
+    let is *u8 as a = "<!doctype html><title>Erro</title><style>body{font-family:sans-serif;margin:64px;color:#333}h1{font-size:24px}code{color:#666}</style><h1>Não foi possível abrir esta página</h1><p>";
+    let is *u8 as b = "</p><p><code>";
+    let is *u8 as c = "</code></p>";
+    let is i64 as an = url.len_of(a);
+    let is i64 as wn = url.len_of(why);
+    let is i64 as bn = url.len_of(b);
+    let is i64 as un = url.len_of(cast(*u8, &p.url));
+    let is i64 as cn = url.len_of(c);
+    let is *u8 as out = arena.alloc(&p.tmp_a, an + wn + bn + un * 5 + cn + 1);
+    let is i64 as w with mut = _append(&p.tmp_a, out, 0, a, an);
+    w = _append(&p.tmp_a, out, w, why, wn);
+    w = _append(&p.tmp_a, out, w, b, bn);
+    let is i64 as i with mut = 0;
+    while (i < un) {
+        let is i64 as x = cast(i64, p.url[i]);
+        i = i + 1;
+        if (x == 38) { w = _append(&p.tmp_a, out, w, "&amp;", 5); continue; }
+        if (x == 60) { w = _append(&p.tmp_a, out, w, "&lt;", 4); continue; }
+        out[w] = cast(u8, x);
+        w = w + 1;
+    }
+    w = _append(&p.tmp_a, out, w, c, cn);
+    *n = w;
+    return out;
+}
+
+fn _type_is(r as *net.Resource, prefix as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (prefix[i] != 0) {
+        if (r.ctype[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// A page for an image alone: the picture, in a document, the way any browser shows one.
+fn _image_doc(p as *Page, n as *i64) as *u8 {
+    let is *u8 as a = "<!doctype html><style>body{margin:0;background:#222}img{display:block;margin:auto;max-width:100%}</style><img src=\"";
+    let is i64 as an = url.len_of(a);
+    let is i64 as un = url.len_of(cast(*u8, &p.url));
+    let is *u8 as out = arena.alloc(&p.tmp_a, an + un * 6 + 8);
+    let is i64 as w with mut = _append(&p.tmp_a, out, 0, a, an);
+    let is i64 as i with mut = 0;
+    while (i < un) {
+        let is i64 as x = cast(i64, p.url[i]);
+        i = i + 1;
+        if (x == 34) { w = _append(&p.tmp_a, out, w, "&quot;", 6); continue; }
+        if (x == 38) { w = _append(&p.tmp_a, out, w, "&amp;", 5); continue; }
+        out[w] = cast(u8, x);
+        w = w + 1;
+    }
+    out[w] = cast(u8, 34);
+    out[w + 1] = cast(u8, 62);
+    *n = w + 2;
+    return out;
+}
+
+fn _start_document(p as *Page) as void {
+    dom.init(&p.doc);
+    arena.init(&p.docs_a);
+    arena.init(&p.style_a);
+    arena.init(&p.box_a);
+    arena.init(&p.paint_a);
+    arena.init(&p.tmp_a);
+    p.loaded = 1;
+    p.images = cast(*Loaded, 0);
+    p.nimages = 0;
+    p.root = cast(*bx.Box, 0);
+    p.title_n = 0;
+    p.title[0] = cast(u8, 0);
+}
+
+// After the bytes are a tree: what only the tree can say.
+fn _read_head(p as *Page) as void {
+    _copy_url(cast(*u8, &p.base), cast(*u8, &p.url));
+    let is i64 as have_title with mut = 0;
+    let is i64 as have_base with mut = 0;
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        if (x.ns == dom.NS_HTML) {
+            if (have_title == 0 && x.tag == tg.TITLE) {
+                let is i64 as n with mut = 0;
+                let is *u8 as t = _element_text(&p.tmp_a, x, &n);
+                _set_title(p, t, n);
+                have_title = 1;
+            }
+            if (have_base == 0 && x.tag == tg.BASE) {
+                let is *dom.Attr as h = dom.find_attr(x, "href", 4);
+                if (h != null) {
+                    let is [MAX_URL]u8 as abs with mut;
+                    if (url.resolve(cast(*u8, &p.url), h.value, h.value_len, cast(*u8, &abs), MAX_URL) >= 0) {
+                        _copy_url(cast(*u8, &p.base), cast(*u8, &abs));
+                    }
+                    have_base = 1;
+                }
+            }
+        }
+        x = _next_element(root, x);
+    }
+}
+
+// The page at u, replacing whatever was here. There is always a document afterwards, if
+// only one saying what went wrong. It has no boxes until relayout.
+fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
+    unload(p);
+    _start_document(p);
+    _copy_url(cast(*u8, &p.url), u);
+    p.vw = vw;
+    p.vh = vh;
+    decl.saw_viewport = 0;
+
+    let is net.Resource as r with mut;
+    let is *u8 as src with mut = cast(*u8, 0);
+    let is i64 as n with mut = 0;
+    let is i64 as have = cast(i64, net.get(u, &r) == 0);
+    if (have == 0) {
+        src = _error_page(p, r.error, &n);
+    } else {
+        _copy_url(cast(*u8, &p.url), cast(*u8, &r.final));
+        if (_type_is(&r, "image/") == 1) { src = _image_doc(p, &n); }
+        else if (_type_is(&r, "text/plain") == 1 || _type_is(&r, "text/css") == 1 ||
+                 _type_is(&r, "application/json") == 1 || _type_is(&r, "text/javascript") == 1 ||
+                 _type_is(&r, "application/javascript") == 1) {
+            src = _escaped(&p.tmp_a, r.data, r.len, &n);
+        } else {
+            src = r.data;
+            n = r.len;
+        }
+    }
+    if (tree.parse(&p.doc, src, n) != 0) { n = 0; }
+    if (have == 1) { net.free(&r); }
+    _read_head(p);
+
+    style.init(&p.engine, &p.style_a, &p.docs_a, cast(*u8, &p.base));
+    anim.init(&p.motion, &p.engine);
+    let is *sh.Sheet as s = cast(*sh.Sheet, arena.alloc(&p.docs_a, sizeof(sh.Sheet)));
+    sh.init(s, &p.docs_a);
+    ua.load(s);
+    style.add_sheet(&p.engine, s);
+    _load_sheets(p);
+    style.style_document(&p.engine, &p.doc, vw, vh);
+    anim.after_restyle(&p.motion, &p.doc, time.now_ms());
+    if (decl.saw_viewport == 1) { p.engine.viewport = 1; }
+    _load_images(p);
+
+    p.c.a = &p.box_a;
+    p.c.e = &p.engine;
+    p.c.images = fn_ptr(_image_for);
+    p.c.user = cast(*u8, p);
+    p.c.base = cast(*u8, &p.base);
+}
+
+// Boxes and a display list for a window this size. Styles are only made again when
+// something in them depends on it.
+fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
+    if (p.loaded == 0) { return; }
+    let is i64 as resized = cast(i64, vw != p.engine.vw || vh != p.engine.vh);
+    if (resized == 1 && p.engine.viewport == 1) { _style_again(p, vw, vh); }
+    arena.free(&p.box_a);
+    arena.free(&p.tmp_a);
+    arena.free(&p.paint_a);
+    p.c.hits = cast(*bx.HitItem, 0);
+    p.c.nhits = 0;
+    p.c.caphits = 0;
+    p.vw = vw;
+    p.vh = vh;
+    p.c.vw = vw;
+    p.c.vh = vh;
+    p.root = layout.run(&p.c, &p.doc);
+    let is f64 as w with mut = vw;
+    let is f64 as h with mut = vh;
+    if (p.c.doc_w > w) { w = p.c.doc_w; }
+    if (p.c.doc_h > h) { h = p.c.doc_h; }
+    p.doc_w = w;
+    p.doc_h = h;
+    anim.after_layout(&p.motion, p.root);
+    paint.paint(&p.c, p.root, l, w, h, &p.tmp_a);
+}
+
+// New styles for everything, with the old ones kept until what changed has been seen.
+fn _style_again(p as *Page, vw as f64, vh as f64) as void {
+    let is arena.Arena as old with mut = p.style_a;
+    arena.init(&p.style_a);
+    style.style_document(&p.engine, &p.doc, vw, vh);
+    anim.after_restyle(&p.motion, &p.doc, time.now_ms());
+    arena.free(&old);
+}
+
+// A frame of what is moving: what it looks like now, with nothing laid out. 1 when the
+// list has been made again.
+fn tick(p as *Page, l as *dl.List, sy as f64) as i64 {
+    if (p.loaded == 0 || p.root == null) { return 0; }
+    if (anim.wants_frame(&p.motion, sy, p.vh) == 0) { return 0; }
+    anim.tick(&p.motion, time.now_ms());
+    arena.free(&p.tmp_a);
+    arena.free(&p.paint_a);
+    p.c.a = &p.paint_a;
+    p.c.hits = cast(*bx.HitItem, 0);
+    p.c.nhits = 0;
+    p.c.caphits = 0;
+    paint.paint(&p.c, p.root, l, p.doc_w, p.doc_h, &p.tmp_a);
+    p.c.a = &p.box_a;
+    return 1;
+}
+
+// What the last frame changed, in the page: 1, or 0 when that is all of it.
+fn moved_area(p as *Page, x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as i64 {
+    return anim.area(&p.motion, x0, y0, x1, y1);
+}
+
+// Whether anything on the page is still to move.
+fn moving(p as *Page) as i64 {
+    if (p.loaded == 0) { return 0; }
+    return anim.active(&p.motion);
+}
+
+// --- Asking about it ---
+
+// What is at a point of the page. (x, y) is in the page, (sx, sy) how far it is scrolled.
+fn hit_at(p as *Page, x as f64, y as f64, sx as f64, sy as f64, out as *layout.Hit) as void {
+    out.node = cast(*dom.Node, 0);
+    out.box = cast(*bx.Box, 0);
+    out.over_text = 0;
+    if (p.root == null) { return; }
+    paint.hit(&p.c, x, y, sx, sy, &out.node, &out.box, &out.over_text);
+}
+
+// The nearest link at or above an element, as a full URL in out: its length, or 0 for none.
+fn link_from(p as *Page, n0 as *dom.Node, out as *u8, cap as i64) as i64 {
+    let is *dom.Node as n with mut = n0;
+    while (n != null) {
+        if (n.kind == dom.ELEMENT && n.ns == dom.NS_HTML && (n.tag == tg.A || n.tag == tg.AREA)) {
+            let is *dom.Attr as h = dom.find_attr(n, "href", 4);
+            if (h != null) {
+                let is i64 as m = url.resolve(cast(*u8, &p.base), h.value, h.value_len, out, cap);
+                if (m > 0) { return m; }
+                return 0;
+            }
+        }
+        n = n.parent;
+    }
+    return 0;
+}
+
+// The CSS cursor keyword for what is under the pointer.
+fn cursor_of(h as *layout.Hit) as i64 {
+    if (h.node == null) { return pr.K_DEFAULT; }
+    let is *style.Style as st = style.of(h.node);
+    if (st == null) { return pr.K_DEFAULT; }
+    let is i64 as k = st.v.i[pr.P_CURSOR];
+    if (k != pr.K_AUTO) { return k; }
+    if (h.over_text == 1) { return pr.K_TEXT; }
+    return pr.K_DEFAULT;
+}
+
+// --- What a person is doing to it ---
+
+// An element and everything above it, gaining or losing a flag. Styles only go stale if a
+// rule asks about an element whose answer changed, and the page is told when one does.
+fn _flag_chain(p as *Page, n0 as *dom.Node, flag as i64, on as i64, spare as *dom.Node) as void {
+    let is *dom.Node as n with mut = n0;
+    while (n != null && n.kind == dom.ELEMENT) {
+        let is i64 as has = cast(i64, (n.flags & flag) != 0);
+        // An element still above the new one keeps it, and nothing changed there.
+        if (on == 0 && spare != null && dom.contains(n, spare) == 1) { return; }
+        if (has != on) {
+            if (on == 1) { n.flags = n.flags | flag; }
+            else { n.flags = n.flags & (0 - 1 - flag); }
+            if (style.state_matters(&p.engine, n) == 1) { p.dirty = 1; }
+        }
+        n = n.parent;
+    }
+}
+
+fn set_hover(p as *Page, n as *dom.Node) as void {
+    if (p.hover == n) { return; }
+    _flag_chain(p, p.hover, dom.FLAG_HOVER, 0, n);
+    _flag_chain(p, n, dom.FLAG_HOVER, 1, cast(*dom.Node, 0));
+    p.hover = n;
+}
+
+fn set_active(p as *Page, n as *dom.Node) as void {
+    if (p.active == n) { return; }
+    _flag_chain(p, p.active, dom.FLAG_ACTIVE, 0, n);
+    _flag_chain(p, n, dom.FLAG_ACTIVE, 1, cast(*dom.Node, 0));
+    p.active = n;
+}
+
+// The element with the focus, or null for none. ring says the focus should show, which it
+// does when it came by keyboard and always in something typed into.
+fn set_focus(p as *Page, n as *dom.Node, ring as i64) as void {
+    if (p.focus == n) {
+        if (n != null && ring == 1 && (n.flags & dom.FLAG_FOCUS_RING) == 0) {
+            n.flags = n.flags | dom.FLAG_FOCUS_RING;
+            if (style.state_matters(&p.engine, n) == 1) { p.dirty = 1; }
+        }
+        return;
+    }
+    let is *dom.Node as old = p.focus;
+    if (old != null) {
+        old.flags = old.flags & (0 - 1 - dom.FLAG_FOCUS - dom.FLAG_FOCUS_RING);
+        if (style.state_matters(&p.engine, old) == 1) { p.dirty = 1; }
+        _flag_chain(p, old, dom.FLAG_FOCUS_WITHIN, 0, n);
+    }
+    if (n != null) {
+        n.flags = n.flags | dom.FLAG_FOCUS;
+        if (ring == 1) { n.flags = n.flags | dom.FLAG_FOCUS_RING; }
+        if (style.state_matters(&p.engine, n) == 1) { p.dirty = 1; }
+        _flag_chain(p, n, dom.FLAG_FOCUS_WITHIN, 1, cast(*dom.Node, 0));
+    }
+    p.focus = n;
+}
+
+fn focused(p as *Page) as *dom.Node { return p.focus; }
+
+// Styles and everything after them again, for what changed in the document or its state.
+fn refresh(p as *Page, l as *dl.List) as void {
+    if (p.loaded == 0) { return; }
+    _style_again(p, p.engine.vw, p.engine.vh);
+    p.dirty = 0;
+    relayout(p, p.vw, p.vh, l);
+}
+
+// Only where things are and what is drawn: a box inside the page scrolled.
+fn replace(p as *Page, l as *dl.List) as void {
+    if (p.root == null) { return; }
+    layout.place_again(&p.c, p.root);
+    let is f64 as w with mut = p.vw;
+    let is f64 as h with mut = p.vh;
+    if (p.c.doc_w > w) { w = p.c.doc_w; }
+    if (p.c.doc_h > h) { h = p.c.doc_h; }
+    p.doc_w = w;
+    p.doc_h = h;
+    paint.paint(&p.c, p.root, l, w, h, &p.tmp_a);
+}
+
+// Where the element a fragment names begins, or -1 when nothing here has that name.
+fn anchor_y(p as *Page, frag as *u8, n as i64) as f64 {
+    if (p.root == null) { return 0.0 - 1.0; }
+    if (n == 0) { return 0.0; }
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        let is *dom.Attr as id with mut = dom.find_attr(x, "id", 2);
+        if (id == null && x.tag == tg.A) { id = dom.find_attr(x, "name", 4); }
+        if (id != null && id.value_len == n) {
+            let is i64 as i with mut = 0;
+            while (i < n && id.value[i] == frag[i]) { i = i + 1; }
+            if (i == n) {
+                if (p.target != x) {
+                    if (p.target != null) {
+                        p.target.flags = p.target.flags & (0 - 1 - dom.FLAG_TARGET);
+                        if (style.state_matters(&p.engine, p.target) == 1) { p.dirty = 1; }
+                    }
+                    x.flags = x.flags | dom.FLAG_TARGET;
+                    if (style.state_matters(&p.engine, x) == 1) { p.dirty = 1; }
+                    p.target = x;
+                }
+                // What a page keeps clear at the top, a fixed header's height as a rule.
+                let is f64 as clear with mut = 0.0;
+                let is *dom.Node as top = _next_element(root, root);
+                let is *style.Style as ts = style.of(top);
+                let is *style.Style as xs = style.of(x);
+                if (ts != null) { clear = clear + ts.v.f[pr.P_SCROLL_PADDING_TOP]; }
+                if (xs != null) { clear = clear + xs.v.f[pr.P_SCROLL_MARGIN_TOP]; }
+                let is f64 as at = layout.y_of(p.root, x) - clear;
+                if (at < 0.0) { return 0.0; }
+                return at;
+            }
+        }
+        x = _next_element(root, x);
+    }
+    return 0.0 - 1.0;
+}
+
+// Each loaded image in turn: null when past the last. For whoever made textures of them.
+fn first_image(p as *Page) as *Loaded { return p.images; }
+fn next_image(l as *Loaded) as *Loaded { return l.next; }
+fn pixels_of(l as *Loaded) as *dl.Image {
+    if (l.ok == 0) { return cast(*dl.Image, 0); }
+    return &l.img;
+}

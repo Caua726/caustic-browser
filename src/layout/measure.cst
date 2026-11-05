@@ -1,0 +1,181 @@
+// layout/measure.cst — how wide text is, asked of whoever knows.
+//
+// Layout must not touch the toolkit, so the window hands in a function for this. With
+// none, as in --dump-layout, it estimates: a page still lays out, only with the wrong
+// line breaks.
+//
+// Text is measured word by word and a page has few distinct words, so answers are kept
+// across pages in a table that overwrites on collision. The key is a 64-bit hash, not
+// the words, because a wrong width from a collision costs one misplaced word once in
+// more pages than anyone will ever load.
+
+use "std/mem.cst" as mem;
+use "../css/props.cst" as pr;
+use "../css/style.cst" as style;
+
+struct Query {
+    text   as *u8;
+    len    as i64;
+    family as *u8;
+    size   as f64;
+    weight as i64;
+    italic as i64;
+    width  as f64;   // answers
+    height as f64;
+    ascent as f64;
+}
+
+type MeasureFn = fn(*u8, *Query) as void;
+
+let is i64 as WIDTHS with imut = 131072;
+let is i64 as FONTS  with imut = 1024;
+
+struct _Width {
+    key as i64;
+    w   as f64;
+}
+
+struct _Font {
+    key as i64;
+    asc as f64;
+    h   as f64;
+    sp  as f64;
+}
+
+let is MeasureFn as _fn with mut = cast(MeasureFn, 0);
+let is *u8 as _user with mut = cast(*u8, 0);
+let is *_Width as _widths with mut = cast(*_Width, 0);
+let is *_Font as _fonts with mut = cast(*_Font, 0);
+
+fn set_backend(f as MeasureFn, user as *u8) as void {
+    _fn = f;
+    _user = user;
+}
+
+fn _mix(h as i64, x as i64) as i64 {
+    return (h ^ x) * 1099511628211;
+}
+
+fn _font_key(family as *u8, size as f64, weight as i64, italic as i64) as i64 {
+    let is i64 as h with mut = 7809847782465536322;
+    if (family != null) {
+        let is i64 as i with mut = 0;
+        while (family[i] != 0) {
+            h = _mix(h, cast(i64, family[i]));
+            i = i + 1;
+        }
+    }
+    h = _mix(h, cast(i64, size * 64.0));
+    h = _mix(h, weight);
+    return _mix(h, italic);
+}
+
+fn _ask(q as *Query) as void {
+    if (cast(i64, _fn) != 0) {
+        call(_fn, _user, q);
+        return;
+    }
+    q.width = cast(f64, q.len) * q.size * 0.5;
+    q.height = q.size * 1.2;
+    q.ascent = q.size * 0.95;
+}
+
+fn _setup() as void {
+    if (_widths == null) {
+        _widths = cast(*_Width, mem.core.mmap_anon(WIDTHS * sizeof(_Width)));
+        _fonts = cast(*_Font, mem.core.mmap_anon(FONTS * sizeof(_Font)));
+    }
+}
+
+fn text_width(s as *u8, n as i64, family as *u8, size as f64, weight as i64, italic as i64) as f64 {
+    if (n == 0) { return 0.0; }
+    _setup();
+    let is i64 as fk = _font_key(family, size, weight, italic);
+    let is i64 as h with mut = fk;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = _mix(h, cast(i64, s[i]));
+        i = i + 1;
+    }
+    h = _mix(h, n);
+    if (h == 0) { h = 1; }
+    let is *_Width as e = &_widths[(h >> 7) & (WIDTHS - 1)];
+    if (e.key == h) { return e.w; }
+    let is Query as q with mut;
+    q.text = s;
+    q.len = n;
+    q.family = family;
+    q.size = size;
+    q.weight = weight;
+    q.italic = italic;
+    q.width = 0.0;
+    q.height = 0.0;
+    q.ascent = 0.0;
+    _ask(&q);
+    e.key = h;
+    e.w = q.width;
+    return q.width;
+}
+
+fn _font(family as *u8, size as f64, weight as i64, italic as i64) as *_Font {
+    _setup();
+    let is i64 as k with mut = _font_key(family, size, weight, italic);
+    if (k == 0) { k = 1; }
+    let is *_Font as e = &_fonts[(k >> 7) & (FONTS - 1)];
+    if (e.key == k) { return e; }
+    let is Query as q with mut;
+    q.text = "x";
+    q.len = 1;
+    q.family = family;
+    q.size = size;
+    q.weight = weight;
+    q.italic = italic;
+    q.width = 0.0;
+    q.height = 0.0;
+    q.ascent = 0.0;
+    _ask(&q);
+    e.key = k;
+    e.asc = q.ascent;
+    e.h = q.height;
+    // A line's width leaves out the spaces that hang off its end, so a space is
+    // measured between two letters.
+    let is f64 as two = text_width("xx", 2, family, size, weight, italic);
+    let is f64 as three = text_width("x x", 3, family, size, weight, italic);
+    e.sp = three - two;
+    if (e.sp <= 0.0) { e.sp = size * 0.25; }
+    return e;
+}
+
+// --- By a style ---
+
+fn _family(st as *style.Style) as *u8 { return cast(*u8, st.v.i[pr.P_FONT_FAMILY]); }
+fn _weight(st as *style.Style) as i64 { return cast(i64, st.v.f[pr.P_FONT_WEIGHT]); }
+fn _italic(st as *style.Style) as i64 {
+    let is i64 as k = st.v.i[pr.P_FONT_STYLE];
+    if (k == pr.K_ITALIC || k == pr.K_OBLIQUE) { return 1; }
+    return 0;
+}
+
+fn width(st as *style.Style, s as *u8, n as i64) as f64 {
+    return text_width(s, n, _family(st), st.v.f[pr.P_FONT_SIZE], _weight(st), _italic(st));
+}
+
+fn ascent(st as *style.Style) as f64 {
+    return _font(_family(st), st.v.f[pr.P_FONT_SIZE], _weight(st), _italic(st)).asc;
+}
+
+fn height(st as *style.Style) as f64 {
+    return _font(_family(st), st.v.f[pr.P_FONT_SIZE], _weight(st), _italic(st)).h;
+}
+
+fn space(st as *style.Style) as f64 {
+    return _font(_family(st), st.v.f[pr.P_FONT_SIZE], _weight(st), _italic(st)).sp;
+}
+
+// line-height as pixels, for the style's own font.
+fn line_height(st as *style.Style) as f64 {
+    let is i64 as k = st.v.i[pr.P_LINE_HEIGHT];
+    if (k == pr.K_NORMAL) { return height(st); }
+    if (k == pr.K_NUMBER) { return st.v.f[pr.P_LINE_HEIGHT] * st.v.f[pr.P_FONT_SIZE]; }
+    return st.v.f[pr.P_LINE_HEIGHT];
+}
