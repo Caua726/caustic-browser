@@ -775,7 +775,10 @@ fn _bg_pos_kw_x(kw as i64) as i64 {
     return 0;
 }
 
-fn _bg_position(s as *_Sh) as i64 {
+fn _bg_position(s as *_Sh) as i64 { return _position_of(s, pr.P_BACKGROUND_POSITION_X); }
+fn _mask_position(s as *_Sh) as i64 { return _position_of(s, pr.P_MASK_POSITION_X); }
+
+fn _position_of(s as *_Sh, first as i64) as i64 {
     let is v.Value as x with mut;
     let is v.Value as y with mut;
     mem.memzero(cast(*u8, &x), sizeof(v.Value));
@@ -797,8 +800,8 @@ fn _bg_position(s as *_Sh) as i64 {
         x = a;
         if (have_b == 1) { y = b; }
     }
-    _emit(s, pr.P_BACKGROUND_POSITION_X, &x);
-    _emit(s, pr.P_BACKGROUND_POSITION_Y, &y);
+    _emit(s, first, &x);
+    _emit(s, first + 1, &y);
     return 1;
 }
 
@@ -819,7 +822,10 @@ fn _pos_value(c as *Cur, out as *v.Value) as i64 {
     return parse_one(c, pr.P_BACKGROUND_SIZE_H, out);
 }
 
-fn _bg_size(s as *_Sh) as i64 {
+fn _bg_size(s as *_Sh) as i64 { return _size_of(s, pr.P_BACKGROUND_SIZE_W); }
+fn _mask_size(s as *_Sh) as i64 { return _size_of(s, pr.P_MASK_SIZE_W); }
+
+fn _size_of(s as *_Sh, first as i64) as i64 {
     let is v.Value as w with mut;
     let is v.Value as h with mut;
     if (parse_one(s.c, pr.P_BACKGROUND_SIZE_W, &w) == 0) { return 0; }
@@ -828,8 +834,111 @@ fn _bg_size(s as *_Sh) as i64 {
         h.kind = v.V_KW;
         h.kw = pr.K_AUTO;
     }
-    _emit(s, pr.P_BACKGROUND_SIZE_W, &w);
-    _emit(s, pr.P_BACKGROUND_SIZE_H, &h);
+    _emit(s, first, &w);
+    _emit(s, first + 1, &h);
+    return 1;
+}
+
+// mask: an image, how it repeats, where it sits and how big, of the first layer. A mask
+// that is a gradient is not read, and the declaration goes, leaving the element whole.
+fn _mask(s as *_Sh) as i64 {
+    let is v.Value as image with mut;
+    let is v.Value as repeat with mut;
+    let is v.Value as px with mut;
+    let is v.Value as py with mut;
+    let is v.Value as sw with mut;
+    let is v.Value as sh with mut;
+    let is i64 as have_image with mut = 0;
+    let is i64 as have_repeat with mut = 0;
+    let is i64 as have_pos with mut = 0;
+    let is i64 as have_size with mut = 0;
+    let is i64 as layer with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as t = _peek(s.c);
+        if (t.kind == tok.T_COMMA) {
+            s.c.i = s.c.i + 1;
+            layer = layer + 1;
+            continue;
+        }
+        if (t.kind == tok.T_IDENT &&
+            (eq(t.s, t.n, "none") == 1 || eq(t.s, t.n, "alpha") == 1 || eq(t.s, t.n, "luminance") == 1 ||
+             eq(t.s, t.n, "match-source") == 1 || eq(t.s, t.n, "add") == 1 || eq(t.s, t.n, "subtract") == 1 ||
+             eq(t.s, t.n, "intersect") == 1 || eq(t.s, t.n, "exclude") == 1 || eq(t.s, t.n, "no-clip") == 1 ||
+             eq(t.s, t.n, "border-box") == 1 || eq(t.s, t.n, "padding-box") == 1 || eq(t.s, t.n, "content-box") == 1 ||
+             eq(t.s, t.n, "fill-box") == 1 || eq(t.s, t.n, "stroke-box") == 1 || eq(t.s, t.n, "view-box") == 1)) {
+            s.c.i = s.c.i + 1;
+            continue;
+        }
+        let is v.Value as tmp with mut;
+        if (parse_one(s.c, pr.P_MASK_IMAGE, &tmp) == 1) {
+            if (have_image == 0 && tmp.kind == v.V_URL) {
+                image = tmp;
+                have_image = 1;
+            }
+            continue;
+        }
+        if (parse_one(s.c, pr.P_MASK_REPEAT, &tmp) == 1) {
+            if (layer == 0) {
+                repeat = tmp;
+                have_repeat = 1;
+            }
+            continue;
+        }
+        let is v.Value as a with mut;
+        if (_pos_value(s.c, &a) == 0) { return 0; }
+        let is v.Value as b with mut;
+        let is i64 as two = _pos_value(s.c, &b);
+        if (layer == 0) {
+            have_pos = 1;
+            mem.memzero(cast(*u8, &px), sizeof(v.Value));
+            mem.memzero(cast(*u8, &py), sizeof(v.Value));
+            px.kind = v.V_LEN;
+            px.len.pct = 50.0;
+            py.kind = v.V_LEN;
+            py.len.pct = 50.0;
+            if (a.kind == v.V_KW && (a.kw == pr.K_TOP || a.kw == pr.K_BOTTOM)) {
+                py = a;
+                if (two == 1) { px = b; }
+            } else {
+                px = a;
+                if (two == 1) { py = b; }
+            }
+        }
+        if (_is_delim(_peek(s.c), 47) == 1) {
+            s.c.i = s.c.i + 1;
+            if (parse_one(s.c, pr.P_BACKGROUND_SIZE_W, &tmp) == 0) { return 0; }
+            let is v.Value as tmp2 with mut;
+            let is i64 as has2 = parse_one(s.c, pr.P_BACKGROUND_SIZE_H, &tmp2);
+            if (layer == 0) {
+                sw = tmp;
+                have_size = 1;
+                if (has2 == 1) { sh = tmp2; }
+                else {
+                    mem.memzero(cast(*u8, &sh), sizeof(v.Value));
+                    sh.kind = v.V_KW;
+                    sh.kw = pr.K_AUTO;
+                }
+            }
+        }
+    }
+    if (have_image == 1) { _emit(s, pr.P_MASK_IMAGE, &image); }
+    else { _emit_kw(s, pr.P_MASK_IMAGE, pr.K_NONE); }
+    if (have_repeat == 1) { _emit(s, pr.P_MASK_REPEAT, &repeat); }
+    else { _emit_kw(s, pr.P_MASK_REPEAT, pr.K_REPEAT); }
+    if (have_pos == 1) {
+        _emit(s, pr.P_MASK_POSITION_X, &px);
+        _emit(s, pr.P_MASK_POSITION_Y, &py);
+    } else {
+        _emit_px(s, pr.P_MASK_POSITION_X, 0.0);
+        _emit_px(s, pr.P_MASK_POSITION_Y, 0.0);
+    }
+    if (have_size == 1) {
+        _emit(s, pr.P_MASK_SIZE_W, &sw);
+        _emit(s, pr.P_MASK_SIZE_H, &sh);
+    } else {
+        _emit_kw(s, pr.P_MASK_SIZE_W, pr.K_AUTO);
+        _emit_kw(s, pr.P_MASK_SIZE_H, pr.K_AUTO);
+    }
     return 1;
 }
 
@@ -2264,6 +2373,9 @@ fn _range(name as *u8, n as i64, first as *i64) as i64 {
     if (eq(name, n, "background") == 1) { *first = pr.P_BACKGROUND_COLOR; return 8; }
     if (eq(name, n, "background-position") == 1) { *first = pr.P_BACKGROUND_POSITION_X; return 2; }
     if (eq(name, n, "background-size") == 1) { *first = pr.P_BACKGROUND_SIZE_W; return 2; }
+    if (eq(name, n, "mask") == 1) { *first = pr.P_MASK_IMAGE; return 6; }
+    if (eq(name, n, "mask-position") == 1) { *first = pr.P_MASK_POSITION_X; return 2; }
+    if (eq(name, n, "mask-size") == 1) { *first = pr.P_MASK_SIZE_W; return 2; }
     if (eq(name, n, "overflow") == 1) { *first = pr.P_OVERFLOW_X; return 2; }
     if (eq(name, n, "flex") == 1) { *first = pr.P_FLEX_GROW; return 3; }
     if (eq(name, n, "flex-flow") == 1) { *first = pr.P_FLEX_DIRECTION; return 2; }
@@ -2295,7 +2407,15 @@ fn _side_index(name as *u8, n as i64, prefix as *u8, plen as i64, out as *i64) a
 
 // The tokens of one declaration's value into longhands, appended to out. 0 when it is
 // invalid or unknown, and then nothing was appended.
+// -webkit-mask and its parts are mask and its parts: pages write both, or only the first.
 fn parse(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *tok.Token, n as i64, important as i64) as i64 {
+    if (nlen >= 12 && eq(name, 8, "-webkit-") == 1 && eq(&name[8], 4, "mask") == 1) {
+        return _parse_named(a, out, &name[8], nlen - 8, t, n, important);
+    }
+    return _parse_named(a, out, name, nlen, t, n, important);
+}
+
+fn _parse_named(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *tok.Token, n as i64, important as i64) as i64 {
     let is Cur as cur with mut;
     cur.a = a;
     cur.t = t;
@@ -2358,6 +2478,9 @@ fn parse(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *
     else if (eq(name, nlen, "outline") == 1) { ok = _outline(s); }
     else if (eq(name, nlen, "background") == 1) { ok = _background(s); }
     else if (eq(name, nlen, "background-image") == 1) { ok = _bg_image(s); }
+    else if (eq(name, nlen, "mask") == 1) { ok = _mask(s); }
+    else if (eq(name, nlen, "mask-position") == 1) { ok = _mask_position(s); }
+    else if (eq(name, nlen, "mask-size") == 1) { ok = _mask_size(s); }
     else if (eq(name, nlen, "box-shadow") == 1) { ok = _box_shadow(s); }
     else if (eq(name, nlen, "transform") == 1) { ok = _transform(s); }
     else if (eq(name, nlen, "transform-origin") == 1) { ok = _transform_origin(s); }

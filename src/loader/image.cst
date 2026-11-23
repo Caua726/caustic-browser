@@ -70,6 +70,7 @@ fn decode(data as *u8, len as i64, im as *dl.Image) as i64 {
     im.nat_h = cast(f64, h);
     im.sized = 1;
     im.keeps_shape = 0;
+    im.mask_tex = 0;
     return 1;
 }
 

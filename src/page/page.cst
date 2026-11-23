@@ -344,6 +344,8 @@ fn _load_images(p as *Page) as void {
         if (st != null && st.v.i[pr.P_DISPLAY] != pr.K_NONE) {
             let is *u8 as bg = _value_url(st, pr.P_BACKGROUND_IMAGE);
             if (bg != null) { _fetch_image(p, bg, url.len_of(bg)); }
+            let is *u8 as mk = _value_url(st, pr.P_MASK_IMAGE);
+            if (mk != null) { _fetch_image(p, mk, url.len_of(mk)); }
             let is *u8 as li = _value_url(st, pr.P_LIST_STYLE_IMAGE);
             if (li != null && st.v.i[pr.P_DISPLAY] == pr.K_LIST_ITEM) { _fetch_image(p, li, url.len_of(li)); }
             if (x.ns == dom.NS_HTML && x.tag == tg.IMG) {

@@ -642,13 +642,13 @@ fn set_hint(t as *tree.Tree, w as i64, s as *u8, n as i64) as void {
 
 // The texture of an image goes with the page that showed it.
 fn release_image(t as *tree.Tree, im as *dl.Image) as void {
-    if (im.tex <= 0) {
-        im.tex = 0;
-        return;
-    }
     let is *txt.Service as svc = txt.of(t);
-    if (cast(i64, svc) != 0 && cast(i64, svc.d) != 0) { texture.destroy(svc.d, im.tex); }
+    if (cast(i64, svc) != 0 && cast(i64, svc.d) != 0) {
+        if (im.tex > 0) { texture.destroy(svc.d, im.tex); }
+        if (im.mask_tex > 0) { texture.destroy(svc.d, im.mask_tex); }
+    }
     im.tex = 0;
+    im.mask_tex = 0;
 }
 
 // No size of its own: it takes what its parent gives it.
@@ -1437,7 +1437,41 @@ fn _draw_svg(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64,
     _made_draw(p, slot, c, x, y);
 }
 
+// A picture as a mask: white where it shows and how much, for the colour to come through.
+fn _mask_image(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    let is *dl.Image as im = c.img;
+    if (im.mask_tex == 0 && cast(i64, svc) != 0 && cast(i64, svc.d) != 0) {
+        im.mask_tex = 0 - 1;
+        let is i64 as bytes = im.width * im.height * 4;
+        let is *u8 as px = mem.core.mmap_anon(bytes);
+        let is i64 as got = cast(i64, px);
+        if (got != 0 && got != 0 - 1) {
+            let is i64 as i with mut = 0;
+            while (i < bytes) {
+                px[i] = cast(u8, 255);
+                px[i + 1] = cast(u8, 255);
+                px[i + 2] = cast(u8, 255);
+                px[i + 3] = im.pixels[i + 3];
+                i = i + 4;
+            }
+            let is texture.Desc as td = texture.desc(im.width, im.height, texture.RGBA8, texture.SAMPLED);
+            let is i64 as tex = texture.create(svc.d, &td);
+            if (tex != 0) {
+                texture.upload(svc.d, tex, px, bytes);
+                im.mask_tex = tex;
+            }
+            mem.core.munmap(px, bytes);
+        }
+    }
+    if (im.mask_tex <= 0) { return; }
+    draw2d.image(p.canvas, im.mask_tex, 1, x, y, c.w, c.h, 0.0, 0.0, 1.0, 1.0, _color(c));
+}
+
 fn _image(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y as f64) as void {
+    if (c.deco == 1) {
+        _mask_image(svc, p, c, x, y);
+        return;
+    }
     let is *dl.Image as im = c.img;
     if (im.tex == 0 && cast(i64, svc) != 0 && cast(i64, svc.d) != 0) {
         let is texture.Desc as td = texture.desc(im.width, im.height, texture.RGBA8, texture.SAMPLED);

@@ -54,6 +54,13 @@ OWN = [
     ("background-position-y", LEN | PCT, "top center bottom", 0),
     ("background-size-w", LEN | PCT, "auto cover contain", AUTO),
     ("background-size-h", LEN | PCT, AUTO, AUTO),
+    # In the order of the background's: painting walks both the same way.
+    ("mask-image", URL, "none", "none"),
+    ("mask-repeat", 0, "repeat repeat-x repeat-y no-repeat space round", "repeat"),
+    ("mask-position-x", LEN | PCT, "left center right", 0),
+    ("mask-position-y", LEN | PCT, "top center bottom", 0),
+    ("mask-size-w", LEN | PCT, "auto cover contain", AUTO),
+    ("mask-size-h", LEN | PCT, AUTO, AUTO),
     ("-x-gradient", STR, "none", "none"),
     ("box-shadow", STR, "none", "none"),
     ("flex-direction", 0, "row row-reverse column column-reverse", "row"),

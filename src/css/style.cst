@@ -795,6 +795,10 @@ fn _find_var(st as *Style, s as *u8, n as i64) as *Var {
     return cast(*Var, 0);
 }
 
+let is i64 as MAX_EXPANDING with imut = 16;
+let is [16]*Var as _expanding with mut;     // the properties being expanded, outermost first
+let is i64 as _nexpanding with mut = 0;
+
 // The tokens of t with every var() replaced. 0 when one has no value and no fallback,
 // which makes the declaration invalid at this element.
 fn _expand(e as *Engine, st as *Style, t as *tok.Token, n as i64, o as *_Toks, depth as i64) as i64 {
@@ -822,9 +826,24 @@ fn _expand(e as *Engine, st as *Style, t as *tok.Token, n as i64, o as *_Toks, d
         while (a < n && t[a].kind == tok.T_WS) { a = a + 1; }
         if (a >= n || t[a].kind != tok.T_IDENT) { return 0; }
         let is *Var as found = _find_var(st, t[a].s, t[a].n);
+        let is i64 as usable with mut = 0;
         if (found != null) {
-            if (_expand(e, st, found.toks, found.ntoks, o, depth + 1) == 0) { return 0; }
-        } else {
+            // In a cycle, every property on it has no value, whatever fallback sits inside.
+            let is i64 as on with mut = 0;
+            while (on < _nexpanding) {
+                if (_expanding[on] == found) { return 0; }
+                on = on + 1;
+            }
+            if (_nexpanding == MAX_EXPANDING) { return 0; }
+            _expanding[_nexpanding] = found;
+            _nexpanding = _nexpanding + 1;
+            let is i64 as mark = o.n;
+            usable = _expand(e, st, found.toks, found.ntoks, o, depth + 1);
+            _nexpanding = _nexpanding - 1;
+            if (usable == 0) { o.n = mark; }
+        }
+        // One that turned out to have no value is as good as none: this one's fallback.
+        if (usable == 0) {
             if (comma < 0) { return 0; }
             let is i64 as fb_end with mut = k;
             if (d == 0) { fb_end = k - 1; }

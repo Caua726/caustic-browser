@@ -219,13 +219,19 @@ fn hit(c as *bx.Ctx, x as f64, y as f64, sx as f64, sy as f64, node as **dom.Nod
 // --- Backgrounds and borders ---
 
 fn _bg_tiles(p as *Painter, b as *bx.Box, im as *dl.Image, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
+    _tiles(p, b, im, x, y, w, h, alpha, pr.P_BACKGROUND_REPEAT, 0 - 1);
+}
+
+// Tiles by the five properties from first on, a background's or a mask's: repeat, position
+// and size. A tint from 0 up makes them a mask of that colour.
+fn _tiles(p as *Painter, b as *bx.Box, im as *dl.Image, x as f64, y as f64, w as f64, h as f64, alpha as f64, first as i64, tint as i64) as void {
     let is *pr.Values as s = &b.st.v;
     let is f64 as iw with mut = im.nat_w;
     let is f64 as ih with mut = im.nat_h;
     if (iw <= 0.0 || ih <= 0.0) { return; }
-    let is i64 as kw = s.i[pr.P_BACKGROUND_SIZE_W];
+    let is i64 as kw = s.i[first + 3];
     // A picture with only a shape, at no size asked for, fits the area like contain.
-    let is i64 as fits = cast(i64, im.sized == 0 && kw == pr.K_AUTO && s.i[pr.P_BACKGROUND_SIZE_H] == pr.K_AUTO);
+    let is i64 as fits = cast(i64, im.sized == 0 && kw == pr.K_AUTO && s.i[first + 4] == pr.K_AUTO);
     if (kw == pr.K_COVER || kw == pr.K_CONTAIN || fits == 1) {
         let is f64 as sx = w / iw;
         let is f64 as sy = h / ih;
@@ -235,18 +241,18 @@ fn _bg_tiles(p as *Painter, b as *bx.Box, im as *dl.Image, x as f64, y as f64, w
         ih = ih * k;
     } else {
         let is i64 as has_w = cast(i64, kw == 0);
-        let is i64 as has_h = cast(i64, s.i[pr.P_BACKGROUND_SIZE_H] == 0);
+        let is i64 as has_h = cast(i64, s.i[first + 4] == 0);
         let is f64 as ow = iw;
         let is f64 as oh = ih;
-        if (has_w == 1) { iw = bx.resolve(b, pr.P_BACKGROUND_SIZE_W, w); }
-        if (has_h == 1) { ih = bx.resolve(b, pr.P_BACKGROUND_SIZE_H, h); }
+        if (has_w == 1) { iw = bx.resolve(b, first + 3, w); }
+        if (has_h == 1) { ih = bx.resolve(b, first + 4, h); }
         if (has_w == 1 && has_h == 0) { ih = oh * iw / ow; }
         if (has_w == 0 && has_h == 1) { iw = ow * ih / oh; }
     }
     if (iw <= 0.0 || ih <= 0.0) { return; }
-    let is f64 as px = s.f[pr.P_BACKGROUND_POSITION_X] + s.p[pr.P_BACKGROUND_POSITION_X] * (w - iw) / 100.0;
-    let is f64 as py = s.f[pr.P_BACKGROUND_POSITION_Y] + s.p[pr.P_BACKGROUND_POSITION_Y] * (h - ih) / 100.0;
-    let is i64 as rep = s.i[pr.P_BACKGROUND_REPEAT];
+    let is f64 as px = s.f[first + 1] + s.p[first + 1] * (w - iw) / 100.0;
+    let is f64 as py = s.f[first + 2] + s.p[first + 2] * (h - ih) / 100.0;
+    let is i64 as rep = s.i[first];
     let is i64 as rep_x = cast(i64, rep == pr.K_REPEAT || rep == pr.K_REPEAT_X || rep == pr.K_SPACE || rep == pr.K_ROUND);
     let is i64 as rep_y = cast(i64, rep == pr.K_REPEAT || rep == pr.K_REPEAT_Y || rep == pr.K_SPACE || rep == pr.K_ROUND);
     let is f64 as first_x with mut = px;
@@ -267,7 +273,14 @@ fn _bg_tiles(p as *Painter, b as *bx.Box, im as *dl.Image, x as f64, y as f64, w
         let is f64 as tx with mut = first_x;
         while (tx < w && tiles < MAX_TILES) {
             let is *dl.Cmd as c = dl.image(p.l, x + tx, y + ty, iw, ih, im, alpha);
-            if (c != null) { c.fixed = p.fixed; }
+            if (c != null) {
+                c.fixed = p.fixed;
+                if (tint >= 0) {
+                    c.color = _rgb(tint);
+                    c.alpha = alpha * _a(tint);
+                    c.deco = 1;
+                }
+            }
             tiles = tiles + 1;
             if (rep_x == 0) { break; }
             tx = tx + iw;
@@ -440,6 +453,19 @@ fn _grad_layers(p as *Painter, b as *bx.Box, g as *v.Gradient, x as f64, y as f6
 
 fn _background(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
     let is *pr.Values as s = &b.st.v;
+    // A mask of a plain colour, which is what an icon is. What the mask covers should go for
+    // the element's content as well, and for pictures in its background; that would take
+    // drawing it all aside first, so those stay whole, and no colour stays nothing.
+    if (s.i[pr.P_MASK_IMAGE] != pr.K_NONE && s.i[pr.P_BACKGROUND_IMAGE] == pr.K_NONE && s.i[pr.P_X_GRADIENT] == pr.K_NONE) {
+        let is i64 as col with mut = s.i[pr.P_BACKGROUND_COLOR];
+        if (col == v.COLOR_CURRENT) { col = s.i[pr.P_COLOR]; }
+        if (_a(col) > 0.0 && cast(i64, p.c.images) != 0) {
+            let is *u8 as mu = cast(*u8, s.i[pr.P_MASK_IMAGE]);
+            let is *dl.Image as mi = call(p.c.images, p.c.user, mu, url.len_of(mu));
+            if (mi != null) { _tiles(p, b, mi, x, y, w, h, alpha, pr.P_MASK_REPEAT, col); }
+        }
+        return;
+    }
     let is *dl.Cmd as c = _rect(p, x, y, w, h, s.i[pr.P_BACKGROUND_COLOR], alpha);
     if (c != null && _has_radius(b) == 1) { _radii(b, c, w, h); }
     if (s.i[pr.P_BACKGROUND_IMAGE] != pr.K_NONE && cast(i64, p.c.images) != 0) {

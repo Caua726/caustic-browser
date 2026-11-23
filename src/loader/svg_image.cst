@@ -292,6 +292,7 @@ fn decode(data as *u8, len as i64, im as *dl.Image) as i64 {
             im.nat_h = h;
             im.sized = sized;
             im.keeps_shape = keeps;
+            im.mask_tex = 0;
             im.tex = 0;
             ok = 1;
         }

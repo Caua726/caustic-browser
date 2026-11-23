@@ -44,6 +44,7 @@ struct Image {
     nat_h  as f64;
     sized  as i64;    // 0 when it only has a shape: nat_w by nat_h is that shape, at a plain size
     keeps_shape as i64;   // 1 when a box of another shape letterboxes it rather than stretches it
+    mask_tex as i64;      // the same picture as white and how much shows, for a colour to come through
 }
 
 // A gradient worked out for its box: every length is pixels by now, and each stop a place
@@ -83,7 +84,7 @@ struct Cmd {
     r4     as f64;
     family as *u8;    // RUN only: as CSS writes it, null for the interface's
     italic as i64;    // RUN only
-    deco   as i64;    // RUN only: DECO_* bits
+    deco   as i64;    // RUN: DECO_* bits. IMAGE: 1 to use it as a mask of color
     fixed  as i64;    // does not move when the page scrolls
     img    as *Image; // IMAGE only
     rw     as f64;    // RUN only: how wide layout measured it
