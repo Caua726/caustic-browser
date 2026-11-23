@@ -14,6 +14,7 @@ use "../css/style.cst" as style;
 use "../css/decl.cst" as decl;
 use "../dom/dom.cst" as dom;
 use "../dom/tags.cst" as tg;
+use "../loader/img_source.cst" as source;
 use "../loader/url.cst" as url;
 use "../paint/display_list.cst" as dl;
 use "./box.cst" as bx;
@@ -654,14 +655,27 @@ fn _textarea(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     return b;
 }
 
+fn _image_at(c as *bx.Ctx, u as *u8, n as i64) as *dl.Image {
+    let is i64 as cap = n + url.len_of(c.base) + 16;
+    let is *u8 as abs = arena.alloc(c.a, cap);
+    let is i64 as w = url.resolve(c.base, u, n, abs, cap);
+    if (w < 0) { return cast(*dl.Image, 0); }
+    return call(c.images, c.user, abs, w);
+}
+
 fn _image_box(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     let is *dom.Attr as src = dom.find_attr(n, "src", 3);
     let is *dl.Image as im with mut = cast(*dl.Image, 0);
-    if (src != null && src.value_len > 0 && cast(i64, c.images) != 0) {
-        let is i64 as cap = src.value_len + url.len_of(c.base) + 16;
-        let is *u8 as abs = arena.alloc(c.a, cap);
-        let is i64 as m = url.resolve(c.base, src.value, src.value_len, abs, cap);
-        if (m >= 0) { im = call(c.images, c.user, abs, m); }
+    let is f64 as density with mut = 1.0;
+    if (cast(i64, c.images) != 0) {
+        let is i64 as un with mut = 0;
+        let is *u8 as u = source.pick(c.a, n, c.vw, c.vh, &un, &density);
+        if (u != cast(*u8, 0)) { im = _image_at(c, u, un); }
+        // What was offered would not do: src, if that is something else.
+        if (im == null && src != null && src.value_len > 0 && u != src.value) {
+            im = _image_at(c, src.value, src.value_len);
+            density = 1.0;
+        }
     }
     if (im == null) {
         // A missing image is its alt text, in a line with what is around it.
@@ -677,8 +691,8 @@ fn _image_box(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     }
     let is *bx.Box as b = _replaced_shell(c, n, st);
     b.img = im;
-    b.iw = im.nat_w;
-    b.ih = im.nat_h;
+    b.iw = im.nat_w / density;
+    b.ih = im.nat_h / density;
     // Only a shape: it takes the width there is, as an <svg> with no size does.
     if (im.sized == 0) {
         b.iw = 0.0;

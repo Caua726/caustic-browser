@@ -999,6 +999,28 @@ fn parse(s as *Sheet, src as *u8, len as i64, origin as i64, url as *u8) as void
     _rules(&ps, ps.n, cast(*Media, 0));
 }
 
+// Whether a media list given as text holds, for what HTML writes in its own attributes.
+fn media_text_holds(a as *arena.Arena, s as *u8, n as i64, w as f64, h as f64) as i64 {
+    let is tok.List as l with mut;
+    tok.tokenize(a, s, n, &l);
+    let is _P as ps with mut;
+    let is Sheet as none with mut;
+    init(&none, a);
+    ps.sh = &none;
+    ps.a = a;
+    ps.t = l.t;
+    ps.n = l.n;
+    ps.i = 0;
+    ps.origin = ORIGIN_AUTHOR;
+    let is *Query as q with mut = _media_list(&ps, ps.n);
+    if (q == null) { return 1; }
+    while (q != null) {
+        if (_query_holds(q, w, h) == 1) { return 1; }
+        q = q.next;
+    }
+    return 0;
+}
+
 // A style attribute: a declaration list and nothing else.
 fn parse_inline(a as *arena.Arena, src as *u8, len as i64, out as *v.DeclList, url as *u8) as void {
     let is tok.List as l with mut;

@@ -1,0 +1,189 @@
+// loader/img_source.cst — which file an <img> shows, of all it offers.
+//
+// <picture> offers it others first, each under a condition, and srcset offers several
+// sizes of one picture. What is chosen depends on the window, so loading a page and laying
+// it out ask here alike and get the same answer. Only one device pixel to a CSS pixel is
+// assumed: a screen scale reaches layout too late to choose by.
+
+use "../base/arena.cst" as arena;
+use "../css/decl.cst" as decl;
+use "../css/sheet.cst" as sh;
+use "../dom/dom.cst" as dom;
+
+fn _is_ws(c as u8) as i64 { return cast(i64, c == 32 || c == 9 || c == 10 || c == 12 || c == 13); }
+
+// A number at s, how far it went into used; used of 0 when there is none.
+fn _num(s as *u8, n as i64, used as *i64) as f64 {
+    let is i64 as i with mut = 0;
+    let is f64 as v with mut = 0.0;
+    while (i < n && s[i] >= 48 && s[i] <= 57) {
+        v = v * 10.0 + cast(f64, cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    if (i < n && s[i] == 46) {
+        i = i + 1;
+        let is f64 as place with mut = 0.1;
+        while (i < n && s[i] >= 48 && s[i] <= 57) {
+            v = v + cast(f64, cast(i64, s[i]) - 48) * place;
+            place = place * 0.1;
+            i = i + 1;
+        }
+    }
+    *used = i;
+    return v;
+}
+
+// A length in sizes, in pixels, or below 0 for one this does not read.
+fn _size_len(s as *u8, n as i64, vw as f64, vh as f64) as f64 {
+    let is i64 as used with mut = 0;
+    let is f64 as v = _num(s, n, &used);
+    if (used == 0) { return 0.0 - 1.0; }
+    let is i64 as left = n - used;
+    if (left == 0 && v == 0.0) { return 0.0; }
+    if (decl.eq(&s[used], left, "px") == 1) { return v; }
+    if (decl.eq(&s[used], left, "vw") == 1) { return v * vw / 100.0; }
+    if (decl.eq(&s[used], left, "vh") == 1) { return v * vh / 100.0; }
+    if (decl.eq(&s[used], left, "em") == 1 || decl.eq(&s[used], left, "rem") == 1) { return v * 16.0; }
+    return 0.0 - 1.0;
+}
+
+// How wide the image will be, by sizes: the length of the first entry whose condition
+// holds. With no sizes, or one this cannot read, the width of the window.
+fn _slot(a as *arena.Arena, sizes as *dom.Attr, vw as f64, vh as f64) as f64 {
+    if (sizes == null) { return vw; }
+    let is *u8 as s = sizes.value;
+    let is i64 as n = sizes.value_len;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        // One entry: up to a comma outside brackets.
+        let is i64 as from = i;
+        let is i64 as depth with mut = 0;
+        while (i < n && (s[i] != 44 || depth > 0)) {
+            if (s[i] == 40) { depth = depth + 1; }
+            if (s[i] == 41) { depth = depth - 1; }
+            i = i + 1;
+        }
+        let is i64 as end with mut = i;
+        i = i + 1;
+        while (end > from && _is_ws(s[end - 1]) == 1) { end = end - 1; }
+        // Its length is the last thing in it; what comes before is the condition.
+        let is i64 as at with mut = end;
+        depth = 0;
+        while (at > from && (_is_ws(s[at - 1]) == 0 || depth > 0)) {
+            if (s[at - 1] == 41) { depth = depth + 1; }
+            if (s[at - 1] == 40) { depth = depth - 1; }
+            at = at - 1;
+        }
+        if (at == from || sh.media_text_holds(a, &s[from], at - from, vw, vh) == 1) {
+            let is f64 as px = _size_len(&s[at], end - at, vw, vh);
+            if (px >= 0.0) { return px; }
+            return vw;
+        }
+    }
+    return vw;
+}
+
+// The candidate of srcset that fits: the smallest that still covers a pixel of the screen
+// with a pixel of its own, or failing that the biggest there is.
+fn _from_srcset(a as *arena.Arena, set as *dom.Attr, sizes as *dom.Attr, vw as f64, vh as f64, out_n as *i64, out_d as *f64) as *u8 {
+    let is *u8 as s = set.value;
+    let is i64 as n = set.value_len;
+    let is f64 as slot = _slot(a, sizes, vw, vh);
+    let is *u8 as enough with mut = cast(*u8, 0);
+    let is i64 as enough_n with mut = 0;
+    let is f64 as enough_d with mut = 0.0;
+    let is *u8 as biggest with mut = cast(*u8, 0);
+    let is i64 as biggest_n with mut = 0;
+    let is f64 as biggest_d with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        while (i < n && (_is_ws(s[i]) == 1 || s[i] == 44)) { i = i + 1; }
+        if (i >= n) { break; }
+        // The URL runs to a space. A comma it ends in is the list's, and any inside are its
+        // own, which a data: URL is full of.
+        let is i64 as from = i;
+        while (i < n && _is_ws(s[i]) == 0) { i = i + 1; }
+        let is i64 as to with mut = i;
+        let is i64 as listed with mut = 0;
+        while (to > from && s[to - 1] == 44) {
+            to = to - 1;
+            listed = 1;
+        }
+        let is f64 as density with mut = 1.0;
+        if (listed == 0) {
+            while (i < n && _is_ws(s[i]) == 1) { i = i + 1; }
+            let is i64 as used with mut = 0;
+            let is f64 as v = _num(&s[i], n - i, &used);
+            if (used > 0 && i + used < n) {
+                if (s[i + used] == 119 && slot > 0.0) { density = v / slot; }
+                if (s[i + used] == 120) { density = v; }
+            }
+            while (i < n && s[i] != 44) { i = i + 1; }
+        }
+        if (to > from) {
+            if (density > biggest_d) {
+                biggest = &s[from];
+                biggest_n = to - from;
+                biggest_d = density;
+            }
+            if (density >= 1.0 && (enough == cast(*u8, 0) || density < enough_d)) {
+                enough = &s[from];
+                enough_n = to - from;
+                enough_d = density;
+            }
+        }
+    }
+    if (enough != cast(*u8, 0)) {
+        *out_n = enough_n;
+        *out_d = enough_d;
+        return enough;
+    }
+    *out_n = biggest_n;
+    if (biggest_d > 0.0) { *out_d = biggest_d; }
+    return biggest;
+}
+
+// Whether a <source>'s type is one this can show. One it has not heard of is not.
+fn _type_ok(t as *dom.Attr) as i64 {
+    if (t == null || t.value_len == 0) { return 1; }
+    let is *u8 as s = t.value;
+    let is i64 as n with mut = 0;
+    while (n < t.value_len && s[n] != 59 && _is_ws(s[n]) == 0) { n = n + 1; }
+    if (decl.eq(s, n, "image/png") == 1 || decl.eq(s, n, "image/jpeg") == 1 || decl.eq(s, n, "image/jpg") == 1 ||
+        decl.eq(s, n, "image/gif") == 1 || decl.eq(s, n, "image/webp") == 1 || decl.eq(s, n, "image/svg+xml") == 1 ||
+        decl.eq(s, n, "image/bmp") == 1 || decl.eq(s, n, "image/x-icon") == 1 ||
+        decl.eq(s, n, "image/vnd.microsoft.icon") == 1 || decl.eq(s, n, "image/tiff") == 1) { return 1; }
+    return 0;
+}
+
+// The URL an <img> should show, as it is written, n bytes of it into out_n; null for none.
+// out_d is how many of its pixels make one of CSS's, which is how it gets its size.
+fn pick(a as *arena.Arena, img as *dom.Node, vw as f64, vh as f64, out_n as *i64, out_d as *f64) as *u8 {
+    *out_n = 0;
+    *out_d = 1.0;
+    let is *dom.Node as up = img.parent;
+    if (up != null && up.kind == dom.ELEMENT && decl.eq(up.name, up.name_len, "picture") == 1) {
+        let is *dom.Node as x with mut = up.first;
+        while (x != null && x != img) {
+            if (x.kind == dom.ELEMENT && decl.eq(x.name, x.name_len, "source") == 1) {
+                let is *dom.Attr as set = dom.find_attr(x, "srcset", 6);
+                let is *dom.Attr as media = dom.find_attr(x, "media", 5);
+                if (set != null && set.value_len > 0 && _type_ok(dom.find_attr(x, "type", 4)) == 1 &&
+                    (media == null || sh.media_text_holds(a, media.value, media.value_len, vw, vh) == 1)) {
+                    let is *u8 as u = _from_srcset(a, set, dom.find_attr(x, "sizes", 5), vw, vh, out_n, out_d);
+                    if (u != cast(*u8, 0)) { return u; }
+                }
+            }
+            x = x.next;
+        }
+    }
+    let is *dom.Attr as set = dom.find_attr(img, "srcset", 6);
+    if (set != null && set.value_len > 0) {
+        let is *u8 as u = _from_srcset(a, set, dom.find_attr(img, "sizes", 5), vw, vh, out_n, out_d);
+        if (u != cast(*u8, 0)) { return u; }
+    }
+    let is *dom.Attr as src = dom.find_attr(img, "src", 3);
+    if (src == null || src.value_len == 0) { return cast(*u8, 0); }
+    *out_n = src.value_len;
+    return src.value;
+}

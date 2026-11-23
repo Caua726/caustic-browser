@@ -23,6 +23,7 @@ use "../html/tree.cst" as tree;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
 use "../loader/image.cst" as image;
+use "../loader/img_source.cst" as source;
 use "./forms.cst" as forms;
 use "../loader/svg_image.cst" as svg_image;
 use "../loader/net.cst" as net;
@@ -325,7 +326,14 @@ fn _fetch_image(p as *Page, u as *u8, n as i64) as void {
 
 // What layout calls to find an image, by the URL it has.
 fn _image_for(user as *u8, u as *u8, n as i64) as *dl.Image {
-    let is *Loaded as l = _find(cast(*Page, user), u, n);
+    let is *Page as p = cast(*Page, user);
+    let is *Loaded as l with mut = _find(p, u, n);
+    // Not asked for when the page loaded: a <picture> choosing another at this size, or the
+    // src of one whose choice failed. It is fetched while there is still time for it.
+    if (l == null) {
+        _fetch_image(p, u, n);
+        l = _find(p, u, n);
+    }
     if (l == null || l.ok == 0) { return cast(*dl.Image, 0); }
     return &l.img;
 }
@@ -351,10 +359,12 @@ fn _load_images(p as *Page) as void {
             let is *u8 as li = _value_url(st, pr.P_LIST_STYLE_IMAGE);
             if (li != null && st.v.i[pr.P_DISPLAY] == pr.K_LIST_ITEM) { _fetch_image(p, li, url.len_of(li)); }
             if (x.ns == dom.NS_HTML && x.tag == tg.IMG) {
-                let is *dom.Attr as src = dom.find_attr(x, "src", 3);
-                if (src != null && src.value_len > 0) {
+                let is i64 as un with mut = 0;
+                let is f64 as density with mut = 1.0;
+                let is *u8 as u = source.pick(&p.docs_a, x, p.vw, p.vh, &un, &density);
+                if (u != cast(*u8, 0)) {
                     let is [MAX_URL]u8 as abs with mut;
-                    let is i64 as m = url.resolve(cast(*u8, &p.base), src.value, src.value_len, cast(*u8, &abs), MAX_URL);
+                    let is i64 as m = url.resolve(cast(*u8, &p.base), u, un, cast(*u8, &abs), MAX_URL);
                     if (m >= 0) { _fetch_image(p, cast(*u8, &abs), m); }
                 }
             }
@@ -571,6 +581,8 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     if (p.loaded == 0) { return; }
     let is i64 as resized = cast(i64, vw != p.engine.vw || vh != p.engine.vh);
     if (resized == 1 && p.engine.viewport == 1) { _style_again(p, vw, vh); }
+    // A window of another size may choose other files, and it can wait for them.
+    if (resized == 1) { p.budget_end = time.now_ms() + IMAGE_BUDGET_MS; }
     arena.free(&p.box_a);
     arena.free(&p.tmp_a);
     arena.free(&p.paint_a);
