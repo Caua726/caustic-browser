@@ -233,6 +233,11 @@ fn _get_data(u as *u8, r as *Resource) as i64 {
 }
 
 fn _get_http(u as *u8, r as *Resource) as i64 {
+    return _exchange(u, cast(*u8, 0), cast(*u8, 0), 0, cast(*u8, 0), cast(*u8, 0), r);
+}
+
+// With a body when ctype is not null: a POST, otherwise a GET.
+fn _exchange(u as *u8, ctype as *u8, body as *u8, n0 as i64, origin as *u8, referer as *u8, r as *Resource) as i64 {
     _setup();
     if (_ready != 2 && _starts(u, "https:") == 1) {
         r.error = "Não há certificados confiáveis neste sistema";
@@ -244,7 +249,9 @@ fn _get_http(u as *u8, r as *Resource) as i64 {
         return 0 - 1;
     }
     fetch.fetch_set_jar(f, &_jar);
-    let is i64 as rc = fetch.fetch_get(f, u, conn.deadline_in(DEADLINE_MS));
+    let is i64 as rc with mut = 0;
+    if (cast(i64, ctype) != 0) { rc = fetch.fetch_post(f, u, ctype, body, n0, origin, referer, conn.deadline_in(DEADLINE_MS)); }
+    else { rc = fetch.fetch_get(f, u, conn.deadline_in(DEADLINE_MS)); }
     if (rc != 0) {
         r.error = fetch.fetch_err_name(rc);
         fetch.fetch_free(f);
@@ -270,6 +277,16 @@ fn _get_http(u as *u8, r as *Resource) as i64 {
     r.len = n;
     fetch.fetch_free(f);
     return 0;
+}
+
+// A form's body sent to u, and the answer into r, as get does. Only HTTP has anywhere to
+// send one: anything else is just read.
+fn post(u as *u8, ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8, r as *Resource) as i64 {
+    if (_starts(u, "http:") == 1 || _starts(u, "https:") == 1) {
+        _init(r, u);
+        return _exchange(u, ctype, body, n, origin, referer, r);
+    }
+    return get(u, r);
 }
 
 // The bytes at u, into r. 0, or -1 with r.error saying why. r is free()d either way.

@@ -120,6 +120,15 @@ let is i64 as _pend_push with mut = 0;
 let is i64 as _pend_mode with mut = 0;
 let is f64 as _pend_y with mut = 0.0;
 let is [MAX_URL]u8 as _pend_url with mut;
+// A form's body to go with it. It has to outlast the page that made it, which the load
+// replaces before it sends anything.
+let is i64 as MAX_POST with imut = 4194304;
+let is i64 as _pend_post with mut = 0;
+let is *u8 as _pend_body with mut = cast(*u8, 0);
+let is i64 as _pend_body_n with mut = 0;
+let is [128]u8 as _pend_type with mut;
+let is [MAX_URL]u8 as _pend_origin with mut;
+let is [MAX_URL]u8 as _pend_referer with mut;
 
 fn _doc(i as i64) as *Doc { return &br.docs[br.order[i]]; }
 
@@ -289,6 +298,7 @@ fn _reload() as void {
     }
     _request(d, _hist_url(d, d.hist_at), 0, pv.scroll_y(br.t, d.view));
     _pend_mode = GO_RELOAD;
+    _pend_post = 0;
 }
 
 // Opens down and to the left, so it stays inside the window at its right edge.
@@ -438,6 +448,7 @@ fn _request(d as *Doc, u as *u8, push as i64, y as f64) as void {
     _pend_slot = _slot_of(d);
     _pend_push = push;
     _pend_mode = GO_PLAIN;
+    _pend_post = 0;
     _pend_y = y;
     _copy_cut(cast(*u8, &_pend_url), u, MAX_URL);
 }
@@ -576,6 +587,7 @@ fn _history_step(by as i64) as void {
     d.hist_at = at;
     _request(d, _hist_url(d, at), 0, d.hist_y[at]);
     _pend_mode = GO_HISTORY;
+    _pend_post = 0;
 }
 
 // The textures of what a tab shows: they have to go while there is still a device.
@@ -694,7 +706,9 @@ fn _service() as void {
     let is [MAX_URL]u8 as u with mut;
     _copy_cut(cast(*u8, &u), cast(*u8, &_pend_url), MAX_URL);
 
-    if (_is_same_document(d, cast(*u8, &u)) == 1) {
+    let is i64 as posting = _pend_post;
+    _pend_post = 0;
+    if (posting == 0 && _is_same_document(d, cast(*u8, &u)) == 1) {
         if (push == 1) { _push_history(d, cast(*u8, &u)); }
         _copy_cut(cast(*u8, &d.pg.url), cast(*u8, &u), pg.MAX_URL);
         if (_go_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
@@ -720,6 +734,13 @@ fn _service() as void {
     _release_images(d);
     // Nothing can be drawn from the old list while the new page replaces its memory.
     dl.clear(&d.list);
+    if (posting == 1) {
+        let is *u8 as origin with mut = cast(*u8, &_pend_origin);
+        if (_pend_origin[0] == 0) { origin = "null"; }
+        let is *u8 as referer with mut = cast(*u8, &_pend_referer);
+        if (_pend_referer[0] == 0) { referer = cast(*u8, 0); }
+        pg.post_next(cast(*u8, &_pend_type), _pend_body, _pend_body_n, origin, referer);
+    }
     pg.load(d.pg, cast(*u8, &u), w, h);
     if (push == 1) { _push_history(d, cast(*u8, &d.pg.url)); }
     _lay_out(d);
@@ -1051,10 +1072,75 @@ fn _submit(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
     let is [MAX_URL]u8 as to with mut;
     let is i64 as n = forms.submit_url(&d.pg.doc, form, submitter, cast(*u8, &d.pg.base), cast(*u8, &to), MAX_URL);
     if (n == forms.NEEDS_POST) {
-        _say("Este formulário usa POST, que o navegador ainda não envia");
+        _submit_post(d, form, submitter);
         return;
     }
     if (n > 0) { _request(d, cast(*u8, &to), 1, 0.0); }
+}
+
+// How much of a page's address is its origin: scheme, host and port. 0 when it has none
+// worth telling anyone about, which is anything but HTTP.
+fn _origin_len(u as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    if (u[0] != 104 || u[1] != 116 || u[2] != 116 || u[3] != 112) { return 0; }
+    while (u[i] != 0 && u[i] != 58) { i = i + 1; }
+    if (u[i] != 58 || u[i + 1] != 47 || u[i + 2] != 47) { return 0; }
+    i = i + 3;
+    while (u[i] != 0 && u[i] != 47 && u[i] != 63 && u[i] != 35) { i = i + 1; }
+    return i;
+}
+
+fn _submit_post(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
+    if (_pend_body == cast(*u8, 0)) {
+        _pend_body = mem.core.mmap_anon(MAX_POST);
+        let is i64 as got = cast(i64, _pend_body);
+        if (got == 0 || got == 0 - 1) {
+            _pend_body = cast(*u8, 0);
+            _say(NO_ROOM);
+            return;
+        }
+    }
+    let is [MAX_URL]u8 as to with mut;
+    let is *dom.Document as doc = &d.pg.doc;
+    if (forms.post_url(form, submitter, cast(*u8, &d.pg.base), cast(*u8, &to), MAX_URL) <= 0) { return; }
+    let is i64 as n = forms.post_body(doc, form, submitter, _pend_body, MAX_POST, cast(*u8, &_pend_type));
+    if (n < 0) {
+        _say("O formulário é grande demais para enviar");
+        return;
+    }
+    _pend_body_n = n;
+    // Who is asking: the origin, and the page too when it goes to the same place.
+    let is *u8 as here = cast(*u8, &d.pg.url);
+    let is i64 as on = _origin_len(here);
+    let is i64 as k with mut = 0;
+    while (k < on) {
+        _pend_origin[k] = here[k];
+        k = k + 1;
+    }
+    _pend_origin[k] = cast(u8, 0);
+    let is i64 as same with mut = cast(i64, on > 0 && on == _origin_len(cast(*u8, &to)));
+    k = 0;
+    while (same == 1 && k < on) {
+        if (here[k] != to[k]) { same = 0; }
+        k = k + 1;
+    }
+    k = 0;
+    if (same == 1) {
+        while (here[k] != 0 && here[k] != 35 && k < MAX_URL - 1) {
+            _pend_referer[k] = here[k];
+            k = k + 1;
+        }
+    } else if (on > 0) {
+        while (k < on) {
+            _pend_referer[k] = here[k];
+            k = k + 1;
+        }
+        _pend_referer[k] = cast(u8, 47);
+        k = k + 1;
+    }
+    _pend_referer[k] = cast(u8, 0);
+    _request(d, cast(*u8, &to), 1, 0.0);
+    _pend_post = 1;
 }
 
 let is i64 as _sel_menu with mut = 0;

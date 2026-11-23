@@ -493,6 +493,21 @@ fn _read_head(p as *Page) as void {
 
 // The page at u, replacing whatever was here. There is always a document afterwards, if
 // only one saying what went wrong. It has no boxes until relayout.
+// The next load sends this body, and all of it is the caller's until then.
+let is *u8 as _post_type with mut = cast(*u8, 0);
+let is *u8 as _post_body with mut = cast(*u8, 0);
+let is i64 as _post_n with mut = 0;
+let is *u8 as _post_origin with mut = cast(*u8, 0);
+let is *u8 as _post_referer with mut = cast(*u8, 0);
+
+fn post_next(ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8) as void {
+    _post_type = ctype;
+    _post_body = body;
+    _post_n = n;
+    _post_origin = origin;
+    _post_referer = referer;
+}
+
 fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
     unload(p);
     _start_document(p);
@@ -504,7 +519,13 @@ fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
     let is net.Resource as r with mut;
     let is *u8 as src with mut = cast(*u8, 0);
     let is i64 as n with mut = 0;
-    let is i64 as have = cast(i64, net.get(u, &r) == 0);
+    let is i64 as have with mut = 0;
+    if (cast(i64, _post_type) != 0) {
+        have = cast(i64, net.post(u, _post_type, _post_body, _post_n, _post_origin, _post_referer, &r) == 0);
+        _post_type = cast(*u8, 0);
+    } else {
+        have = cast(i64, net.get(u, &r) == 0);
+    }
     if (have == 0) {
         src = _error_page(p, r.error, &n);
     } else {

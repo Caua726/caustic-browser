@@ -430,7 +430,48 @@ fn _encode(out as *u8, w0 as i64, cap as i64, s as *u8, n as i64) as i64 {
     return w;
 }
 
+// The separator of a multipart body being written, null for the other kinds.
+let is *u8 as _boundary with mut = cast(*u8, 0);
+let is *u8 as BOUNDARY with imut = "----CausticFormBoundary7MA4YWxkTrZu0gW";
+
+fn _put(out as *u8, w0 as i64, cap as i64, s as *u8, n as i64) as i64 {
+    if (w0 < 0 || w0 + n >= cap) { return 0 - 1; }
+    if (n > 0) { mem.core.memcpy(&out[w0], s, n); }
+    return w0 + n;
+}
+
+fn _put_str(out as *u8, w0 as i64, cap as i64, s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return _put(out, w0, cap, s, n);
+}
+
+// A name inside its quotes: what would end them, or the line, written as a form must.
+fn _put_quoted(out as *u8, w0 as i64, cap as i64, s as *u8, n as i64) as i64 {
+    let is i64 as w with mut = w0;
+    let is i64 as i with mut = 0;
+    while (i < n && w >= 0) {
+        if (s[i] == 34) { w = _put(out, w, cap, "%22", 3); }
+        else if (s[i] == 13) { w = _put(out, w, cap, "%0D", 3); }
+        else if (s[i] == 10) { w = _put(out, w, cap, "%0A", 3); }
+        else { w = _put(out, w, cap, &s[i], 1); }
+        i = i + 1;
+    }
+    return w;
+}
+
+fn _part(out as *u8, w0 as i64, cap as i64, name as *dom.Attr, val as *u8, n as i64) as i64 {
+    let is i64 as w with mut = _put_str(out, w0, cap, "--");
+    w = _put_str(out, w, cap, _boundary);
+    w = _put_str(out, w, cap, "\r\nContent-Disposition: form-data; name=\"");
+    w = _put_quoted(out, w, cap, name.value, name.value_len);
+    w = _put_str(out, w, cap, "\"\r\n\r\n");
+    w = _put(out, w, cap, val, n);
+    return _put_str(out, w, cap, "\r\n");
+}
+
 fn _field(out as *u8, w0 as i64, cap as i64, name as *dom.Attr, val as *u8, n as i64, first as *i64) as i64 {
+    if (cast(i64, _boundary) != 0) { return _part(out, w0, cap, name, val, n); }
     let is i64 as w with mut = w0;
     if (w < 0 || w + 2 >= cap) { return 0 - 1; }
     if (*first == 0) {
@@ -445,13 +486,10 @@ fn _field(out as *u8, w0 as i64, cap as i64, name as *dom.Attr, val as *u8, n as
 }
 
 // The URL submitting a form goes to, in out: its length, -1 when it will not fit, or
-// NEEDS_POST for the method the network library cannot send a body with.
+// NEEDS_POST for a form whose body goes separately: see post_url and post_body.
 fn submit_url(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, base as *u8, out as *u8, cap as i64) as i64 {
-    if (_attr_is(form, "method", 6, "post") == 1) { return NEEDS_POST; }
-    let is *dom.Attr as action = dom.find_attr(form, "action", 6);
-    let is i64 as w with mut = 0;
-    if (action != null && action.value_len > 0) { w = url.resolve(base, action.value, action.value_len, out, cap); }
-    else { w = url.resolve(base, "", 0, out, cap); }
+    if (_is_post(form, submitter) == 1) { return NEEDS_POST; }
+    let is i64 as w with mut = _action_url(form, submitter, base, out, cap);
     if (w < 0) { return w; }
     // Whatever query or fragment it had, the form's own takes its place.
     let is i64 as k with mut = 0;
@@ -460,6 +498,98 @@ fn submit_url(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, bas
     if (w + 2 >= cap) { return 0 - 1; }
     out[w] = cast(u8, 63);
     w = w + 1;
+    _boundary = cast(*u8, 0);
+    w = _fields(d, form, submitter, out, w, cap);
+    if (w < 0 || w >= cap) { return 0 - 1; }
+    out[w] = cast(u8, 0);
+    return w;
+}
+
+// A button may ask for another method and another address than its form's.
+fn _is_post(form as *dom.Node, submitter as *dom.Node) as i64 {
+    if (submitter != null && dom.find_attr(submitter, "formmethod", 10) != null) {
+        return _attr_is(submitter, "formmethod", 10, "post");
+    }
+    return _attr_is(form, "method", 6, "post");
+}
+
+fn _action_url(form as *dom.Node, submitter as *dom.Node, base as *u8, out as *u8, cap as i64) as i64 {
+    let is *dom.Attr as action with mut = cast(*dom.Attr, 0);
+    if (submitter != null) { action = dom.find_attr(submitter, "formaction", 10); }
+    if (action == null) { action = dom.find_attr(form, "action", 6); }
+    if (action != null && action.value_len > 0) { return url.resolve(base, action.value, action.value_len, out, cap); }
+    return url.resolve(base, "", 0, out, cap);
+}
+
+// Where a POST goes, without any fragment, which never reaches the server.
+fn post_url(form as *dom.Node, submitter as *dom.Node, base as *u8, out as *u8, cap as i64) as i64 {
+    let is i64 as w = _action_url(form, submitter, base, out, cap);
+    if (w < 0) { return w; }
+    let is i64 as k with mut = 0;
+    while (k < w && out[k] != 35) { k = k + 1; }
+    out[k] = cast(u8, 0);
+    return k;
+}
+
+// The body of a POST and what to call it. The bytes it comes to, or below 0 when they
+// will not fit in cap. A form that asks for text/plain gets the common kind: it is meant
+// for people reading mail, and a server has to expect it to be anything.
+fn post_body(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, out as *u8, cap as i64, ctype as *u8) as i64 {
+    let is *dom.Attr as how with mut = cast(*dom.Attr, 0);
+    if (submitter != null) { how = dom.find_attr(submitter, "formenctype", 11); }
+    let is i64 as multipart with mut = 0;
+    if (how != null) { multipart = _attr_is(submitter, "formenctype", 11, "multipart/form-data"); }
+    else { multipart = _attr_is(form, "enctype", 7, "multipart/form-data"); }
+    if (multipart == 0) {
+        _boundary = cast(*u8, 0);
+        _put_str(ctype, 0, 128, "application/x-www-form-urlencoded");
+        ctype[33] = cast(u8, 0);
+        let is i64 as w = _fields(d, form, submitter, out, 0, cap);
+        return w;
+    }
+    _boundary = BOUNDARY;
+    let is i64 as tn = _put_str(ctype, 0, 128, "multipart/form-data; boundary=");
+    let is i64 as te = _put_str(ctype, tn, 128, BOUNDARY);
+    ctype[te] = cast(u8, 0);
+    let is i64 as w with mut = _fields(d, form, submitter, out, 0, cap);
+    w = _put_str(out, w, cap, "--");
+    w = _put_str(out, w, cap, BOUNDARY);
+    w = _put_str(out, w, cap, "--\r\n");
+    _boundary = cast(*u8, 0);
+    return w;
+}
+
+// A <textarea>'s lines end in CR LF on the way out, however they ended on the way in.
+fn _area_field(d as *dom.Document, x as *dom.Node, out as *u8, w0 as i64, cap as i64, name as *dom.Attr, first as *i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is *u8 as v = value_of(d, x, &n);
+    let is i64 as room = n * 2 + 1;
+    let is *u8 as lines = mem.core.mmap_anon(room);
+    let is i64 as got = cast(i64, lines);
+    if (got == 0 || got == 0 - 1) { return 0 - 1; }
+    let is i64 as m with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is u8 as c = v[i];
+        if (c == 13 || c == 10) {
+            lines[m] = cast(u8, 13);
+            lines[m + 1] = cast(u8, 10);
+            m = m + 2;
+            if (c == 13 && i + 1 < n && v[i + 1] == 10) { i = i + 1; }
+        } else {
+            lines[m] = c;
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    let is i64 as w = _field(out, w0, cap, name, lines, m, first);
+    mem.core.munmap(lines, room);
+    return w;
+}
+
+// What a form sends, each control that counts in document order, from w0 on in out.
+fn _fields(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, out as *u8, w0 as i64, cap as i64) as i64 {
+    let is i64 as w with mut = w0;
     let is i64 as first with mut = 1;
     let is *dom.Node as root = d.node;
     let is *dom.Node as x with mut = next_element(root, root);
@@ -469,7 +599,9 @@ fn submit_url(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, bas
         let is i64 as hidden = cast(i64, x.ns == dom.NS_HTML && x.tag == tg.INPUT && _attr_is(x, "type", 4, "hidden") == 1);
         if (name != null && name.value_len > 0 && (k2 != NONE || hidden == 1) && is_disabled(x) == 0 && form_of(d, x) == form) {
             let is i64 as n with mut = 0;
-            if (hidden == 1 || k2 == TEXT || k2 == AREA) {
+            if (k2 == AREA) {
+                w = _area_field(d, x, out, w, cap, name, &first);
+            } else if (hidden == 1 || k2 == TEXT) {
                 let is *u8 as v = value_of(d, x, &n);
                 w = _field(out, w, cap, name, v, n, &first);
             } else if (k2 == RANGE) {
@@ -499,8 +631,6 @@ fn submit_url(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, bas
         }
         x = next_element(root, x);
     }
-    if (w < 0 || w >= cap) { return 0 - 1; }
-    out[w] = cast(u8, 0);
     return w;
 }
 
