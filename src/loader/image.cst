@@ -5,13 +5,81 @@
 // little-endian machines this runs on is the second of the pair.
 
 use "caustic-image/decode.cst" as dec;
+use "caustic-image/formats/gif.cst" as gif;
 use "caustic-image/core/image.cst" as cimg;
 use "caustic-image/core/pixfmt.cst" as pf;
 use "../paint/display_list.cst" as dl;
 use "std/mem.cst" as mem;
 
+// More frames than this comes to, in memory, and it is shown still: its frames are kept
+// whole, and a long one at a large size is a lot of them.
+let is i64 as MAX_ANIM_BYTES with imut = 268435456;
+
+fn _still(im as *dl.Image) as void {
+    im.anim = cast(*u8, 0);
+    im.frame = 0;
+    im.frame_due = 0;
+    im.frame_up = 0;
+    im.moved = 0;
+}
+
+// A GIF of more than one frame into im, ready to run. 0 when it is not one, for the
+// ordinary way to read it.
+fn _decode_moving(data as *u8, len as i64, im as *dl.Image) as i64 {
+    if (len < 6 || data[0] != 71 || data[1] != 73 || data[2] != 70) { return 0; }
+    let is *gif.GifAnim as a = cast(*gif.GifAnim, mem.core.mmap_anon(sizeof(gif.GifAnim)));
+    let is i64 as got = cast(i64, a);
+    if (got == 0 || got == 0 - 1) { return 0; }
+    if (gif.gif_decode_anim(data, len, a) != 0) {
+        mem.core.munmap(cast(*u8, a), sizeof(gif.GifAnim));
+        return 0;
+    }
+    if (a.count < 2 || a.count * a.width * a.height * 4 > MAX_ANIM_BYTES) {
+        gif.gif_anim_free(a);
+        mem.core.munmap(cast(*u8, a), sizeof(gif.GifAnim));
+        return 0;
+    }
+    im.anim = cast(*u8, a);
+    im.frame = 0;
+    im.frame_due = 0;
+    im.frame_up = 0;
+    im.moved = 0;
+    im.pixels = gif.gif_anim_frame(a, 0);
+    im.width = a.width;
+    im.height = a.height;
+    im.tex = 0;
+    im.nat_w = cast(f64, a.width);
+    im.nat_h = cast(f64, a.height);
+    im.sized = 1;
+    im.keeps_shape = 0;
+    im.mask_tex = 0;
+    return 1;
+}
+
+// Onto its next frame, if it is time. 1 when it moved. A delay of nothing, or next to it,
+// is how old files say "as fast as you can", and every browser reads it as a tenth of a second.
+fn step(im as *dl.Image, now as i64) as i64 {
+    if (cast(i64, im.anim) == 0) { return 0; }
+    let is *gif.GifAnim as a = cast(*gif.GifAnim, im.anim);
+    if (im.frame_due == 0) { im.frame_due = now + _delay_of(a, im.frame); }
+    if (now < im.frame_due) { return 0; }
+    im.frame = (im.frame + 1) % a.count;
+    im.pixels = gif.gif_anim_frame(a, im.frame);
+    im.frame_due = now + _delay_of(a, im.frame);
+    im.moved = 1;
+    return 1;
+}
+
+fn _delay_of(a as *gif.GifAnim, i as i64) as i64 {
+    let is i64 as cs = *cast(*i64, a.delays + i * 8);
+    if (cs <= 1) { return 100; }
+    return cs * 10;
+}
+
 // len bytes into im. 1, or 0 when they are not an image this can read.
 fn decode(data as *u8, len as i64, im as *dl.Image) as i64 {
+    if (_decode_moving(data, len, im) == 1) { return 1; }
+    _still(im);
     let is cimg.Image as src with mut;
     if (dec.decode(data, len, &src) != 0) { return 0; }
     let is i64 as w = src.width;
@@ -75,6 +143,13 @@ fn decode(data as *u8, len as i64, im as *dl.Image) as i64 {
 }
 
 fn free(im as *dl.Image) as void {
+    if (cast(i64, im.anim) != 0) {
+        gif.gif_anim_free(cast(*gif.GifAnim, im.anim));
+        mem.core.munmap(im.anim, sizeof(gif.GifAnim));
+        im.anim = cast(*u8, 0);
+        im.pixels = cast(*u8, 0);
+        return;
+    }
     if (im.pixels != null) { mem.core.munmap(im.pixels, im.width * im.height * 4); }
     im.pixels = cast(*u8, 0);
 }

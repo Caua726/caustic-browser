@@ -23,6 +23,7 @@ use "../html/tree.cst" as tree;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
 use "../loader/image.cst" as image;
+use "./forms.cst" as forms;
 use "../loader/svg_image.cst" as svg_image;
 use "../loader/net.cst" as net;
 use "../loader/url.cst" as url;
@@ -99,6 +100,7 @@ fn _copy_url(to as *u8, from as *u8) as void {
 // have to be gone before this, by whoever made them.
 fn unload(p as *Page) as void {
     if (p.loaded == 0) { return; }
+    forms.files_forget(&p.doc);
     let is *Loaded as l with mut = p.images;
     while (l != null) {
         if (l.ok == 1) { image.free(&l.img); }
@@ -624,7 +626,36 @@ fn moved_area(p as *Page, x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as i64
 // Whether anything on the page is still to move.
 fn moving(p as *Page) as i64 {
     if (p.loaded == 0) { return 0; }
+    if (anim.active(&p.motion) == 1) { return 1; }
+    return _has_moving_image(p);
+}
+
+// Whether CSS has anything moving, which is what costs a new list every frame.
+fn css_moving(p as *Page) as i64 {
+    if (p.loaded == 0) { return 0; }
     return anim.active(&p.motion);
+}
+
+fn _has_moving_image(p as *Page) as i64 {
+    let is *Loaded as l with mut = p.images;
+    while (l != null) {
+        if (l.ok == 1 && cast(i64, l.img.anim) != 0) { return 1; }
+        l = l.next;
+    }
+    return 0;
+}
+
+// Every image that moves onto the frame it should be on. 1 when one changed.
+fn images_step(p as *Page) as i64 {
+    if (p.loaded == 0) { return 0; }
+    let is i64 as now = time.now_ms();
+    let is i64 as changed with mut = 0;
+    let is *Loaded as l with mut = p.images;
+    while (l != null) {
+        if (l.ok == 1 && image.step(&l.img, now) == 1) { changed = 1; }
+        l = l.next;
+    }
+    return changed;
 }
 
 // --- Asking about it ---

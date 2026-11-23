@@ -623,6 +623,7 @@ fn _box_decorations(p as *Painter, b as *bx.Box, alpha as f64) as void {
     _background(p, b, b.ax, b.ay, w, h, alpha);
     _border(p, b, b.ax, b.ay, w, h, alpha);
     if (b.control == bx.CTL_SELECT) { _select_arrow(p, b, alpha); }
+    if (b.control == bx.CTL_FILE) { _file_button(p, b, b.ax, b.ay, h, alpha); }
     if (b.control == bx.CTL_DATE) {
         _date_icon(p, b, alpha);
         _date_part_mark(p, b, alpha);
@@ -920,6 +921,25 @@ fn _date_part_mark(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
     let is f64 as y = b.ay + bx.border_h(b) / 2.0 - h / 2.0;
     _round(_rect(p, x + x0 - 1.0, y, x1 - x0 + 2.0, h, _accent(b), alpha * 0.25), 3.0);
+}
+
+// The button at the start of a file control, around the first of its words.
+fn _file_button(p as *Painter, b as *bx.Box, x as f64, y as f64, h as f64, alpha as f64) as void {
+    let is *u8 as family = cast(*u8, b.st.v.i[pr.P_FONT_FAMILY]);
+    let is f64 as em = b.st.v.f[pr.P_FONT_SIZE];
+    let is i64 as weight = cast(i64, b.st.v.f[pr.P_FONT_WEIGHT]);
+    let is f64 as w = m.text_width("Escolher arquivo", 16, family, em, weight, 0) + b.p[bx.LEFT] * 2.0;
+    let is i64 as col with mut = 4293914607;    // #efefef
+    if (b.node != null && forms.is_disabled(b.node) == 0) {
+        if ((b.node.flags & dom.FLAG_ACTIVE) != 0) { col = 4294309365; }        // #f5f5f5
+        else if ((b.node.flags & dom.FLAG_HOVER) != 0) { col = 4293256677; }    // #e5e5e5
+    }
+    _round(_rect(p, x, y, w, h, col, alpha), 3.0);
+    let is *dl.Cmd as e = dl.stroke(p.l, x, y, w, h, 1.0, 7763574, alpha);
+    if (e != null) {
+        e.fixed = p.fixed;
+        _round(e, 3.0);
+    }
 }
 
 fn _date_icon(p as *Painter, b as *bx.Box, alpha as f64) as void {

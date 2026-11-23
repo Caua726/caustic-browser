@@ -123,6 +123,8 @@ let is [MAX_URL]u8 as _pend_url with mut;
 // A form's body to go with it. It has to outlast the page that made it, which the load
 // replaces before it sends anything.
 let is i64 as MAX_POST with imut = 4194304;
+let is i64 as MAX_UPLOAD with imut = 536870912;
+let is i64 as _pend_body_cap with mut = 0;
 let is i64 as _pend_post with mut = 0;
 let is *u8 as _pend_body with mut = cast(*u8, 0);
 let is i64 as _pend_body_n with mut = 0;
@@ -701,6 +703,8 @@ fn _service() as void {
     _hush();
     if (_ed_doc == d) { _close_editor(); }
     if (_cal_doc == d) { _cal_doc = cast(*Doc, 0); }
+    if (_color_doc == d) { _color_doc = cast(*Doc, 0); }
+    if (_file_doc == d) { _file_doc = cast(*Doc, 0); }
     let is i64 as push = _pend_push;
     let is f64 as y0 = _pend_y;
     let is [MAX_URL]u8 as u with mut;
@@ -790,21 +794,61 @@ fn _restyle(d as *Doc) as void {
 
 let is i64 as _motion_id with mut = 0;
 
+// Whatever shows a picture that changed, drawn again. Only what the window can see counts.
+fn _images_moved(d as *Doc) as void {
+    let is f64 as sy = pv.scroll_y(br.t, d.view);
+    let is f64 as vw with mut = 0.0;
+    let is f64 as vh with mut = 0.0;
+    _view_size(d, &vw, &vh);
+    let is i64 as any with mut = 0;
+    let is f64 as x0 with mut = 0.0;
+    let is f64 as y0 with mut = 0.0;
+    let is f64 as x1 with mut = 0.0;
+    let is f64 as y1 with mut = 0.0;
+    let is i64 as n = dl.count(&d.list);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *dl.Cmd as c = dl.at(&d.list, i);
+        if (c.kind == dl.IMAGE && c.img.moved == 1) {
+            let is f64 as top with mut = c.y;
+            if (c.fixed == 1) { top = top + sy; }
+            if (top < sy + vh && top + c.h > sy) {
+                if (any == 0 || c.x < x0) { x0 = c.x; }
+                if (any == 0 || top < y0) { y0 = top; }
+                if (any == 0 || c.x + c.w > x1) { x1 = c.x + c.w; }
+                if (any == 0 || top + c.h > y1) { y1 = top + c.h; }
+                any = 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        let is *dl.Cmd as c = dl.at(&d.list, i);
+        if (c.kind == dl.IMAGE) { c.img.moved = 0; }
+        i = i + 1;
+    }
+    if (any == 1) { pv.set_list_part(br.t, d.view, &d.list, x0, y0, x1, y1); }
+}
+
 fn _motion_due(user as *u8) as void {
     let is i64 as still with mut = 0;
     if (br.n > 0 && ui.app.window_valid(br.a, br.win) == 1) {
         let is *Doc as d = _doc(br.cur);
         if (_has_page(d) == 1 && pg.moving(d.pg) == 1) {
             still = 1;
-            dl.snap(&d.list, &_shown);
-            if (pg.tick(d.pg, &d.list, pv.scroll_y(br.t, d.view)) == 1) {
-                let is f64 as x0 with mut = 0.0;
-                let is f64 as y0 with mut = 0.0;
-                let is f64 as x1 with mut = 0.0;
-                let is f64 as y1 with mut = 0.0;
-                if (pg.moved_area(d.pg, &x0, &y0, &x1, &y1) == 1) { pv.set_list_part(br.t, d.view, &d.list, x0, y0, x1, y1); }
-                else { pv.set_list_changed(br.t, d.view, &d.list, &_shown); }
+            if (pg.css_moving(d.pg) == 1) {
+                dl.snap(&d.list, &_shown);
+                if (pg.tick(d.pg, &d.list, pv.scroll_y(br.t, d.view)) == 1) {
+                    let is f64 as x0 with mut = 0.0;
+                    let is f64 as y0 with mut = 0.0;
+                    let is f64 as x1 with mut = 0.0;
+                    let is f64 as y1 with mut = 0.0;
+                    if (pg.moved_area(d.pg, &x0, &y0, &x1, &y1) == 1) { pv.set_list_part(br.t, d.view, &d.list, x0, y0, x1, y1); }
+                    else { pv.set_list_changed(br.t, d.view, &d.list, &_shown); }
+                }
             }
+            if (pg.images_step(d.pg) == 1) { _images_moved(d); }
         }
     }
     if (still == 0 && _motion_id != 0) {
@@ -1091,11 +1135,20 @@ fn _origin_len(u as *u8) as i64 {
 }
 
 fn _submit_post(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
-    if (_pend_body == cast(*u8, 0)) {
-        _pend_body = mem.core.mmap_anon(MAX_POST);
+    // What the fields take, and the files on top.
+    let is i64 as room = MAX_POST + forms.files_size(&d.pg.doc, form);
+    if (room > MAX_UPLOAD) {
+        _say("Os arquivos são grandes demais para enviar");
+        return;
+    }
+    if (room > _pend_body_cap) {
+        if (_pend_body != cast(*u8, 0)) { mem.core.munmap(_pend_body, _pend_body_cap); }
+        _pend_body = mem.core.mmap_anon(room);
+        _pend_body_cap = room;
         let is i64 as got = cast(i64, _pend_body);
         if (got == 0 || got == 0 - 1) {
             _pend_body = cast(*u8, 0);
+            _pend_body_cap = 0;
             _say(NO_ROOM);
             return;
         }
@@ -1103,7 +1156,7 @@ fn _submit_post(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
     let is [MAX_URL]u8 as to with mut;
     let is *dom.Document as doc = &d.pg.doc;
     if (forms.post_url(form, submitter, cast(*u8, &d.pg.base), cast(*u8, &to), MAX_URL) <= 0) { return; }
-    let is i64 as n = forms.post_body(doc, form, submitter, _pend_body, MAX_POST, cast(*u8, &_pend_type));
+    let is i64 as n = forms.post_body(doc, form, submitter, _pend_body, _pend_body_cap, cast(*u8, &_pend_type));
     if (n < 0) {
         _say("O formulário é grande demais para enviar");
         return;
@@ -1419,6 +1472,33 @@ fn _can_follow(u as *u8, n as i64) as i64 {
 }
 
 // What a click on an element does, from it upward, to the first thing that does anything.
+let is ui.dialog.Ref as _file_dialog with mut;
+let is i64 as _file_dialog_made with mut = 0;
+let is *Doc as _file_doc with mut = cast(*Doc, 0);
+let is *dom.Node as _file_node with mut = cast(*dom.Node, 0);
+
+fn _file_chosen(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    if (*cast(*i64, arg) != ui.dialog.OK) { return; }
+    if (_file_doc == cast(*Doc, 0) || _has_page(_file_doc) == 0 || _file_node == null) { return; }
+    let is [4096]u8 as p with mut;
+    let is i64 as n = ui.filechooser.chosen(t, w, cast(*u8, &p), 4095);
+    if (forms.file_set(&_file_doc.pg.doc, _file_node, cast(*u8, &p), n) == 1) { _file_doc.pg.dirty = 1; }
+}
+
+fn _choose_file(d as *Doc, n as *dom.Node) as void {
+    let is *ui.tree.Tree as dt = ui.dialog.window_tree(br.t);
+    if (_file_dialog_made == 0 || ui.dialog.ref_valid(&_file_dialog) == 0) {
+        let is i64 as fc = ui.file_chooser(dt, ui.filechooser.OPEN, "Escolher arquivo");
+        if (fc == 0) { return; }
+        ui.on(dt, fc, ui.signal.ACTIVATED, fn_ptr(_file_chosen));
+        _file_dialog = ui.dialog.ref(dt, fc);
+        _file_dialog_made = 1;
+    }
+    _file_doc = d;
+    _file_node = n;
+    ui.dialog.show(_file_dialog.t, ui.router.of(_file_dialog.t), _file_dialog.w, 1);
+}
+
 fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
     let is *dom.Document as doc = &d.pg.doc;
     let is *dom.Node as x with mut = n0;
@@ -1431,6 +1511,7 @@ fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
                 d.pg.dirty = 1;
             }
             if (k == forms.COLOR) { _open_color(d, x); }
+            if (forms.is_file(x) == 1) { _choose_file(d, x); }
             if (k == forms.SUBMIT) {
                 let is *dom.Node as form = forms.form_of(doc, x);
                 if (form != null) { _submit(d, form, x); }

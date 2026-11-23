@@ -92,7 +92,7 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "input:disabled, textarea:disabled, select:disabled { background-color: rgba(239, 239, 239, 0.3); border-color: rgba(118, 118, 118, 0.3); }");
     _r(s, "input[type=checkbox]:disabled, input[type=radio]:disabled { background-color: transparent; border-color: #cbcbcb; }");
     _r(s, "input[type=date] { cursor: default; }");
-    _r(s, "input[type=file] { background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; }");
+    _r(s, "input[type=file] { border: none; border-radius: 0; background-color: transparent; padding: 3px 0 3px 8px; cursor: default; }");
     _r(s, "progress, meter { vertical-align: -0.2em; }");
     _r(s, "::placeholder { color: #757575; }");
     _r(s, "input[type=range] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; border-radius: 0; background-color: transparent; cursor: default; }");

@@ -499,6 +499,9 @@ fn _control_label(c as *bx.Ctx, b as *bx.Box, st as *style.Style, s as *u8, n as
     b.inline_ctx = 1;
 }
 
+let is *u8 as FILE_WORD with imut = "Escolher arquivo";
+let is i64 as FILE_WORD_N with imut = 16;
+
 fn _input(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     let is *dom.Attr as t = dom.find_attr(n, "type", 4);
     if (t != null && (decl.eq(t.value, t.value_len, "checkbox") == 1 || decl.eq(t.value, t.value_len, "radio") == 1)) {
@@ -534,7 +537,23 @@ fn _input(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
         return b;
     }
     if (t != null && decl.eq(t.value, t.value_len, "file") == 1) {
-        _control_label(c, b, st, "Escolher arquivo", 16, 0);
+        // The button is painted behind the start of this, which is why it starts with its word.
+        b.control = bx.CTL_FILE;
+        let is i64 as fn_n with mut = 0;
+        let is *u8 as fname with mut = forms.file_name(n, &fn_n);
+        if (fn_n == 0) {
+            fname = "Nenhum arquivo escolhido";
+            fn_n = 24;
+        }
+        let is *u8 as all = arena.alloc(c.a, fn_n + 24);
+        mem.core.memcpy(all, FILE_WORD, FILE_WORD_N);
+        let is i64 as gap with mut = FILE_WORD_N;
+        while (gap < FILE_WORD_N + 3) {
+            all[gap] = cast(u8, 32);
+            gap = gap + 1;
+        }
+        mem.core.memcpy(&all[gap], fname, fn_n);
+        _control_label(c, b, st, all, gap + fn_n, 0);
         return b;
     }
     if (t != null && decl.eq(t.value, t.value_len, "password") == 1 && val != null && val.value_len > 0) {

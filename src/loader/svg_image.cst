@@ -293,6 +293,11 @@ fn decode(data as *u8, len as i64, im as *dl.Image) as i64 {
             im.sized = sized;
             im.keeps_shape = keeps;
             im.mask_tex = 0;
+            im.anim = cast(*u8, 0);
+            im.frame = 0;
+            im.frame_due = 0;
+            im.frame_up = 0;
+            im.moved = 0;
             im.tex = 0;
             ok = 1;
         }

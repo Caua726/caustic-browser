@@ -1481,6 +1481,11 @@ fn _image(svc as *txt.Service, p as *painter.Painter, c as *dl.Cmd, x as f64, y 
         else { im.tex = 0 - 1; }
     }
     if (im.tex <= 0) { return; }
+    // A picture that moves: the frame it is on, if the texture has not got it yet.
+    if (cast(i64, im.anim) != 0 && im.frame_up != im.frame) {
+        texture.upload(svc.d, im.tex, im.pixels, im.width * im.height * 4);
+        im.frame_up = im.frame;
+    }
     draw2d.image(p.canvas, im.tex, 1, x, y, c.w, c.h, 0.0, 0.0, 1.0, 1.0, math.color.rgba(1.0, 1.0, 1.0, c.alpha));
 }
 

@@ -10,6 +10,7 @@ use "../css/props.cst" as pr;
 use "../css/style.cst" as style;
 use "../dom/dom.cst" as dom;
 use "../dom/tags.cst" as tg;
+use "../loader/file.cst" as file;
 use "../loader/url.cst" as url;
 use "std/mem.cst" as mem;
 
@@ -393,6 +394,7 @@ fn reset(d as *dom.Document, form as *dom.Node) as void {
         if ((k == TEXT || k == RANGE || k == COLOR) && form_of(d, x) == form) { _restore(d, x, "value", 5, "-x-default", 10); }
         if (k == TEXT && form_of(d, x) == form && dom.find_attr(x, "-x-date", 7) != null) { dom.remove_attr(x, "-x-date", 7); }
         if ((k == CHECK || k == RADIO) && form_of(d, x) == form) { _restore(d, x, "checked", 7, "-x-checked", 10); }
+        if (k == BUTTON && form_of(d, x) == form && is_file(x) == 1) { file_clear(x); }
         if (k == SELECT && form_of(d, x) == form) {
             let is *dom.Node as o with mut = next_option(x, cast(*dom.Node, 0));
             while (o != null) {
@@ -623,6 +625,12 @@ fn _fields(d as *dom.Document, form as *dom.Node, submitter as *dom.Node, out as
                 if (o != null) {
                     let is *u8 as v = _option_value(d, o, &n);
                     w = _field(out, w, cap, name, v, n, &first);
+                }
+            } else if (k2 == BUTTON && is_file(x) == 1) {
+                if (cast(i64, _boundary) != 0) { w = _file_part(x, out, w, cap, name); }
+                else {
+                    let is *u8 as fname = file_name(x, &n);
+                    w = _field(out, w, cap, name, fname, n, &first);
                 }
             } else if (k2 == SUBMIT && x == submitter) {
                 let is *u8 as v = value_of(d, x, &n);
@@ -994,4 +1002,147 @@ fn date_clear(d as *dom.Document, n as *dom.Node) as void {
     }
     _date_digits = 0;
     _date_put(d, n, cast(*u8, &text));
+}
+
+// --- Files ---
+//
+// The file a person chose for an <input type=file>. It is kept here and not on the element,
+// where a page's own markup could write it: a page never gets to name a file to send.
+
+let is i64 as MAX_CHOSEN with imut = 16;
+let is i64 as PATH_MAX with imut = 4096;
+
+struct _Chosen {
+    doc  as *dom.Document;
+    node as *dom.Node;
+    n    as i64;
+    path as [4096]u8;
+}
+
+let is [16]_Chosen as _chosen with mut;
+
+fn is_file(n as *dom.Node) as i64 {
+    if (n.kind != dom.ELEMENT || n.ns != dom.NS_HTML || n.tag != tg.INPUT) { return 0; }
+    return _attr_is(n, "type", 4, "file");
+}
+
+fn _chosen_of(n as *dom.Node) as *_Chosen {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CHOSEN) {
+        if (_chosen[i].node == n && n != null) { return &_chosen[i]; }
+        i = i + 1;
+    }
+    return cast(*_Chosen, 0);
+}
+
+fn file_set(d as *dom.Document, n as *dom.Node, path as *u8, len as i64) as i64 {
+    if (len <= 0 || len >= PATH_MAX) { return 0; }
+    let is *_Chosen as c with mut = _chosen_of(n);
+    if (cast(i64, c) == 0) { c = _chosen_of_free(); }
+    if (cast(i64, c) == 0) { return 0; }
+    c.doc = d;
+    c.node = n;
+    c.n = len;
+    mem.core.memcpy(cast(*u8, &c.path), path, len);
+    c.path[len] = cast(u8, 0);
+    return 1;
+}
+
+fn _chosen_of_free() as *_Chosen {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CHOSEN) {
+        if (_chosen[i].node == null) { return &_chosen[i]; }
+        i = i + 1;
+    }
+    return cast(*_Chosen, 0);
+}
+
+// The name of the file chosen, without its folders; null for none.
+fn file_name(n as *dom.Node, out_n as *i64) as *u8 {
+    let is *_Chosen as c = _chosen_of(n);
+    *out_n = 0;
+    if (cast(i64, c) == 0) { return cast(*u8, 0); }
+    let is i64 as from with mut = c.n;
+    while (from > 0 && c.path[from - 1] != 47) { from = from - 1; }
+    *out_n = c.n - from;
+    return &c.path[from];
+}
+
+fn file_clear(n as *dom.Node) as void {
+    let is *_Chosen as c = _chosen_of(n);
+    if (cast(i64, c) != 0) { c.node = cast(*dom.Node, 0); }
+}
+
+// A document's go with it, and their elements with them.
+fn files_forget(d as *dom.Document) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CHOSEN) {
+        if (_chosen[i].doc == d) { _chosen[i].node = cast(*dom.Node, 0); }
+        i = i + 1;
+    }
+}
+
+// What the files a form would send come to, for room to be made first.
+fn files_size(d as *dom.Document, form as *dom.Node) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_CHOSEN) {
+        let is *_Chosen as c = &_chosen[i];
+        if (c.node != null && c.doc == d && form_of(d, c.node) == form) {
+            let is file.File as f with mut;
+            if (file.read(cast(*u8, &c.path), &f) == 0) {
+                total = total + f.len;
+                file.free(&f);
+            }
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn _ends_with(s as *u8, n as i64, tail as *u8) as i64 {
+    let is i64 as t with mut = 0;
+    while (tail[t] != 0) { t = t + 1; }
+    if (n < t) { return 0; }
+    return decl.eq(&s[n - t], t, tail);
+}
+
+// What a server is told a file is, from its name; it can look for itself.
+fn _type_of_name(s as *u8, n as i64) as *u8 {
+    if (_ends_with(s, n, ".txt") == 1) { return "text/plain"; }
+    if (_ends_with(s, n, ".html") == 1 || _ends_with(s, n, ".htm") == 1) { return "text/html"; }
+    if (_ends_with(s, n, ".css") == 1) { return "text/css"; }
+    if (_ends_with(s, n, ".json") == 1) { return "application/json"; }
+    if (_ends_with(s, n, ".pdf") == 1) { return "application/pdf"; }
+    if (_ends_with(s, n, ".zip") == 1) { return "application/zip"; }
+    if (_ends_with(s, n, ".png") == 1) { return "image/png"; }
+    if (_ends_with(s, n, ".jpg") == 1 || _ends_with(s, n, ".jpeg") == 1) { return "image/jpeg"; }
+    if (_ends_with(s, n, ".gif") == 1) { return "image/gif"; }
+    if (_ends_with(s, n, ".webp") == 1) { return "image/webp"; }
+    if (_ends_with(s, n, ".svg") == 1) { return "image/svg+xml"; }
+    return "application/octet-stream";
+}
+
+// A file control's part of a body: with no file, empty, as a form must still send it.
+fn _file_part(x as *dom.Node, out as *u8, w0 as i64, cap as i64, name as *dom.Attr) as i64 {
+    let is i64 as fn_n with mut = 0;
+    let is *u8 as fname = file_name(x, &fn_n);
+    let is i64 as w with mut = _put_str(out, w0, cap, "--");
+    w = _put_str(out, w, cap, _boundary);
+    w = _put_str(out, w, cap, "\r\nContent-Disposition: form-data; name=\"");
+    w = _put_quoted(out, w, cap, name.value, name.value_len);
+    w = _put_str(out, w, cap, "\"; filename=\"");
+    if (fn_n > 0) { w = _put_quoted(out, w, cap, fname, fn_n); }
+    w = _put_str(out, w, cap, "\"\r\nContent-Type: ");
+    if (fn_n > 0) { w = _put_str(out, w, cap, _type_of_name(fname, fn_n)); }
+    else { w = _put_str(out, w, cap, "application/octet-stream"); }
+    w = _put_str(out, w, cap, "\r\n\r\n");
+    if (fn_n > 0 && w >= 0) {
+        let is *_Chosen as c = _chosen_of(x);
+        let is file.File as f with mut;
+        if (file.read(cast(*u8, &c.path), &f) != 0) { return 0 - 1; }
+        w = _put(out, w, cap, f.data, f.len);
+        file.free(&f);
+    }
+    return _put_str(out, w, cap, "\r\n");
 }

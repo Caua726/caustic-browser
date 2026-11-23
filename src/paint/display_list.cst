@@ -45,6 +45,12 @@ struct Image {
     sized  as i64;    // 0 when it only has a shape: nat_w by nat_h is that shape, at a plain size
     keeps_shape as i64;   // 1 when a box of another shape letterboxes it rather than stretches it
     mask_tex as i64;      // the same picture as white and how much shows, for a colour to come through
+    // One that moves: pixels is the frame it is on. See loader/image.cst.
+    anim      as *u8;     // what holds its frames, null for a still picture
+    frame     as i64;
+    frame_due as i64;     // when the next one is, in ms
+    frame_up  as i64;     // the frame in the texture
+    moved     as i64;     // 1 when it changed and that has not been drawn
 }
 
 // A gradient worked out for its box: every length is pixels by now, and each stop a place
