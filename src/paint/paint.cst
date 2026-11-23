@@ -220,15 +220,17 @@ fn hit(c as *bx.Ctx, x as f64, y as f64, sx as f64, sy as f64, node as **dom.Nod
 
 fn _bg_tiles(p as *Painter, b as *bx.Box, im as *dl.Image, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
     let is *pr.Values as s = &b.st.v;
-    let is f64 as iw with mut = cast(f64, im.width);
-    let is f64 as ih with mut = cast(f64, im.height);
+    let is f64 as iw with mut = im.nat_w;
+    let is f64 as ih with mut = im.nat_h;
     if (iw <= 0.0 || ih <= 0.0) { return; }
     let is i64 as kw = s.i[pr.P_BACKGROUND_SIZE_W];
-    if (kw == pr.K_COVER || kw == pr.K_CONTAIN) {
+    // A picture with only a shape, at no size asked for, fits the area like contain.
+    let is i64 as fits = cast(i64, im.sized == 0 && kw == pr.K_AUTO && s.i[pr.P_BACKGROUND_SIZE_H] == pr.K_AUTO);
+    if (kw == pr.K_COVER || kw == pr.K_CONTAIN || fits == 1) {
         let is f64 as sx = w / iw;
         let is f64 as sy = h / ih;
         let is f64 as k with mut = _max(sx, sy);
-        if (kw == pr.K_CONTAIN) { k = _min(sx, sy); }
+        if (kw == pr.K_CONTAIN || fits == 1) { k = _min(sx, sy); }
         iw = iw * k;
         ih = ih * k;
     } else {
@@ -682,7 +684,19 @@ fn _replaced(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
     let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
     if (b.img != null) {
-        let is *dl.Cmd as c = dl.image(p.l, x, y, b.w, b.h, b.img, alpha);
+        let is f64 as ix with mut = x;
+        let is f64 as iy with mut = y;
+        let is f64 as iw with mut = b.w;
+        let is f64 as ih with mut = b.h;
+        // A picture that keeps its shape sits in the middle of a box of another.
+        if (b.img.keeps_shape == 1 && b.w > 0.0 && b.h > 0.0) {
+            let is f64 as k = _min(b.w / b.img.nat_w, b.h / b.img.nat_h);
+            iw = b.img.nat_w * k;
+            ih = b.img.nat_h * k;
+            ix = x + (b.w - iw) / 2.0;
+            iy = y + (b.h - ih) / 2.0;
+        }
+        let is *dl.Cmd as c = dl.image(p.l, ix, iy, iw, ih, b.img, alpha);
         if (c != null) { c.fixed = p.fixed; }
         return;
     }
@@ -905,8 +919,8 @@ fn _marker(p as *Painter, b as *bx.Box, alpha as f64) as void {
     let is f64 as right = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
     let is i64 as col = st.v.i[pr.P_COLOR];
     if (b.marker == bx.MARK_IMAGE && b.mimg != null) {
-        let is f64 as w = cast(f64, b.mimg.width);
-        let is f64 as h = cast(f64, b.mimg.height);
+        let is f64 as w = b.mimg.nat_w;
+        let is f64 as h = b.mimg.nat_h;
         let is *dl.Cmd as c = dl.image(p.l, right - w - em * 0.4, base - h, w, h, b.mimg, alpha);
         if (c != null) { c.fixed = p.fixed; }
         return;

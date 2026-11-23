@@ -23,6 +23,7 @@ use "../html/tree.cst" as tree;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
 use "../loader/image.cst" as image;
+use "../loader/svg_image.cst" as svg_image;
 use "../loader/net.cst" as net;
 use "../loader/url.cst" as url;
 use "../paint/display_list.cst" as dl;
@@ -315,6 +316,7 @@ fn _fetch_image(p as *Page, u as *u8, n as i64) as void {
     if (net.get(l.url, &r) != 0) { return; }
     if (r.status >= 200 && r.status < 300 && r.len > 0) {
         l.ok = image.decode(r.data, r.len, &l.img);
+        if (l.ok == 0) { l.ok = svg_image.decode(r.data, r.len, &l.img); }
     }
     net.free(&r);
 }

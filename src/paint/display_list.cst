@@ -40,6 +40,10 @@ struct Image {
     width  as i64;
     height as i64;
     tex    as i64;
+    nat_w  as f64;    // its size to CSS, which a drawn picture's pixels are finer than
+    nat_h  as f64;
+    sized  as i64;    // 0 when it only has a shape: nat_w by nat_h is that shape, at a plain size
+    keeps_shape as i64;   // 1 when a box of another shape letterboxes it rather than stretches it
 }
 
 // A gradient worked out for its box: every length is pixels by now, and each stop a place

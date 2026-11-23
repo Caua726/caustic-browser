@@ -66,6 +66,10 @@ fn decode(data as *u8, len as i64, im as *dl.Image) as i64 {
     im.width = w;
     im.height = h;
     im.tex = 0;
+    im.nat_w = cast(f64, w);
+    im.nat_h = cast(f64, h);
+    im.sized = 1;
+    im.keeps_shape = 0;
     return 1;
 }
 

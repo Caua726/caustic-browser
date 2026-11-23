@@ -233,6 +233,27 @@ fn _color(o as *_Out, s as *u8, n as i64, out as *i64) as i64 {
     return decl.named_color(s, n, out);
 }
 
+// A colour is 32 bits and a keyword a small number: anything past that is the URL of a paint.
+fn _is_url_value(k as i64) as i64 { return cast(i64, k > 4294967295); }
+
+// url(#id) as the cascade kept it, resolved against the document, so the id is what
+// follows the last #.
+fn _paint_of_url(o as *_Out, u as *u8, was as *_Paint) as void {
+    let is i64 as n with mut = 0;
+    let is i64 as hash with mut = 0 - 1;
+    while (u[n] != 0) {
+        if (u[n] == 35) { hash = n; }
+        n = n + 1;
+    }
+    was.kind = PAINT_NONE;
+    if (hash < 0) { return; }
+    let is *dom.Node as g = _by_id(_doc_root(o.root), &u[hash + 1], n - hash - 1);
+    if (g != null) {
+        was.kind = PAINT_GRAD;
+        was.grad = g;
+    }
+}
+
 fn _paint_of(o as *_Out, s as *u8, n as i64, was as *_Paint) as void {
     if (decl.eq(s, n, "none") == 1) { was.kind = PAINT_NONE; return; }
     if (n > 5 && s[0] == 117 && s[1] == 114 && s[2] == 108) {
@@ -1145,6 +1166,7 @@ fn _take_state(o as *_Out, n as *dom.Node, st as *_State) as void {
         let is i64 as f = cs.v.i[pr.P_FILL];
         if (f != pr.K_AUTO && (ps == null || ps.v.i[pr.P_FILL] != f)) {
             if (f == pr.K_NONE) { st.fill.kind = PAINT_NONE; }
+            else if (_is_url_value(f) == 1) { _paint_of_url(o, cast(*u8, f), &st.fill); }
             else {
                 st.fill.kind = PAINT_COLOR;
                 st.fill.color = f;
@@ -1154,6 +1176,7 @@ fn _take_state(o as *_Out, n as *dom.Node, st as *_State) as void {
         let is i64 as k = cs.v.i[pr.P_STROKE];
         if (k != pr.K_AUTO && (ps == null || ps.v.i[pr.P_STROKE] != k)) {
             if (k == pr.K_NONE) { st.stroke.kind = PAINT_NONE; }
+            else if (_is_url_value(k) == 1) { _paint_of_url(o, cast(*u8, k), &st.stroke); }
             else {
                 st.stroke.kind = PAINT_COLOR;
                 st.stroke.color = k;
@@ -1191,6 +1214,27 @@ fn _take_state(o as *_Out, n as *dom.Node, st as *_State) as void {
     }
     v = _prop(n, "fill-rule", 9, &l);
     if (v != null) { st.evenodd = cast(i32, decl.eq(v, l, "evenodd")); }
+    // The same, from a stylesheet, which beats an attribute.
+    if (n.style != null) {
+        let is *pr.Values as sv = &style.of(n).v;
+        if (sv.i[pr.P_STROKE_WIDTH] != pr.K_AUTO) { st.width = _maxf(sv.f[pr.P_STROKE_WIDTH], 0.0); }
+        if (sv.i[pr.P_STROKE_MITERLIMIT] != pr.K_AUTO) { st.miter = _maxf(sv.f[pr.P_STROKE_MITERLIMIT], 1.0); }
+        if (sv.i[pr.P_FILL_OPACITY] != pr.K_AUTO) { st.fill_a = _minf(_maxf(sv.f[pr.P_FILL_OPACITY], 0.0), 1.0); }
+        if (sv.i[pr.P_STROKE_OPACITY] != pr.K_AUTO) { st.stroke_a = _minf(_maxf(sv.f[pr.P_STROKE_OPACITY], 0.0), 1.0); }
+        // The <svg> itself is a box, and its opacity the page's to draw.
+        if (n != o.root) { st.alpha = st.alpha * _minf(_maxf(sv.f[pr.P_OPACITY], 0.0), 1.0); }
+        let is i64 as cap = sv.i[pr.P_STROKE_LINECAP];
+        if (cap == pr.K_BUTT) { st.cap = CAP_BUTT; }
+        if (cap == pr.K_ROUND) { st.cap = CAP_ROUND; }
+        if (cap == pr.K_SQUARE) { st.cap = CAP_SQUARE; }
+        let is i64 as join = sv.i[pr.P_STROKE_LINEJOIN];
+        if (join == pr.K_MITER) { st.join = JOIN_MITER; }
+        if (join == pr.K_ROUND) { st.join = JOIN_ROUND; }
+        if (join == pr.K_BEVEL) { st.join = JOIN_BEVEL; }
+        let is i64 as rule = sv.i[pr.P_FILL_RULE];
+        if (rule == pr.K_NONZERO) { st.evenodd = 0; }
+        if (rule == pr.K_EVENODD) { st.evenodd = 1; }
+    }
     let is *dom.Attr as tr = dom.find_attr(n, "transform", 9);
     if (tr != null) { _transform(tr.value, tr.value_len, &st.m); }
 }

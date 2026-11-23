@@ -658,8 +658,14 @@ fn _image_box(c as *bx.Ctx, n as *dom.Node, st as *style.Style) as *bx.Box {
     }
     let is *bx.Box as b = _replaced_shell(c, n, st);
     b.img = im;
-    b.iw = cast(f64, im.width);
-    b.ih = cast(f64, im.height);
+    b.iw = im.nat_w;
+    b.ih = im.nat_h;
+    // Only a shape: it takes the width there is, as an <svg> with no size does.
+    if (im.sized == 0) {
+        b.iw = 0.0;
+        b.ih = 0.0;
+        b.ratio = im.nat_w / im.nat_h;
+    }
     return b;
 }
 
