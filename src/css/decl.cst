@@ -1495,6 +1495,11 @@ fn _track_list(s as *_Sh, prop as i64) as i64 {
         _emit_kw(s, prop, pr.K_NONE);
         return 1;
     }
+    if (t.kind == tok.T_IDENT && eq(t.s, t.n, "subgrid") == 1) {
+        s.c.i = s.c.i + 1;
+        _emit_kw(s, prop, pr.K_SUBGRID);
+        return 1;
+    }
     let is *v.TrackList as l = cast(*v.TrackList, arena.alloc(s.c.a, sizeof(v.TrackList)));
     mem.memzero(cast(*u8, l), sizeof(v.TrackList));
     let is i64 as cap with mut = 0;

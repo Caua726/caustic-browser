@@ -115,6 +115,10 @@ struct Box {
     p as [4]f64;
 
     def_h  as f64;       // its content height when known in advance, else negative
+    // A grid whose rows are its parent grid's: how tall they want to be, and how tall they are.
+    sub_n     as i64;
+    sub_sizes as *f64;
+    sub_force as *f64;
     min_cw as f64;       // its intrinsic widths, content box, negative until asked
     max_cw as f64;
     first_base as f64;   // from its context's content box

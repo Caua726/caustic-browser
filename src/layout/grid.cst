@@ -1,8 +1,11 @@
 // layout/grid.cst — CSS Grid: items into cells, then tracks sized from what is in them.
 //
 // Columns first, because a height needs a width; then each item laid out at the width of
-// its cells to learn how tall it is, then the rows. Named lines are not read, subgrid is
-// not either, and `dense` packs as sparse does.
+// its cells to learn how tall it is, then the rows. Named lines are not read, `dense` packs
+// as sparse does, and subgrid is only for rows: a column subgrid has columns of its own.
+//
+// Rows that are the parent's: laid out once to learn how tall each wants to be, which the
+// parent takes in place of the item's own height, and again at the heights that came of it.
 
 use "../base/arena.cst" as arena;
 use "../css/props.cst" as pr;
@@ -43,7 +46,7 @@ fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
 fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
 
 fn _list_of(b as *bx.Box, p as i64) as *v.TrackList {
-    if (b.st.v.i[p] == pr.K_NONE || b.st.v.i[p] == pr.K_AUTO) { return cast(*v.TrackList, 0); }
+    if (b.st.v.i[p] == pr.K_NONE || b.st.v.i[p] == pr.K_AUTO || b.st.v.i[p] == pr.K_SUBGRID) { return cast(*v.TrackList, 0); }
     return cast(*v.TrackList, b.st.v.i[p]);
 }
 
@@ -273,6 +276,53 @@ fn _sorted(b as *bx.Box) as *bx.Box {
     return head;
 }
 
+fn _rows_are_sub(b as *bx.Box) as i64 {
+    if (b.st.v.i[pr.P_GRID_TEMPLATE_ROWS] != pr.K_SUBGRID) { return 0; }
+    return cast(i64, b.kind == bx.B_GRID && b.parent != null && b.parent.kind == bx.B_GRID && b.rowspan > 0);
+}
+
+fn _edge_top(it as *bx.Box) as f64 { return it.m[bx.TOP] + it.b[bx.TOP] + it.p[bx.TOP]; }
+fn _edge_bottom(it as *bx.Box) as f64 { return it.m[bx.BOTTOM] + it.b[bx.BOTTOM] + it.p[bx.BOTTOM]; }
+
+// What items with the parent's rows want of those rows. Their first and last rows hold their
+// edges too.
+fn _take_sub_rows(items as *bx.Box, rows as *_T, nrows as i64) as void {
+    let is *bx.Box as it with mut = items;
+    while (it != null) {
+        if (_rows_are_sub(it) == 1 && it.sub_sizes != null) {
+            let is i64 as r with mut = 0;
+            while (r < it.sub_n && it.row + r < nrows) {
+                let is *_T as x = &rows[it.row + r];
+                let is f64 as need with mut = it.sub_sizes[r];
+                if (r == 0) { need = need + _edge_top(it); }
+                if (r == it.sub_n - 1) { need = need + _edge_bottom(it); }
+                if (x.lo == v.TRACK_AUTO || x.lo == v.TRACK_MIN || x.lo == v.TRACK_MAX) {
+                    x.base = _max(x.base, need);
+                    x.grow = _max(x.grow, x.base);
+                }
+                r = r + 1;
+            }
+        }
+        it = it.next_item;
+    }
+}
+
+// The heights an item with the parent's rows is to use, without its edges.
+fn _give_sub_rows(c as *bx.Ctx, it as *bx.Box, rows as *_T, nrows as i64) as void {
+    let is i64 as n = it.rowspan;
+    it.sub_n = n;
+    it.sub_force = cast(*f64, arena.alloc(c.a, n * sizeof(f64)));
+    let is i64 as r with mut = 0;
+    while (r < n) {
+        let is f64 as h with mut = 0.0;
+        if (it.row + r < nrows) { h = rows[it.row + r].base; }
+        if (r == 0) { h = h - _edge_top(it); }
+        if (r == n - 1) { h = h - _edge_bottom(it); }
+        it.sub_force[r] = _max(h, 0.0);
+        r = r + 1;
+    }
+}
+
 fn _same_name(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
     if (an != bn) { return 0; }
     let is i64 as i with mut = 0;
@@ -443,6 +493,7 @@ fn _place_items(c as *bx.Ctx, b as *bx.Box, gr as *_Grid, avail as f64, col_gap 
     if (gr.nrows < gr.n_exp_rows) { gr.nrows = gr.n_exp_rows; }
     if (areas != null && gr.ncols < areas.cols) { gr.ncols = areas.cols; }
     if (areas != null && gr.nrows < areas.rows) { gr.nrows = areas.rows; }
+    if (_rows_are_sub(b) == 1 && gr.nrows < b.rowspan) { gr.nrows = b.rowspan; }
     gr.cols = _new_tracks(c, b, gr.ncols, pr.P_GRID_TEMPLATE_COLUMNS, gr.n_exp_cols, pr.P_GRID_AUTO_COLUMNS, avail, col_gap);
     gr.rows = _new_tracks(c, b, gr.nrows, pr.P_GRID_TEMPLATE_ROWS, gr.n_exp_rows, pr.P_GRID_AUTO_ROWS, b.def_h, row_gap);
 }
@@ -870,10 +921,16 @@ fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
     it = g.items;
     while (it != null) {
         let is f64 as area_w = _span_size(g.cols, it.col, it.colspan, col_gap);
+        it.sub_force = cast(*f64, 0);
         _lay_item(c, b, it, area_w);
         let is f64 as tall = it.m[bx.TOP] + bx.border_h(it) + it.m[bx.BOTTOM];
         it.hypo = tall;
         it.base = tall;
+        // It asks row by row instead, below.
+        if (_rows_are_sub(it) == 1) {
+            it.hypo = 0.0;
+            it.base = 0.0;
+        }
         // One that scrolls can be as short as its row makes it.
         if (it.st.v.i[pr.P_OVERFLOW_Y] != pr.K_VISIBLE && it.st.v.i[pr.P_MIN_HEIGHT] == pr.K_AUTO) {
             it.base = it.m[bx.TOP] + bx.edges_h(it) + it.m[bx.BOTTOM];
@@ -881,6 +938,24 @@ fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
         it = it.next_item;
     }
     _size_tracks(g.items, g.rows, g.nrows, b.def_h, row_gap, 0, FIT_NONE);
+    _take_sub_rows(g.items, g.rows, g.nrows);
+    if (_rows_are_sub(b) == 1) {
+        if (b.sub_force == null) {
+            b.sub_n = g.nrows;
+            b.sub_sizes = cast(*f64, arena.alloc(c.a, g.nrows * sizeof(f64)));
+            let is i64 as r with mut = 0;
+            while (r < g.nrows) {
+                b.sub_sizes[r] = g.rows[r].base;
+                r = r + 1;
+            }
+        } else {
+            let is i64 as r with mut = 0;
+            while (r < g.nrows && r < b.sub_n) {
+                g.rows[r].base = b.sub_force[r];
+                r = r + 1;
+            }
+        }
+    }
     let is f64 as total with mut = _sum_bases(g.rows, g.nrows, row_gap);
     let is f64 as room with mut = b.def_h;
     if (room < 0.0) {
@@ -910,8 +985,12 @@ fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
             if (target < 0.0 && _fills(it, ky) == 1 && top_bot_auto == 0) {
                 target = flow.clamp_h(it, _max(area_h - it.m[bx.TOP] - it.m[bx.BOTTOM] - bx.edges_h(it), 0.0), area_h);
             }
-            if (target >= 0.0 && target != it.h) {
+            let is i64 as sub_rows = _rows_are_sub(it);
+            if (sub_rows == 1) { _give_sub_rows(c, it, g.rows, g.nrows); }
+            if (target >= 0.0 && (target != it.h || sub_rows == 1)) {
                 it.def_h = target;
+                flow.contents(c, it, area_h);
+            } else if (sub_rows == 1) {
                 flow.contents(c, it, area_h);
             }
         }
