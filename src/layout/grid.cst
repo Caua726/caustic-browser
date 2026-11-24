@@ -1,8 +1,8 @@
 // layout/grid.cst — CSS Grid: items into cells, then tracks sized from what is in them.
 //
 // Columns first, because a height needs a width; then each item laid out at the width of
-// its cells to learn how tall it is, then the rows. Named lines and grid-template-areas
-// are not read, subgrid is not either, and `dense` packs as sparse does.
+// its cells to learn how tall it is, then the rows. Named lines are not read, subgrid is
+// not either, and `dense` packs as sparse does.
 
 use "../base/arena.cst" as arena;
 use "../css/props.cst" as pr;
@@ -273,6 +273,54 @@ fn _sorted(b as *bx.Box) as *bx.Box {
     return head;
 }
 
+fn _same_name(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _areas_of(b as *bx.Box) as *v.GridAreas {
+    let is i64 as k = b.st.v.i[pr.P_GRID_TEMPLATE_AREAS];
+    if (k == pr.K_NONE || k == 0) { return cast(*v.GridAreas, 0); }
+    return cast(*v.GridAreas, k);
+}
+
+// An item in a named area takes the rectangle its name covers. Nothing when the template
+// has no such name.
+fn _area_place(a as *v.GridAreas, it as *bx.Box, ca as *i64, cs as *i64, ra as *i64, rs as *i64) as void {
+    let is i64 as k = it.st.v.i[pr.P_GRID_AREA_NAME];
+    if (a == null || k == pr.K_NONE || k == 0) { return; }
+    let is *v.GridCell as name = cast(*v.GridCell, k);
+    let is i64 as r0 with mut = a.rows;
+    let is i64 as r1 with mut = 0 - 1;
+    let is i64 as c0 with mut = a.cols;
+    let is i64 as c1 with mut = 0 - 1;
+    let is i64 as r with mut = 0;
+    while (r < a.rows) {
+        let is i64 as q with mut = 0;
+        while (q < a.cols) {
+            let is *v.GridCell as cell = &a.cells[r * a.cols + q];
+            if (cell.name != null && _same_name(cell.name, cell.n, name.name, name.n) == 1) {
+                if (r < r0) { r0 = r; }
+                if (r > r1) { r1 = r; }
+                if (q < c0) { c0 = q; }
+                if (q > c1) { c1 = q; }
+            }
+            q = q + 1;
+        }
+        r = r + 1;
+    }
+    if (r1 < 0) { return; }
+    *ca = c0;
+    *cs = c1 - c0 + 1;
+    *ra = r0;
+    *rs = r1 - r0 + 1;
+}
+
 fn _place_items(c as *bx.Ctx, b as *bx.Box, gr as *_Grid, avail as f64, col_gap as f64) as void {
     gr.items = _sorted(b);
     let is f64 as row_gap = bx.resolve(b, pr.P_ROW_GAP, b.def_h);
@@ -283,6 +331,10 @@ fn _place_items(c as *bx.Ctx, b as *bx.Box, gr as *_Grid, avail as f64, col_gap 
     // Each item's lines, and how wide the minor axis has to be.
     let is i64 as minors with mut = gr.n_exp_cols;
     if (by_col == 1) { minors = gr.n_exp_rows; }
+    // The template of areas makes tracks of its own, sized as the automatic ones are.
+    let is *v.GridAreas as areas = _areas_of(b);
+    if (areas != null && by_col == 0 && areas.cols > minors) { minors = areas.cols; }
+    if (areas != null && by_col == 1 && areas.rows > minors) { minors = areas.rows; }
     let is *bx.Box as it with mut = gr.items;
     while (it != null) {
         let is i64 as ca with mut = 0;
@@ -291,6 +343,7 @@ fn _place_items(c as *bx.Ctx, b as *bx.Box, gr as *_Grid, avail as f64, col_gap 
         let is i64 as rs with mut = 1;
         _line_of(b, it, pr.P_GRID_COLUMN_START, pr.P_GRID_COLUMN_END, gr.n_exp_cols, &ca, &cs);
         _line_of(b, it, pr.P_GRID_ROW_START, pr.P_GRID_ROW_END, gr.n_exp_rows, &ra, &rs);
+        _area_place(areas, it, &ca, &cs, &ra, &rs);
         it.col = ca;
         it.colspan = cs;
         it.row = ra;
@@ -388,6 +441,8 @@ fn _place_items(c as *bx.Ctx, b as *bx.Box, gr as *_Grid, avail as f64, col_gap 
     }
     if (gr.ncols < gr.n_exp_cols) { gr.ncols = gr.n_exp_cols; }
     if (gr.nrows < gr.n_exp_rows) { gr.nrows = gr.n_exp_rows; }
+    if (areas != null && gr.ncols < areas.cols) { gr.ncols = areas.cols; }
+    if (areas != null && gr.nrows < areas.rows) { gr.nrows = areas.rows; }
     gr.cols = _new_tracks(c, b, gr.ncols, pr.P_GRID_TEMPLATE_COLUMNS, gr.n_exp_cols, pr.P_GRID_AUTO_COLUMNS, avail, col_gap);
     gr.rows = _new_tracks(c, b, gr.nrows, pr.P_GRID_TEMPLATE_ROWS, gr.n_exp_rows, pr.P_GRID_AUTO_ROWS, b.def_h, row_gap);
 }

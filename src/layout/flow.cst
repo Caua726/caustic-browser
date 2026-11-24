@@ -208,6 +208,14 @@ fn _edges_guess(b as *bx.Box) as f64 {
     return e;
 }
 
+// A content width raised to a min-width that does not depend on what holds the box.
+fn _at_least_min(b as *bx.Box, w as f64) as f64 {
+    if (bx.is_definite(b, pr.P_MIN_WIDTH, 0.0 - 1.0) == 0) { return w; }
+    let is f64 as mn with mut = bx.resolve(b, pr.P_MIN_WIDTH, 0.0 - 1.0);
+    if (_box_sized(b) == 1) { mn = mn - _edges_guess(b); }
+    return _max(w, mn);
+}
+
 // What a child adds to the width of whatever holds it, in each sense.
 fn outer_min(c as *bx.Ctx, b as *bx.Box) as f64 {
     if (b.kind == bx.B_REPLACED) {
@@ -222,7 +230,7 @@ fn outer_min(c as *bx.Ctx, b as *bx.Box) as f64 {
         return w + _outer_edges(b);
     }
     intrinsic(c, b);
-    return b.min_cw + _outer_edges(b);
+    return _at_least_min(b, b.min_cw) + _outer_edges(b);
 }
 
 fn outer_max(c as *bx.Ctx, b as *bx.Box) as f64 {
@@ -240,7 +248,7 @@ fn outer_max(c as *bx.Ctx, b as *bx.Box) as f64 {
     if (b.st.v.i[pr.P_MAX_WIDTH] == 0 && b.st.v.p[pr.P_MAX_WIDTH] == 0.0 && b.st.v.f[pr.P_MAX_WIDTH] < mw) {
         mw = b.st.v.f[pr.P_MAX_WIDTH];
     }
-    return mw + _outer_edges(b);
+    return _at_least_min(b, mw) + _outer_edges(b);
 }
 
 fn _outer_margins(b as *bx.Box) as f64 {
@@ -1244,6 +1252,7 @@ fn items_baseline(b as *bx.Box) as void {
         if (x.is_abs == 0 && x.is_float == 0 && x.kind != bx.B_TEXT && x.kind != bx.B_BR && x.kind != bx.B_COL) {
             if (x.last_base != bx.NO_BASE) { b.last_base = x.y + x.b[bx.TOP] + x.p[bx.TOP] + x.last_base; }
             else { b.last_base = x.y + bx.border_h(x); }
+            b.first_base = b.last_base;
             return;
         }
         x = x.next;
@@ -1255,13 +1264,17 @@ fn _atomic_metrics(x as *bx.Box, parent as *style.Style, asc as *f64, desc as *f
     let is i64 as va = x.st.v.i[pr.P_VERTICAL_ALIGN];
     let is f64 as a with mut = mh;
     let is *pr.Values as s = &x.st.v;
+    // Clipping takes the baseline away from an inline-block; a flex or grid box keeps it.
     if (x.kind != bx.B_REPLACED && x.last_base != bx.NO_BASE &&
-        s.i[pr.P_OVERFLOW_Y] == pr.K_VISIBLE) {
+        (s.i[pr.P_OVERFLOW_Y] == pr.K_VISIBLE || x.kind == bx.B_FLEX || x.kind == bx.B_GRID)) {
         a = x.m[bx.TOP] + x.b[bx.TOP] + x.p[bx.TOP] + x.last_base;
     }
     if (va == pr.K_MIDDLE) {
         a = mh / 2.0 + parent.v.f[pr.P_FONT_SIZE] * 0.25;
     }
+    // Against the parent's text rather than its baseline.
+    if (va == pr.K_TEXT_TOP) { a = m.ascent(parent); }
+    if (va == pr.K_TEXT_BOTTOM) { a = mh - (m.height(parent) - m.ascent(parent)); }
     *asc = a;
     *desc = mh - a;
 }

@@ -480,6 +480,22 @@ fn _background(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f
 
 // What is outside the box goes under it, last of the list first. An inset one is left out:
 // the list has nothing that darkens only the inside of an edge.
+fn _band(p as *Painter, x0 as f64, y0 as f64, x1 as f64, y1 as f64, rgb as i64, a as f64) as void {
+    if (x1 <= x0 || y1 <= y0) { return; }
+    let is *dl.Cmd as c = dl.box(p.l, x0, y0, x1 - x0, y1 - y0, rgb, a);
+    if (c != null) { c.fixed = p.fixed; }
+}
+
+// The shadow at sx, sy without the box at x, y: what shows above, below and to each side.
+fn _hard_shadow(p as *Painter, x as f64, y as f64, w as f64, h as f64, sx as f64, sy as f64, sw as f64, sh as f64, rgb as i64, a as f64) as void {
+    _band(p, sx, sy, sx + sw, _min(sy + sh, y), rgb, a);
+    _band(p, sx, _max(sy, y + h), sx + sw, sy + sh, rgb, a);
+    let is f64 as top = _max(sy, y);
+    let is f64 as bottom = _min(sy + sh, y + h);
+    _band(p, sx, top, _min(sx + sw, x), bottom, rgb, a);
+    _band(p, _max(sx, x + w), top, sx + sw, bottom, rgb, a);
+}
+
 fn _shadows_of(p as *Painter, b as *bx.Box, x0 as *v.Shadow, x as f64, y as f64, w as f64, h as f64, alpha as f64) as void {
     if (x0 == null) { return; }
     _shadows_of(p, b, x0.next, x, y, w, h, alpha);
@@ -500,6 +516,12 @@ fn _shadows_of(p as *Painter, b as *bx.Box, x0 as *v.Shadow, x as f64, y as f64,
         r = _max(bx.resolve(b, pr.P_BORDER_TOP_LEFT_RADIUS, base), bx.resolve(b, pr.P_BORDER_TOP_RIGHT_RADIUS, base));
         r = _max(r, _max(bx.resolve(b, pr.P_BORDER_BOTTOM_RIGHT_RADIUS, base), bx.resolve(b, pr.P_BORDER_BOTTOM_LEFT_RADIUS, base)));
         r = _max(r + sp, 0.0);
+    }
+    // A shadow is never drawn under its own box. A hard square one can say so exactly, and
+    // is how a page draws a line beside a box with nothing behind it.
+    if (blur == 0.0 && r == 0.0 && _has_radius(b) == 0) {
+        _hard_shadow(p, x, y, w, h, x + dx - sp, y + dy - sp, sw, sh, _rgb(col), a);
+        return;
     }
     // The toolkit rounds a shadow's corners by at least its blur, and on a box narrower than
     // twice that the fade folds over itself, in spikes.
@@ -665,6 +687,7 @@ fn _outline(p as *Painter, b as *bx.Box, x0 as f64, y0 as f64, w0 as f64, h0 as 
 // A thumb for a box that scrolls. It only says how far: the wheel is what moves it.
 fn _box_scrollbar(p as *Painter, b as *bx.Box) as void {
     if (layout_scrolls(b) == 0) { return; }
+    if (bx.prop(b, pr.P_VISIBILITY) != pr.K_VISIBLE) { return; }
     let is f64 as x = b.ax + b.b[bx.LEFT];
     let is f64 as y = b.ay + b.b[bx.TOP];
     let is f64 as w = b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];

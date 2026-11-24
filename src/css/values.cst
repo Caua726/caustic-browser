@@ -70,6 +70,18 @@ struct TrackList {
     rep_n  as i64;
 }
 
+// What grid-template-areas came to, rows * cols cells with a null name for a dot.
+struct GridCell {
+    name as *u8;
+    n    as i64;
+}
+
+struct GridAreas {
+    cells as *GridCell;
+    rows  as i64;
+    cols  as i64;
+}
+
 // grid-row-start and its kin hold a line number, or this plus how many tracks to span.
 let is f64 as GRID_SPAN with imut = 1000000.0;
 

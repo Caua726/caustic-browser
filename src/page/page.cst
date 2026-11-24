@@ -22,6 +22,8 @@ use "../dom/tags.cst" as tg;
 use "../html/tree.cst" as tree;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
+use "../layout/dump.cst" as boxdump;
+use "std/env.cst" as env;
 use "../loader/image.cst" as image;
 use "../loader/img_source.cst" as source;
 use "./forms.cst" as forms;
@@ -594,6 +596,7 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     p.c.vw = vw;
     p.c.vh = vh;
     p.root = layout.run(&p.c, &p.doc);
+    if (env.getenv("CAUSTIC_BOXES") != null) { boxdump.boxes(p.root); }
     let is f64 as w with mut = vw;
     let is f64 as h with mut = vh;
     if (p.c.doc_w > w) { w = p.c.doc_w; }

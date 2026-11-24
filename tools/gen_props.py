@@ -81,6 +81,8 @@ OWN = [
     ("justify-self", 0, "auto " + SELF + " left right", AUTO),
     ("grid-template-columns", STR, "none", "none"),
     ("grid-template-rows", STR, "none", "none"),
+    ("grid-template-areas", STR, "none", "none"),
+    ("grid-area-name", STR, "none", "none"),
     ("grid-auto-columns", STR, AUTO, AUTO),
     ("grid-auto-rows", STR, AUTO, AUTO),
     ("grid-auto-flow", 0, "row column", "row"),

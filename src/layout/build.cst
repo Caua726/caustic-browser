@@ -965,15 +965,15 @@ fn _flex_items(c as *bx.Ctx, b as *bx.Box) as void {
             }
         } else {
             anon = cast(*bx.Box, 0);
-            if (bx.is_out_of_flow(x) == 0) {
+            // Float means nothing to a flex container: it is an item like the rest.
+            x.is_float = 0;
+            if (x.is_abs == 0) {
                 x.flex_item = 1;
                 x.atomic = 0;
                 if (x.kind == bx.B_INLINE) {
                     x.kind = bx.B_BLOCK;
                     _normalize(c, x);
                 }
-            } else {
-                x.is_float = 0;
             }
             bx.append(b, x);
         }

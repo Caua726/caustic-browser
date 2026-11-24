@@ -254,6 +254,15 @@ fn _layout(c as *bx.Ctx, b as *bx.Box) as void {
     flow.items_baseline(b);
 }
 
+// The content height a row's min-height asks for, 0 when its height is known already.
+fn _least_cross(b as *bx.Box, row as i64, cross_size as f64) as f64 {
+    if (row == 0 || cross_size >= 0.0) { return 0.0; }
+    if (bx.is_definite(b, pr.P_MIN_HEIGHT, 0.0 - 1.0) == 0) { return 0.0; }
+    let is f64 as mn with mut = bx.resolve(b, pr.P_MIN_HEIGHT, 0.0 - 1.0);
+    if (bx.prop(b, pr.P_BOX_SIZING) == pr.K_BORDER_BOX) { mn = mn - bx.edges_h(b); }
+    return mn;
+}
+
 fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
     let is i64 as row = _is_row(b);
     let is i64 as reverse = _is_reverse(b);
@@ -359,9 +368,12 @@ fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
     if (used_main < 0.0) { used_main = biggest_main; }
     let is f64 as used_cross with mut = cross_size;
     if (used_cross < 0.0) { used_cross = cross_total; }
+    // No height, but a least one: the box will be that tall, so its lines may as well know.
+    let is f64 as least = _least_cross(b, row, cross_size);
+    if (least > used_cross) { used_cross = least; }
 
     // A single line with a known cross size takes all of it.
-    if (wrap == 0 && lines != null && cross_size >= 0.0) { lines.cross = cross_size; cross_total = cross_size; }
+    if (wrap == 0 && lines != null && (cross_size >= 0.0 || least > cross_total)) { lines.cross = used_cross; cross_total = used_cross; }
 
     // Lines along the cross axis.
     let is f64 as cross_free = used_cross - cross_total;

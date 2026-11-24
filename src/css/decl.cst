@@ -140,7 +140,9 @@ fn _unit(l as *v.Len, num as f64, u as *u8, n as i64) as i64 {
     if (eq(u, n, "mm") == 1) { l.px = num * 96.0 / 25.4; return 1; }
     if (eq(u, n, "q") == 1) { l.px = num * 96.0 / 101.6; return 1; }
     if (eq(u, n, "ex") == 1) { l.em = num * 0.5; return 1; }
-    if (eq(u, n, "ch") == 1) { l.em = num * 0.5; return 1; }
+    // Really the width of a zero in the font, which is not known here. Most text fonts come
+    // close to this, and a line measured in ch had better be a little too long than wrap.
+    if (eq(u, n, "ch") == 1) { l.em = num * 0.6; return 1; }
     return 0;
 }
 
@@ -1301,6 +1303,11 @@ fn _content(s as *_Sh) as i64 {
     let is i64 as n with mut = 0;
     while (_done(s.c) == 0) {
         let is *tok.Token as u = _peek(s.c);
+        // What follows a slash is what a screen reader says instead. Nothing here shows it.
+        if (_is_delim(u, 47) == 1) {
+            s.c.i = s.c.n;
+            break;
+        }
         if (u.kind == tok.T_STRING) {
             mem.core.memcpy(&buf[n], u.s, u.n);
             n = n + u.n;
@@ -1496,6 +1503,71 @@ fn _track_list(s as *_Sh, prop as i64) as i64 {
     return 1;
 }
 
+fn _space_at(ch as u8) as i64 {
+    return cast(i64, ch == 32 || ch == 9 || ch == 10 || ch == 12 || ch == 13);
+}
+
+// The cells of one row of grid-template-areas, written after the ones already there if
+// out is not null. How many it has.
+fn _area_row(s as *u8, n as i64, out as *v.GridCell) as i64 {
+    let is i64 as count with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_space_at(s[i]) == 1) { i = i + 1; continue; }
+        let is i64 as start = i;
+        // A run of dots is one empty cell, and a dot ends a name.
+        if (s[i] == 46) {
+            while (i < n && s[i] == 46) { i = i + 1; }
+        } else {
+            while (i < n && _space_at(s[i]) == 0 && s[i] != 46) { i = i + 1; }
+        }
+        if (out != null) {
+            if (s[start] == 46) { out[count].name = cast(*u8, 0); out[count].n = 0; }
+            else { out[count].name = s + start; out[count].n = i - start; }
+        }
+        count = count + 1;
+    }
+    return count;
+}
+
+// grid-template-areas: none, or a string a row whose rows are all as long.
+fn _template_areas(s as *_Sh, prop as i64) as i64 {
+    let is *tok.Token as t = _peek(s.c);
+    if (t == null) { return 0; }
+    if (t.kind == tok.T_IDENT && eq(t.s, t.n, "none") == 1) {
+        s.c.i = s.c.i + 1;
+        _emit_kw(s, prop, pr.K_NONE);
+        return 1;
+    }
+    let is i64 as at = s.c.i;
+    let is i64 as rows with mut = 0;
+    let is i64 as cols with mut = 0;
+    while (_done(s.c) == 0) {
+        let is *tok.Token as r = _peek(s.c);
+        if (r.kind != tok.T_STRING) { return 0; }
+        let is i64 as here = _area_row(r.s, r.n, cast(*v.GridCell, 0));
+        if (here == 0 || (rows > 0 && here != cols)) { return 0; }
+        cols = here;
+        rows = rows + 1;
+        s.c.i = s.c.i + 1;
+    }
+    if (rows == 0) { return 0; }
+    let is *v.GridAreas as a = cast(*v.GridAreas, arena.alloc(s.c.a, sizeof(v.GridAreas)));
+    a.rows = rows;
+    a.cols = cols;
+    a.cells = cast(*v.GridCell, arena.alloc(s.c.a, rows * cols * sizeof(v.GridCell)));
+    s.c.i = at;
+    let is i64 as k with mut = 0;
+    while (k < rows) {
+        let is *tok.Token as r = _peek(s.c);
+        _area_row(r.s, r.n, a.cells + k * cols);
+        s.c.i = s.c.i + 1;
+        k = k + 1;
+    }
+    _emit_data(s, prop, cast(*u8, a));
+    return 1;
+}
+
 // A grid line: auto, a number, or span and a number. A name means nothing without
 // grid-template-areas, so it counts as auto.
 fn _grid_line_val(c as *Cur, out as *v.Value) as i64 {
@@ -1553,6 +1625,17 @@ fn _grid_line_pair(s as *_Sh, start as i64, end as i64) as i64 {
 
 // grid-area: row start, column start, row end, column end.
 fn _grid_area(s as *_Sh) as i64 {
+    // One name is an area of the template, kept for layout. Lines stay automatic.
+    let is *tok.Token as first = _peek(s.c);
+    let is i64 as named = cast(i64, first != null && first.kind == tok.T_IDENT && eq(first.s, first.n, "auto") == 0 && eq(first.s, first.n, "span") == 0);
+    if (named == 1) {
+        let is *v.GridCell as name = cast(*v.GridCell, arena.alloc(s.c.a, sizeof(v.GridCell)));
+        name.name = first.s;
+        name.n = first.n;
+        _emit_data(s, pr.P_GRID_AREA_NAME, cast(*u8, name));
+    } else {
+        _emit_kw(s, pr.P_GRID_AREA_NAME, pr.K_NONE);
+    }
     let is [4]v.Value as x with mut;
     let is i64 as k with mut = 0;
     while (k < 4) {
@@ -2405,10 +2488,124 @@ fn _side_index(name as *u8, n as i64, prefix as *u8, plen as i64, out as *i64) a
     return 0;
 }
 
+// --- Logical properties ---
+// Text here always runs left to right and top to bottom, so these are other names.
+
+fn _starts(name as *u8, n as i64, lit as *u8, ln as i64) as i64 {
+    if (n < ln) { return 0; }
+    return eq(name, ln, lit);
+}
+
+fn _put_text(to as *u8, at as i64, s as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        to[at + i] = s[i];
+        i = i + 1;
+    }
+    return at + n;
+}
+
+// Where a second value starts in a list of two, or -1 for just the one.
+fn _second_value(t as *tok.Token, n as i64) as i64 {
+    let is i64 as depth with mut = 0;
+    let is i64 as seen with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as k = t[i].kind;
+        if (k == tok.T_FUNCTION || k == tok.T_LPAREN || k == tok.T_LBRACKET) { depth = depth + 1; }
+        if (k == tok.T_RPAREN || k == tok.T_RBRACKET) { depth = depth - 1; }
+        if (k == tok.T_WS && depth == 0 && seen == 1 && i + 1 < n && t[i + 1].kind != tok.T_DELIM) { return i + 1; }
+        if (k != tok.T_WS) { seen = 1; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The one-word names, with nothing to split.
+fn _logical_size(name as *u8, n as i64, out_n as *i64) as *u8 {
+    if (eq(name, n, "inline-size") == 1) { *out_n = 5; return "width"; }
+    if (eq(name, n, "block-size") == 1) { *out_n = 6; return "height"; }
+    if (eq(name, n, "min-inline-size") == 1) { *out_n = 9; return "min-width"; }
+    if (eq(name, n, "max-inline-size") == 1) { *out_n = 9; return "max-width"; }
+    if (eq(name, n, "min-block-size") == 1) { *out_n = 10; return "min-height"; }
+    if (eq(name, n, "max-block-size") == 1) { *out_n = 10; return "max-height"; }
+    if (eq(name, n, "border-start-start-radius") == 1) { *out_n = 22; return "border-top-left-radius"; }
+    if (eq(name, n, "border-start-end-radius") == 1) { *out_n = 23; return "border-top-right-radius"; }
+    if (eq(name, n, "border-end-start-radius") == 1) { *out_n = 25; return "border-bottom-left-radius"; }
+    if (eq(name, n, "border-end-end-radius") == 1) { *out_n = 26; return "border-bottom-right-radius"; }
+    return cast(*u8, 0);
+}
+
+// A logical property, as what it stands for. Its result as parse's, or -1 if it is not one.
+fn _logical(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *tok.Token, n as i64, important as i64) as i64 {
+    let is i64 as size_n with mut = 0;
+    let is *u8 as size = _logical_size(name, nlen, &size_n);
+    if (size != null) { return _parse_named(a, out, size, size_n, t, n, important); }
+
+    let is i64 as plen with mut = 0;
+    let is i64 as border = _starts(name, nlen, "border-", 7);
+    let is i64 as inset = _starts(name, nlen, "inset-", 6);
+    if (_starts(name, nlen, "margin-", 7) == 1 || border == 1) { plen = 7; }
+    else if (_starts(name, nlen, "padding-", 8) == 1) { plen = 8; }
+    else if (inset == 1) { plen = 6; }
+    else { return 0 - 1; }
+
+    let is *u8 as rest = &name[plen];
+    let is i64 as m = nlen - plen;
+    let is i64 as inline = _starts(rest, m, "inline", 6);
+    let is i64 as axis with mut = 5;
+    if (inline == 1) { axis = 6; }
+    else if (_starts(rest, m, "block", 5) == 0) { return 0 - 1; }
+
+    let is *u8 as after = &rest[axis];
+    let is i64 as left = m - axis;
+    let is i64 as sides with mut = 3;
+    let is i64 as skip with mut = 0;
+    if (_starts(after, left, "-start", 6) == 1) { sides = 1; skip = 6; }
+    else if (_starts(after, left, "-end", 4) == 1) { sides = 2; skip = 4; }
+    let is *u8 as tail = &after[skip];
+    let is i64 as tail_n = left - skip;
+    if (tail_n != 0 && (border == 0 || (eq(tail, tail_n, "-width") == 0 && eq(tail, tail_n, "-style") == 0 && eq(tail, tail_n, "-color") == 0))) {
+        return 0 - 1;
+    }
+
+    // Two values only ever belong to margin, padding and inset; a border takes its whole
+    // value on each side.
+    let is i64 as split with mut = 0 - 1;
+    if (sides == 3 && border == 0) { split = _second_value(t, n); }
+    let is i64 as start_n with mut = n;
+    if (split >= 0) { start_n = split; }
+    let is i64 as before = out.n;
+    let is [64]u8 as buf with mut;
+    let is i64 as side with mut = 1;
+    while (side <= 2) {
+        if ((sides & side) != 0) {
+            let is i64 as w with mut = 0;
+            if (inset == 0) { w = _put_text(&buf[0], 0, name, plen); }
+            if (inline == 1 && side == 1) { w = _put_text(&buf[0], w, "left", 4); }
+            if (inline == 1 && side == 2) { w = _put_text(&buf[0], w, "right", 5); }
+            if (inline == 0 && side == 1) { w = _put_text(&buf[0], w, "top", 3); }
+            if (inline == 0 && side == 2) { w = _put_text(&buf[0], w, "bottom", 6); }
+            w = _put_text(&buf[0], w, tail, tail_n);
+            let is *tok.Token as from with mut = t;
+            let is i64 as count with mut = start_n;
+            if (side == 2 && split >= 0) { from = &t[split]; count = n - split; }
+            if (_parse_named(a, out, &buf[0], w, from, count, important) == 0) {
+                out.n = before;
+                return 0;
+            }
+        }
+        side = side + 1;
+    }
+    return 1;
+}
+
 // The tokens of one declaration's value into longhands, appended to out. 0 when it is
 // invalid or unknown, and then nothing was appended.
 // -webkit-mask and its parts are mask and its parts: pages write both, or only the first.
 fn parse(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64, t as *tok.Token, n as i64, important as i64) as i64 {
+    let is i64 as logical = _logical(a, out, name, nlen, t, n, important);
+    if (logical >= 0) { return logical; }
     if (nlen >= 12 && eq(name, 8, "-webkit-") == 1 && eq(&name[8], 4, "mask") == 1) {
         return _parse_named(a, out, &name[8], nlen - 8, t, n, important);
     }
@@ -2496,6 +2693,8 @@ fn _parse_named(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64,
     else if (eq(name, nlen, "animation-timing-function") == 1) { ok = _eases_prop(s, pr.P_ANIMATION_TIMING_FUNCTION); }
     else if (eq(name, nlen, "columns") == 1) { ok = _columns(s); }
     else if (eq(name, nlen, "grid-template-columns") == 1) { ok = _track_list(s, pr.P_GRID_TEMPLATE_COLUMNS); }
+    else if (eq(name, nlen, "grid-template-areas") == 1) { ok = _template_areas(s, pr.P_GRID_TEMPLATE_AREAS); }
+    else if (eq(name, nlen, "grid-area-name") == 1) { ok = 0; }
     else if (eq(name, nlen, "grid-template-rows") == 1) { ok = _track_list(s, pr.P_GRID_TEMPLATE_ROWS); }
     else if (eq(name, nlen, "grid-auto-columns") == 1) { ok = _track_list(s, pr.P_GRID_AUTO_COLUMNS); }
     else if (eq(name, nlen, "grid-auto-rows") == 1) { ok = _track_list(s, pr.P_GRID_AUTO_ROWS); }

@@ -1,0 +1,50 @@
+// layout/dump.cst — the finished boxes as text on stderr, a line each, to set beside
+// what another browser made of the same page. Only asked for through CAUSTIC_BOXES.
+
+use "std/io.cst" as io;
+use "../dom/dom.cst" as dom;
+use "./box.cst" as bx;
+
+fn _attr(n as *dom.Node, name as *u8, len as i64) as void {
+    let is *dom.Attr as a = dom.find_attr(n, name, len);
+    if (a == null) { return; }
+    let is i64 as most with mut = a.value_len;
+    if (most > 50) { most = 50; }
+    io.write_bytes(2, a.value, most);
+}
+
+fn _walk(b as *bx.Box, depth as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < depth) { io.write_str(2, " "); i = i + 1; }
+    if (b.node != null && b.node.kind == dom.ELEMENT) {
+        io.write_bytes(2, b.node.name, b.node.name_len);
+        io.write_str(2, "#");
+        _attr(b.node, "id", 2);
+        io.write_str(2, ".");
+        _attr(b.node, "class", 5);
+    } else {
+        io.write_str(2, "(anon)");
+    }
+    io.write_str(2, "\t");
+    io.write_int(2, cast(i64, b.ax));
+    io.write_str(2, "\t");
+    io.write_int(2, cast(i64, b.ay));
+    io.write_str(2, "\t");
+    io.write_int(2, cast(i64, b.w));
+    io.write_str(2, "\t");
+    io.write_int(2, cast(i64, b.h));
+    if (b.is_float == 1) { io.write_str(2, "\tfloat"); }
+    if (b.is_abs == 1) { io.write_str(2, "\tabs"); }
+    if (b.flex_item == 1) { io.write_str(2, "\tflexitem"); }
+    io.write_str(2, "\n");
+    let is *bx.Box as k with mut = b.first;
+    while (k != null) {
+        _walk(k, depth + 1);
+        k = k.next;
+    }
+}
+
+fn boxes(root as *bx.Box) as void {
+    io.write_str(2, "=== boxes\n");
+    if (root != null) { _walk(root, 0); }
+}

@@ -370,14 +370,46 @@ fn _any_in_list(n as *dom.Node, l0 as *sh.Selector) as i64 {
     return 0;
 }
 
-fn _has_below(n as *dom.Node, l as *sh.Selector, depth as i64) as i64 {
+fn _one_below(n as *dom.Node, s as *sh.Selector, depth as i64) as i64 {
     if (depth > MAX_DEPTH) { return 0; }
     let is *dom.Node as c with mut = n.first;
     while (c != null) {
         if (c.kind == dom.ELEMENT) {
-            if (_any_in_list(c, l) == 1 || _has_below(c, l, depth + 1) == 1) { return 1; }
+            if (_match_from(c, s.right) == 1 || _one_below(c, s, depth + 1) == 1) { return 1; }
         }
         c = c.next;
+    }
+    return 0;
+}
+
+// A relative selector from n. One with more compounds after its combinator is only looked
+// for under n: anchoring its left end to n too is more than any page has asked of this.
+fn _has_one(n as *dom.Node, s as *sh.Selector) as i64 {
+    if (s.right.left != null || s.lead == sh.C_NONE) { return _one_below(n, s, 0); }
+    if (s.lead == sh.C_CHILD) {
+        let is *dom.Node as c with mut = n.first;
+        while (c != null) {
+            if (c.kind == dom.ELEMENT && _match_from(c, s.right) == 1) { return 1; }
+            c = c.next;
+        }
+        return 0;
+    }
+    let is *dom.Node as x with mut = _next_elem(n);
+    if (s.lead == sh.C_ADJACENT) {
+        return cast(i64, x != null && _match_from(x, s.right) == 1);
+    }
+    while (x != null) {
+        if (_match_from(x, s.right) == 1) { return 1; }
+        x = _next_elem(x);
+    }
+    return 0;
+}
+
+fn _has_below(n as *dom.Node, l as *sh.Selector) as i64 {
+    let is *sh.Selector as s with mut = l;
+    while (s != null) {
+        if (_has_one(n, s) == 1) { return 1; }
+        s = s.next;
     }
     return 0;
 }
@@ -443,7 +475,7 @@ fn _match_simple(n as *dom.Node, s as *sh.Simple) as i64 {
     }
     if (k == sh.S_NOT) { return 1 - _any_in_list(n, s.sub); }
     if (k == sh.S_IS) { return _any_in_list(n, s.sub); }
-    if (k == sh.S_HAS) { return _has_below(n, s.sub, 0); }
+    if (k == sh.S_HAS) { return _has_below(n, s.sub); }
     if (k == sh.S_CHECKED) {
         if (n.tag == tg.INPUT && dom.find_attr(n, "checked", 7) != null) { return 1; }
         if (n.tag == tg.OPTION && dom.find_attr(n, "selected", 8) != null) { return 1; }

@@ -90,6 +90,7 @@ struct Selector {
     spec   as i64;       // ids << 20 | classes << 10 | types
     pseudo as i64;
     next   as *Selector; // the next in its comma-separated list
+    lead   as i64;       // in :has(), the combinator it starts with, else C_NONE
 }
 
 let is i64 as MEDIA_MAX_FEATURES with imut = 8;
@@ -521,10 +522,13 @@ fn _complex(p as *_P, end as i64) as *Selector {
     let is *Compound as cur with mut = cast(*Compound, 0);
     let is i64 as pending with mut = C_NONE;
     _skip_ws(p);
-    // :has() takes relative selectors, and a leading combinator has no meaning here
-    // beyond "somewhere under it", which is what it does anyway.
+    // :has() takes relative selectors, and they may start with a combinator.
+    sel.lead = C_NONE;
     if (p.i < end && p.t[p.i].kind == tok.T_DELIM &&
         (p.t[p.i].delim == 62 || p.t[p.i].delim == 43 || p.t[p.i].delim == 126)) {
+        if (p.t[p.i].delim == 62) { sel.lead = C_CHILD; }
+        if (p.t[p.i].delim == 43) { sel.lead = C_ADJACENT; }
+        if (p.t[p.i].delim == 126) { sel.lead = C_SIBLING; }
         p.i = p.i + 1;
         _skip_ws(p);
     }
@@ -715,11 +719,146 @@ fn _px_of(t as *tok.Token, out as *f64) as i64 {
     return 1;
 }
 
+// calc() of lengths and plain numbers, the only sum a query has anything to fill in with.
+// The index past its closing bracket, or -1 for what it cannot work out.
+fn _calc(p as *_P, start as i64, end as i64, out as *f64) as i64 {
+    let is f64 as total with mut = 0.0;
+    let is f64 as sign with mut = 1.0;
+    let is f64 as term with mut = 0.0;
+    let is i64 as have with mut = 0;
+    let is i64 as op with mut = 0;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        let is *tok.Token as t = &p.t[i];
+        i = i + 1;
+        if (t.kind == tok.T_RPAREN) {
+            *out = total + sign * term;
+            return i;
+        }
+        if (t.kind == tok.T_WS) { continue; }
+        if (t.kind == tok.T_DELIM && (t.delim == 43 || t.delim == 45)) {
+            total = total + sign * term;
+            sign = 1.0;
+            if (t.delim == 45) { sign = 0.0 - 1.0; }
+            term = 0.0;
+            have = 0;
+            continue;
+        }
+        if (t.kind == tok.T_DELIM && (t.delim == 42 || t.delim == 47)) {
+            op = t.delim;
+            continue;
+        }
+        let is f64 as val with mut = 0.0;
+        if (t.kind == tok.T_LPAREN || (t.kind == tok.T_FUNCTION && _eq(t.s, t.n, "calc") == 1)) {
+            i = _calc(p, i, end, &val);
+            if (i < 0) { return 0 - 1; }
+        }
+        else if (t.kind == tok.T_NUMBER) { val = t.num; }
+        else if (_px_of(t, &val) == 0) { return 0 - 1; }
+        if (have == 0) { term = val; have = 1; }
+        else if (op == 42) { term = term * val; }
+        else if (op == 47 && val != 0.0) { term = term / val; }
+        else { return 0 - 1; }
+    }
+    return 0 - 1;
+}
+
+// A length at i, written out or as calc(). The index past it, or -1.
+fn _length_at(p as *_P, i as i64, end as i64, out as *f64) as i64 {
+    if (i >= end) { return 0 - 1; }
+    let is *tok.Token as t = &p.t[i];
+    if (t.kind == tok.T_FUNCTION && _eq(t.s, t.n, "calc") == 1) {
+        return _calc(p, i + 1, end, out);
+    }
+    if (_px_of(t, out) == 1) { return i + 1; }
+    return 0 - 1;
+}
+
+fn _past_space(p as *_P, i0 as i64, end as i64) as i64 {
+    let is i64 as i with mut = i0;
+    while (i < end && p.t[i].kind == tok.T_WS) { i = i + 1; }
+    return i;
+}
+
+let is i64 as _CMP_MORE  with imut = 0;
+let is i64 as _CMP_LESS  with imut = 1;
+let is i64 as _CMP_EQUAL with imut = 2;
+
+// A comparison at i: which way in *cmp, and whether it takes the equal case in *or_eq.
+fn _cmp_at(p as *_P, i as i64, end as i64, cmp as *i64, or_eq as *i64) as i64 {
+    if (i >= end || p.t[i].kind != tok.T_DELIM) { return 0 - 1; }
+    let is i64 as d = p.t[i].delim;
+    *or_eq = 0;
+    if (d == 61) { *cmp = _CMP_EQUAL; *or_eq = 1; return i + 1; }
+    if (d != 60 && d != 62) { return 0 - 1; }
+    *cmp = _CMP_MORE;
+    if (d == 60) { *cmp = _CMP_LESS; }
+    if (i + 1 < end && p.t[i + 1].kind == tok.T_DELIM && p.t[i + 1].delim == 61) {
+        *or_eq = 1;
+        return i + 2;
+    }
+    return i + 1;
+}
+
+// One side of a range. The limits a query keeps take their own value, so one that leaves
+// it out is a hair inside. 1, or 0 for a feature with no such limits.
+fn _limit(p as *_P, q as *Query, name as *tok.Token, cmp as i64, or_eq as i64, px as f64) as i64 {
+    let is f64 as hair with mut = 0.01;
+    if (or_eq == 1) { hair = 0.0; }
+    if (_eq(name.s, name.n, "width") == 1) {
+        if (cmp != _CMP_LESS) { q.min_w = px + hair; }
+        if (cmp != _CMP_MORE) { q.max_w = px - hair; }
+    } else if (_eq(name.s, name.n, "height") == 1) {
+        if (cmp != _CMP_LESS) { q.min_h = px + hair; }
+        if (cmp != _CMP_MORE) { q.max_h = px - hair; }
+    } else {
+        return 0;
+    }
+    p.sh.viewport = 1;
+    return 1;
+}
+
+// width >= 600px, 600px <= width, 400px <= width < 900px. 1 when it was one of them.
+fn _range(p as *_P, start as i64, end as i64, q as *Query) as i64 {
+    let is i64 as i with mut = start;
+    let is f64 as px with mut = 0.0;
+    let is i64 as cmp with mut = 0;
+    let is i64 as or_eq with mut = 0;
+    if (p.t[i].kind == tok.T_IDENT) {
+        let is *tok.Token as name = &p.t[i];
+        i = _cmp_at(p, _past_space(p, i + 1, end), end, &cmp, &or_eq);
+        if (i < 0) { return 0; }
+        i = _length_at(p, _past_space(p, i, end), end, &px);
+        if (i < 0 || _past_space(p, i, end) != end) { return 0; }
+        return _limit(p, q, name, cmp, or_eq, px);
+    }
+    i = _length_at(p, i, end, &px);
+    if (i < 0) { return 0; }
+    i = _cmp_at(p, _past_space(p, i, end), end, &cmp, &or_eq);
+    if (i < 0) { return 0; }
+    i = _past_space(p, i, end);
+    if (i >= end || p.t[i].kind != tok.T_IDENT) { return 0; }
+    let is *tok.Token as named = &p.t[i];
+    // The feature stands on the right here, so the comparison reads the other way round.
+    let is i64 as turned with mut = cmp;
+    if (cmp == _CMP_LESS) { turned = _CMP_MORE; }
+    if (cmp == _CMP_MORE) { turned = _CMP_LESS; }
+    if (_limit(p, q, named, turned, or_eq, px) == 0) { return 0; }
+    i = _past_space(p, i + 1, end);
+    if (i == end) { return 1; }
+    i = _cmp_at(p, i, end, &cmp, &or_eq);
+    if (i < 0) { return 0; }
+    i = _length_at(p, _past_space(p, i, end), end, &px);
+    if (i < 0 || _past_space(p, i, end) != end) { return 0; }
+    return _limit(p, q, named, cmp, or_eq, px);
+}
+
 fn _feature(p as *_P, start as i64, end as i64, q as *Query) as void {
     let is i64 as i with mut = start;
     while (i < end && p.t[i].kind == tok.T_WS) { i = i + 1; }
+    if (i < end && _range(p, i, end, q) == 1) { return; }
     if (i >= end || p.t[i].kind != tok.T_IDENT) {
-        // Range syntax, nested conditions: not understood, so not applied.
+        // Nested conditions: not understood, so not applied.
         q.never = 1;
         return;
     }
@@ -735,7 +874,7 @@ fn _feature(p as *_P, start as i64, end as i64, q as *Query) as void {
     }
     let is *u8 as s = name.s;
     let is i64 as n = name.n;
-    if (val != null && _px_of(val, &px) == 1) {
+    if (val != null && _length_at(p, i, end, &px) >= 0) {
         if (_eq(s, n, "min-width") == 1) { q.min_w = px; p.sh.viewport = 1; return; }
         if (_eq(s, n, "max-width") == 1) { q.max_w = px; p.sh.viewport = 1; return; }
         if (_eq(s, n, "min-height") == 1) { q.min_h = px; p.sh.viewport = 1; return; }
@@ -920,11 +1059,16 @@ fn _keyframes(p as *_P, start as i64, prelude_end as i64, body as i64, end as i6
 // cannot do: a page has a plainer fallback outside the block for exactly that.
 fn _supports(p as *_P, start as i64, end as i64) as i64 {
     let is i64 as k with mut = start;
+    while (k < end && p.t[k].kind == tok.T_WS) { k = k + 1; }
+    // A leading "not" asks the opposite of all that follows it.
+    if (k < end && p.t[k].kind == tok.T_IDENT && _eq(p.t[k].s, p.t[k].n, "not") == 1) {
+        return 1 - _supports(p, k + 1, end);
+    }
     while (k < end) {
         let is *tok.Token as t = &p.t[k];
         if (t.kind == tok.T_IDENT) {
             if (_eq(t.s, t.n, "not") == 1) { return 0; }
-            if (_eq(t.s, t.n, "grid") == 1 || _eq(t.s, t.n, "subgrid") == 1 || _eq(t.s, t.n, "backdrop-filter") == 1 ||
+            if (_eq(t.s, t.n, "subgrid") == 1 || _eq(t.s, t.n, "backdrop-filter") == 1 ||
                 _eq(t.s, t.n, "contain") == 1) { return 0; }
         }
         k = k + 1;

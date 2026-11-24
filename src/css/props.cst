@@ -89,68 +89,70 @@ let is i64 as P_JUSTIFY_ITEMS with imut = 79;
 let is i64 as P_JUSTIFY_SELF with imut = 80;
 let is i64 as P_GRID_TEMPLATE_COLUMNS with imut = 81;
 let is i64 as P_GRID_TEMPLATE_ROWS with imut = 82;
-let is i64 as P_GRID_AUTO_COLUMNS with imut = 83;
-let is i64 as P_GRID_AUTO_ROWS with imut = 84;
-let is i64 as P_GRID_AUTO_FLOW with imut = 85;
-let is i64 as P_GRID_ROW_START with imut = 86;
-let is i64 as P_GRID_COLUMN_START with imut = 87;
-let is i64 as P_GRID_ROW_END with imut = 88;
-let is i64 as P_GRID_COLUMN_END with imut = 89;
-let is i64 as P_SCROLL_PADDING_TOP with imut = 90;
-let is i64 as P_SCROLL_MARGIN_TOP with imut = 91;
-let is i64 as P_TRANSFORM with imut = 92;
-let is i64 as P_TRANSFORM_ORIGIN_X with imut = 93;
-let is i64 as P_TRANSFORM_ORIGIN_Y with imut = 94;
-let is i64 as P_TRANSITION_PROPERTY with imut = 95;
-let is i64 as P_TRANSITION_DURATION with imut = 96;
-let is i64 as P_TRANSITION_DELAY with imut = 97;
-let is i64 as P_TRANSITION_TIMING_FUNCTION with imut = 98;
-let is i64 as P_ANIMATION_NAME with imut = 99;
-let is i64 as P_ANIMATION_DURATION with imut = 100;
-let is i64 as P_ANIMATION_DELAY with imut = 101;
-let is i64 as P_ANIMATION_ITERATION_COUNT with imut = 102;
-let is i64 as P_ANIMATION_DIRECTION with imut = 103;
-let is i64 as P_ANIMATION_FILL_MODE with imut = 104;
-let is i64 as P_ANIMATION_TIMING_FUNCTION with imut = 105;
-let is i64 as P_TABLE_LAYOUT with imut = 106;
-let is i64 as P_CONTENT with imut = 107;
-let is i64 as P_TEXT_DECORATION_LINE with imut = 108;
-let is i64 as P_VERTICAL_ALIGN with imut = 109;
-let is i64 as P_OUTLINE_WIDTH with imut = 110;
-let is i64 as P_OUTLINE_STYLE with imut = 111;
-let is i64 as P_OUTLINE_COLOR with imut = 112;
-let is i64 as P_OUTLINE_OFFSET with imut = 113;
-let is i64 as P_VISIBILITY with imut = 114;
-let is i64 as P_ACCENT_COLOR with imut = 115;
-let is i64 as P_FILL with imut = 116;
-let is i64 as P_STROKE with imut = 117;
-let is i64 as P_COLOR with imut = 118;
-let is i64 as P_FONT_FAMILY with imut = 119;
-let is i64 as P_FONT_SIZE with imut = 120;
-let is i64 as P_FONT_WEIGHT with imut = 121;
-let is i64 as P_FONT_STYLE with imut = 122;
-let is i64 as P_LINE_HEIGHT with imut = 123;
-let is i64 as P_TEXT_ALIGN with imut = 124;
-let is i64 as P_TEXT_INDENT with imut = 125;
-let is i64 as P_TEXT_TRANSFORM with imut = 126;
-let is i64 as P_WHITE_SPACE with imut = 127;
-let is i64 as P_LIST_STYLE_TYPE with imut = 128;
-let is i64 as P_LIST_STYLE_POSITION with imut = 129;
-let is i64 as P_LIST_STYLE_IMAGE with imut = 130;
-let is i64 as P_BORDER_COLLAPSE with imut = 131;
-let is i64 as P_BORDER_SPACING_H with imut = 132;
-let is i64 as P_BORDER_SPACING_V with imut = 133;
-let is i64 as P_CAPTION_SIDE with imut = 134;
-let is i64 as P_CURSOR with imut = 135;
-let is i64 as P_POINTER_EVENTS with imut = 136;
-let is i64 as P_SCROLL_BEHAVIOR with imut = 137;
-let is i64 as P_LETTER_SPACING with imut = 138;
-let is i64 as P_WORD_SPACING with imut = 139;
-let is i64 as P_WORD_BREAK with imut = 140;
-let is i64 as P_OVERFLOW_WRAP with imut = 141;
-let is i64 as P_X_DECORATIONS with imut = 142;
-let is i64 as P_COUNT with imut = 143;
-let is i64 as P_INHERITED with imut = 114;
+let is i64 as P_GRID_TEMPLATE_AREAS with imut = 83;
+let is i64 as P_GRID_AREA_NAME with imut = 84;
+let is i64 as P_GRID_AUTO_COLUMNS with imut = 85;
+let is i64 as P_GRID_AUTO_ROWS with imut = 86;
+let is i64 as P_GRID_AUTO_FLOW with imut = 87;
+let is i64 as P_GRID_ROW_START with imut = 88;
+let is i64 as P_GRID_COLUMN_START with imut = 89;
+let is i64 as P_GRID_ROW_END with imut = 90;
+let is i64 as P_GRID_COLUMN_END with imut = 91;
+let is i64 as P_SCROLL_PADDING_TOP with imut = 92;
+let is i64 as P_SCROLL_MARGIN_TOP with imut = 93;
+let is i64 as P_TRANSFORM with imut = 94;
+let is i64 as P_TRANSFORM_ORIGIN_X with imut = 95;
+let is i64 as P_TRANSFORM_ORIGIN_Y with imut = 96;
+let is i64 as P_TRANSITION_PROPERTY with imut = 97;
+let is i64 as P_TRANSITION_DURATION with imut = 98;
+let is i64 as P_TRANSITION_DELAY with imut = 99;
+let is i64 as P_TRANSITION_TIMING_FUNCTION with imut = 100;
+let is i64 as P_ANIMATION_NAME with imut = 101;
+let is i64 as P_ANIMATION_DURATION with imut = 102;
+let is i64 as P_ANIMATION_DELAY with imut = 103;
+let is i64 as P_ANIMATION_ITERATION_COUNT with imut = 104;
+let is i64 as P_ANIMATION_DIRECTION with imut = 105;
+let is i64 as P_ANIMATION_FILL_MODE with imut = 106;
+let is i64 as P_ANIMATION_TIMING_FUNCTION with imut = 107;
+let is i64 as P_TABLE_LAYOUT with imut = 108;
+let is i64 as P_CONTENT with imut = 109;
+let is i64 as P_TEXT_DECORATION_LINE with imut = 110;
+let is i64 as P_VERTICAL_ALIGN with imut = 111;
+let is i64 as P_OUTLINE_WIDTH with imut = 112;
+let is i64 as P_OUTLINE_STYLE with imut = 113;
+let is i64 as P_OUTLINE_COLOR with imut = 114;
+let is i64 as P_OUTLINE_OFFSET with imut = 115;
+let is i64 as P_VISIBILITY with imut = 116;
+let is i64 as P_ACCENT_COLOR with imut = 117;
+let is i64 as P_FILL with imut = 118;
+let is i64 as P_STROKE with imut = 119;
+let is i64 as P_COLOR with imut = 120;
+let is i64 as P_FONT_FAMILY with imut = 121;
+let is i64 as P_FONT_SIZE with imut = 122;
+let is i64 as P_FONT_WEIGHT with imut = 123;
+let is i64 as P_FONT_STYLE with imut = 124;
+let is i64 as P_LINE_HEIGHT with imut = 125;
+let is i64 as P_TEXT_ALIGN with imut = 126;
+let is i64 as P_TEXT_INDENT with imut = 127;
+let is i64 as P_TEXT_TRANSFORM with imut = 128;
+let is i64 as P_WHITE_SPACE with imut = 129;
+let is i64 as P_LIST_STYLE_TYPE with imut = 130;
+let is i64 as P_LIST_STYLE_POSITION with imut = 131;
+let is i64 as P_LIST_STYLE_IMAGE with imut = 132;
+let is i64 as P_BORDER_COLLAPSE with imut = 133;
+let is i64 as P_BORDER_SPACING_H with imut = 134;
+let is i64 as P_BORDER_SPACING_V with imut = 135;
+let is i64 as P_CAPTION_SIDE with imut = 136;
+let is i64 as P_CURSOR with imut = 137;
+let is i64 as P_POINTER_EVENTS with imut = 138;
+let is i64 as P_SCROLL_BEHAVIOR with imut = 139;
+let is i64 as P_LETTER_SPACING with imut = 140;
+let is i64 as P_WORD_SPACING with imut = 141;
+let is i64 as P_WORD_BREAK with imut = 142;
+let is i64 as P_OVERFLOW_WRAP with imut = 143;
+let is i64 as P_X_DECORATIONS with imut = 144;
+let is i64 as P_COUNT with imut = 145;
+let is i64 as P_INHERITED with imut = 116;
 
 let is i64 as K_BLOCK with imut = 1;
 let is i64 as K_INLINE with imut = 2;
@@ -359,7 +361,7 @@ struct Values {
     p as [P_COUNT]f64;
 }
 
-let is *u8 as _PROPS with imut = "display position float clear top right bottom left z-index margin-top margin-right margin-bottom margin-left padding-top padding-right padding-bottom padding-left border-top-width border-right-width border-bottom-width border-left-width border-top-style border-right-style border-bottom-style border-left-style border-top-color border-right-color border-bottom-color border-left-color border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius width height min-width max-width min-height max-height box-sizing overflow-x overflow-y opacity stroke-width stroke-miterlimit stroke-opacity fill-opacity stroke-linecap stroke-linejoin fill-rule background-color background-image background-repeat background-position-x background-position-y background-size-w background-size-h mask-image mask-repeat mask-position-x mask-position-y mask-size-w mask-size-h -x-gradient box-shadow flex-direction flex-wrap flex-grow flex-shrink flex-basis justify-content align-items align-self align-content order row-gap column-gap column-count column-width justify-items justify-self grid-template-columns grid-template-rows grid-auto-columns grid-auto-rows grid-auto-flow grid-row-start grid-column-start grid-row-end grid-column-end scroll-padding-top scroll-margin-top transform transform-origin-x transform-origin-y transition-property transition-duration transition-delay transition-timing-function animation-name animation-duration animation-delay animation-iteration-count animation-direction animation-fill-mode animation-timing-function table-layout content text-decoration-line vertical-align outline-width outline-style outline-color outline-offset visibility accent-color fill stroke color font-family font-size font-weight font-style line-height text-align text-indent text-transform white-space list-style-type list-style-position list-style-image border-collapse border-spacing-h border-spacing-v caption-side cursor pointer-events scroll-behavior letter-spacing word-spacing word-break overflow-wrap -x-decorations ";
+let is *u8 as _PROPS with imut = "display position float clear top right bottom left z-index margin-top margin-right margin-bottom margin-left padding-top padding-right padding-bottom padding-left border-top-width border-right-width border-bottom-width border-left-width border-top-style border-right-style border-bottom-style border-left-style border-top-color border-right-color border-bottom-color border-left-color border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius width height min-width max-width min-height max-height box-sizing overflow-x overflow-y opacity stroke-width stroke-miterlimit stroke-opacity fill-opacity stroke-linecap stroke-linejoin fill-rule background-color background-image background-repeat background-position-x background-position-y background-size-w background-size-h mask-image mask-repeat mask-position-x mask-position-y mask-size-w mask-size-h -x-gradient box-shadow flex-direction flex-wrap flex-grow flex-shrink flex-basis justify-content align-items align-self align-content order row-gap column-gap column-count column-width justify-items justify-self grid-template-columns grid-template-rows grid-template-areas grid-area-name grid-auto-columns grid-auto-rows grid-auto-flow grid-row-start grid-column-start grid-row-end grid-column-end scroll-padding-top scroll-margin-top transform transform-origin-x transform-origin-y transition-property transition-duration transition-delay transition-timing-function animation-name animation-duration animation-delay animation-iteration-count animation-direction animation-fill-mode animation-timing-function table-layout content text-decoration-line vertical-align outline-width outline-style outline-color outline-offset visibility accent-color fill stroke color font-family font-size font-weight font-style line-height text-align text-indent text-transform white-space list-style-type list-style-position list-style-image border-collapse border-spacing-h border-spacing-v caption-side cursor pointer-events scroll-behavior letter-spacing word-spacing word-break overflow-wrap -x-decorations ";
 let is *u8 as _KEYWORDS with imut = "block inline inline-block list-item flow-root none table inline-table table-row table-row-group table-header-group table-footer-group table-column table-column-group table-cell table-caption flex inline-flex grid inline-grid contents static relative absolute fixed sticky left right both auto thin medium thick hidden dotted dashed solid double groove ridge inset outset currentcolor min-content max-content fit-content content-box border-box visible clip scroll butt round square miter bevel nonzero evenodd transparent repeat repeat-x repeat-y no-repeat space center top bottom cover contain row row-reverse column column-reverse nowrap wrap wrap-reverse content flex-start flex-end space-between space-around space-evenly start end normal stretch baseline all infinite reverse alternate alternate-reverse forwards backwards underline overline line-through sub super text-top middle text-bottom collapse black family xx-small x-small small large x-large xx-large xxx-large smaller larger bold bolder lighter italic oblique justify -internal-center -webkit-center -moz-center -webkit-left -webkit-right -moz-left -moz-right uppercase lowercase capitalize pre pre-wrap pre-line break-spaces disc circle decimal decimal-leading-zero lower-alpha upper-alpha lower-latin upper-latin lower-roman upper-roman outside inside separate default context-menu help pointer progress wait cell crosshair text vertical-text alias copy move no-drop not-allowed grab grabbing e-resize n-resize ne-resize nw-resize s-resize se-resize sw-resize w-resize ew-resize ns-resize nesw-resize nwse-resize col-resize row-resize all-scroll zoom-in zoom-out smooth break-all keep-all break-word anywhere inherit initial unset revert revert-layer number ";
 
 fn _lower(c as i64) as i64 {
@@ -452,6 +454,8 @@ fn flags_of(p as i64) as i64 {
     if (p == P_COLUMN_WIDTH) { return 1; }
     if (p == P_GRID_TEMPLATE_COLUMNS) { return 32; }
     if (p == P_GRID_TEMPLATE_ROWS) { return 32; }
+    if (p == P_GRID_TEMPLATE_AREAS) { return 32; }
+    if (p == P_GRID_AREA_NAME) { return 32; }
     if (p == P_GRID_AUTO_COLUMNS) { return 32; }
     if (p == P_GRID_AUTO_ROWS) { return 32; }
     if (p == P_GRID_ROW_START) { return 64; }
@@ -564,6 +568,8 @@ fn keywords_of(p as i64) as *u8 {
     if (p == P_JUSTIFY_SELF) { return "auto normal stretch flex-start flex-end center baseline start end left right "; }
     if (p == P_GRID_TEMPLATE_COLUMNS) { return "none "; }
     if (p == P_GRID_TEMPLATE_ROWS) { return "none "; }
+    if (p == P_GRID_TEMPLATE_AREAS) { return "none "; }
+    if (p == P_GRID_AREA_NAME) { return "none "; }
     if (p == P_GRID_AUTO_COLUMNS) { return "auto "; }
     if (p == P_GRID_AUTO_ROWS) { return "auto "; }
     if (p == P_GRID_AUTO_FLOW) { return "row column "; }
@@ -700,6 +706,8 @@ fn set_initial(v as *Values) as void {
     v.i[P_JUSTIFY_SELF] = K_AUTO;
     v.i[P_GRID_TEMPLATE_COLUMNS] = K_NONE;
     v.i[P_GRID_TEMPLATE_ROWS] = K_NONE;
+    v.i[P_GRID_TEMPLATE_AREAS] = K_NONE;
+    v.i[P_GRID_AREA_NAME] = K_NONE;
     v.i[P_GRID_AUTO_COLUMNS] = K_AUTO;
     v.i[P_GRID_AUTO_ROWS] = K_AUTO;
     v.i[P_GRID_AUTO_FLOW] = K_ROW;
