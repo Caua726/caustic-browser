@@ -305,7 +305,7 @@ fn _lay_out_items(c as *bx.Ctx, b as *bx.Box) as void {
         let is f64 as sum with mut = 0.0;
         while (it != null) {
             let is f64 as size = it.hypo + _main_edges(it, row);
-            if (wrap == 1 && l.n > 0 && main_size >= 0.0 && sum + main_gap + size > main_size) { break; }
+            if (wrap == 1 && l.n > 0 && main_size >= 0.0 && sum + main_gap + size > main_size + 0.01) { break; }
             if (l.n > 0) { sum = sum + main_gap; }
             sum = sum + size;
             l.n = l.n + 1;

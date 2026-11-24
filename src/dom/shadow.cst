@@ -1,0 +1,212 @@
+// dom/shadow.cst — declarative shadow roots, put where a page without scripts leaves them.
+//
+// Nothing can ever attach, move or look into one here, so the tree layout walks can simply
+// be the flat one: a host's children become its shadow's, and each <slot> takes the light
+// children assigned to it. What stays of the boundary is the scope on each element, which
+// keeps a shadow's rules to its own elements and the document's rules out of them.
+//
+// Roots with the same styles share a scope and one copy of those styles: a page repeats
+// its components, and their sheets, many times over.
+
+use "./dom.cst" as dom;
+use "./tags.cst" as tg;
+
+let is i64 as MAX_DEPTH with imut = 256;
+let is i64 as MAX_SCOPES with imut = 256;
+
+let is [MAX_SCOPES]i64 as _hashes with mut;
+let is i64 as _nscopes with mut = 0;
+
+fn _is_name(n as *dom.Node, s as *u8, len as i64) as i64 {
+    if (n.name_len != len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (n.name[i] != s[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _root_template(host as *dom.Node) as *dom.Node {
+    let is *dom.Node as c with mut = host.first;
+    while (c != null) {
+        if (c.kind == dom.ELEMENT && c.tag == tg.TEMPLATE && c.content != null) {
+            let is *dom.Attr as mode = dom.find_attr(c, "shadowrootmode", 14);
+            if (mode != null) { return c; }
+        }
+        c = c.next;
+    }
+    return cast(*dom.Node, 0);
+}
+
+fn _mix(h0 as i64, s as *u8, n as i64) as i64 {
+    let is i64 as h with mut = h0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = (h ^ cast(i64, s[i])) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _is_sheet(n as *dom.Node) as i64 {
+    return cast(i64, n.kind == dom.ELEMENT && (n.tag == tg.STYLE || n.tag == tg.LINK));
+}
+
+// What decides a root's styles: its <style>s and <link>s, wherever under it, in order.
+fn _styles_hash(first as *dom.Node, h0 as i64, depth as i64) as i64 {
+    let is i64 as h with mut = h0;
+    if (depth > MAX_DEPTH) { return h; }
+    let is *dom.Node as c with mut = first;
+    while (c != null) {
+        if (_is_sheet(c) == 1) {
+            let is *dom.Node as t with mut = c.first;
+            while (t != null) {
+                if (t.kind == dom.TEXT) { h = _mix(h, t.text, t.text_len); }
+                t = t.next;
+            }
+            let is *dom.Attr as href = dom.find_attr(c, "href", 4);
+            if (href != null) { h = _mix(h, href.value, href.value_len); }
+        } else if (c.kind == dom.ELEMENT) {
+            h = _styles_hash(c.first, h, depth + 1);
+        }
+        c = c.next;
+    }
+    return h;
+}
+
+// Takes out what another root of these styles has already brought.
+fn _drop_sheets(parent as *dom.Node, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *dom.Node as c with mut = parent.first;
+    while (c != null) {
+        let is *dom.Node as next = c.next;
+        if (_is_sheet(c) == 1) { dom.remove(c); }
+        else if (c.kind == dom.ELEMENT) { _drop_sheets(c, depth + 1); }
+        c = next;
+    }
+}
+
+// The scope for a root with these contents, and they lose their sheets if it is not new.
+fn _scope_for(frag as *dom.Node) as i64 {
+    let is i64 as h = _styles_hash(frag.first, 1469598103934665603, 0);
+    let is i64 as i with mut = 0;
+    while (i < _nscopes) {
+        if (_hashes[i] == h) {
+            _drop_sheets(frag, 0);
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    if (_nscopes < MAX_SCOPES) {
+        _hashes[_nscopes] = h;
+        _nscopes = _nscopes + 1;
+        return _nscopes;
+    }
+    // Out of room: still a scope of its own, only not one the next root can find.
+    return MAX_SCOPES + 1 + _nscopes;
+}
+
+// Whether a node goes in the slot of this name. Text has no slot attribute, so it goes in
+// the unnamed one.
+fn _wants(n as *dom.Node, name as *u8, len as i64) as i64 {
+    let is *u8 as has with mut = cast(*u8, "");
+    let is i64 as hn with mut = 0;
+    if (n.kind == dom.ELEMENT) {
+        let is *dom.Attr as a = dom.find_attr(n, "slot", 4);
+        if (a != null) { has = a.value; hn = a.value_len; }
+    }
+    if (hn != len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (has[i] != name[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Light children into the first slot of their name. What is in a slot that gets something
+// was only there for when it got nothing.
+fn _fill(slot as *dom.Node, light as *dom.Node) as void {
+    let is *u8 as name with mut = cast(*u8, "");
+    let is i64 as len with mut = 0;
+    let is *dom.Attr as a = dom.find_attr(slot, "name", 4);
+    if (a != null) { name = a.value; len = a.value_len; }
+    let is i64 as filled with mut = 0;
+    let is *dom.Node as c with mut = light.first;
+    while (c != null) {
+        let is *dom.Node as next = c.next;
+        if ((c.kind == dom.ELEMENT || c.kind == dom.TEXT) && _wants(c, name, len) == 1) {
+            if (filled == 0) {
+                filled = 1;
+                while (slot.first != null) { dom.remove(slot.first); }
+            }
+            dom.remove(c);
+            dom.append(slot, c);
+        }
+        c = next;
+    }
+}
+
+fn _slots(n as *dom.Node, scope as i64, light as *dom.Node, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *dom.Node as c with mut = n.first;
+    while (c != null) {
+        let is *dom.Node as next = c.next;
+        if (c.kind == dom.ELEMENT) {
+            if (c.scope == scope && _is_name(c, "slot", 4) == 1) { _fill(c, light); }
+            else { _slots(c, scope, light, depth + 1); }
+        }
+        c = next;
+    }
+}
+
+fn _attach(d as *dom.Document, host as *dom.Node, depth as i64) as void {
+    let is *dom.Node as t = _root_template(host);
+    if (t == null) { return; }
+    dom.remove(t);
+    let is *dom.Node as frag = t.content;
+    let is i64 as scope = _scope_for(frag);
+    host.host_scope = scope;
+    _visit(d, frag, scope, depth + 1);
+
+    // A fragment to hold the light children while the shadow's come in.
+    let is *dom.Node as light = dom.fragment(d, host);
+    dom.move_children(host, light);
+    _slots(frag, scope, light, 0);
+    dom.move_children(frag, host);
+}
+
+fn _visit(d as *dom.Document, n as *dom.Node, scope as i64, depth as i64) as void {
+    if (depth > MAX_DEPTH) { return; }
+    let is *dom.Node as c with mut = n.first;
+    while (c != null) {
+        let is *dom.Node as next = c.next;
+        if (c.kind == dom.ELEMENT) {
+            c.scope = scope;
+            _visit(d, c, scope, depth + 1);
+            _attach(d, c, depth);
+        }
+        c = next;
+    }
+}
+
+fn _any(n as *dom.Node, depth as i64) as i64 {
+    if (depth > MAX_DEPTH) { return 0; }
+    let is *dom.Node as c with mut = n.first;
+    while (c != null) {
+        if (c.kind == dom.ELEMENT) {
+            if (c.tag == tg.TEMPLATE && dom.find_attr(c, "shadowrootmode", 14) != null) { return 1; }
+            if (_any(c, depth + 1) == 1) { return 1; }
+        }
+        c = c.next;
+    }
+    return 0;
+}
+
+// Makes a parsed document flat. A page with no shadow root is left as it is.
+fn flatten(d as *dom.Document) as void {
+    _nscopes = 0;
+    if (_any(d.node, 0) == 0) { return; }
+    _visit(d, d.node, 0, 0);
+}

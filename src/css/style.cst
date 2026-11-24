@@ -67,7 +67,11 @@ struct Entry {
     seq  as i64;
     next as *Entry;
     dyn_next as *Entry;   // among those that ask what a person is doing
+    scope as i64;         // whose elements it is for, SCOPE_ALL for every tree's
+    of_host as i64;       // it is about the host of that scope, from inside
 }
+
+let is i64 as SCOPE_ALL with imut = 0 - 1;
 
 // All of a page's sheets, indexed. The index outlives the styles made from it.
 struct Engine {
@@ -83,6 +87,8 @@ struct Engine {
     root_em  as f64;
     base     as *u8;
     keyframes as *sh.Keyframes;
+    scope_now as i64;          // what the sheets being added are for
+    containers as i64;         // some rule asks how big a container is
 }
 
 let is pr.Values as _initial with mut;
@@ -112,6 +118,8 @@ fn init(e as *Engine, a as *arena.Arena, ia as *arena.Arena, base as *u8) as voi
     e.dynamic = cast(*Entry, 0);
     e.seq = 0;
     e.keyframes = cast(*sh.Keyframes, 0);
+    e.scope_now = SCOPE_ALL;
+    e.containers = 0;
     e.viewport = 0;
     e.vw = 0.0;
     e.vh = 0.0;
@@ -138,6 +146,7 @@ fn add_sheet(e as *Engine, s as *sh.Sheet) as void {
     }
     let is *sh.Rule as r with mut = s.first;
     while (r != null) {
+        if (r.container != null) { e.containers = 1; }
         let is *sh.Selector as x with mut = r.selectors;
         while (x != null) {
             _index(e, x, r);
@@ -153,6 +162,13 @@ fn _index(e as *Engine, x as *sh.Selector, r as *sh.Rule) as void {
     en.rule = r;
     en.seq = e.seq;
     e.seq = e.seq + 1;
+    en.scope = e.scope_now;
+    en.of_host = 0;
+    let is *sh.Simple as part with mut = x.right.first;
+    while (part != null) {
+        if (part.kind == sh.S_HOST) { en.of_host = 1; }
+        part = part.next;
+    }
     if (_selector_asks(x) == 1) {
         en.dyn_next = e.dynamic;
         e.dynamic = en;
@@ -243,9 +259,14 @@ fn state_matters(e as *Engine, n as *dom.Node) as i64 {
 
 // --- Selector matching ---
 
+// The parent a selector sees: in n's own tree, past the shadow trees it was slotted into,
+// and ending at the host for what is inside a shadow.
 fn _elem_parent(n as *dom.Node) as *dom.Node {
-    let is *dom.Node as p = n.parent;
-    if (p != null && p.kind == dom.ELEMENT) { return p; }
+    let is *dom.Node as p with mut = n.parent;
+    while (p != null && p.kind == dom.ELEMENT) {
+        if (p.scope == n.scope || p.host_scope == n.scope) { return p; }
+        p = p.parent;
+    }
     return cast(*dom.Node, 0);
 }
 
@@ -473,6 +494,10 @@ fn _match_simple(n as *dom.Node, s as *sh.Simple) as i64 {
         if (_position(n, 0, 1) == 1 && _position(n, 1, 1) == 1) { return 1; }
         return 0;
     }
+    if (k == sh.S_HOST) {
+        if (n.host_scope == 0) { return 0; }
+        return cast(i64, s.sub == null || _any_in_list(n, s.sub) == 1);
+    }
     if (k == sh.S_NOT) { return 1 - _any_in_list(n, s.sub); }
     if (k == sh.S_IS) { return _any_in_list(n, s.sub); }
     if (k == sh.S_HAS) { return _has_below(n, s.sub); }
@@ -540,11 +565,46 @@ struct _Found {
     n as i64;
 }
 
+fn _in_scope(en as *Entry, n as *dom.Node) as i64 {
+    if (en.scope == SCOPE_ALL) { return 1; }
+    if (en.of_host == 1) { return cast(i64, en.scope == n.host_scope); }
+    return cast(i64, en.scope == n.scope);
+}
+
+// The container a query asks about, from n up: the nearest of its name. Its size comes
+// from the last layout, and one that has not been laid out holds no condition.
+fn _container_holds(c0 as *sh.Container, n as *dom.Node) as i64 {
+    let is *sh.Container as c with mut = c0;
+    while (c != null) {
+        let is *dom.Node as p with mut = n.parent;
+        let is i64 as found with mut = 0;
+        while (p != null && p.kind == dom.ELEMENT && found == 0) {
+            let is *Style as st = of(p);
+            if (st != null && st.v.i[pr.P_CONTAINER_TYPE] != pr.K_NORMAL) {
+                if (c.name == null) { found = 1; }
+                else {
+                    let is i64 as named = st.v.i[pr.P_CONTAINER_NAME];
+                    if (named != pr.K_NONE && named != 0) {
+                        let is *v.GridCell as nm = cast(*v.GridCell, named);
+                        if (nm.n == c.nlen && _bytes_eq(nm.name, c.name, nm.n, 0) == 1) { found = 1; }
+                    }
+                }
+            }
+            if (found == 0) { p = p.parent; }
+        }
+        if (found == 0 || p.cont_known == 0) { return 0; }
+        if (sh.media_holds(&c.m, p.cont_w, p.cont_h) == 0) { return 0; }
+        c = c.parent;
+    }
+    return 1;
+}
+
 fn _try_list(e as *Engine, n as *dom.Node, pseudo as i64, l0 as *Entry, f as *_Found) as void {
     let is *Entry as en with mut = l0;
     while (en != null) {
-        if (en.sel.pseudo == pseudo && f.n < MAX_MATCHES &&
+        if (en.sel.pseudo == pseudo && f.n < MAX_MATCHES && _in_scope(en, n) == 1 &&
             (en.rule.media == null || sh.media_holds(en.rule.media, e.vw, e.vh) == 1) &&
+            (en.rule.container == null || _container_holds(en.rule.container, n) == 1) &&
             _match_from(n, en.sel.right) == 1) {
             _matches[f.n] = en;
             f.n = f.n + 1;
@@ -555,6 +615,8 @@ fn _try_list(e as *Engine, n as *dom.Node, pseudo as i64, l0 as *Entry, f as *_F
 
 fn _cascades_before(a as *Entry, b as *Entry) as i64 {
     if (a.rule.origin != b.rule.origin) { return cast(i64, a.rule.origin < b.rule.origin); }
+    // A shadow's say over its host gives way to the document's, however specific.
+    if (a.of_host != b.of_host) { return a.of_host; }
     if (a.sel.spec != b.sel.spec) { return cast(i64, a.sel.spec < b.sel.spec); }
     return cast(i64, a.seq < b.seq);
 }

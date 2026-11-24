@@ -36,6 +36,7 @@ let is i64 as S_HAS       with imut = 18;   // sub
 let is i64 as S_CHECKED   with imut = 19;
 let is i64 as S_DISABLED  with imut = 20;
 let is i64 as S_ENABLED   with imut = 21;
+let is i64 as S_HOST      with imut = 40;   // sub, or none for any host
 // What a person is doing to an element, so a change means styling again.
 let is i64 as S_HOVER     with imut = 22;
 let is i64 as S_ACTIVE    with imut = 23;
@@ -113,10 +114,19 @@ struct Media {
     parent as *Media;
 }
 
+// One @container a rule is inside, and the next one out.
+struct Container {
+    m      as Media;
+    name   as *u8;     // null for the nearest of any name
+    nlen   as i64;
+    parent as *Container;
+}
+
 struct Rule {
     selectors as *Selector;
     decls     as v.DeclList;
     media     as *Media;
+    container as *Container;
     order     as i64;
     origin    as i64;
     next      as *Rule;
@@ -159,6 +169,7 @@ struct _P {
     n      as i64;
     i      as i64;
     origin as i64;
+    inside as *Container;
 }
 
 fn init(s as *Sheet, a as *arena.Arena) as void {
@@ -380,6 +391,11 @@ fn _pseudo_fn(p as *_P, spec as *i64) as *Simple {
         s.sub = _selector_list(p, end, forgiving);
         if (s.sub == null && forgiving == 0) { p.i = after; return null; }
         if (_eq(t.s, t.n, "where") == 0) { *spec = *spec + _max_spec(s.sub); }
+    } else if (_eq(t.s, t.n, "host") == 1) {
+        s = _simple(p, S_HOST);
+        s.sub = _selector_list(p, end, 0);
+        if (s.sub == null) { p.i = after; return null; }
+        *spec = *spec + 1024 + _max_spec(s.sub);
     } else if (_eq(t.s, t.n, "nth-child") == 1 || _eq(t.s, t.n, "nth-last-child") == 1 ||
                _eq(t.s, t.n, "nth-of-type") == 1 || _eq(t.s, t.n, "nth-last-of-type") == 1) {
         let is i64 as kind with mut = S_NTH;
@@ -428,6 +444,7 @@ fn _pseudo(p as *_P, spec as *i64, sel as *Selector, double as i64) as *Simple {
     }
     if (double == 1) { return null; }
     *spec = *spec + 1024;
+    if (_eq(s, n, "host") == 1) { *spec = *spec + 1024; return _simple(p, S_HOST); }
     if (_eq(s, n, "root") == 1) { return _simple(p, S_ROOT); }
     if (_eq(s, n, "empty") == 1) { return _simple(p, S_EMPTY); }
     if (_eq(s, n, "link") == 1 || _eq(s, n, "any-link") == 1 || _eq(s, n, "-webkit-any-link") == 1) { return _simple(p, S_LINK); }
@@ -942,12 +959,30 @@ fn _add_rule(p as *_P, sel as *Selector, list as *v.DeclList, media as *Media) a
     r.selectors = sel;
     r.decls = *list;
     r.media = media;
+    r.container = p.inside;
     r.origin = p.origin;
     r.order = p.sh.nrules;
     p.sh.nrules = p.sh.nrules + 1;
     if (p.sh.first == null) { p.sh.first = r; }
     else { p.sh.last.next = r; }
     p.sh.last = r;
+}
+
+// @container's prelude: a name if it has one, then conditions as a media query has them.
+fn _container(p as *_P, start as i64, end as i64) as *Container {
+    let is *Container as c = cast(*Container, arena.alloc(p.a, sizeof(Container)));
+    c.parent = p.inside;
+    c.name = cast(*u8, 0);
+    c.nlen = 0;
+    c.m.parent = cast(*Media, 0);
+    p.i = _past_space(p, start, end);
+    if (p.i < end && p.t[p.i].kind == tok.T_IDENT && _eq(p.t[p.i].s, p.t[p.i].n, "not") == 0) {
+        c.name = arena.copy(p.a, p.t[p.i].s, p.t[p.i].n);
+        c.nlen = p.t[p.i].n;
+        p.i = p.i + 1;
+    }
+    c.m.q = _media_list(p, end);
+    return c;
 }
 
 fn _at_rule(p as *_P, media as *Media) as void {
@@ -984,6 +1019,12 @@ fn _at_rule(p as *_P, media as *Media) as void {
         m.q = _media_list(p, prelude_end);
         m.parent = media;
         inner = m;
+    } else if (_eq(s, n, "container") == 1) {
+        let is *Container as outer = p.inside;
+        p.inside = _container(p, start, prelude_end);
+        p.i = open + 1;
+        _rules(p, end, inner);
+        p.inside = outer;
     } else if (_eq(s, n, "supports") == 1) {
         enter = _supports(p, start, prelude_end);
     } else if (_eq(s, n, "layer") == 1 || _eq(s, n, "scope") == 1) {
@@ -1138,6 +1179,7 @@ fn parse(s as *Sheet, src as *u8, len as i64, origin as i64, url as *u8) as void
     ps.t = l.t;
     ps.n = l.n;
     ps.i = 0;
+    ps.inside = cast(*Container, 0);
     ps.origin = origin;
     decl.set_base(url);
     _rules(&ps, ps.n, cast(*Media, 0));
@@ -1155,6 +1197,7 @@ fn media_text_holds(a as *arena.Arena, s as *u8, n as i64, w as f64, h as f64) a
     ps.t = l.t;
     ps.n = l.n;
     ps.i = 0;
+    ps.inside = cast(*Container, 0);
     ps.origin = ORIGIN_AUTHOR;
     let is *Query as q with mut = _media_list(&ps, ps.n);
     if (q == null) { return 1; }
@@ -1177,6 +1220,7 @@ fn parse_inline(a as *arena.Arena, src as *u8, len as i64, out as *v.DeclList, u
     ps.t = l.t;
     ps.n = l.n;
     ps.i = 0;
+    ps.inside = cast(*Container, 0);
     ps.origin = ORIGIN_AUTHOR;
     decl.set_base(url);
     _decls(&ps, ps.n, out);

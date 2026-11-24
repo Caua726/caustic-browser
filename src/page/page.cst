@@ -19,6 +19,7 @@ use "../css/ua.cst" as ua;
 use "./anim.cst" as anim;
 use "../dom/dom.cst" as dom;
 use "../dom/tags.cst" as tg;
+use "../dom/shadow.cst" as shadow;
 use "../html/tree.cst" as tree;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
@@ -271,10 +272,18 @@ fn _fetch_sheet(p as *Page, href as *u8, n as i64, base as *u8, depth as i64) as
 
 // The page's own sheets, in document order, each with whatever it imports.
 fn _load_sheets(p as *Page) as void {
+    // Shadows' first: a rule on a host from inside gives way to the document's.
+    _load_sheets_of(p, 1);
+    _load_sheets_of(p, 0);
+}
+
+fn _load_sheets_of(p as *Page, shadows as i64) as void {
     let is *dom.Node as root = p.doc.node;
     let is *dom.Node as x with mut = _next_element(root, root);
+    p.engine.scope_now = 0;
     while (x != null) {
-        if (x.ns == dom.NS_HTML) {
+        if (x.ns == dom.NS_HTML && cast(i64, x.scope != 0) == shadows) {
+            p.engine.scope_now = x.scope;
             if (x.tag == tg.STYLE && _media_excludes(x) == 0) {
                 let is i64 as n with mut = 0;
                 let is *u8 as text = _element_text(&p.docs_a, x, &n);
@@ -556,6 +565,7 @@ fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
     }
     if (tree.parse(&p.doc, src, n) != 0) { n = 0; }
     if (have == 1) { net.free(&r); }
+    shadow.flatten(&p.doc);
     _read_head(p);
 
     style.init(&p.engine, &p.style_a, &p.docs_a, cast(*u8, &p.base));
@@ -596,6 +606,19 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     p.c.vw = vw;
     p.c.vh = vh;
     p.root = layout.run(&p.c, &p.doc);
+    // A style that asks how big its container is can only be answered from a layout, and
+    // its answer can change what the next layout finds. Twice more settles what pages do.
+    let is i64 as rounds with mut = 0;
+    while (p.engine.containers == 1 && rounds < 3 && p.root != null && layout.note_containers(p.root) == 1) {
+        rounds = rounds + 1;
+        _style_again(p, vw, vh);
+        arena.free(&p.box_a);
+        arena.free(&p.tmp_a);
+        p.c.hits = cast(*bx.HitItem, 0);
+        p.c.nhits = 0;
+        p.c.caphits = 0;
+        p.root = layout.run(&p.c, &p.doc);
+    }
     if (env.getenv("CAUSTIC_BOXES") != null) { boxdump.boxes(p.root); }
     let is f64 as w with mut = vw;
     let is f64 as h with mut = vh;

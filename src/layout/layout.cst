@@ -237,6 +237,24 @@ fn _place_inline(c as *bx.Ctx, b as *bx.Box, ox as f64, oy as f64, parent_w as f
 }
 
 // Everything's place again, with nothing about its size changed: a box scrolled.
+// Each query container's size, kept for the styles to ask. 1 if any has changed.
+fn note_containers(b as *bx.Box) as i64 {
+    let is i64 as changed with mut = 0;
+    if (b.node != null && b.st.v.i[pr.P_CONTAINER_TYPE] != pr.K_NORMAL) {
+        let is *dom.Node as n = b.node;
+        if (n.cont_known == 0 || n.cont_w != b.w || n.cont_h != b.h) { changed = 1; }
+        n.cont_known = 1;
+        n.cont_w = b.w;
+        n.cont_h = b.h;
+    }
+    let is *bx.Box as k with mut = b.first;
+    while (k != null) {
+        if (note_containers(k) == 1) { changed = 1; }
+        k = k.next;
+    }
+    return changed;
+}
+
 fn place_again(c as *bx.Ctx, root as *bx.Box) as void {
     let is Rect as view with mut;
     view.x = 0.0;

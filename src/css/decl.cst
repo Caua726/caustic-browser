@@ -1560,11 +1560,45 @@ fn _template_areas(s as *_Sh, prop as i64) as i64 {
     let is i64 as k with mut = 0;
     while (k < rows) {
         let is *tok.Token as r = _peek(s.c);
-        _area_row(r.s, r.n, a.cells + k * cols);
+        _area_row(arena.copy(s.c.a, r.s, r.n), r.n, a.cells + k * cols);
         s.c.i = s.c.i + 1;
         k = k + 1;
     }
     _emit_data(s, prop, cast(*u8, a));
+    return 1;
+}
+
+// A name kept as it is written, for what is looked up by it later.
+fn _emit_kept_name(s as *_Sh, prop as i64, t as *tok.Token) as void {
+    let is *v.GridCell as name = cast(*v.GridCell, arena.alloc(s.c.a, sizeof(v.GridCell)));
+    name.name = arena.copy(s.c.a, t.s, t.n);
+    name.n = t.n;
+    _emit_data(s, prop, cast(*u8, name));
+}
+
+// One name; a list of them is rare, and the first is what most queries ask for.
+fn _container_name(s as *_Sh) as i64 {
+    let is *tok.Token as t = _peek(s.c);
+    if (t == null || t.kind != tok.T_IDENT) { return 0; }
+    s.c.i = s.c.i + 1;
+    if (eq(t.s, t.n, "none") == 1) { _emit_kw(s, pr.P_CONTAINER_NAME, pr.K_NONE); }
+    else { _emit_kept_name(s, pr.P_CONTAINER_NAME, t); }
+    while (_done(s.c) == 0 && _is_delim(_peek(s.c), 47) == 0) { s.c.i = s.c.i + 1; }
+    return 1;
+}
+
+// container: name, and after a slash a type.
+fn _container(s as *_Sh) as i64 {
+    if (_container_name(s) == 0) { return 0; }
+    let is i64 as kind with mut = pr.K_NORMAL;
+    if (_is_delim(_peek(s.c), 47) == 1) {
+        s.c.i = s.c.i + 1;
+        let is *tok.Token as t = _peek(s.c);
+        if (t == null || t.kind != tok.T_IDENT) { return 0; }
+        kind = pr.kw_lookup(t.s, t.n);
+        s.c.i = s.c.i + 1;
+    }
+    _emit_kw(s, pr.P_CONTAINER_TYPE, kind);
     return 1;
 }
 
@@ -1629,10 +1663,7 @@ fn _grid_area(s as *_Sh) as i64 {
     let is *tok.Token as first = _peek(s.c);
     let is i64 as named = cast(i64, first != null && first.kind == tok.T_IDENT && eq(first.s, first.n, "auto") == 0 && eq(first.s, first.n, "span") == 0);
     if (named == 1) {
-        let is *v.GridCell as name = cast(*v.GridCell, arena.alloc(s.c.a, sizeof(v.GridCell)));
-        name.name = first.s;
-        name.n = first.n;
-        _emit_data(s, pr.P_GRID_AREA_NAME, cast(*u8, name));
+        _emit_kept_name(s, pr.P_GRID_AREA_NAME, first);
     } else {
         _emit_kw(s, pr.P_GRID_AREA_NAME, pr.K_NONE);
     }
@@ -2695,6 +2726,8 @@ fn _parse_named(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64,
     else if (eq(name, nlen, "grid-template-columns") == 1) { ok = _track_list(s, pr.P_GRID_TEMPLATE_COLUMNS); }
     else if (eq(name, nlen, "grid-template-areas") == 1) { ok = _template_areas(s, pr.P_GRID_TEMPLATE_AREAS); }
     else if (eq(name, nlen, "grid-area-name") == 1) { ok = 0; }
+    else if (eq(name, nlen, "container") == 1) { ok = _container(s); }
+    else if (eq(name, nlen, "container-name") == 1) { ok = _container_name(s); }
     else if (eq(name, nlen, "grid-template-rows") == 1) { ok = _track_list(s, pr.P_GRID_TEMPLATE_ROWS); }
     else if (eq(name, nlen, "grid-auto-columns") == 1) { ok = _track_list(s, pr.P_GRID_AUTO_COLUMNS); }
     else if (eq(name, nlen, "grid-auto-rows") == 1) { ok = _track_list(s, pr.P_GRID_AUTO_ROWS); }

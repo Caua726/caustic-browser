@@ -73,6 +73,15 @@ struct Node {
     // back at its template here, because it has no parent to climb to.
     content as *Node;
 
+    // Declarative shadow trees are flattened into the tree: which one an element belongs
+    // to, 0 for the document's, and the one it is host of. See dom/shadow.cst.
+    scope      as i64;
+    host_scope as i64;
+    // A query container's content box, from the last layout that saw it.
+    cont_known as i64;
+    cont_w     as f64;
+    cont_h     as f64;
+
     // ELEMENT and DOCTYPE: its name.
     name     as *u8;
     name_len as i64;

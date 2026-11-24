@@ -75,6 +75,8 @@ OWN = [
     ("order", INT, "", 0),
     ("row-gap", LEN | PCT, "normal", "normal"),
     ("column-gap", LEN | PCT, "normal", "normal"),
+    ("container-type", 0, "normal size inline-size", "normal"),
+    ("container-name", STR, "none", "none"),
     ("column-count", INT, AUTO, AUTO),
     ("column-width", LEN, AUTO, AUTO),
     ("justify-items", 0, SELF + " left right", "normal"),

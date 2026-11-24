@@ -19,6 +19,7 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "[hidden], dialog:not([open]) { display: none; }");
     _r(s, "details:not([open]) > :not(summary) { display: none; }");
     _r(s, "li { display: list-item; }");
+    _r(s, "slot { display: contents; }");
     _r(s, "html { color: black; }");
     _r(s, "body { margin: 8px; }");
     _r(s, "blockquote, figure { margin: 1em 40px; }");
