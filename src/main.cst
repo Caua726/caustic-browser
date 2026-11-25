@@ -8,6 +8,7 @@
 
 use "std/io.cst" as io;
 use "std/env.cst" as env;
+if (__target_is_linux) use "std/os/linux.cst" as linux;
 use "caustic-media/ui/ui.cst" as ui;
 use "ui/browser.cst" as browser;
 use "dom/dom.cst" as dom;
@@ -140,8 +141,9 @@ fn main(argc as i64, argv as *u8) as i32 {
     else { browser.run(); }
     ui.program.close(&prog);
     browser.free_docs();
-    if (checking == 0) { return 0; }
-    if (fails != 0) { return cast(i32, fails); }
-    io.write_str(1, "browser: all checks pass\n");
+    if (checking == 1 && fails == 0) { io.write_str(1, "browser: all checks pass\n"); }
+    // The fetcher's threads never end by themselves, and returning from here would only
+    // end this one.
+    if (__target_is_linux) { linux.exit(fails); }
     return 0;
 }

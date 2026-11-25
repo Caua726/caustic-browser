@@ -1,0 +1,209 @@
+// loader/fetcher.cst — the network, on threads of its own, so a window never waits for it.
+//
+// Only bytes are fetched here. Parsing them, styling and decoding stay on the window's
+// thread, where the page's memory is: a job holds nothing of a page's but an owner to be
+// handed back to, and what comes back for a page that has since moved on is thrown away.
+//
+// Asked in order, except that a document goes to the front: someone is waiting for it, and
+// the last page's pictures are not what they are waiting for.
+
+use "std/mem.cst" as mem;
+use "std/sync.cst" as sync;
+use "std/thread.cst" as thread;
+use "./net.cst" as net;
+
+let is i64 as MAX_URL with imut = 4096;
+let is i64 as WORKERS with imut = 4;
+let is i64 as MAX_TYPE with imut = 128;
+
+type NotifyFn = fn(*u8) as void;
+
+struct Job {
+    owner as *u8;
+    era   as i64;
+    tag   as i64;
+    data  as *u8;
+    url   as [MAX_URL]u8;
+    // A form's: copies, the page that sent it may be gone.
+    posting as i64;
+    ctype   as [MAX_TYPE]u8;
+    body    as *u8;
+    body_n  as i64;
+    origin  as [MAX_URL]u8;
+    has_ref as i64;
+    referer as [MAX_URL]u8;
+    r  as net.Resource;
+    ok as i64;
+    next as *Job;
+}
+
+let is sync.Mutex as _lock with mut;
+let is *Job as _head with mut = cast(*Job, 0);
+let is *Job as _tail with mut = cast(*Job, 0);
+let is *Job as _done with mut = cast(*Job, 0);
+let is *Job as _done_tail with mut = cast(*Job, 0);
+let is u32 as _waiting with mut = cast(u32, 0);
+let is i64 as _told with mut = 0;
+let is i64 as _started with mut = 0;
+let is [WORKERS]thread.Thread as _threads with mut;
+let is NotifyFn as _notify with mut;
+let is *u8 as _notify_user with mut = cast(*u8, 0);
+
+fn _copy(to as *u8, cap as i64, from as *u8) as void {
+    let is i64 as i with mut = 0;
+    if (cast(i64, from) != 0) {
+        while (i < cap - 1 && from[i] != 0) {
+            to[i] = from[i];
+            i = i + 1;
+        }
+    }
+    to[i] = cast(u8, 0);
+}
+
+fn _worker(arg as i64) as i64 {
+    let is *u8 as f = mem.core.mmap_anon(net.fetch_size());
+    while (1 == 1) {
+        let is u32 as seen = _waiting;
+        sync.mutex_lock(&_lock);
+        let is *Job as j = _head;
+        if (j != null) {
+            _head = j.next;
+            if (_head == null) { _tail = cast(*Job, 0); }
+        }
+        sync.mutex_unlock(&_lock);
+        if (j == null) {
+            thread.futex_wait(&_waiting, seen);
+            continue;
+        }
+        j.next = cast(*Job, 0);
+        let is *u8 as u = cast(*u8, &j.url);
+        if (j.posting == 1) {
+            let is *u8 as referer with mut = cast(*u8, 0);
+            if (j.has_ref == 1) { referer = cast(*u8, &j.referer); }
+            j.ok = cast(i64, net.post(f, u, cast(*u8, &j.ctype), j.body, j.body_n, cast(*u8, &j.origin), referer, &j.r) == 0);
+        } else {
+            j.ok = cast(i64, net.get(f, u, &j.r) == 0);
+        }
+        sync.mutex_lock(&_lock);
+        if (_done_tail == null) { _done = j; }
+        else { _done_tail.next = j; }
+        _done_tail = j;
+        let is i64 as tell = cast(i64, _told == 0);
+        _told = 1;
+        sync.mutex_unlock(&_lock);
+        if (tell == 1) { call(_notify, _notify_user); }
+    }
+    return 0;
+}
+
+// Before the first job. notify is called from a worker, at most once between takes.
+fn start(notify as NotifyFn, user as *u8) as void {
+    if (_started == 1) { return; }
+    _started = 1;
+    _notify = notify;
+    _notify_user = user;
+    net.prepare();
+    let is i64 as i with mut = 0;
+    while (i < WORKERS) {
+        thread.spawn(&_threads[i], cast(*u8, fn_ptr(_worker)), i);
+        i = i + 1;
+    }
+}
+
+fn _make(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8) as *Job {
+    let is *Job as j = cast(*Job, mem.core.mmap_anon(sizeof(Job)));
+    j.owner = owner;
+    j.era = era;
+    j.tag = tag;
+    j.data = data;
+    _copy(cast(*u8, &j.url), MAX_URL, u);
+    return j;
+}
+
+fn _give(j as *Job, front as i64) as void {
+    sync.mutex_lock(&_lock);
+    if (front == 1) {
+        j.next = _head;
+        _head = j;
+        if (_tail == null) { _tail = j; }
+    } else {
+        if (_tail == null) { _head = j; }
+        else { _tail.next = j; }
+        _tail = j;
+    }
+    _waiting = _waiting + cast(u32, 1);
+    sync.mutex_unlock(&_lock);
+    thread.futex_wake_one(&_waiting);
+}
+
+fn get(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8, front as i64) as void {
+    _give(_make(owner, era, tag, data, u), front);
+}
+
+fn post(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8, ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8) as void {
+    let is *Job as j = _make(owner, era, tag, data, u);
+    j.posting = 1;
+    _copy(cast(*u8, &j.ctype), MAX_TYPE, ctype);
+    _copy(cast(*u8, &j.origin), MAX_URL, origin);
+    if (cast(i64, referer) != 0) {
+        j.has_ref = 1;
+        _copy(cast(*u8, &j.referer), MAX_URL, referer);
+    }
+    if (n > 0) {
+        j.body = mem.core.mmap_anon(n);
+        mem.core.memcpy(j.body, body, n);
+        j.body_n = n;
+    }
+    _give(j, 1);
+}
+
+// A job that has been taken, and all it holds.
+fn free(j as *Job) as void {
+    net.free(&j.r);
+    if (j.body_n > 0) { mem.core.munmap(j.body, j.body_n); }
+    mem.core.munmap(cast(*u8, j), sizeof(Job));
+}
+
+// What an owner still has waiting no longer wanted. What a worker has started comes back,
+// and whoever takes it can tell by its era.
+fn cancel(owner as *u8) as void {
+    sync.mutex_lock(&_lock);
+    let is *Job as keep with mut = cast(*Job, 0);
+    let is *Job as last with mut = cast(*Job, 0);
+    let is *Job as drop with mut = cast(*Job, 0);
+    let is *Job as j with mut = _head;
+    while (j != null) {
+        let is *Job as next = j.next;
+        j.next = cast(*Job, 0);
+        if (j.owner == owner) {
+            j.next = drop;
+            drop = j;
+        } else {
+            if (last == null) { keep = j; }
+            else { last.next = j; }
+            last = j;
+        }
+        j = next;
+    }
+    _head = keep;
+    _tail = last;
+    sync.mutex_unlock(&_lock);
+    while (drop != null) {
+        let is *Job as next = drop.next;
+        // Never reached a worker, so it has no answer to free.
+        if (drop.body_n > 0) { mem.core.munmap(drop.body, drop.body_n); }
+        mem.core.munmap(cast(*u8, drop), sizeof(Job));
+        drop = next;
+    }
+}
+
+// All that has finished, in the order it did, through .next. The caller frees each.
+fn take() as *Job {
+    sync.mutex_lock(&_lock);
+    let is *Job as j = _done;
+    _done = cast(*Job, 0);
+    _done_tail = cast(*Job, 0);
+    _told = 0;
+    sync.mutex_unlock(&_lock);
+    return j;
+}

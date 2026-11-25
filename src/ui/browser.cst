@@ -1,7 +1,8 @@
 // ui/browser.cst — the window: tabs in the title bar and, under them, the page of
 // whichever one is current, with its toolbar and address.
 //
-// Pages load between events, on the thread that draws, so the window waits for them.
+// The network is on threads of its own: a page's answers come back as events do, and the
+// window goes on meanwhile. See loader/fetcher.cst.
 //
 // The tabs are our own rather than the toolkit's tabs widget, which holds its strip
 // and its pages as one and so cannot put the strip in the title bar. A stack holds
@@ -24,6 +25,7 @@ use "../dom/tags.cst" as tg;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
 use "../loader/url.cst" as url;
+use "../loader/fetcher.cst" as fetcher;
 use "../page/forms.cst" as forms;
 use "../page/page.cst" as pg;
 use "../paint/display_list.cst" as dl;
@@ -61,6 +63,11 @@ let is i64 as TAB_TITLE with imut = 96;    // bytes of a page's title on its tab
 // as the tab lives, so a view can keep pointing at its list; `order` is what moves.
 struct Doc {
     used  as i64;
+    load_push as i64;
+    load_y    as f64;
+    load_url  as [MAX_URL]u8;
+    pictures_due as i64;
+    laid_at   as i64;
     tab   as i64;
     page  as i64;
     entry as i64;
@@ -606,6 +613,7 @@ fn _release_images(d as *Doc) as void {
 fn _forget_page(d as *Doc) as void {
     if (cast(i64, d.pg) == 0) { return; }
     _release_images(d);
+    pg.cancel(d.pg);
     pg.unload(d.pg);
     d.hist_n = 0;
     d.hist_at = 0;
@@ -694,17 +702,22 @@ fn _go_to_fragment(d as *Doc, u as *u8) as i64 {
     return 1;
 }
 
+// Whatever was open on the page, closed: it is leaving, or at least about to.
+fn _let_go_of_page(d as *Doc) as void {
+    _hush();
+    if (_ed_doc == d) { _close_editor(); }
+    if (_cal_doc == d) { _cal_doc = cast(*Doc, 0); }
+    if (_color_doc == d) { _color_doc = cast(*Doc, 0); }
+    if (_file_doc == d) { _file_doc = cast(*Doc, 0); }
+}
+
 // The load that was asked for, if any.
 fn _service() as void {
     if (_pend_slot < 0) { return; }
     let is *Doc as d = &br.docs[_pend_slot];
     _pend_slot = 0 - 1;
     if (d.used == 0) { return; }
-    _hush();
-    if (_ed_doc == d) { _close_editor(); }
-    if (_cal_doc == d) { _cal_doc = cast(*Doc, 0); }
-    if (_color_doc == d) { _color_doc = cast(*Doc, 0); }
-    if (_file_doc == d) { _file_doc = cast(*Doc, 0); }
+    _let_go_of_page(d);
     let is i64 as push = _pend_push;
     let is f64 as y0 = _pend_y;
     let is [MAX_URL]u8 as u with mut;
@@ -727,34 +740,109 @@ fn _service() as void {
             return;
         }
     }
-    // Loading blocks the window, so what it says about that has to be drawn first.
     pv.set_hint(br.t, d.view, LOADING, ui.len(LOADING));
-    ui.host.step(br.hs, 0);
-    if (d.used == 0) { return; }
-
+    ui.entry.set_text(br.t, d.entry, cast(*u8, &u), url.len_of(cast(*u8, &u)));
     let is f64 as w with mut = 0.0;
     let is f64 as h with mut = 0.0;
     _view_size(d, &w, &h);
-    _release_images(d);
-    // Nothing can be drawn from the old list while the new page replaces its memory.
-    dl.clear(&d.list);
+    d.load_push = push;
+    d.load_y = y0;
+    _copy_cut(cast(*u8, &d.load_url), cast(*u8, &u), MAX_URL);
     if (posting == 1) {
         let is *u8 as origin with mut = cast(*u8, &_pend_origin);
         if (_pend_origin[0] == 0) { origin = "null"; }
         let is *u8 as referer with mut = cast(*u8, &_pend_referer);
         if (_pend_referer[0] == 0) { referer = cast(*u8, 0); }
-        pg.post_next(cast(*u8, &_pend_type), _pend_body, _pend_body_n, origin, referer);
+        pg.begin_post(d.pg, cast(*u8, &u), w, h, cast(*u8, &_pend_type), _pend_body, _pend_body_n, origin, referer);
+    } else {
+        pg.begin(d.pg, cast(*u8, &u), w, h);
     }
-    pg.load(d.pg, cast(*u8, &u), w, h);
-    if (push == 1) { _push_history(d, cast(*u8, &d.pg.url)); }
+}
+
+// A page can show for the first time: its boxes, and everything said about it.
+fn _first_paint(d as *Doc) as void {
+    let is *u8 as asked = cast(*u8, &d.load_url);
+    if (d.load_push == 1) { _push_history(d, cast(*u8, &d.pg.url)); }
     _lay_out(d);
-    if (_scroll_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
+    if (_scroll_to_fragment(d, asked) == 0) { pv.scroll_to(br.t, d.view, 0.0, d.load_y); }
     _name_tab(d);
     let is *u8 as shown = cast(*u8, &d.pg.url);
     ui.entry.set_text(br.t, d.entry, shown, url.len_of(shown));
     _nav_buttons(d);
     pv.set_hint(br.t, d.view, cast(*u8, 0), 0);
     if (&br.docs[br.order[br.cur]] == d) { ui.router.focus(br.t, br.r, d.view, 0); }
+}
+
+fn _doc_of_page(owner as *u8) as *Doc {
+    let is i64 as i with mut = 0;
+    while (i < br.n) {
+        let is *Doc as d = _doc(i);
+        if (d.used == 1 && cast(*u8, d.pg) == owner) { return d; }
+        i = i + 1;
+    }
+    return cast(*Doc, 0);
+}
+
+// Pictures come one at a time and a layout is not cheap: they are shown together, with
+// the last of them always shown.
+let is i64 as PICTURES_EVERY_MS with imut = 150;
+
+fn _answer(j as *fetcher.Job) as void {
+    let is *Doc as d = _doc_of_page(j.owner);
+    if (d == null || pg.is_current(d.pg, j) == 0) { return; }
+    if (pg.is_document(j) == 1) {
+        // The document that was showing is about to go, and all that points into it.
+        _let_go_of_page(d);
+        _release_images(d);
+        dl.clear(&d.list);
+    }
+    let is i64 as shown = d.pg.loaded;
+    let is i64 as was_document = pg.is_document(j);
+    pg.arrived(d.pg, j);
+    if (d.pg.loaded == 0) { return; }
+    if (shown == 0 || was_document == 1) {
+        _first_paint(d);
+        d.laid_at = time.now_ms();
+        return;
+    }
+    d.pictures_due = 1;
+}
+
+fn _show_pictures(d as *Doc) as void {
+    if (d.pictures_due == 0 || d.pg.loaded == 0) { return; }
+    let is i64 as now = time.now_ms();
+    if (pg.images_waiting(d.pg) > 0 && now - d.laid_at < PICTURES_EVERY_MS) { return; }
+    d.pictures_due = 0;
+    d.laid_at = now;
+    // A tab out of sight is laid out when it comes back, as for a window of another size.
+    if (&br.docs[br.order[br.cur]] != d) {
+        d.view_w = 0.0 - 1.0;
+        return;
+    }
+    let is f64 as y = pv.scroll_y(br.t, d.view);
+    _lay_out(d);
+    pv.scroll_to(br.t, d.view, 0.0, y);
+}
+
+// Finished work, from the fetcher's threads, comes round through here.
+fn _fetched(user as *u8) as void {
+    let is *fetcher.Job as j with mut = fetcher.take();
+    while (j != null) {
+        let is *fetcher.Job as next = j.next;
+        _answer(j);
+        fetcher.free(j);
+        j = next;
+    }
+    let is i64 as i with mut = 0;
+    while (i < br.n) {
+        let is *Doc as d = _doc(i);
+        if (d.used == 1 && cast(i64, d.pg) != 0) { _show_pictures(d); }
+        i = i + 1;
+    }
+}
+
+fn _tell_loop(user as *u8) as void {
+    ui.host.post(br.hs, fn_ptr(_fetched), cast(*u8, 0));
 }
 
 // A page laid out for another size is laid out again. Checked after events, not during
@@ -1853,6 +1941,7 @@ fn _ctx_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void {
 
 // Until the last window closes.
 fn run() as void {
+    _start_fetching();
     while (ui.host.step(br.hs, 0 - 1) == 1) {
         _follow_width();
         _follow_editor();
@@ -1860,6 +1949,8 @@ fn run() as void {
         _follow_view();
     }
 }
+
+fn _start_fetching() as void { fetcher.start(fn_ptr(_tell_loop), cast(*u8, 0)); }
 
 // After the program closed: the views are gone, so the lists can go. The textures went
 // with the device.
@@ -1885,6 +1976,7 @@ fn _expect(what as *u8, ok as i32) as void {
 }
 
 fn _rounds(n as i64) as void {
+    _start_fetching();
     let is i64 as k with mut = 0;
     while (k < n) {
         ui.host.step(br.hs, 20);

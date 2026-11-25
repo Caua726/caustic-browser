@@ -1,6 +1,7 @@
 // page/page.cst — one page, from a URL to a display list.
 //
-//   load       fetch it, parse it, fetch what it needs, style it
+//   begin      ask for it; the page shown so far stays until the answer
+//   arrived    each answer: the document, then its sheets, then its pictures
 //   relayout   boxes and a display list for a window this size
 //   link_at    what a point in it leads to
 //
@@ -30,6 +31,7 @@ use "../loader/img_source.cst" as source;
 use "./forms.cst" as forms;
 use "../loader/svg_image.cst" as svg_image;
 use "../loader/net.cst" as net;
+use "../loader/fetcher.cst" as fetcher;
 use "../loader/url.cst" as url;
 use "../paint/display_list.cst" as dl;
 use "../paint/paint.cst" as paint;
@@ -39,7 +41,18 @@ let is i64 as MAX_TITLE   with imut = 256;
 let is i64 as MAX_IMPORT_DEPTH with imut = 4;
 let is i64 as MAX_IMAGES  with imut = 512;
 // A slow image must not hold a page up for ever: past this, the rest stay out.
-let is i64 as IMAGE_BUDGET_MS with imut = 20000;
+
+// A sheet in the place the cascade wants it: after what it imports, and those may not be
+// here yet. Nothing is applied until every one is in.
+struct SheetSlot {
+    sheet  as *sh.Sheet;   // null when it came to nothing
+    kept   as *u8;
+    scope  as i64;
+    depth  as i64;
+    first  as *SheetSlot;  // what it imports
+    last   as *SheetSlot;
+    next   as *SheetSlot;
+}
 
 struct Loaded {
     url  as *u8;
@@ -69,7 +82,13 @@ struct Page {
     root   as *bx.Box;
     images as *Loaded;
     nimages as i64;
-    budget_end as i64;
+    era    as i64;      // this load's number, to know an answer for an older one
+    started as i64;     // has memory of a document, whether or not it can show yet
+    waiting_doc as i64;
+    sheets_first as *SheetSlot;
+    sheets_last  as *SheetSlot;
+    sheets_out   as i64;
+    images_out   as i64;
 
     vw as f64;
     vh as f64;
@@ -103,7 +122,7 @@ fn _copy_url(to as *u8, from as *u8) as void {
 // Everything a page holds, so it can be loaded again or thrown away. Its images' textures
 // have to be gone before this, by whoever made them.
 fn unload(p as *Page) as void {
-    if (p.loaded == 0) { return; }
+    if (p.started == 0) { return; }
     forms.files_forget(&p.doc);
     let is *Loaded as l with mut = p.images;
     while (l != null) {
@@ -126,7 +145,12 @@ fn unload(p as *Page) as void {
     arena.free(&p.paint_a);
     anim.free(&p.motion);
     p.loaded = 0;
+    p.started = 0;
     p.title_n = 0;
+    p.sheets_first = cast(*SheetSlot, 0);
+    p.sheets_last = cast(*SheetSlot, 0);
+    p.sheets_out = 0;
+    p.images_out = 0;
 }
 
 // --- Finding things in the document ---
@@ -235,12 +259,38 @@ fn _element_text(a as *arena.Arena, n as *dom.Node, out_n as *i64) as *u8 {
 }
 
 // One sheet's source, after the sheets it imports, whose rules come first.
-fn _add_source(p as *Page, src as *u8, n as i64, base as *u8, depth as i64) as void {
+fn _new_slot(p as *Page, parent as *SheetSlot, scope as i64, depth as i64) as *SheetSlot {
+    let is *SheetSlot as x = cast(*SheetSlot, arena.alloc(&p.docs_a, sizeof(SheetSlot)));
+    x.scope = scope;
+    x.depth = depth;
+    if (parent == null) {
+        if (p.sheets_last == null) { p.sheets_first = x; }
+        else { p.sheets_last.next = x; }
+        p.sheets_last = x;
+    } else {
+        if (parent.last == null) { parent.first = x; }
+        else { parent.last.next = x; }
+        parent.last = x;
+    }
+    return x;
+}
+
+fn _ask_sheet(p as *Page, x as *SheetSlot, href as *u8, n as i64, base as *u8) as void {
+    let is [MAX_URL]u8 as abs with mut;
+    if (url.resolve(base, href, n, cast(*u8, &abs), MAX_URL) < 0) { return; }
+    p.sheets_out = p.sheets_out + 1;
+    fetcher.get(cast(*u8, p), p.era, TAG_SHEET, cast(*u8, x), cast(*u8, &abs), 0);
+}
+
+// The text of a sheet into its slot, and what it imports asked for.
+fn _fill_slot(p as *Page, x as *SheetSlot, src as *u8, n as i64, base as *u8) as void {
     let is *sh.Sheet as s = cast(*sh.Sheet, arena.alloc(&p.docs_a, sizeof(sh.Sheet)));
     sh.init(s, &p.docs_a);
     let is *u8 as kept = arena.copy(&p.docs_a, base, url.len_of(base));
     sh.parse(s, src, n, sh.ORIGIN_AUTHOR, kept);
-    if (depth < MAX_IMPORT_DEPTH) {
+    x.sheet = s;
+    x.kept = kept;
+    if (x.depth < MAX_IMPORT_DEPTH) {
         // Kept back to front as they were read, so reverse them to apply in order.
         let is *sh.Import as rev with mut = cast(*sh.Import, 0);
         let is *sh.Import as im with mut = s.imports;
@@ -252,49 +302,48 @@ fn _add_source(p as *Page, src as *u8, n as i64, base as *u8, depth as i64) as v
         }
         im = rev;
         while (im != null) {
-            _fetch_sheet(p, im.url, im.n, kept, depth + 1);
+            let is *SheetSlot as kid = _new_slot(p, x, x.scope, x.depth + 1);
+            _ask_sheet(p, kid, im.url, im.n, kept);
             im = im.next;
         }
     }
-    style.add_sheet(&p.engine, s);
 }
 
-fn _fetch_sheet(p as *Page, href as *u8, n as i64, base as *u8, depth as i64) as void {
-    let is [MAX_URL]u8 as abs with mut;
-    if (url.resolve(base, href, n, cast(*u8, &abs), MAX_URL) < 0) { return; }
-    let is net.Resource as r with mut;
-    if (net.get(cast(*u8, &abs), &r) != 0) { return; }
-    if (r.status >= 200 && r.status < 300) {
-        _add_source(p, r.data, r.len, cast(*u8, &r.final), depth);
+fn _apply_slots(p as *Page, x0 as *SheetSlot) as void {
+    let is *SheetSlot as x with mut = x0;
+    while (x != null) {
+        _apply_slots(p, x.first);
+        if (x.sheet != null) {
+            p.engine.scope_now = x.scope;
+            style.add_sheet(&p.engine, x.sheet);
+        }
+        x = x.next;
     }
-    net.free(&r);
 }
 
-// The page's own sheets, in document order, each with whatever it imports.
-fn _load_sheets(p as *Page) as void {
-    // Shadows' first: a rule on a host from inside gives way to the document's.
-    _load_sheets_of(p, 1);
-    _load_sheets_of(p, 0);
+// The page's own sheets, in document order, each with whatever it imports. Shadows' first:
+// a rule on a host from inside gives way to the document's.
+fn _ask_sheets(p as *Page) as void {
+    _ask_sheets_of(p, 1);
+    _ask_sheets_of(p, 0);
 }
 
-fn _load_sheets_of(p as *Page, shadows as i64) as void {
+fn _ask_sheets_of(p as *Page, shadows as i64) as void {
     let is *dom.Node as root = p.doc.node;
     let is *dom.Node as x with mut = _next_element(root, root);
-    p.engine.scope_now = 0;
     while (x != null) {
         if (x.ns == dom.NS_HTML && cast(i64, x.scope != 0) == shadows) {
-            p.engine.scope_now = x.scope;
             if (x.tag == tg.STYLE && _media_excludes(x) == 0) {
                 let is i64 as n with mut = 0;
                 let is *u8 as text = _element_text(&p.docs_a, x, &n);
-                _add_source(p, text, n, cast(*u8, &p.base), 0);
+                _fill_slot(p, _new_slot(p, cast(*SheetSlot, 0), x.scope, 0), text, n, cast(*u8, &p.base));
             }
             if (x.tag == tg.LINK && _media_excludes(x) == 0) {
                 let is *dom.Attr as rel = dom.find_attr(x, "rel", 3);
                 let is *dom.Attr as href = dom.find_attr(x, "href", 4);
                 if (rel != null && href != null && _has_word_ci(rel.value, rel.value_len, "stylesheet") == 1 &&
                     _has_word_ci(rel.value, rel.value_len, "alternate") == 0) {
-                    _fetch_sheet(p, href.value, href.value_len, cast(*u8, &p.base), 0);
+                    _ask_sheet(p, _new_slot(p, cast(*SheetSlot, 0), x.scope, 0), href.value, href.value_len, cast(*u8, &p.base));
                 }
             }
         }
@@ -319,20 +368,14 @@ fn _find(p as *Page, u as *u8, n as i64) as *Loaded {
 
 fn _fetch_image(p as *Page, u as *u8, n as i64) as void {
     if (_find(p, u, n) != null || p.nimages >= MAX_IMAGES) { return; }
-    if (time.now_ms() > p.budget_end) { return; }
     let is *Loaded as l = cast(*Loaded, arena.alloc(&p.docs_a, sizeof(Loaded)));
     l.url = arena.copy(&p.docs_a, u, n);
     l.n = n;
     l.next = p.images;
     p.images = l;
     p.nimages = p.nimages + 1;
-    let is net.Resource as r with mut;
-    if (net.get(l.url, &r) != 0) { return; }
-    if (r.status >= 200 && r.status < 300 && r.len > 0) {
-        l.ok = image.decode(r.data, r.len, &l.img);
-        if (l.ok == 0) { l.ok = svg_image.decode(r.data, r.len, &l.img); }
-    }
-    net.free(&r);
+    p.images_out = p.images_out + 1;
+    fetcher.get(cast(*u8, p), p.era, TAG_IMAGE, cast(*u8, l), l.url, 0);
 }
 
 // What layout calls to find an image, by the URL it has.
@@ -340,12 +383,12 @@ fn _image_for(user as *u8, u as *u8, n as i64) as *dl.Image {
     let is *Page as p = cast(*Page, user);
     let is *Loaded as l with mut = _find(p, u, n);
     // Not asked for when the page loaded: a <picture> choosing another at this size, or the
-    // src of one whose choice failed. It is fetched while there is still time for it.
+    // src of one whose choice failed. The layout after it arrives will find it.
     if (l == null) {
         _fetch_image(p, u, n);
-        l = _find(p, u, n);
+        return cast(*dl.Image, 0);
     }
-    if (l == null || l.ok == 0) { return cast(*dl.Image, 0); }
+    if (l.ok == 0) { return cast(*dl.Image, 0); }
     return &l.img;
 }
 
@@ -357,7 +400,6 @@ fn _value_url(st as *style.Style, prop as i64) as *u8 {
 
 // Everything visible that names an image. Only after styling is it known what is visible.
 fn _load_images(p as *Page) as void {
-    p.budget_end = time.now_ms() + IMAGE_BUDGET_MS;
     let is *dom.Node as root = p.doc.node;
     let is *dom.Node as x with mut = _next_element(root, root);
     while (x != null) {
@@ -476,7 +518,7 @@ fn _start_document(p as *Page) as void {
     arena.init(&p.box_a);
     arena.init(&p.paint_a);
     arena.init(&p.tmp_a);
-    p.loaded = 1;
+    p.started = 1;
     p.images = cast(*Loaded, 0);
     p.nimages = 0;
     p.root = cast(*bx.Box, 0);
@@ -514,49 +556,70 @@ fn _read_head(p as *Page) as void {
     }
 }
 
-// The page at u, replacing whatever was here. There is always a document afterwards, if
-// only one saying what went wrong. It has no boxes until relayout.
-// The next load sends this body, and all of it is the caller's until then.
-let is *u8 as _post_type with mut = cast(*u8, 0);
-let is *u8 as _post_body with mut = cast(*u8, 0);
-let is i64 as _post_n with mut = 0;
-let is *u8 as _post_origin with mut = cast(*u8, 0);
-let is *u8 as _post_referer with mut = cast(*u8, 0);
+let is i64 as TAG_DOC   with imut = 1;
+let is i64 as TAG_SHEET with imut = 2;
+let is i64 as TAG_IMAGE with imut = 3;
 
-fn post_next(ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8) as void {
-    _post_type = ctype;
-    _post_body = body;
-    _post_n = n;
-    _post_origin = origin;
-    _post_referer = referer;
-}
-
-fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
-    unload(p);
-    _start_document(p);
-    _copy_url(cast(*u8, &p.url), u);
+// Asks for a page. Until the answer comes, what was showing stays as it was.
+fn begin(p as *Page, u as *u8, vw as f64, vh as f64) as void {
+    cancel(p);
+    p.waiting_doc = 1;
     p.vw = vw;
     p.vh = vh;
-    decl.saw_viewport = 0;
+    fetcher.get(cast(*u8, p), p.era, TAG_DOC, cast(*u8, 0), u, 1);
+}
 
-    let is net.Resource as r with mut;
+fn begin_post(p as *Page, u as *u8, vw as f64, vh as f64, ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8) as void {
+    cancel(p);
+    p.waiting_doc = 1;
+    p.vw = vw;
+    p.vh = vh;
+    fetcher.post(cast(*u8, p), p.era, TAG_DOC, cast(*u8, 0), u, ctype, body, n, origin, referer);
+}
+
+// Nothing more wanted for what was asked so far.
+fn cancel(p as *Page) as void {
+    p.era = p.era + 1;
+    p.waiting_doc = 0;
+    fetcher.cancel(cast(*u8, p));
+}
+
+fn is_current(p as *Page, j as *fetcher.Job) as i64 { return cast(i64, j.era == p.era); }
+fn is_document(j as *fetcher.Job) as i64 { return cast(i64, j.tag == TAG_DOC); }
+
+// Sheets done: everything a first layout needs.
+fn _sheets_in(p as *Page) as void {
+    _apply_slots(p, p.sheets_first);
+    p.engine.scope_now = 0;
+    style.style_document(&p.engine, &p.doc, p.vw, p.vh);
+    anim.after_restyle(&p.motion, &p.doc, time.now_ms());
+    if (decl.saw_viewport == 1) { p.engine.viewport = 1; }
+    p.c.a = &p.box_a;
+    p.c.e = &p.engine;
+    p.c.images = fn_ptr(_image_for);
+    p.c.user = cast(*u8, p);
+    p.c.base = cast(*u8, &p.base);
+    p.loaded = 1;
+    _load_images(p);
+}
+
+fn _doc_arrived(p as *Page, j as *fetcher.Job) as void {
+    unload(p);
+    _start_document(p);
+    p.waiting_doc = 0;
+    _copy_url(cast(*u8, &p.url), cast(*u8, &j.url));
+    decl.saw_viewport = 0;
+    let is net.Resource as r = j.r;
     let is *u8 as src with mut = cast(*u8, 0);
     let is i64 as n with mut = 0;
-    let is i64 as have with mut = 0;
-    if (cast(i64, _post_type) != 0) {
-        have = cast(i64, net.post(u, _post_type, _post_body, _post_n, _post_origin, _post_referer, &r) == 0);
-        _post_type = cast(*u8, 0);
-    } else {
-        have = cast(i64, net.get(u, &r) == 0);
-    }
-    if (have == 0) {
+    if (j.ok == 0) {
         src = _error_page(p, r.error, &n);
     } else {
-        _copy_url(cast(*u8, &p.url), cast(*u8, &r.final));
-        if (_type_is(&r, "image/") == 1) { src = _image_doc(p, &n); }
-        else if (_type_is(&r, "text/plain") == 1 || _type_is(&r, "text/css") == 1 ||
-                 _type_is(&r, "application/json") == 1 || _type_is(&r, "text/javascript") == 1 ||
-                 _type_is(&r, "application/javascript") == 1) {
+        _copy_url(cast(*u8, &p.url), cast(*u8, &j.r.final));
+        if (_type_is(&j.r, "image/") == 1) { src = _image_doc(p, &n); }
+        else if (_type_is(&j.r, "text/plain") == 1 || _type_is(&j.r, "text/css") == 1 ||
+                 _type_is(&j.r, "application/json") == 1 || _type_is(&j.r, "text/javascript") == 1 ||
+                 _type_is(&j.r, "application/javascript") == 1) {
             src = _escaped(&p.tmp_a, r.data, r.len, &n);
         } else {
             src = r.data;
@@ -564,7 +627,6 @@ fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
         }
     }
     if (tree.parse(&p.doc, src, n) != 0) { n = 0; }
-    if (have == 1) { net.free(&r); }
     shadow.flatten(&p.doc);
     _read_head(p);
 
@@ -574,18 +636,36 @@ fn load(p as *Page, u as *u8, vw as f64, vh as f64) as void {
     sh.init(s, &p.docs_a);
     ua.load(s);
     style.add_sheet(&p.engine, s);
-    _load_sheets(p);
-    style.style_document(&p.engine, &p.doc, vw, vh);
-    anim.after_restyle(&p.motion, &p.doc, time.now_ms());
-    if (decl.saw_viewport == 1) { p.engine.viewport = 1; }
-    _load_images(p);
-
-    p.c.a = &p.box_a;
-    p.c.e = &p.engine;
-    p.c.images = fn_ptr(_image_for);
-    p.c.user = cast(*u8, p);
-    p.c.base = cast(*u8, &p.base);
+    _ask_sheets(p);
+    if (p.sheets_out == 0) { _sheets_in(p); }
 }
+
+fn _sheet_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.sheets_out = p.sheets_out - 1;
+    if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) {
+        _fill_slot(p, cast(*SheetSlot, j.data), j.r.data, j.r.len, cast(*u8, &j.r.final));
+    }
+    if (p.sheets_out == 0) { _sheets_in(p); }
+}
+
+fn _image_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.images_out = p.images_out - 1;
+    let is *Loaded as l = cast(*Loaded, j.data);
+    if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300 && j.r.len > 0) {
+        l.ok = image.decode(j.r.data, j.r.len, &l.img);
+        if (l.ok == 0) { l.ok = svg_image.decode(j.r.data, j.r.len, &l.img); }
+    }
+}
+
+// An answer for this page, current or not checked by is_current before this: for the
+// document, whoever calls this has already let go of what was drawn from the last one.
+fn arrived(p as *Page, j as *fetcher.Job) as void {
+    if (j.tag == TAG_DOC) { _doc_arrived(p, j); }
+    else if (j.tag == TAG_SHEET) { _sheet_arrived(p, j); }
+    else if (j.tag == TAG_IMAGE) { _image_arrived(p, j); }
+}
+
+fn images_waiting(p as *Page) as i64 { return p.images_out; }
 
 // Boxes and a display list for a window this size. Styles are only made again when
 // something in them depends on it.
@@ -593,8 +673,6 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     if (p.loaded == 0) { return; }
     let is i64 as resized = cast(i64, vw != p.engine.vw || vh != p.engine.vh);
     if (resized == 1 && p.engine.viewport == 1) { _style_again(p, vw, vh); }
-    // A window of another size may choose other files, and it can wait for them.
-    if (resized == 1) { p.budget_end = time.now_ms() + IMAGE_BUDGET_MS; }
     arena.free(&p.box_a);
     arena.free(&p.tmp_a);
     arena.free(&p.paint_a);

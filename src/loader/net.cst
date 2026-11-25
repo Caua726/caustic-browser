@@ -32,7 +32,6 @@ struct Resource {
 let is trust.TrustStore as _store with mut;
 let is cookie.Jar as _jar with mut;
 let is i64 as _ready with mut = 0;      // 1 the jar, 2 and a trust store
-let is fetch.Fetch as _f with mut;
 
 fn _setup() as void {
     if (_ready != 0) { return; }
@@ -232,18 +231,16 @@ fn _get_data(u as *u8, r as *Resource) as i64 {
     return 0;
 }
 
-fn _get_http(u as *u8, r as *Resource) as i64 {
-    return _exchange(u, cast(*u8, 0), cast(*u8, 0), 0, cast(*u8, 0), cast(*u8, 0), r);
+fn _get_http(f as *fetch.Fetch, u as *u8, r as *Resource) as i64 {
+    return _exchange(f, u, cast(*u8, 0), cast(*u8, 0), 0, cast(*u8, 0), cast(*u8, 0), r);
 }
 
 // With a body when ctype is not null: a POST, otherwise a GET.
-fn _exchange(u as *u8, ctype as *u8, body as *u8, n0 as i64, origin as *u8, referer as *u8, r as *Resource) as i64 {
-    _setup();
+fn _exchange(f as *fetch.Fetch, u as *u8, ctype as *u8, body as *u8, n0 as i64, origin as *u8, referer as *u8, r as *Resource) as i64 {
     if (_ready != 2 && _starts(u, "https:") == 1) {
         r.error = "Não há certificados confiáveis neste sistema";
         return 0 - 1;
     }
-    let is *fetch.Fetch as f = &_f;
     if (fetch.fetch_init(f, &_store) != 0) {
         r.error = "Sem memória";
         return 0 - 1;
@@ -279,22 +276,30 @@ fn _exchange(u as *u8, ctype as *u8, body as *u8, n0 as i64, origin as *u8, refe
     return 0;
 }
 
+// What everything after this needs, made before there is more than one thread to want it.
+fn prepare() as void {
+    conn.conn_heap_warm();
+    _setup();
+}
+
+fn fetch_size() as i64 { return sizeof(fetch.Fetch); }
+
 // A form's body sent to u, and the answer into r, as get does. Only HTTP has anywhere to
-// send one: anything else is just read.
-fn post(u as *u8, ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8, r as *Resource) as i64 {
+// send one: anything else is just read. f is the caller's, one to a thread.
+fn post(f as *u8, u as *u8, ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8, r as *Resource) as i64 {
     if (_starts(u, "http:") == 1 || _starts(u, "https:") == 1) {
         _init(r, u);
-        return _exchange(u, ctype, body, n, origin, referer, r);
+        return _exchange(cast(*fetch.Fetch, f), u, ctype, body, n, origin, referer, r);
     }
-    return get(u, r);
+    return get(f, u, r);
 }
 
 // The bytes at u, into r. 0, or -1 with r.error saying why. r is free()d either way.
-fn get(u as *u8, r as *Resource) as i64 {
+fn get(f as *u8, u as *u8, r as *Resource) as i64 {
     _init(r, u);
     if (_starts(u, "file:") == 1) { return _get_file(u, r); }
     if (_starts(u, "data:") == 1) { return _get_data(u, r); }
-    if (_starts(u, "http:") == 1 || _starts(u, "https:") == 1) { return _get_http(u, r); }
+    if (_starts(u, "http:") == 1 || _starts(u, "https:") == 1) { return _get_http(cast(*fetch.Fetch, f), u, r); }
     r.error = "Este tipo de endereço não existe aqui";
     return 0 - 1;
 }
