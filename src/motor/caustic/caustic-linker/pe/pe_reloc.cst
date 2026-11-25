@@ -1,0 +1,99 @@
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../../src/ir/opt_mem.cst" as om;
+
+// Build the .reloc section. Iterates over every R_X86_64_64 relocation in
+// every input obj, computes the final RVA of the patched 8 bytes, then
+// groups by 4 KiB page and emits the standard PE base-relocation blocks:
+//
+//   PageRVA (4) | BlockSize (4) | entries[N] (2 each, padded to 4-byte align)
+//
+// Each entry is `(type << 12) | offset_in_page`, where type 10 is
+// IMAGE_REL_BASED_DIR64 and type 0 is IMAGE_REL_BASED_ABSOLUTE (used as a
+// no-op padding entry to keep BlockSize a multiple of 4).
+//
+// Returns the number of bytes written into `out`. Result may be 0 if the
+// program contains no absolute addresses (typical for our hello-world).
+fn build_reloc_blob(ls as *linker.LinkerState, out as *reader.ByteBuffer,
+                    text_rva_base as i64, rodata_rva as i64, data_rva as i64) as i64 {
+    // Capacity: 4096 ADDR64 sites should fit any realistic program.
+    let is i32 as MAX = 4096;
+    let is *i64 as rvas = cast(*i64, om.opt_alloc(cast(i64, MAX) * 8));
+    let is i32 as count with mut = 0;
+
+    // Collect all ADDR64 reloc RVAs.
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as obj = linker.get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+            if (rel.rtype == reader.R_X86_64_64 && count < MAX) {
+                let is i64 as rva with mut = 0 - 1;
+                if (rel.section == reader.SECIDX_TEXT) {
+                    rva = text_rva_base + obj.text_offset + rel.offset;
+                } else if (rel.section == reader.SECIDX_RODATA) {
+                    rva = rodata_rva + obj.rodata_offset + rel.offset;
+                } else if (rel.section == reader.SECIDX_DATA) {
+                    rva = data_rva + obj.data_offset + rel.offset;
+                } else if (rel.section > reader.SECIDX_BSS) {
+                    let is i64 as vaddr = linker.resolve_sym_vaddr(ls, obj, rel.section, rel.offset);
+                    if (vaddr != 0) { rva = vaddr - ls.base_addr; }
+                }
+                if (rva >= 0) {
+                    rvas[count] = rva;
+                    count = count + 1;
+                }
+            }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+
+    if (count == 0) { return 0; }
+
+    // Insertion sort (small N; keeps the page-grouping pass simple).
+    let is i32 as a with mut = 1;
+    while (a < count) {
+        let is i64 as key = rvas[a];
+        let is i32 as b with mut = a - 1;
+        while (b >= 0 && rvas[b] > key) {
+            rvas[b + 1] = rvas[b];
+            b = b - 1;
+        }
+        rvas[b + 1] = key;
+        a = a + 1;
+    }
+
+    // Emit per-page blocks.
+    let is i64 as written with mut = 0;
+    let is i32 as cur with mut = 0;
+    while (cur < count) {
+        let is i64 as page_rva = rvas[cur] - (rvas[cur] % 4096);
+        let is i32 as end with mut = cur;
+        while (end < count && rvas[end] - (rvas[end] % 4096) == page_rva) {
+            end = end + 1;
+        }
+        let is i32 as n_in_page = end - cur;
+        let is i32 as needs_pad with mut = 0;
+        if (n_in_page % 2 != 0) { needs_pad = 1; }
+        let is i32 as block_size = 8 + n_in_page * 2 + needs_pad * 2;
+
+        reader.buf_emit32_le(out, page_rva);
+        reader.buf_emit32_le(out, cast(i64, block_size));
+        // Each entry packs IMAGE_REL_BASED_DIR64 (type 10) in the high
+        // 4 bits with the offset-in-page in the low 12 bits.
+        let is i64 as DIR64_TAG = 40960;       // 10 << 12
+        let is i32 as k with mut = cur;
+        while (k < end) {
+            reader.buf_emit16_le(out, cast(i32, DIR64_TAG + (rvas[k] % 4096)));
+            k = k + 1;
+        }
+        if (needs_pad == 1) {
+            reader.buf_emit16_le(out, 0);    // IMAGE_REL_BASED_ABSOLUTE
+        }
+        written = written + cast(i64, block_size);
+        cur = end;
+    }
+    return written;
+}

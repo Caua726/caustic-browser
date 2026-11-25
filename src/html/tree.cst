@@ -22,9 +22,9 @@
 // WHAT IS LEFT OUT, all of it needing something this browser does not have:
 //   * Parse errors are not reported. Only their recoveries change the tree, and those
 //     are all here. Where the spec says only "parse error", there is no code.
-//   * Scripting is Disabled, the spec's mode for a browser without scripts. <script>
-//     collects its text and nothing runs, <noscript> content parses as content, and
-//     everything reentrant about document.write has nothing to do.
+//   * Scripts run after the document is parsed, so everything reentrant about
+//     document.write has nothing to do. Scripting counts as enabled for <noscript>,
+//     whose content is text.
 //   * The fragment case, which only innerHTML reaches, and there is no JavaScript.
 //   * Processing instructions: the tokenizer still makes `<?x?>` a bogus comment.
 //   * Declarative shadow roots and <template for>: both parse as a plain <template>.
@@ -1073,8 +1073,7 @@ fn _in_head(p as *Parser) as void {
         if (tag == t.TITLE) { _text_element(p, tk.ST_RCDATA); return; }
         if (tag == t.NOFRAMES || tag == t.STYLE) { _text_element(p, tk.ST_RAWTEXT); return; }
         if (tag == t.NOSCRIPT) {
-            _insert(p);
-            p.mode = M_IN_HEAD_NOSCRIPT;
+            _text_element(p, tk.ST_RAWTEXT);
             return;
         }
         if (tag == t.SCRIPT) { _text_element(p, tk.ST_SCRIPT); return; }
@@ -1386,7 +1385,7 @@ fn _body_start(p as *Parser) as void {
         _text_element(p, tk.ST_RAWTEXT);
         return;
     }
-    if (tag == t.NOEMBED) { _text_element(p, tk.ST_RAWTEXT); return; }
+    if (tag == t.NOEMBED || tag == t.NOSCRIPT) { _text_element(p, tk.ST_RAWTEXT); return; }
     if (tag == t.SELECT) {
         if (_in_scope(p, t.SELECT) == 1) {
             _pop_until(p, t.SELECT);

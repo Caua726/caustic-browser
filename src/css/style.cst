@@ -89,6 +89,8 @@ struct Engine {
     keyframes as *sh.Keyframes;
     scope_now as i64;          // what the sheets being added are for
     containers as i64;         // some rule asks how big a container is
+    faces      as *sh.FontFace;
+    faces_last as *sh.FontFace;
 }
 
 let is pr.Values as _initial with mut;
@@ -120,6 +122,8 @@ fn init(e as *Engine, a as *arena.Arena, ia as *arena.Arena, base as *u8) as voi
     e.keyframes = cast(*sh.Keyframes, 0);
     e.scope_now = SCOPE_ALL;
     e.containers = 0;
+    e.faces = cast(*sh.FontFace, 0);
+    e.faces_last = cast(*sh.FontFace, 0);
     e.viewport = 0;
     e.vw = 0.0;
     e.vh = 0.0;
@@ -134,6 +138,11 @@ fn init(e as *Engine, a as *arena.Arena, ia as *arena.Arena, base as *u8) as voi
 
 // The rules of a sheet, after those of any added before it.
 fn add_sheet(e as *Engine, s as *sh.Sheet) as void {
+    if (s.faces != null) {
+        if (e.faces == null) { e.faces = s.faces; }
+        else { e.faces_last.next = s.faces; }
+        e.faces_last = s.faces_last;
+    }
     if (s.viewport == 1) { e.viewport = 1; }
     // The last one of a name wins, so the newest go first.
     let is *sh.Keyframes as k with mut = s.keyframes;

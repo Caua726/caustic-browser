@@ -3,7 +3,9 @@
 // The whole picture is worked out at once into an image: rect, circle, ellipse, line,
 // polyline, polygon, path, g and use, filled and stroked, in a colour or a gradient, under
 // any transform. Paint comes from attributes, from style="", and from fill and stroke in a
-// stylesheet. <text>, clipping, masks, filters, patterns and dashes are not drawn.
+// stylesheet. clip-path, mask and a filter's blur are drawn through a layer of their own.
+// <use> reaches into other files once the page has loaded them. <text>, patterns, dashes and
+// the other filter primitives are not drawn.
 
 use "../dom/dom.cst" as dom;
 use "../css/decl.cst" as decl;
@@ -66,6 +68,8 @@ struct _Out {
     h       as i64;
     current as i64;
     px      as *u8;
+    ext     as *dom.Node;   // the other file a <use> is drawing from, if any
+    layers  as i64;
 }
 
 fn _maxf(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
@@ -195,6 +199,45 @@ fn _doc_root(n as *dom.Node) as *dom.Node {
     return x;
 }
 
+fn _ids(o as *_Out) as *dom.Node {
+    if (o.ext != null) { return o.ext; }
+    return _doc_root(o.root);
+}
+
+// Other files <use> points at, by which document asked and how it wrote the address.
+struct _Ext { owner as *dom.Node; href as [256]u8; n as i64; root as *dom.Node; }
+let is i64 as MAX_EXT with imut = 32;
+let is [MAX_EXT]_Ext as _exts with mut;
+let is i64 as _next_ext with mut = 0;
+fn _ext_find(owner as *dom.Node, h as *u8, n as i64) as *_Ext {
+    let is i64 as i with mut = 0;
+    while (i < MAX_EXT) {
+        let is *_Ext as e = &_exts[i];
+        if (e.owner == owner && e.n == n && mem.core.memcmp(cast(*u8, &e.href), h, n) == 0) { return e; }
+        i = i + 1;
+    }
+    return cast(*_Ext, 0);
+}
+// A place for a file, new for this document: null if it was already asked for, so it is
+// fetched once. What it holds is filled in by ext_loaded.
+fn ext_ask(owner as *dom.Node, h as *u8, n as i64) as *u8 {
+    if (n <= 0 || n >= 256 || _ext_find(owner, h, n) != null) { return cast(*u8, 0); }
+    let is *_Ext as e = &_exts[_next_ext];
+    _next_ext = (_next_ext + 1) % MAX_EXT;
+    e.owner = owner;
+    e.n = n;
+    e.root = cast(*dom.Node, 0);
+    mem.core.memcpy(cast(*u8, &e.href), h, n);
+    return cast(*u8, e);
+}
+fn ext_loaded(slot as *u8, root as *dom.Node) as void { cast(*_Ext, slot).root = root; }
+// The part of an href before its #, or all of it.
+fn href_file_len(h as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n && h[i] != 35) { i = i + 1; }
+    return i;
+}
+
 // rgb() and rgba(), the two that are written by hand in an attribute.
 fn _rgb_fn(s as *u8, n as i64, out as *i64) as i64 {
     let is i64 as i with mut = 0;
@@ -247,7 +290,7 @@ fn _paint_of_url(o as *_Out, u as *u8, was as *_Paint) as void {
     }
     was.kind = PAINT_NONE;
     if (hash < 0) { return; }
-    let is *dom.Node as g = _by_id(_doc_root(o.root), &u[hash + 1], n - hash - 1);
+    let is *dom.Node as g = _by_id(_ids(o), &u[hash + 1], n - hash - 1);
     if (g != null) {
         was.kind = PAINT_GRAD;
         was.grad = g;
@@ -261,7 +304,7 @@ fn _paint_of(o as *_Out, s as *u8, n as i64, was as *_Paint) as void {
         while (i < n && (s[i] == 39 || s[i] == 34 || s[i] == 35 || _is_ws(cast(i64, s[i])) == 1)) { i = i + 1; }
         let is i64 as e with mut = i;
         while (e < n && s[e] != 41 && s[e] != 39 && s[e] != 34) { e = e + 1; }
-        let is *dom.Node as g = _by_id(_doc_root(o.root), &s[i], e - i);
+        let is *dom.Node as g = _by_id(_ids(o), &s[i], e - i);
         if (g != null) {
             was.kind = PAINT_GRAD;
             was.grad = g;
@@ -706,7 +749,7 @@ fn _stops_owner(o as *_Out, g0 as *dom.Node) as *dom.Node {
         let is *dom.Attr as h with mut = dom.find_attr(g, "href", 4);
         if (h == null) { h = dom.find_attr(g, "xlink:href", 10); }
         if (h == null || h.value_len < 2 || h.value[0] != 35) { return cast(*dom.Node, 0); }
-        g = _by_id(_doc_root(o.root), &h.value[1], h.value_len - 1);
+        g = _by_id(_ids(o), &h.value[1], h.value_len - 1);
         hops = hops + 1;
     }
     return cast(*dom.Node, 0);
@@ -1251,6 +1294,147 @@ fn _hidden(n as *dom.Node) as i64 {
     return 0;
 }
 
+// url(#id) in one of an element's properties, as the element it names.
+fn _ref_of(o as *_Out, n as *dom.Node, name as *u8, nlen as i64) as *dom.Node {
+    let is i64 as l with mut = 0;
+    let is *u8 as v = _prop(n, name, nlen, &l);
+    if (v == null || l < 6) { return cast(*dom.Node, 0); }
+    let is i64 as a with mut = 0;
+    while (a < l && v[a] != 35) { a = a + 1; }
+    if (a >= l) { return cast(*dom.Node, 0); }
+    a = a + 1;
+    let is i64 as e with mut = a;
+    while (e < l && v[e] != 41 && v[e] != 34 && v[e] != 39) { e = e + 1; }
+    return _by_id(_ids(o), &v[a], e - a);
+}
+// A layer over what is under it. Both hold colour already multiplied by alpha.
+fn _over(o as *_Out, layer as *u8) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as n = o.w * o.h * 4;
+    let is *u8 as d = o.px;
+    while (i < n) {
+        let is i64 as sa = cast(i64, layer[i + 3]);
+        if (sa != 0) {
+            let is i64 as keep = 255 - sa;
+            let is i64 as k with mut = 0;
+            while (k < 4) {
+                let is i64 as v = cast(i64, layer[i + k]) + (cast(i64, d[i + k]) * keep + 127) / 255;
+                if (v > 255) { d[i + k] = cast(u8, 255); } else { d[i + k] = cast(u8, v); }
+                k = k + 1;
+            }
+        }
+        i = i + 4;
+    }
+}
+// A layer cut down by what a <mask> or <clipPath> draws, in the same space as the element.
+fn _apply_part(o as *_Out, layer as *u8, part as *dom.Node, from as *_State, is_mask as i64) as void {
+    let is i64 as bytes = o.w * o.h * 4;
+    let is *u8 as m = mem.core.mmap_anon(bytes);
+    let is i64 as mv = cast(i64, m);
+    if (mv == 0 || mv == 0 - 1) { return; }
+    let is _State as st with mut;
+    mem.memzero(cast(*u8, &st), sizeof(_State));
+    st.fill.kind = PAINT_COLOR;
+    st.fill.color = 4278190080;
+    st.stroke.kind = PAINT_NONE;
+    st.width = 1.0;
+    st.miter = 4.0;
+    st.fill_a = 1.0;
+    st.stroke_a = 1.0;
+    st.alpha = 1.0;
+    st.m = from.m;
+    let is *u8 as under = o.px;
+    o.px = m;
+    o.layers = o.layers + 1;
+    let is *dom.Node as x with mut = part.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT) { _element(o, x, &st, 1); }
+        x = x.next;
+    }
+    o.layers = o.layers - 1;
+    o.px = under;
+    // A mask counts by how bright it is, unless it says alpha. A clip only by being there.
+    let is i64 as by_alpha with mut = cast(i64, is_mask == 0);
+    let is i64 as vl with mut = 0;
+    let is *u8 as mt = _prop(part, "mask-type", 9, &vl);
+    if (mt != null && decl.eq(mt, vl, "alpha") == 1) { by_alpha = 1; }
+    let is i64 as i with mut = 0;
+    while (i < bytes) {
+        let is i64 as cover with mut = cast(i64, m[i + 3]);
+        if (by_alpha == 0) {
+            // Multiplied by alpha already, so this is luminance times alpha.
+            cover = (cast(i64, m[i]) * 54 + cast(i64, m[i + 1]) * 183 + cast(i64, m[i + 2]) * 19) >> 8;
+        }
+        let is i64 as k with mut = 0;
+        while (k < 4) {
+            layer[i + k] = cast(u8, (cast(i64, layer[i + k]) * cover + 127) / 255);
+            k = k + 1;
+        }
+        i = i + 4;
+    }
+    mem.core.munmap(m, bytes);
+}
+// Three box blurs one way, which comes close enough to the Gaussian the spec describes.
+fn _blur_line(src as *u8, dst as *u8, n as i64, step as i64, d as i64) as void {
+    // One channel of one line, from src to dst. Past the ends is transparent.
+    let is i64 as lead = d / 2;
+    let is i64 as trail = d - lead;
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n + lead) {
+        if (i < n) { sum = sum + cast(i64, src[i * step]); }
+        if (i >= d) { sum = sum - cast(i64, src[(i - d) * step]); }
+        if (i >= lead) { dst[(i - lead) * step] = cast(u8, sum / d); }
+        i = i + 1;
+    }
+}
+fn _blur(o as *_Out, px as *u8, sigma as f64) as void {
+    if (sigma <= 0.0) { return; }
+    let is i64 as d with mut = cast(i64, sigma * 1.8799712 + 0.5);
+    if (d < 1) { d = 1; }
+    if (d == 1) { return; }
+    let is i64 as w = o.w;
+    let is i64 as h = o.h;
+    let is i64 as bytes = w * h * 4;
+    let is *u8 as tmp = mem.core.mmap_anon(bytes);
+    let is i64 as tv = cast(i64, tmp);
+    if (tv == 0 || tv == 0 - 1) { return; }
+    let is i64 as pass with mut = 0;
+    while (pass < 3) {
+        let is i64 as y with mut = 0;
+        while (y < h) {
+            let is i64 as c with mut = 0;
+            while (c < 4) {
+                _blur_line(&px[(y * w) * 4 + c], &tmp[(y * w) * 4 + c], w, 4, d);
+                c = c + 1;
+            }
+            y = y + 1;
+        }
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as c with mut = 0;
+            while (c < 4) {
+                _blur_line(&tmp[x * 4 + c], &px[x * 4 + c], h, w * 4, d);
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        pass = pass + 1;
+    }
+    mem.core.munmap(tmp, bytes);
+}
+fn _filter(o as *_Out, layer as *u8, f as *dom.Node, m as *_Mat) as void {
+    let is f64 as scale = fm.sqrt(_abs(m.a * m.d - m.b * m.c));
+    let is *dom.Node as x with mut = f.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && decl.eq(x.name, x.name_len, "fegaussianblur") == 1) {
+            let is f64 as sd = _attr_num(x, "stdDeviation", 12, 0.0);
+            _blur(o, layer, sd * scale);
+        }
+        x = x.next;
+    }
+}
+
 fn _element(o as *_Out, n as *dom.Node, from as *_State, depth as i64) as void {
     if (depth > MAX_DEPTH) { return; }
     let is *u8 as t = n.name;
@@ -1266,8 +1450,36 @@ fn _element(o as *_Out, n as *dom.Node, from as *_State, depth as i64) as void {
     if (_prop(n, "display", 7, &l) != null || n.style != null) {
         if (_hidden(n) == 1) { return; }
     }
-    l = n.name_len;
     _take_state(o, n, &st);
+    let is *dom.Node as clip = _ref_of(o, n, "clip-path", 9);
+    let is *dom.Node as msk = _ref_of(o, n, "mask", 4);
+    let is *dom.Node as flt = _ref_of(o, n, "filter", 6);
+    if ((clip != null || msk != null || flt != null) && o.layers < 8) {
+        let is i64 as bytes = o.w * o.h * 4;
+        let is *u8 as layer = mem.core.mmap_anon(bytes);
+        let is i64 as lv = cast(i64, layer);
+        if (lv != 0 && lv != 0 - 1) {
+            let is *u8 as under = o.px;
+            o.px = layer;
+            o.layers = o.layers + 1;
+            _draw_self(o, n, &st, depth);
+            if (flt != null) { _filter(o, layer, flt, &st.m); }
+            if (msk != null) { _apply_part(o, layer, msk, &st, 1); }
+            if (clip != null) { _apply_part(o, layer, clip, &st, 0); }
+            o.layers = o.layers - 1;
+            o.px = under;
+            _over(o, layer);
+            mem.core.munmap(layer, bytes);
+            return;
+        }
+    }
+    _draw_self(o, n, &st, depth);
+}
+
+fn _draw_self(o as *_Out, n as *dom.Node, st0 as *_State, depth as i64) as void {
+    let is _State as st with mut = *st0;
+    let is *u8 as t = n.name;
+    let is i64 as l = n.name_len;
     if (decl.eq(t, l, "g") == 1 || decl.eq(t, l, "svg") == 1 || decl.eq(t, l, "a") == 1 || decl.eq(t, l, "switch") == 1) {
         let is *dom.Node as x with mut = n.first;
         while (x != null) {
@@ -1279,23 +1491,53 @@ fn _element(o as *_Out, n as *dom.Node, from as *_State, depth as i64) as void {
     if (decl.eq(t, l, "use") == 1) {
         let is *dom.Attr as h with mut = dom.find_attr(n, "href", 4);
         if (h == null) { h = dom.find_attr(n, "xlink:href", 10); }
-        if (h == null || h.value_len < 2 || h.value[0] != 35) { return; }
-        let is *dom.Node as to = _by_id(_doc_root(o.root), &h.value[1], h.value_len - 1);
-        if (to == null) { return; }
+        if (h == null || h.value_len < 2) { return; }
+        let is i64 as fl = href_file_len(h.value, h.value_len);
+        if (fl + 1 >= h.value_len) { return; }
+        let is *dom.Node as was_ext = o.ext;
+        if (fl > 0) {
+            let is *_Ext as e = _ext_find(_doc_root(o.root), h.value, fl);
+            if (e == null || e.root == null) { return; }
+            o.ext = e.root;
+        }
+        let is *dom.Node as to = _by_id(_ids(o), &h.value[fl + 1], h.value_len - fl - 1);
+        if (to == null) { o.ext = was_ext; return; }
         let is _Mat as tr = _ident();
         tr.e = _attr_num(n, "x", 1, 0.0);
         tr.f = _attr_num(n, "y", 1, 0.0);
         st.m = _mul(&st.m, &tr);
-        // A symbol is drawn only by being used.
+        // A symbol is drawn only by being used, in the space its view says, at the size the
+        // <use> asks or that of what it is in.
         if (decl.eq(to.name, to.name_len, "symbol") == 1) {
+            let is *dom.Attr as vb = dom.find_attr(to, "viewBox", 7);
+            if (vb != null) {
+                let is [4]f64 as nums with mut;
+                let is i64 as at with mut = 0;
+                let is i64 as k with mut = 0;
+                while (k < 4 && _num(vb.value, vb.value_len, &at, &nums[k]) == 1) { k = k + 1; }
+                if (k == 4 && nums[2] > 0.0 && nums[3] > 0.0) {
+                    let is f64 as scale_now = fm.sqrt(_abs(st.m.a * st.m.d - st.m.b * st.m.c));
+                    let is f64 as uw = _attr_num(n, "width", 5, cast(f64, o.w) / _maxf(scale_now, 0.0001));
+                    let is f64 as uh = _attr_num(n, "height", 6, cast(f64, o.h) / _maxf(scale_now, 0.0001));
+                    let is f64 as sc = _minf(uw / nums[2], uh / nums[3]);
+                    let is _Mat as vm = _ident();
+                    vm.a = sc;
+                    vm.d = sc;
+                    vm.e = (uw - nums[2] * sc) / 2.0 - nums[0] * sc;
+                    vm.f = (uh - nums[3] * sc) / 2.0 - nums[1] * sc;
+                    st.m = _mul(&st.m, &vm);
+                }
+            }
             let is *dom.Node as x with mut = to.first;
             while (x != null) {
                 if (x.kind == dom.ELEMENT) { _element(o, x, &st, depth + 1); }
                 x = x.next;
             }
+            o.ext = was_ext;
             return;
         }
         _element(o, to, &st, depth + 1);
+        o.ext = was_ext;
         return;
     }
     let is path.Path as p = path.open(_shape_points(n));
@@ -1318,6 +1560,8 @@ fn render(root0 as *u8, w as i64, h as i64, current as i64, out as *u8) as void 
     o.h = h;
     o.current = current;
     o.px = out;
+    o.ext = cast(*dom.Node, 0);
+    o.layers = 0;
     let is _State as st with mut;
     mem.memzero(cast(*u8, &st), sizeof(_State));
     st.fill.kind = PAINT_COLOR;

@@ -1,0 +1,1526 @@
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../../src/ir/opt_mem.cst" as om;
+use "../../src/codegen/target.cst" as tgt;
+use "../readers/elf_reader.cst" as reader;
+
+// ============================================================
+// linker.cst — Core linking logic
+// Merge sections, resolve symbols, build the symbol table, DCE.
+// Relocation lives in core/relocate.cst; link-map output in
+// core/map_writer.cst (both import this module as the base).
+// ============================================================
+
+// ============================================================
+// Global symbol table
+// ============================================================
+
+struct GlobalSym {
+    name as *u8;
+    name_len as i32;
+    section as i32;     // 1=text, 2=data, 3=rodata, 4=bss, 0=undef
+    vaddr as i64;       // final virtual address
+    obj_idx as i32;     // which .o file defined this
+    defined as i32;     // 1 if defined, 0 if undefined
+}
+
+struct GlobalSymTab {
+    data as *u8;
+    count as i32;
+    cap as i32;
+}
+
+fn gsym_init() as GlobalSymTab {
+    let is GlobalSymTab as st;
+    st.cap = 256;
+    st.data = om.opt_alloc(cast(i64, st.cap) * sizeof(GlobalSym));
+    st.count = 0;
+    return st;
+}
+
+fn gsym_get(st as *GlobalSymTab, idx as i32) as *GlobalSym {
+    return cast(*GlobalSym, cast(i64, st.data) + cast(i64, idx) * sizeof(GlobalSym));
+}
+
+fn gsym_find(st as *GlobalSymTab, name as *u8, name_len as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < st.count) {
+        let is *GlobalSym as g = gsym_get(st, i);
+        if (reader.streq(g.name, g.name_len, name, name_len) == 1) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn gsym_add(st as *GlobalSymTab, name as *u8, name_len as i32, section as i32,
+            vaddr as i64, obj_idx as i32, defined as i32) as i32 {
+    if (st.count >= st.cap) {
+        let is i32 as new_cap = st.cap * 2;
+        let is *u8 as new_data = om.opt_alloc(cast(i64, new_cap) * sizeof(GlobalSym));
+        mem.memcpy(new_data, st.data, cast(i64, st.count) * sizeof(GlobalSym));
+        om.opt_free(st.data);
+        st.data = new_data;
+        st.cap = new_cap;
+    }
+    let is *GlobalSym as g = gsym_get(st, st.count);
+    g.name = name;
+    g.name_len = name_len;
+    g.section = section;
+    g.vaddr = vaddr;
+    g.obj_idx = obj_idx;
+    g.defined = defined;
+    st.count = st.count + 1;
+    return st.count - 1;
+}
+
+// ============================================================
+// Linker state
+// ============================================================
+
+struct LinkerState {
+    text as *u8;        // *reader.ByteBuffer
+    rodata as *u8;      // *reader.ByteBuffer
+    data_sec as *u8;    // *reader.ByteBuffer
+    bss_total as i64;
+
+    base_addr as i64;
+    text_vaddr as i64;
+    rodata_vaddr as i64;
+    data_vaddr as i64;
+    bss_vaddr as i64;
+
+    text_size as i64;
+    rodata_size as i64;
+    data_size as i64;
+
+    gsyms as *u8;       // *GlobalSymTab
+    objs as *u8;        // array of *ObjFile pointers
+    obj_count as i32;
+
+    entry_name as *u8;
+    entry_vaddr as i64;
+    verbose as i32;
+    do_strip as i32;
+    do_map as i32;
+    keep_empty as i32;
+    freestanding as i32;
+    is_shared as i32;       // 1 when emitting a .so/.dll (no entry, base 0)
+    line_layout as i32;     // 1: the .loopalign layout of --cpu=znver3: functions keep
+                            // their offset in a 64-byte line, each .text starts 32 in
+    align_funcs as i32;     // >1: each function in .text starts at a multiple of this (0 = packed)
+
+    // Custom sections (merged)
+    csec_bufs as *u8;      // array of reader.ByteBuffer, csec_cap of them
+    csec_names as *u8;     // array of *u8 name pointers
+    csec_name_lens as *u8; // array of i32
+    csec_sizes as *u8;     // array of i64
+    csec_vaddrs as *u8;    // array of i64
+    csec_execs as *u8;     // array of i32 — 1 = section holds code (SHF_EXECINSTR)
+    csec_count as i32;
+    csec_cap as i32;       // entries allocated in each csec_* array
+
+    // Dynamic linking
+    needed_libs as *u8;     // array of *u8 c-strings (lib names like "libc.so.6")
+    needed_count as i32;
+    dynsyms as *u8;         // *DynSymTab
+    plt_buf as *u8;         // *reader.ByteBuffer — PLT stubs
+    got_buf as *u8;         // *reader.ByteBuffer — GOT.PLT entries
+    interp_buf as *u8;      // *reader.ByteBuffer — .interp
+    dynsym_buf as *u8;      // *reader.ByteBuffer — .dynsym
+    dynstr_buf as *u8;      // *reader.ByteBuffer — .dynstr
+    hash_buf as *u8;        // *reader.ByteBuffer — .hash
+    relaplt_buf as *u8;     // *reader.ByteBuffer — .rela.plt
+    dynamic_buf as *u8;     // *reader.ByteBuffer — .dynamic
+    data_got_buf as *u8;    // *reader.ByteBuffer — .got (for GOTPCREL data globals)
+    reladyn_buf as *u8;     // *reader.ByteBuffer — .rela.dyn (GLOB_DAT entries)
+
+    // PE/Windows imports — collected from .cstimport custom section of each
+    // input .obj during link. The PE writer groups by DLL and emits the
+    // import table, ILT, IAT, hint/name table. Each entry is one (dll, sym).
+    cstimport_dll_ptrs as *u8;  // cap * 8 — *u8 dll name (in obj file memory)
+    cstimport_dll_lens as *u8;  // cap * 4 — i32 dll name length
+    cstimport_sym_ptrs as *u8;  // cap * 8 — *u8 sym name
+    cstimport_sym_lens as *u8;  // cap * 4 — i32 sym name length
+    cstimport_count as i32;
+    cstimport_cap as i32;
+}
+
+fn alloc_bytebuf(cap as i64) as *u8 {
+    let is *u8 as p = om.opt_alloc(sizeof(reader.ByteBuffer));
+    let is *reader.ByteBuffer as bb = cast(*reader.ByteBuffer, p);
+    let is reader.ByteBuffer as tmp = reader.buf_init(cap);
+    bb.data = tmp.data;
+    bb.len = tmp.len;
+    bb.cap = tmp.cap;
+    return p;
+}
+
+fn get_text(ls as *LinkerState) as *reader.ByteBuffer {
+    return cast(*reader.ByteBuffer, ls.text);
+}
+fn get_rodata(ls as *LinkerState) as *reader.ByteBuffer {
+    return cast(*reader.ByteBuffer, ls.rodata);
+}
+fn get_data(ls as *LinkerState) as *reader.ByteBuffer {
+    return cast(*reader.ByteBuffer, ls.data_sec);
+}
+fn get_gsyms(ls as *LinkerState) as *GlobalSymTab {
+    return cast(*GlobalSymTab, ls.gsyms);
+}
+
+fn linker_init(base_addr as i64) as LinkerState {
+    let is LinkerState as ls;
+    ls.text = alloc_bytebuf(65536);
+    ls.rodata = alloc_bytebuf(4096);
+    ls.data_sec = alloc_bytebuf(4096);
+    ls.bss_total = 0;
+    ls.base_addr = base_addr;
+    ls.text_vaddr = 0;
+    ls.rodata_vaddr = 0;
+    ls.data_vaddr = 0;
+    ls.bss_vaddr = 0;
+    ls.text_size = 0;
+    ls.rodata_size = 0;
+    ls.data_size = 0;
+    let is *u8 as gs = om.opt_alloc(sizeof(GlobalSymTab));
+    let is *GlobalSymTab as gst = cast(*GlobalSymTab, gs);
+    let is GlobalSymTab as tmp_gs = gsym_init();
+    gst.data = tmp_gs.data;
+    gst.count = tmp_gs.count;
+    gst.cap = tmp_gs.cap;
+    ls.gsyms = gs;
+    ls.objs = cast(*u8, 0);
+    ls.obj_count = 0;
+    ls.entry_name = "main";
+    ls.entry_vaddr = 0;
+    ls.verbose = 0;
+    ls.do_strip = 0;
+    ls.do_map = 0;
+    ls.keep_empty = 0;
+    ls.freestanding = 0;
+    ls.is_shared = 0;
+    ls.align_funcs = 0;
+    ls.line_layout = 0;
+    ls.needed_libs = cast(*u8, 0);
+    ls.needed_count = 0;
+    ls.dynsyms = cast(*u8, 0);
+    ls.plt_buf = cast(*u8, 0);
+    ls.got_buf = cast(*u8, 0);
+    ls.interp_buf = cast(*u8, 0);
+    ls.dynsym_buf = cast(*u8, 0);
+    ls.dynstr_buf = cast(*u8, 0);
+    ls.hash_buf = cast(*u8, 0);
+    ls.relaplt_buf = cast(*u8, 0);
+    ls.dynamic_buf = cast(*u8, 0);
+    ls.data_got_buf = cast(*u8, 0);
+    ls.reladyn_buf = cast(*u8, 0);
+    ls.csec_cap = 32;
+    ls.csec_bufs = om.opt_alloc(cast(i64, ls.csec_cap) * sizeof(reader.ByteBuffer));
+    ls.csec_names = om.opt_alloc(cast(i64, ls.csec_cap) * 8);
+    ls.csec_name_lens = om.opt_alloc(cast(i64, ls.csec_cap) * 4);
+    ls.csec_sizes = om.opt_alloc(cast(i64, ls.csec_cap) * 8);
+    ls.csec_vaddrs = om.opt_alloc(cast(i64, ls.csec_cap) * 8);
+    ls.csec_execs = om.opt_alloc(cast(i64, ls.csec_cap) * 4);
+    ls.csec_count = 0;
+    ls.cstimport_cap = 1024;
+    ls.cstimport_dll_ptrs = om.opt_alloc(cast(i64, ls.cstimport_cap) * 8);
+    ls.cstimport_dll_lens = om.opt_alloc(cast(i64, ls.cstimport_cap) * 4);
+    ls.cstimport_sym_ptrs = om.opt_alloc(cast(i64, ls.cstimport_cap) * 8);
+    ls.cstimport_sym_lens = om.opt_alloc(cast(i64, ls.cstimport_cap) * 4);
+    ls.cstimport_count = 0;
+    return ls;
+}
+
+// Read a little-endian u32 from a byte buffer at offset off.
+fn read_u32_le(buf as *u8, off as i64) as i64 {
+    let is i64 as b0 = cast(i64, buf[off]);
+    let is i64 as b1 = cast(i64, buf[off + 1]);
+    let is i64 as b2 = cast(i64, buf[off + 2]);
+    let is i64 as b3 = cast(i64, buf[off + 3]);
+    return b0 + (b1 << 8) + (b2 << 16) + (b3 << 24);
+}
+
+// Compare two byte ranges for equality.
+fn bytes_eq(a as *u8, a_len as i32, b as *u8, b_len as i32) as i32 {
+    if (a_len != b_len) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < a_len) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Parse the ".cstimport" custom section from one ObjFile (if present) and
+// accumulate its entries into ls.cstimport_*. Each entry adds one (dll, sym)
+// pair; duplicates across objects collapse via add_cstimport's dedup check.
+// Wire format:
+//   u32 count
+//   for each: u32 dll_len, u32 sym_len, bytes[dll_len], bytes[sym_len]
+// The table grows. It was a fixed 1024 slots, failing the link past that — and
+// failing it on a duplicate too, since the ceiling was checked before the
+// dedup, so 1024 distinct imports and one repeat could not link.
+fn _cstimport_grow(ls as *LinkerState) as void {
+    let is i64 as n = cast(i64, ls.cstimport_count);
+    let is i64 as nc = cast(i64, ls.cstimport_cap) * 2;
+    ls.cstimport_dll_ptrs = _csec_grow_one(ls.cstimport_dll_ptrs, n * 8, nc * 8);
+    ls.cstimport_dll_lens = _csec_grow_one(ls.cstimport_dll_lens, n * 4, nc * 4);
+    ls.cstimport_sym_ptrs = _csec_grow_one(ls.cstimport_sym_ptrs, n * 8, nc * 8);
+    ls.cstimport_sym_lens = _csec_grow_one(ls.cstimport_sym_lens, n * 4, nc * 4);
+    ls.cstimport_cap = cast(i32, nc);
+}
+
+fn add_cstimport(ls as *LinkerState, dll as *u8, dll_len as i32, sym as *u8, sym_len as i32) as void {
+    let is *i64 as dp = cast(*i64, ls.cstimport_dll_ptrs);
+    let is *i32 as dl = cast(*i32, ls.cstimport_dll_lens);
+    let is *i64 as sp = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as sl = cast(*i32, ls.cstimport_sym_lens);
+    let is i32 as i with mut = 0;
+    while (i < ls.cstimport_count) {
+        if (bytes_eq(cast(*u8, dp[i]), dl[i], dll, dll_len) == 1
+            && bytes_eq(cast(*u8, sp[i]), sl[i], sym, sym_len) == 1) {
+            return;
+        }
+        i = i + 1;
+    }
+    if (ls.cstimport_count >= ls.cstimport_cap) { _cstimport_grow(ls); }
+    let is i32 as idx = ls.cstimport_count;
+    let is *i64 as gdp = cast(*i64, ls.cstimport_dll_ptrs);
+    let is *i32 as gdl = cast(*i32, ls.cstimport_dll_lens);
+    let is *i64 as gsp = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as gsl = cast(*i32, ls.cstimport_sym_lens);
+    gdp[idx] = cast(i64, dll);
+    gdl[idx] = dll_len;
+    gsp[idx] = cast(i64, sym);
+    gsl[idx] = sym_len;
+    ls.cstimport_count = ls.cstimport_count + 1;
+}
+
+fn collect_cstimports_from(ls as *LinkerState, obj as *reader.ObjFile) as void {
+    // Find ".cstimport" in obj.csec_*
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (bytes_eq(nm, nlens[i], ".cstimport", 10) == 1) {
+            let is *reader.ObjSection as sec = cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+            let is *u8 as buf = sec.data;
+            let is i64 as sz = sec.size;
+            if (sz < 4) { return; }
+            let is i64 as count = read_u32_le(buf, 0);
+            let is i64 as off with mut = 4;
+            let is i64 as k with mut = 0;
+            while (k < count && off + 8 <= sz) {
+                let is i64 as dll_len = read_u32_le(buf, off);
+                let is i64 as sym_len = read_u32_le(buf, off + 4);
+                off = off + 8;
+                if (off + dll_len + sym_len > sz) { return; }
+                add_cstimport(ls, cast(*u8, cast(i64, buf) + off), cast(i32, dll_len),
+                              cast(*u8, cast(i64, buf) + off + dll_len), cast(i32, sym_len));
+                off = off + dll_len + sym_len;
+                k = k + 1;
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn collect_all_cstimports(ls as *LinkerState) as void {
+    let is i32 as i with mut = 0;
+    while (i < ls.obj_count) {
+        collect_cstimports_from(ls, get_obj(ls, i));
+        i = i + 1;
+    }
+}
+
+// Merge the shared objects named by .cstimport entries into needed_libs, so an
+// ELF link emits a DT_NEEDED for each one and the undefined symbols they cover
+// resolve at load time. On PE the same entries build the import table instead,
+// so callers gate this on a non-PE output.
+//
+// The name is taken verbatim from the extern annotation (`extern "libm.so.6"`),
+// which means it is already a soname — no /usr/lib probing, unlike the -l<name>
+// path in lib_to_soname. A program therefore does not have to repeat -l for a
+// library its own source already named.
+fn add_cstimport_needed_libs(ls as *LinkerState) as void {
+    collect_all_cstimports(ls);
+    if (ls.cstimport_count == 0) { return; }
+
+    // needed_libs is sized exactly to the -l count (and is null when no -l was
+    // passed), so grow it to hold every name we might append.
+    let is *u8 as grown = om.opt_alloc(cast(i64, ls.needed_count + ls.cstimport_count) * 8);
+    let is *i64 as dst = cast(*i64, grown);
+    let is i32 as i with mut = 0;
+    while (i < ls.needed_count) {
+        let is *i64 as old = cast(*i64, ls.needed_libs);
+        dst[i] = old[i];
+        i = i + 1;
+    }
+    let is i32 as n with mut = ls.needed_count;
+
+    let is *i64 as dp = cast(*i64, ls.cstimport_dll_ptrs);
+    let is *i32 as dl = cast(*i32, ls.cstimport_dll_lens);
+    let is i32 as k with mut = 0;
+    while (k < ls.cstimport_count) {
+        let is *u8 as nm = cast(*u8, dp[k]);
+        let is i32 as nl = dl[k];
+        let is i32 as dup with mut = 0;
+        let is i32 as j with mut = 0;
+        while (j < n) {
+            let is *u8 as ex = cast(*u8, dst[j]);
+            if (bytes_eq(ex, reader.cstrlen(ex), nm, nl) == 1) { dup = 1; }
+            j = j + 1;
+        }
+        if (dup == 0) {
+            // .cstimport stores (ptr, len) with no terminator; DT_NEEDED goes
+            // through .dynstr as a C string, so copy and terminate.
+            let is *u8 as cp = om.opt_alloc(cast(i64, nl) + 1);
+            let is i32 as c with mut = 0;
+            while (c < nl) { cp[c] = nm[c]; c = c + 1; }
+            cp[nl] = 0;
+            dst[n] = cast(i64, cp);
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    ls.needed_libs = grown;
+    ls.needed_count = n;
+}
+
+fn get_obj(ls as *LinkerState, idx as i32) as *reader.ObjFile {
+    let is *i64 as arr = cast(*i64, ls.objs);
+    return cast(*reader.ObjFile, arr[idx]);
+}
+
+// ============================================================
+// Dead-code elimination — per-function reachability mark-sweep (link-time dead-code elimination, NOT a runtime GC).
+// Marks .text functions reachable from the entry point and from any reference
+// originating OUTSIDE a .text function (data/rodata/custom relocs → roots), then
+// PRUNES each .o's .text (drops dead functions, repacks the live ones, remaps the
+// surviving symbols/relocations) BEFORE merge_sections. The rest of the pipeline
+// is unchanged. Cuts the ~22% bloat of per-module incremental objects.
+// ============================================================
+
+struct DeadStripFunc {
+    obj_idx as i32;
+    name as *u8;
+    name_len as i32;
+    value as i64;      // symbol offset within obj.text (function entry)
+    rstart as i64;     // copy-range start within obj.text (0 for the first func)
+    rend as i64;       // copy-range end (exclusive)
+    live as i32;
+    new_start as i64;  // entry offset in the pruned .text
+}
+
+let is *u8 as ds_funcs with mut;
+let is i32 as ds_count with mut;
+let is i32 as ds_cap with mut;
+let is *i32 as ds_obj_start with mut;
+let is *i32 as ds_obj_cnt with mut;
+let is *i32 as ds_edge_src with mut;
+let is *i32 as ds_edge_dst with mut;
+let is i32 as ds_edge_count with mut;
+let is i32 as ds_edge_cap with mut;
+
+fn ds_f(idx as i32) as *DeadStripFunc {
+    return cast(*DeadStripFunc, cast(i64, ds_funcs) + cast(i64, idx) * sizeof(DeadStripFunc));
+}
+
+fn ds_name_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    if (mem.memcmp(a, b, cast(i64, alen)) == 0) { return 1; }
+    return 0;
+}
+
+// Resolve a callee by name across all objs. -1 if not a known .text function.
+fn ds_find_name(name as *u8, name_len as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < ds_count) {
+        let is *DeadStripFunc as f = ds_f(i);
+        if (ds_name_eq(f.name, f.name_len, name, name_len) == 1) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Which func in obj `oi` contains text offset `off`? -1 if none.
+fn ds_find_site(oi as i32, off as i64) as i32 {
+    let is i32 as s = ds_obj_start[oi];
+    let is i32 as c = ds_obj_cnt[oi];
+    let is i32 as j with mut = s;
+    while (j < s + c) {
+        let is *DeadStripFunc as f = ds_f(j);
+        if (off >= f.rstart && off < f.rend) { return j; }
+        j = j + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn dead_strip(ls as *LinkerState) as void {
+    let is i32 as nobj = ls.obj_count;
+    if (nobj <= 0) { return; }
+    ds_cap = 65536;
+    ds_funcs = om.opt_alloc(cast(i64, ds_cap) * sizeof(DeadStripFunc));
+    ds_count = 0;
+    ds_obj_start = cast(*i32, om.opt_alloc(cast(i64, nobj) * 4));
+    ds_obj_cnt = cast(*i32, om.opt_alloc(cast(i64, nobj) * 4));
+    ds_edge_cap = 524288;
+    ds_edge_src = cast(*i32, om.opt_alloc(cast(i64, ds_edge_cap) * 4));
+    ds_edge_dst = cast(*i32, om.opt_alloc(cast(i64, ds_edge_cap) * 4));
+    ds_edge_count = 0;
+    let is [64]u8 as tmp;
+
+    // Phase 1: collect .text global functions per obj, sort by value, set ranges.
+    let is i32 as oi with mut = 0;
+    while (oi < nobj) {
+        let is *reader.ObjFile as obj = get_obj(ls, oi);
+        ds_obj_start[oi] = ds_count;
+        let is i32 as si with mut = 0;
+        while (si < obj.sym_count) {
+            let is *reader.ObjSym as s = reader.sym_get(obj, si);
+            if (s.section == reader.SECIDX_TEXT && s.binding == reader.STB_GLOBAL
+                && s.sym_type != reader.STT_SECTION && s.name_len > 0) {
+                if (ds_count < ds_cap) {
+                    let is *DeadStripFunc as f = ds_f(ds_count);
+                    f.obj_idx = oi; f.name = s.name; f.name_len = s.name_len;
+                    f.value = s.value; f.live = 0; f.new_start = 0;
+                    ds_count = ds_count + 1;
+                }
+            }
+            si = si + 1;
+        }
+        let is i32 as base = ds_obj_start[oi];
+        let is i32 as cnt = ds_count - base;
+        ds_obj_cnt[oi] = cnt;
+        // insertion sort this obj's funcs by value
+        let is i32 as a with mut = 1;
+        while (a < cnt) {
+            let is i32 as b with mut = a;
+            let is i32 as moving with mut = 1;
+            while (b > 0 && moving == 1) {
+                let is *DeadStripFunc as fb = ds_f(base + b);
+                let is *DeadStripFunc as fp = ds_f(base + b - 1);
+                if (fb.value < fp.value) {
+                    mem.memcpy(cast(*u8, &tmp), cast(*u8, fb), sizeof(DeadStripFunc));
+                    mem.memcpy(cast(*u8, fb), cast(*u8, fp), sizeof(DeadStripFunc));
+                    mem.memcpy(cast(*u8, fp), cast(*u8, &tmp), sizeof(DeadStripFunc));
+                    b = b - 1;
+                } else { moving = 0; }
+            }
+            a = a + 1;
+        }
+        // ranges: first func covers leading bytes ([0,..); others [value,..).
+        let is i32 as k with mut = 0;
+        while (k < cnt) {
+            let is *DeadStripFunc as f = ds_f(base + k);
+            if (k == 0) { f.rstart = 0; } else { f.rstart = f.value; }
+            if (k + 1 < cnt) {
+                let is *DeadStripFunc as fnx = ds_f(base + k + 1);
+                f.rend = fnx.value;
+            } else {
+                f.rend = obj.text.size;
+            }
+            k = k + 1;
+        }
+        oi = oi + 1;
+    }
+
+    // Phase 2: mark entry root + build edges / external-reference roots.
+    let is i32 as eidx = ds_find_name(ls.entry_name, reader.cstrlen(ls.entry_name));
+    if (eidx >= 0) { ds_f(eidx).live = 1; }
+    oi = 0;
+    while (oi < nobj) {
+        let is *reader.ObjFile as obj = get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as r = reader.reloc_get(obj, ri);
+            let is *reader.ObjSym as ts = reader.sym_get(obj, r.sym_idx);
+            let is i32 as tgt with mut = cast(i32, 0 - 1);
+            if (ts.name_len > 0) { tgt = ds_find_name(ts.name, ts.name_len); }
+            if (tgt >= 0) {
+                let is i32 as src with mut = cast(i32, 0 - 1);
+                if (r.section == reader.SECIDX_TEXT) { src = ds_find_site(oi, r.offset); }
+                if (src >= 0) {
+                    if (ds_edge_count < ds_edge_cap) {
+                        ds_edge_src[ds_edge_count] = src;
+                        ds_edge_dst[ds_edge_count] = tgt;
+                        ds_edge_count = ds_edge_count + 1;
+                    }
+                } else {
+                    ds_f(tgt).live = 1; // referenced from outside any .text function
+                }
+            }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+
+    // (No machine-code scan needed: caustic-as now emits a relocation for EVERY
+    // call — including same-.o calls — so the reloc pass above already has the
+    // complete call graph. See passes.cst pass2_resolve_label's is_global branch.)
+
+    // Phase 3: propagate liveness over edges to a fixpoint.
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        let is i32 as e with mut = 0;
+        while (e < ds_edge_count) {
+            let is *DeadStripFunc as fs = ds_f(ds_edge_src[e]);
+            let is *DeadStripFunc as fd = ds_f(ds_edge_dst[e]);
+            if (fs.live == 1 && fd.live == 0) { fd.live = 1; changed = 1; }
+            e = e + 1;
+        }
+    }
+
+    // Phase 4: prune each obj — repack live functions, remap syms + relocs.
+    oi = 0;
+    while (oi < nobj) {
+        let is *reader.ObjFile as obj = get_obj(ls, oi);
+        let is i32 as base = ds_obj_start[oi];
+        let is i32 as cnt = ds_obj_cnt[oi];
+        if (cnt > 0) {
+            let is i64 as total with mut = 0;
+            let is i32 as k with mut = 0;
+            let is i64 as al = cast(i64, ls.align_funcs);
+            while (k < cnt) {
+                let is *DeadStripFunc as f = ds_f(base + k);
+                if (f.live == 1) {
+                    // With align_funcs the function's own symbol (not the leading
+                    // bytes the first range also carries) lands on a multiple of
+                    // it; the gap is filled with nop below.
+                    // A function the object placed on that boundary keeps its
+                    // offset within a 64-byte line too: the assembler padded its
+                    // loops so they cross as few lines as they can, counting from
+                    // the object's start, which the linker places (below).
+                    if (al > 1) {
+                        let is i64 as lead = f.value - f.rstart;
+                        let is i64 as at = total + lead;
+                        if (ls.line_layout == 1 && f.value % al == 0) { total = total + (f.value % 64 - at % 64 + 64) % 64; }
+                        else { total = total + (al - at % al) % al; }
+                    }
+                    f.new_start = total;
+                    total = total + (f.rend - f.rstart);
+                }
+                k = k + 1;
+            }
+            let is *u8 as nt = om.opt_alloc(total + 1);
+            if (al > 1) {
+                let is i64 as fz with mut = 0;
+                while (fz < total) { nt[fz] = cast(u8, 144); fz = fz + 1; }
+            }
+            k = 0;
+            while (k < cnt) {
+                let is *DeadStripFunc as f = ds_f(base + k);
+                if (f.live == 1) {
+                    mem.memcpy(cast(*u8, cast(i64, nt) + f.new_start),
+                               cast(*u8, cast(i64, obj.text.data) + f.rstart),
+                               f.rend - f.rstart);
+                }
+                k = k + 1;
+            }
+            // remap .text symbols (dead → undefined)
+            let is i32 as si with mut = 0;
+            while (si < obj.sym_count) {
+                let is *reader.ObjSym as sy = reader.sym_get(obj, si);
+                if (sy.section == reader.SECIDX_TEXT) {
+                    let is i32 as fi = ds_find_site(oi, sy.value);
+                    if (fi >= 0) {
+                        let is *DeadStripFunc as f = ds_f(fi);
+                        if (f.live == 1) { sy.value = f.new_start + (sy.value - f.rstart); }
+                        else {
+                            // Pruned function: demote its symbol to LOCAL + undefined so
+                            // build_symtab drops it silently. (Leaving it a defined global
+                            // with a stale offset, or an undefined GLOBAL, makes the linker
+                            // emit a spurious "undefined symbol" warning for code nobody
+                            // references — every dead-target reloc has a dead site and is
+                            // dropped below, so nothing actually needs it.)
+                            sy.section = 0;
+                            sy.binding = reader.STB_LOCAL;
+                        }
+                    }
+                }
+                si = si + 1;
+            }
+            // remap + compact .text relocs (drop dead-function relocs)
+            let is i32 as ri with mut = 0;
+            let is i32 as wi with mut = 0;
+            while (ri < obj.reloc_count) {
+                let is *reader.ObjReloc as r = reader.reloc_get(obj, ri);
+                let is i32 as keep with mut = 1;
+                if (r.section == reader.SECIDX_TEXT) {
+                    let is i32 as fi = ds_find_site(oi, r.offset);
+                    if (fi >= 0) {
+                        let is *DeadStripFunc as f = ds_f(fi);
+                        if (f.live == 1) { r.offset = f.new_start + (r.offset - f.rstart); }
+                        else { keep = 0; }
+                    }
+                }
+                if (keep == 1) {
+                    if (wi != ri) {
+                        let is *reader.ObjReloc as w = reader.reloc_get(obj, wi);
+                        w.offset = r.offset; w.sym_idx = r.sym_idx; w.rtype = r.rtype;
+                        w.addend = r.addend; w.section = r.section;
+                    }
+                    wi = wi + 1;
+                }
+                ri = ri + 1;
+            }
+            obj.reloc_count = wi;
+            obj.text.data = nt;
+            obj.text.size = total;
+        }
+        oi = oi + 1;
+    }
+
+    // Phase 5: silence orphan undefined symbols. A pruned (dead) function leaves
+    // UNDEFINED global entries in every .o that referenced it cross-module; those
+    // relocs were dropped above (their sites are dead), but the symbol-table entry
+    // remains and build_symtab would warn "undefined symbol" for code nobody needs.
+    // Demote any undefined GLOBAL symbol that names a known-dead function to LOCAL
+    // so it is dropped silently. (Real external imports never name a dead function.)
+    oi = 0;
+    while (oi < nobj) {
+        let is *reader.ObjFile as obj = get_obj(ls, oi);
+        let is i32 as si with mut = 0;
+        while (si < obj.sym_count) {
+            let is *reader.ObjSym as sy = reader.sym_get(obj, si);
+            if (sy.section == 0 && sy.binding == reader.STB_GLOBAL && sy.name_len > 0) {
+                let is i32 as gi = ds_find_name(sy.name, sy.name_len);
+                if (gi >= 0 && ds_f(gi).live == 0) { sy.binding = reader.STB_LOCAL; }
+            }
+            si = si + 1;
+        }
+        oi = oi + 1;
+    }
+}
+
+// ============================================================
+// _start stub
+// ============================================================
+
+let is i32 as START_STUB_SIZE with imut = 28;
+let is i32 as START_STUB_REL32_OFF with imut = 12;
+
+fn emit_start_stub(buf as *reader.ByteBuffer) as void {
+    // Exit syscall number: Linux exit=60, CausticOS PROC_EXIT=3. The _start
+    // stub runs main then `mov rax, <exit>; syscall` to terminate; on the
+    // wrong number CausticOS would return E_NOSYS and fall through.
+    let is *tgt.Target as t_stub = tgt.target_get();
+    if (t_stub.arch == tgt.ARCH_AARCH64) {
+        // Linux AArch64 process entry: sp[0] is argc and sp+8 is argv.
+        // Keep the stub at 28 bytes like x86_64 so existing text layout and
+        // metadata stay architecture-independent.
+        reader.buf_emit32_le(buf, 0xF94003E0); // ldr x0, [sp]
+        reader.buf_emit32_le(buf, 0x910023E1); // add x1, sp, #8
+        reader.buf_emit32_le(buf, 0x94000000); // bl main (patched later)
+        reader.buf_emit32_le(buf, 0xD2800BA8); // movz x8, #93 (exit)
+        reader.buf_emit32_le(buf, 0xD4000001); // svc #0
+        reader.buf_emit32_le(buf, 0xD4200000); // brk #0 (unreachable)
+        reader.buf_emit32_le(buf, 0xD4200000);
+        return;
+    }
+    let is i32 as exit_nr with mut = 60;
+    if (t_stub.object_format == 3) { exit_nr = 3; }
+    reader.buf_emit8(buf, 72);  // xor rbp, rbp  (48 31 ed)
+    reader.buf_emit8(buf, 49);
+    reader.buf_emit8(buf, 237);
+    reader.buf_emit8(buf, 95);  // pop rdi        (5f) — argc
+    reader.buf_emit8(buf, 72);  // mov rsi, rsp   (48 89 e6) — argv
+    reader.buf_emit8(buf, 137);
+    reader.buf_emit8(buf, 230);
+    reader.buf_emit8(buf, 72);  // and rsp, -16   (48 83 e4 f0) — align stack
+    reader.buf_emit8(buf, 131);
+    reader.buf_emit8(buf, 228);
+    reader.buf_emit8(buf, 240);
+    reader.buf_emit8(buf, 232); // call rel32     (e8 xx xx xx xx)
+    reader.buf_emit32_le(buf, 0);
+    reader.buf_emit8(buf, 72);  // mov rdi, rax   (48 89 c7)
+    reader.buf_emit8(buf, 137);
+    reader.buf_emit8(buf, 199);
+    reader.buf_emit8(buf, 72);  // mov rax, <exit_nr>  (48 c7 c0 nn 00 00 00)
+    reader.buf_emit8(buf, 199);
+    reader.buf_emit8(buf, 192);
+    reader.buf_emit8(buf, exit_nr);   // 60 = Linux exit, 3 = CausticOS PROC_EXIT
+    reader.buf_emit8(buf, 0);
+    reader.buf_emit8(buf, 0);
+    reader.buf_emit8(buf, 0);
+    reader.buf_emit8(buf, 15);  // syscall         (0f 05)
+    reader.buf_emit8(buf, 5);
+}
+
+// ============================================================
+// Phase 1: Merge sections
+// ============================================================
+
+fn _csec_grow_one(old as *u8, used as i64, new_size as i64) as *u8 {
+    let is *u8 as nb = om.opt_alloc(new_size);
+    let is i64 as i with mut = 0;
+    while (i < used) { nb[i] = old[i]; i = i + 1; }
+    om.opt_free(old);
+    return nb;
+}
+
+// Double every csec_* array. Callers re-read ls.csec_* after
+// csec_find_or_add, so nothing holds a pointer into the old ones.
+fn _csec_grow(ls as *LinkerState) as void {
+    let is i64 as n = cast(i64, ls.csec_count);
+    let is i64 as nc = cast(i64, ls.csec_cap) * 2;
+    let is i64 as bsz = sizeof(reader.ByteBuffer);
+    ls.csec_bufs = _csec_grow_one(ls.csec_bufs, n * bsz, nc * bsz);
+    ls.csec_names = _csec_grow_one(ls.csec_names, n * 8, nc * 8);
+    ls.csec_name_lens = _csec_grow_one(ls.csec_name_lens, n * 4, nc * 4);
+    ls.csec_sizes = _csec_grow_one(ls.csec_sizes, n * 8, nc * 8);
+    ls.csec_vaddrs = _csec_grow_one(ls.csec_vaddrs, n * 8, nc * 8);
+    ls.csec_execs = _csec_grow_one(ls.csec_execs, n * 4, nc * 4);
+    ls.csec_cap = cast(i32, nc);
+}
+
+// Find or create a merged custom section by name. Returns index into ls.csec_* arrays.
+//
+// The arrays grow. They were fixed at 32, and the 33rd distinct section name
+// got index 0 back — so its contents were appended to whichever custom section
+// came first, and its own name never reached the output.
+fn csec_find_or_add(ls as *LinkerState, name as *u8, name_len as i32) as i32 {
+    let is *i64 as names = cast(*i64, ls.csec_names);
+    let is *i32 as nlens = cast(*i32, ls.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < ls.csec_count) {
+        if (nlens[i] == name_len && reader.streq(name, cast(i32, nlens[i]), cast(*u8, names[i]), nlens[i]) == 1) {
+            return i;
+        }
+        i = i + 1;
+    }
+    // Create new
+    if (ls.csec_count >= ls.csec_cap) { _csec_grow(ls); }
+    let is i32 as idx = ls.csec_count;
+    let is *i64 as gnames = cast(*i64, ls.csec_names);
+    let is *i32 as gnlens = cast(*i32, ls.csec_name_lens);
+    gnames[idx] = cast(i64, name);
+    gnlens[idx] = name_len;
+    // Allocate a ByteBuffer for this section
+    let is *reader.ByteBuffer as bufs = cast(*reader.ByteBuffer, ls.csec_bufs);
+    bufs[idx] = reader.buf_init(4096);
+    let is *i64 as sizes = cast(*i64, ls.csec_sizes);
+    sizes[idx] = 0;
+    let is *i32 as xs = cast(*i32, ls.csec_execs);
+    xs[idx] = 0;
+    ls.csec_count = ls.csec_count + 1;
+    return idx;
+}
+
+// The .cst* custom sections are linker metadata, not program data.
+fn _is_meta_csec(name as *u8, name_len as i32) as i32 {
+    if (name_len >= 4 && name[0] == 46 && name[1] == 99 && name[2] == 115 && name[3] == 116) {
+        return 1;
+    }
+    return 0;
+}
+
+fn merge_sections(ls as *LinkerState) as void {
+    // Dead-code elimination: prune unreachable .text functions from each .o before
+    // they are concatenated. Relies on caustic-as emitting a relocation for EVERY
+    // call (function-sections; see passes.cst pass2_resolve_label's is_global branch)
+    // so the linker has the COMPLETE call graph — without that, same-.o calls are
+    // resolved inline and invisible, and any missed edge would drop a live function.
+    // Skipped for shared libraries (every exported symbol is a root there); entry-
+    // rooted reachability is for executables. Removes ~10% off incremental binaries.
+    let is i32 as DCE_ON with imut = 1;
+    if (DCE_ON == 1 && ls.is_shared == 0) {
+        dead_strip(ls);
+    }
+
+    let is *reader.ByteBuffer as text_buf = get_text(ls);
+    let is *reader.ByteBuffer as rodata_buf = get_rodata(ls);
+    let is *reader.ByteBuffer as data_buf = get_data(ls);
+
+    // Linux _start stub: emit only for ELF targets. Windows PE has its own
+    // entry conventions (no argc/argv on stack) — pe_writer.cst handles the
+    // entry stub separately and sets AddressOfEntryPoint at link time.
+    let is *tgt.Target as t = tgt.target_get();
+    if (ls.freestanding == 0 && t.object_format != 2) {
+        emit_start_stub(text_buf);
+    }
+
+    let is i32 as i with mut = 0;
+    while (i < ls.obj_count) {
+        let is *reader.ObjFile as obj = get_obj(ls, i);
+
+        // Each object's .text starts at the same place in a 64-byte line, 32
+        // bytes in (a multiple of the function alignment, which goes up to 32):
+        // the assembler padded loops counting from there (LOOP_BASE in its
+        // passes.cst), and the start stub or objects of any length would shift
+        // it. 32 rather than 0 because fib's entry, its object's first function,
+        // runs 10% slower at the start of a line on Zen 3 (2026-11-01).
+        if (ls.line_layout == 1 && ls.align_funcs > 1 && obj.text.size > 0) {
+            while (text_buf.len % 64 != 32) { reader.buf_emit8(text_buf, 144); }
+        }
+        obj.text_offset = text_buf.len;
+        if (obj.text.size > 0) {
+            reader.buf_append(text_buf, obj.text.data, obj.text.size);
+        }
+
+        obj.rodata_offset = rodata_buf.len;
+        if (obj.rodata.size > 0) {
+            reader.buf_append(rodata_buf, obj.rodata.data, obj.rodata.size);
+        }
+
+        obj.data_offset = data_buf.len;
+        if (obj.data_sec.size > 0) {
+            reader.buf_append(data_buf, obj.data_sec.data, obj.data_sec.size);
+        }
+
+        obj.bss_offset = ls.bss_total;
+        ls.bss_total = ls.bss_total + obj.bss_size;
+
+        // Merge custom sections
+        let is *i64 as obj_csec_offs = cast(*i64, obj.csec_offsets);
+        let is i32 as ci with mut = 0;
+        while (ci < obj.csec_count) {
+            let is *i64 as cnp = cast(*i64, cast(i64, obj.csec_names) + cast(i64, ci) * 8);
+            let is *i32 as cnlp = cast(*i32, cast(i64, obj.csec_name_lens) + cast(i64, ci) * 4);
+            // The .cst* sections are linker metadata (imports, and the debug
+            // info the DWARF/PDB writers read straight from the object). They
+            // are not program data and must not be merged into the image.
+            if (_is_meta_csec(cast(*u8, *cnp), *cnlp) == 1) { ci = ci + 1; continue; }
+            let is i32 as midx = csec_find_or_add(ls, cast(*u8, *cnp), *cnlp);
+            let is *reader.ByteBuffer as mbufs = cast(*reader.ByteBuffer, ls.csec_bufs);
+            obj_csec_offs[ci] = mbufs[midx].len;
+            let is *reader.ObjSection as cs = cast(*reader.ObjSection, cast(i64, obj.csec_data) + cast(i64, ci) * sizeof(reader.ObjSection));
+            if (cs.size > 0) {
+                reader.buf_append(&mbufs[midx], cs.data, cs.size);
+            }
+            // Any contributing object marking the section executable makes the
+            // merged section executable — it holds code from `with section(...)`.
+            let is *i32 as oxp = cast(*i32, cast(i64, obj.csec_execs) + cast(i64, ci) * 4);
+            if (*oxp == 1) {
+                let is *i32 as mxp = cast(*i32, ls.csec_execs);
+                mxp[midx] = 1;
+            }
+            ci = ci + 1;
+        }
+
+        i = i + 1;
+    }
+
+    ls.text_size = text_buf.len;
+    ls.rodata_size = rodata_buf.len;
+    ls.data_size = data_buf.len;
+    // Record final custom section sizes
+    let is *i64 as csizes = cast(*i64, ls.csec_sizes);
+    let is *reader.ByteBuffer as mbufs = cast(*reader.ByteBuffer, ls.csec_bufs);
+    let is i32 as ci with mut = 0;
+    while (ci < ls.csec_count) {
+        csizes[ci] = mbufs[ci].len;
+        ci = ci + 1;
+    }
+}
+
+// ============================================================
+// Phase 2: Assign virtual addresses
+// ============================================================
+
+fn assign_addresses(ls as *LinkerState) as void {
+    ls.text_vaddr = ls.base_addr + 4096;
+
+    // The CausticOS CSE loader mmaps each segment separately (FIXED), and a
+    // read-only (.rodata) page can't share perms with a read-write (.data/.bss)
+    // one — so for the CSE target every section starts on its OWN page. ELF/PE
+    // keep the compact 8-byte packing (their loaders map combined PT_LOAD
+    // segments; same-perm sections sharing a page is fine there).
+    let is *tgt.Target as t_aa = tgt.target_get();
+    let is i64 as cse with mut = 0;
+    if (t_aa.object_format == 3) { cse = 1; }
+
+    // .rodata: always page-aligned after .text.
+    // Executable custom sections (a function carrying `with section(...)`) go
+    // immediately after .text so they fall inside the R+X segment. Data ones
+    // keep their old slot between .data and .bss — putting code there mapped it
+    // non-executable and every call into it faulted.
+    let is i64 as rx_end with mut = ls.text_vaddr + ls.text_size;
+    let is *i32 as x_execs = cast(*i32, ls.csec_execs);
+    let is *i64 as x_vaddrs = cast(*i64, ls.csec_vaddrs);
+    let is *i64 as x_sizes = cast(*i64, ls.csec_sizes);
+    let is i32 as xi with mut = 0;
+    while (xi < ls.csec_count) {
+        if (x_execs[xi] == 1 && x_sizes[xi] > 0) {
+            if (cse == 1) { rx_end = (rx_end + 4095) & (0 - 4096); }
+            else { rx_end = (rx_end + 7) & (0 - 8); }
+            x_vaddrs[xi] = rx_end;
+            rx_end = rx_end + x_sizes[xi];
+        }
+        xi = xi + 1;
+    }
+    let is i64 as rw_start with mut = rx_end;
+    if (rx_end % 4096 != 0) {
+        rw_start = rx_end + 4096 - (rx_end % 4096);
+    }
+    ls.rodata_vaddr = rw_start;
+    // .data: 8-aligned after .rodata (ELF/PE) or its own page (CSE).
+    let is i64 as data_start with mut = (rw_start + ls.rodata_size + 7) & (0 - 8);
+    if (cse == 1) { data_start = (rw_start + ls.rodata_size + 4095) & (0 - 4096); }
+    ls.data_vaddr = data_start;
+    // Custom sections between .data and .bss (file-backed, before bss).
+    let is i64 as csec_addr with mut = ls.data_vaddr + ls.data_size;
+    let is *i64 as cvaddrs = cast(*i64, ls.csec_vaddrs);
+    let is *i64 as csizes = cast(*i64, ls.csec_sizes);
+    let is i32 as ci with mut = 0;
+    while (ci < ls.csec_count) {
+        // Executable ones already got an address up in the R+X region.
+        if (x_execs[ci] == 1 && csizes[ci] > 0) { ci = ci + 1; }
+        else {
+            if (cse == 1) { csec_addr = (csec_addr + 4095) & (0 - 4096); }
+            else { csec_addr = (csec_addr + 7) & (0 - 8); }
+            cvaddrs[ci] = csec_addr;
+            csec_addr = csec_addr + csizes[ci];
+            ci = ci + 1;
+        }
+    }
+    if (cse == 1) { csec_addr = (csec_addr + 4095) & (0 - 4096); }
+    ls.bss_vaddr = csec_addr;
+}
+
+// ============================================================
+// Phase 3: Build global symbol table
+// ============================================================
+
+fn resolve_sym_vaddr(ls as *LinkerState, obj as *reader.ObjFile,
+                     section as i32, value as i64) as i64 {
+    if (section == reader.SECIDX_TEXT) {
+        return ls.text_vaddr + obj.text_offset + value;
+    }
+    if (section == reader.SECIDX_DATA) {
+        return ls.data_vaddr + obj.data_offset + value;
+    }
+    if (section == reader.SECIDX_RODATA) {
+        return ls.rodata_vaddr + obj.rodata_offset + value;
+    }
+    if (section == reader.SECIDX_BSS) {
+        return ls.bss_vaddr + obj.bss_offset + value;
+    }
+    // Custom sections: match the canonical object-local section id.
+    if (section > reader.SECIDX_BSS) {
+        let is *i32 as obj_csec_idx = cast(*i32, obj.csec_indices);
+        let is *i64 as obj_csec_offs = cast(*i64, obj.csec_offsets);
+        let is *i64 as cnp = cast(*i64, obj.csec_names);
+        let is *i32 as cnlp = cast(*i32, obj.csec_name_lens);
+        let is i32 as ci with mut = 0;
+        while (ci < obj.csec_count) {
+            if (obj_csec_idx[ci] == section) {
+                // Find the merged section by name
+                let is *i64 as ls_names = cast(*i64, ls.csec_names);
+                let is *i32 as ls_nlens = cast(*i32, ls.csec_name_lens);
+                let is *i64 as ls_vaddrs = cast(*i64, ls.csec_vaddrs);
+                let is i32 as mi with mut = 0;
+                while (mi < ls.csec_count) {
+                    if (ls_nlens[mi] == cnlp[ci] && reader.streq(cast(*u8, cnp[ci]), cnlp[ci], cast(*u8, ls_names[mi]), ls_nlens[mi]) == 1) {
+                        return ls_vaddrs[mi] + obj_csec_offs[ci] + value;
+                    }
+                    mi = mi + 1;
+                }
+            }
+            ci = ci + 1;
+        }
+    }
+    return 0;
+}
+
+// Build a C-identifier-safe name of the form "<prefix><section>" by
+// stripping a leading '.' from the section name and replacing any
+// remaining '.' with '_'. Returns the newly-allocated name buffer and
+// writes the total length through out_len.
+fn make_bound_sym_name(prefix as *u8, prefix_len as i32,
+                       sec_name as *u8, sec_len as i32,
+                       out_len as *i32) as *u8 {
+    let is *u8 as src with mut = sec_name;
+    let is i32 as src_len with mut = sec_len;
+    if (src_len > 0 && *src == 46) {       // '.'
+        src = cast(*u8, cast(i64, src) + 1);
+        src_len = src_len - 1;
+    }
+    let is i32 as total = prefix_len + src_len;
+    let is *u8 as buf = om.opt_alloc(cast(i64, total + 1));
+    mem.memcpy(buf, prefix, cast(i64, prefix_len));
+    let is i32 as i with mut = 0;
+    while (i < src_len) {
+        let is *u8 as sp = cast(*u8, cast(i64, src) + cast(i64, i));
+        let is *u8 as dp = cast(*u8, cast(i64, buf) + cast(i64, prefix_len + i));
+        if (*sp == 46) { *dp = cast(u8, 95); }   // '.' -> '_'
+        else { *dp = *sp; }
+        i = i + 1;
+    }
+    let is *u8 as term = cast(*u8, cast(i64, buf) + cast(i64, total));
+    *term = cast(u8, 0);
+    *out_len = total;
+    return buf;
+}
+
+fn _define_section_bound(gsyms as *GlobalSymTab, name as *u8, name_len as i32,
+                         vaddr as i64) as i32 {
+    let is i32 as existing = gsym_find(gsyms, name, name_len);
+    if (existing < 0) {
+        gsym_add(gsyms, name, name_len, 0, vaddr, cast(i32, 0 - 1), 1);
+        return 0;
+    }
+    let is *GlobalSym as g = gsym_get(gsyms, existing);
+    if (g.defined == 1) {
+        reader.print_str("error: duplicate symbol: ");
+        io._write_fd(io.STDERR, name, cast(i64, name_len));
+        reader.print_str("\n");
+        om.opt_free(name);
+        return 1;
+    }
+    g.section = 0;
+    g.vaddr = vaddr;
+    g.obj_idx = cast(i32, 0 - 1);
+    g.defined = 1;
+    om.opt_free(name);
+    return 0;
+}
+
+// Inject __start_<name> and __stop_<name> synthetic global symbols for
+// every merged custom section. Callers that reference these names in
+// source (e.g. `&__start_bus_types`) now resolve through the normal
+// name-based relocation path.
+fn synthesize_section_bounds_syms(ls as *LinkerState, gsyms as *GlobalSymTab) as i32 {
+    let is i32 as errors with mut = 0;
+    let is *i64 as names  = cast(*i64, ls.csec_names);
+    let is *i32 as nlens  = cast(*i32, ls.csec_name_lens);
+    let is *i64 as vaddrs = cast(*i64, ls.csec_vaddrs);
+    let is *i64 as sizes  = cast(*i64, ls.csec_sizes);
+
+    let is [8]u8 as start_prefix;
+    start_prefix[0] = cast(u8, 95);  start_prefix[1] = cast(u8, 95);   // _ _
+    start_prefix[2] = cast(u8, 115); start_prefix[3] = cast(u8, 116);  // s t
+    start_prefix[4] = cast(u8, 97);  start_prefix[5] = cast(u8, 114);  // a r
+    start_prefix[6] = cast(u8, 116); start_prefix[7] = cast(u8, 95);   // t _
+
+    let is [7]u8 as stop_prefix;
+    stop_prefix[0] = cast(u8, 95);  stop_prefix[1] = cast(u8, 95);    // _ _
+    stop_prefix[2] = cast(u8, 115); stop_prefix[3] = cast(u8, 116);   // s t
+    stop_prefix[4] = cast(u8, 111); stop_prefix[5] = cast(u8, 112);   // o p
+    stop_prefix[6] = cast(u8, 95);                                    // _
+
+    let is i32 as ci with mut = 0;
+    while (ci < ls.csec_count) {
+        let is *u8 as sec_name = cast(*u8, names[ci]);
+        let is i32 as sec_len = nlens[ci];
+        let is i64 as sec_vaddr = vaddrs[ci];
+        let is i64 as sec_size = sizes[ci];
+
+        let is i32 as start_len with mut = 0;
+        let is *u8 as start_name = make_bound_sym_name(
+            cast(*u8, &start_prefix), 8, sec_name, sec_len, &start_len);
+        errors = errors + _define_section_bound(gsyms, start_name, start_len, sec_vaddr);
+
+        let is i32 as stop_len with mut = 0;
+        let is *u8 as stop_name = make_bound_sym_name(
+            cast(*u8, &stop_prefix), 7, sec_name, sec_len, &stop_len);
+        errors = errors + _define_section_bound(gsyms, stop_name, stop_len, sec_vaddr + sec_size);
+
+        ci = ci + 1;
+    }
+    return errors;
+}
+
+// `__eh_frame_hdr`: the address of the image's .eh_frame_hdr, or 0 when it has
+// none. Defined by the ELF executable writers before relocation; the program
+// references it only when the compiler's __unwind_tables builtin says so
+// (std/exceptions.cst's backtrace).
+fn _is_eh_hdr_name(name as *u8, len as i32) as i32 {
+    if (len != 14) { return 0; }
+    let is *u8 as w = "__eh_frame_hdr";
+    let is i32 as i with mut = 0;
+    while (i < 14) { if (name[i] != w[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn _eh_hdr_find(ls as *LinkerState) as *GlobalSym {
+    let is *GlobalSymTab as gsyms = get_gsyms(ls);
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *GlobalSym as g = gsym_get(gsyms, gi);
+        if (_is_eh_hdr_name(g.name, g.name_len) == 1) { return g; }
+        gi = gi + 1;
+    }
+    return cast(*GlobalSym, 0);
+}
+
+fn define_eh_frame_hdr(ls as *LinkerState, vaddr as i64) as void {
+    let is *GlobalSym as g = _eh_hdr_find(ls);
+    if (cast(i64, g) == 0 || g.defined == 1) { return; }
+    g.section = 0;
+    g.vaddr = vaddr;
+    g.obj_idx = cast(i32, 0 - 1);
+    g.defined = 1;
+}
+
+// The writer's final layout must agree with the address defined earlier.
+fn eh_frame_hdr_sym_check(ls as *LinkerState, vaddr as i64) as i32 {
+    let is *GlobalSym as g = _eh_hdr_find(ls);
+    if (cast(i64, g) == 0 || g.obj_idx >= 0) { return 0; }
+    if (g.vaddr != vaddr) {
+        reader.print_str("error: internal: __eh_frame_hdr layout mismatch\n");
+        return 1;
+    }
+    return 0;
+}
+
+// Validate after the format writer has resolved any synthesized definitions.
+// ELF has its definitions at build_symtab; PE must first assign its helper
+// and IAT addresses. Neither path may relocate an unresolved static symbol.
+fn validate_symbols(ls as *LinkerState) as i32 {
+    let is *GlobalSymTab as gsyms = get_gsyms(ls);
+    let is i32 as errors with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *GlobalSym as g = gsym_get(gsyms, gi);
+        // PE has already registered genuine IAT slots. A matching prefix
+        // alone is not a definition and cannot exempt an unresolved symbol.
+        // __eh_frame_hdr is defined later by the ELF executable writers.
+        let is i32 as later with mut = 0;
+        if (tgt.target_get().object_format == 1 && _is_eh_hdr_name(g.name, g.name_len) == 1) { later = 1; }
+        if (g.defined == 0 && later == 0 && ls.needed_count == 0 && ls.is_shared == 0) {
+            reader.print_str("error: undefined symbol: ");
+            io._write_fd(io.STDERR, g.name, cast(i64, g.name_len));
+            reader.print_str("\n");
+            errors = errors + 1;
+        }
+        gi = gi + 1;
+    }
+    return errors;
+}
+
+fn build_symtab(ls as *LinkerState) as i32 {
+    let is i32 as errors with mut = 0;
+    let is *GlobalSymTab as gsyms = get_gsyms(ls);
+
+    // PE synthesizes bounds only after assigning its actual image addresses.
+    if (tgt.target_get().object_format != 2) {
+        errors = errors + synthesize_section_bounds_syms(ls, gsyms);
+    }
+
+    let is i32 as i with mut = 0;
+
+    while (i < ls.obj_count) {
+        let is *reader.ObjFile as obj = get_obj(ls, i);
+        let is i32 as si with mut = 0;
+
+        while (si < obj.sym_count) {
+            let is *reader.ObjSym as sym = reader.sym_get(obj, si);
+
+            if (si == 0 || sym.sym_type == reader.STT_SECTION) {
+                // Skip null and section symbols
+            } else if (sym.binding == reader.STB_GLOBAL && sym.section != 0) {
+                let is i64 as vaddr = resolve_sym_vaddr(ls, obj, sym.section, sym.value);
+                let is i32 as existing = gsym_find(gsyms, sym.name, sym.name_len);
+                if (existing >= 0) {
+                    let is *GlobalSym as eg = gsym_get(gsyms, existing);
+                    if (eg.defined == 1) {
+                        reader.print_str("error: duplicate symbol: ");
+                        io._write_fd(io.STDERR, sym.name, cast(i64, sym.name_len));
+                        reader.print_str("\n");
+                        errors = errors + 1;
+                    } else {
+                        eg.section = sym.section;
+                        eg.vaddr = vaddr;
+                        eg.obj_idx = i;
+                        eg.defined = 1;
+                    }
+                } else {
+                    gsym_add(gsyms, sym.name, sym.name_len, sym.section, vaddr, i, 1);
+                }
+            } else if (sym.binding == reader.STB_GLOBAL && sym.section == 0) {
+                let is i32 as existing = gsym_find(gsyms, sym.name, sym.name_len);
+                if (existing < 0) {
+                    gsym_add(gsyms, sym.name, sym.name_len, 0, 0, i, 0);
+                }
+            }
+
+            si = si + 1;
+        }
+        i = i + 1;
+    }
+
+    // PE resolves its real helper and IAT definitions after final layout.
+    // Its writer validates before applying relocations; other formats can
+    // validate now, retaining the static-link error contract.
+    if (tgt.target_get().object_format != 2) {
+        errors = errors + validate_symbols(ls);
+    }
+
+    // Find entry point — a shared library (.so/.dll) has no entry, skip.
+    if (ls.is_shared == 0) {
+    let is i32 as entry_name_len = reader.cstrlen(ls.entry_name);
+    let is i32 as entry_idx = gsym_find(gsyms, ls.entry_name, entry_name_len);
+    if (entry_idx < 0) {
+        reader.print_str("error: entry point not found: ");
+        reader.print_str(ls.entry_name);
+        reader.print_str("\n");
+        return 1;
+    }
+    let is *GlobalSym as entry_sym = gsym_get(gsyms, entry_idx);
+    if (entry_sym.defined == 0) {
+        reader.print_str("error: entry point undefined: ");
+        reader.print_str(ls.entry_name);
+        reader.print_str("\n");
+        return 1;
+    }
+
+    let is i64 as main_vaddr = entry_sym.vaddr;
+
+    // Patch the Linux _start stub's relative call to main, but ONLY when
+    // we actually emitted one (i.e. ELF target with freestanding=0). For
+    // Windows PE we skipped emit_start_stub in merge_sections, so the
+    // bytes at offset START_STUB_REL32_OFF are part of main's prologue
+    // and must not be overwritten — entry just points at main directly.
+    let is *tgt.Target as t_bs = tgt.target_get();
+    if (ls.freestanding == 0 && t_bs.object_format != 2) {
+        // Patch _start stub
+        let is *reader.ByteBuffer as text_buf = get_text(ls);
+        let is *u8 as tdata = text_buf.data;
+        if (t_bs.arch == tgt.ARCH_AARCH64) {
+            let is i64 as call_off = 8;
+            let is i64 as call_pc = ls.text_vaddr + call_off;
+            let is i64 as imm26 = (main_vaddr - call_pc) / 4;
+            let is i64 as word = 0x94000000 | (imm26 & 0x03FFFFFF);
+            tdata[call_off] = cast(u8, word & 255);
+            tdata[call_off + 1] = cast(u8, (word >> 8) & 255);
+            tdata[call_off + 2] = cast(u8, (word >> 16) & 255);
+            tdata[call_off + 3] = cast(u8, (word >> 24) & 255);
+        } else {
+            let is i64 as call_site = ls.text_vaddr + cast(i64, START_STUB_REL32_OFF) + 4;
+            let is i64 as rel32 = main_vaddr - call_site;
+            tdata[START_STUB_REL32_OFF]     = cast(u8, rel32 & 255);
+            tdata[START_STUB_REL32_OFF + 1] = cast(u8, (rel32 >> 8) & 255);
+            tdata[START_STUB_REL32_OFF + 2] = cast(u8, (rel32 >> 16) & 255);
+            tdata[START_STUB_REL32_OFF + 3] = cast(u8, (rel32 >> 24) & 255);
+        }
+        ls.entry_vaddr = ls.text_vaddr;
+    } else {
+        ls.entry_vaddr = main_vaddr;
+    }
+    }  // end if (ls.is_shared == 0)
+
+    return errors;
+}
+
+// ============================================================
+// Dynamic symbol table
+// (link map output lives in core/map_writer.cst)
+// ============================================================
+
+struct DynSym {
+    name as *u8;
+    name_len as i32;
+    plt_vaddr as i64;
+    got_vaddr as i64;
+    data_got_vaddr as i64; // for GOTPCREL (data globals like stdout)
+    is_data as i32;        // 1 = data object (GOT), 0 = function (PLT)
+    dynsym_index as i32;   // index in .dynsym (1-based, 0 is null)
+    dynstr_offset as i32;  // offset of name in .dynstr
+}
+
+struct DynSymTab {
+    data as *u8;
+    count as i32;
+    cap as i32;
+}
+
+fn dynsym_init() as DynSymTab {
+    let is DynSymTab as st;
+    st.cap = 64;
+    st.data = om.opt_alloc(cast(i64, st.cap) * sizeof(DynSym));
+    st.count = 0;
+    return st;
+}
+
+fn dynsym_get(st as *DynSymTab, idx as i32) as *DynSym {
+    return cast(*DynSym, cast(i64, st.data) + cast(i64, idx) * sizeof(DynSym));
+}
+
+fn dynsym_add(st as *DynSymTab, name as *u8, name_len as i32) as i32 {
+    if (st.count >= st.cap) {
+        let is i32 as new_cap = st.cap * 2;
+        let is *u8 as new_data = om.opt_alloc(cast(i64, new_cap) * sizeof(DynSym));
+        mem.memcpy(new_data, st.data, cast(i64, st.count) * sizeof(DynSym));
+        om.opt_free(st.data);
+        st.data = new_data;
+        st.cap = new_cap;
+    }
+    let is *DynSym as d = dynsym_get(st, st.count);
+    d.name = name;
+    d.name_len = name_len;
+    d.plt_vaddr = 0;
+    d.got_vaddr = 0;
+    d.data_got_vaddr = 0;
+    d.is_data = 0;
+    d.dynsym_index = 0;
+    d.dynstr_offset = 0;
+    st.count = st.count + 1;
+    return st.count - 1;
+}
+
+fn dynsym_find(st as *DynSymTab, name as *u8, name_len as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < st.count) {
+        let is *DynSym as d = dynsym_get(st, i);
+        if (reader.streq(d.name, d.name_len, name, name_len) == 1) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn get_dynsyms(ls as *LinkerState) as *DynSymTab {
+    return cast(*DynSymTab, ls.dynsyms);
+}
+
+// Collect undefined globals that should become dynamic symbols
+fn collect_dynamic_syms(ls as *LinkerState) as void {
+    let is *u8 as ds = om.opt_alloc(sizeof(DynSymTab));
+    let is *DynSymTab as dst = cast(*DynSymTab, ds);
+    let is DynSymTab as tmp = dynsym_init();
+    dst.data = tmp.data;
+    dst.count = tmp.count;
+    dst.cap = tmp.cap;
+    ls.dynsyms = ds;
+
+    let is *GlobalSymTab as gsyms = get_gsyms(ls);
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *GlobalSym as g = gsym_get(gsyms, gi);
+        if (g.defined == 0) {
+            dynsym_add(dst, g.name, g.name_len);
+            if (ls.verbose == 1) {
+                reader.print_str("  dynamic sym: ");
+                io._write_fd(io.STDERR, g.name, cast(i64, g.name_len));
+                reader.print_str("\n");
+            }
+        }
+        gi = gi + 1;
+    }
+
+    // Scan relocations to detect GOTPCREL symbols (data objects)
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as obj = get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+            if (rel.rtype == reader.R_X86_64_GOTPCREL) {
+                let is *reader.ObjSym as sym = reader.sym_get(obj, rel.sym_idx);
+                if (sym.name_len > 0) {
+                    let is i32 as di = dynsym_find(dst, sym.name, sym.name_len);
+                    if (di >= 0) {
+                        let is *DynSym as d = dynsym_get(dst, di);
+                        d.is_data = 1;
+                    }
+                }
+            }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+}
+
+// ELF hash algorithm
+fn is_dynamic_sym(ls as *LinkerState, name as *u8, name_len as i32) as i32 {
+    if (ls.needed_count == 0 && ls.is_shared == 0) { return 0; }
+    if (cast(i64, ls.dynsyms) == 0) { return 0; }
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as idx = dynsym_find(dst, name, name_len);
+    if (idx >= 0) { return 1; }
+    return 0;
+}
+
+// Get PLT vaddr for a dynamic symbol
+fn get_plt_vaddr(ls as *LinkerState, name as *u8, name_len as i32) as i64 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as idx = dynsym_find(dst, name, name_len);
+    if (idx >= 0) {
+        let is *DynSym as d = dynsym_get(dst, idx);
+        return d.plt_vaddr;
+    }
+    return 0;
+}
+
+// Get data GOT vaddr for a GOTPCREL dynamic symbol
+fn get_data_got_vaddr(ls as *LinkerState, name as *u8, name_len as i32) as i64 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as idx = dynsym_find(dst, name, name_len);
+    if (idx >= 0) {
+        let is *DynSym as d = dynsym_get(dst, idx);
+        return d.data_got_vaddr;
+    }
+    return 0;
+}
+
+// Count data dynamic symbols (GOTPCREL)
+fn count_data_dynsyms(ls as *LinkerState) as i32 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as count with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 1) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// Count function dynamic symbols (PLT)
+fn count_func_dynsyms(ls as *LinkerState) as i32 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as count with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// Build data GOT entries for GOTPCREL symbols
+fn build_data_got(ls as *LinkerState, data_got_base_vaddr as i64) as void {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is *reader.ByteBuffer as dgot = cast(*reader.ByteBuffer, ls.data_got_buf);
+    let is i32 as slot with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 1) {
+            d.data_got_vaddr = data_got_base_vaddr + cast(i64, slot) * 8;
+            // Emit 8 zero bytes (dynamic linker fills at runtime)
+            reader.buf_emit64_le(dgot, 0);
+            slot = slot + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Build .rela.dyn with GLOB_DAT entries for data GOT symbols
+fn build_rela_dyn(ls as *LinkerState) as void {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is *reader.ByteBuffer as rela = cast(*reader.ByteBuffer, ls.reladyn_buf);
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 1) {
+            // r_offset = data GOT entry vaddr
+            reader.buf_emit64_le(rela, d.data_got_vaddr);
+            // r_info = (sym_index << 32) | R_X86_64_GLOB_DAT(6)
+            let is i64 as r_info = (cast(i64, d.dynsym_index) << 32) + reader.R_X86_64_GLOB_DAT;
+            reader.buf_emit64_le(rela, r_info);
+            // r_addend = 0
+            reader.buf_emit64_le(rela, 0);
+        }
+        i = i + 1;
+    }
+}

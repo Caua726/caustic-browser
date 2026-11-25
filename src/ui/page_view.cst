@@ -21,6 +21,7 @@ use "caustic-media/ui/layout.cst" as layout;
 use "caustic-media/ui/painter.cst" as painter;
 use "caustic-media/ui/event.cst" as event;
 use "caustic-media/ui/text.cst" as txt;
+use "../loader/webfont.cst" as webfont;
 use "caustic-media/ui/anim.cst" as anim;
 use "../layout/measure.cst" as measure;
 use "../paint/display_list.cst" as dl;
@@ -123,6 +124,7 @@ let is txt.Run as _mrun with mut;
 
 fn _init(t as *tree.Tree) as void {
     measure.set_backend(fn_ptr(_measure_text), cast(*u8, t));
+    webfont.attach(txt.of(t));
     if (_ready == 1) { return; }
     _kind = widget.kind("page_view", sizeof(Data));
     _kind.measure = fn_ptr(_measure);

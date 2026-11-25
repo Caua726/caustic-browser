@@ -1,0 +1,382 @@
+// === Vectorizer v2 — Legal -> Plan -> Execute auto-vectorizer (LLVM-class) ===
+//
+// Package entry point. Replaces the legacy pattern-matcher (opt_vec.cst)
+// incrementally; gated behind d.vec_use_v2 until it strictly dominates (M4/C17).
+//
+// Architecture (~/.claude/plans/vectorizer-llvm/MASTER-PLAN.md):
+//   build CFG/dom (reuse cfg.cst/dom.cst) -> discover natural loops ->
+//   for each innermost loop: LEGAL (mini-SCEV + IV/recurrence descriptors +
+//   dependence test) -> PLAN (VPlan-lite recipes + cost/VF/UF) ->
+//   EXECUTE (splice widened SIMD IR + skeleton + runtime alias/ISA dispatch).
+//
+// Runs at codegen time (gen_func), -O2 only, post mid-end, before pass_unroll.
+// Returns 1 if it transformed a loop (caller re-invokes to a fixpoint, <=16), else 0.
+//
+// Executors, tried in order on each innermost loop: sum reduction, map, byte
+// fill, byte count (vec_exec.cst), then the loop widener (vec_widen.cst: any
+// straight-line or if-converted body, integer reductions, conversions, float
+// folds kept in order), then multiply-add.
+
+use "../defs.cst" as d;
+use "../cfg.cst" as cfg;
+use "../dom.cst" as dom;
+use "vec_loops.cst" as vl;
+use "vec_scev.cst" as sc;
+use "vec_recur.cst" as rc;
+use "vec_depend.cst" as dep;
+use "vec_exec.cst" as ex;
+use "vec_widen.cst" as wv;
+use "../debug.cst" as dbg;
+
+// inst is `x = ADD(p,q)` where one operand resolves to iv and the other is a
+// compile-time constant C → set *out_c=C, return 1.
+fn add_const_step(inst as *d.IRInst, iv as i32, def_inst as *i64, def_count as *i32, vc as i32, out_c as *i64) as i32 {
+    if (cast(i64, inst) == 0 || inst.op != d.IR_ADD) { return 0; }
+    if (inst.src1.op_type == d.OP_VREG && sc.scev_resolve(def_inst, def_count, vc, inst.src1.vreg) == iv && inst.src2.op_type == d.OP_IMM) { *out_c = inst.src2.imm; return 1; }
+    if (inst.src2.op_type == d.OP_VREG && sc.scev_resolve(def_inst, def_count, vc, inst.src2.vreg) == iv && inst.src1.op_type == d.OP_IMM) { *out_c = inst.src1.imm; return 1; }
+    return 0;
+}
+
+// x = iv + C, or x = iv - C (step -C).
+fn const_step(inst as *d.IRInst, iv as i32, def_inst as *i64, def_count as *i32, vc as i32, out_c as *i64) as i32 {
+    if (add_const_step(inst, iv, def_inst, def_count, vc, out_c) == 1) { return 1; }
+    if (cast(i64, inst) == 0 || inst.op != d.IR_SUB) { return 0; }
+    if (inst.src1.op_type == d.OP_VREG && sc.scev_resolve(def_inst, def_count, vc, inst.src1.vreg) == iv && inst.src2.op_type == d.OP_IMM) { *out_c = 0 - inst.src2.imm; return 1; }
+    return 0;
+}
+
+// Identify the loop's induction variable + per-iteration step. iv comes from the
+// header's exit test (iv < bound via the header-block JZ -> LT); step from the
+// in-loop increment (iv = iv + C, possibly through a MOV copy). Returns 1 on success.
+fn find_loop_iv(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                def_inst as *i64, def_count as *i32, vc as i32, out_iv as *i32, out_step as *i64) as i32 {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    // find the conditional branch in the header block
+    let is *d.IRInst as p with mut = hb.first;
+    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
+    while (cast(i64, p) != 0) {
+        if (p.is_dead == 0 && p.op == d.IR_JZ) { jz = p; }
+        if (cast(i64, p) == cast(i64, hb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+    }
+    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG) { return 0; }
+    let is *d.IRInst as lt = sc.scev_sdef(def_inst, def_count, vc, jz.src1.vreg);
+    if (cast(i64, lt) == 0 || lt.src1.op_type != d.OP_VREG) { return 0; }
+    // iv < n counting up; iv >= lo or iv > lo counting down by one
+    let is i32 as down with mut = 0;
+    if (lt.op == d.IR_GE || lt.op == d.IR_GT) { down = 1; }
+    else if (lt.op != d.IR_LT) { return 0; }
+    let is i32 as iv = sc.scev_resolve(def_inst, def_count, vc, lt.src1.vreg);
+    if (iv < 0 || iv >= vc) { return 0; }
+    // step: scan for the def of iv that is iv = iv + C (direct or through a MOV)
+    let is i32 as found with mut = 0;
+    let is i64 as step with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg == iv && w.op != d.IR_STORE) {
+            if (const_step(w, iv, def_inst, def_count, vc, &step) == 1) { found = 1; }
+            else if (w.op == d.IR_MOV && w.src1.op_type == d.OP_VREG) {
+                let is *d.IRInst as td = sc.scev_sdef(def_inst, def_count, vc, w.src1.vreg);
+                if (const_step(td, iv, def_inst, def_count, vc, &step) == 1) { found = 1; }
+            }
+        }
+        w = w.next;
+    }
+    if (found == 0) { return 0; }
+    if (down == 1 && step != 0 - 1) { return 0; }
+    if (down == 0 && step < 0) { return 0; }
+    *out_iv = iv; *out_step = step;
+    return 1;
+}
+
+fn dump_ae(tag as *u8, ae as *sc.AffineExpr) as void {
+    dbg.pr_str(tag);
+    if (cast(i32, ae.kind) == sc.AE_UNKNOWN) { dbg.pr_str("UNKNOWN\n"); return; }
+    if (cast(i32, ae.kind) == sc.AE_INVARIANT) { dbg.pr_str("invariant base=v"); dbg.pr_int(cast(i64, ae.base)); dbg.pr_str(" imm="); dbg.pr_int(ae.base_imm); dbg.pr_str("\n"); return; }
+    dbg.pr_str("{base=v"); dbg.pr_int(cast(i64, ae.base)); dbg.pr_str(", imm="); dbg.pr_int(ae.base_imm);
+    dbg.pr_str(", +, step="); dbg.pr_int(ae.step); dbg.pr_str("}\n");
+}
+
+// Dump the affine expr of every load/store address in the loop body (debug).
+fn dump_scev(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+             iv as i32, iv_step as i64, def_inst as *i64, def_count as *i32, vc as i32) as void {
+    dbg.pr_str("  iv=v"); dbg.pr_int(cast(i64, iv)); dbg.pr_str(" step="); dbg.pr_int(iv_step); dbg.pr_str("\n");
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as guard with mut = 0;
+    while (cast(i64, p) != 0 && guard < 100000) {
+        if (p.is_dead == 0) {
+            if (p.op == d.IR_LOAD && p.src1.op_type == d.OP_VREG) {
+                let is sc.AffineExpr as ae;
+                sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, p.src1.vreg, &ae, 0);
+                dump_ae("    load  addr=", &ae);
+            } else if (p.op == d.IR_STORE && p.dest.op_type == d.OP_VREG) {
+                let is sc.AffineExpr as ae;
+                sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, p.dest.vreg, &ae, 0);
+                dump_ae("    store addr=", &ae);
+            }
+        }
+        if (cast(i64, p) == cast(i64, lb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+        guard = guard + 1;
+    }
+}
+
+// Dump the loop body's instructions, each with the type it carries (debug).
+fn dump_body(blocks as *cfg.BasicBlock, L as *vl.VecLoop) as void {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as n with mut = 0;
+    while (cast(i64, p) != 0 && n < 400) {
+        if (p.is_dead == 0) {
+            if (cast(i64, p.cast_to) != 0) { dbg.pr_str("      <"); dbg.pr_type_name(p.cast_to); dbg.pr_str(">"); }
+            dbg.print_inst(p, n);
+        }
+        if (cast(i64, p) == cast(i64, lb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+        n = n + 1;
+    }
+}
+
+fn dump_loops(loops as *vl.VecLoop, nloops as i32) as void {
+    dbg.pr_str("[vec] ");
+    dbg.pr_int(cast(i64, nloops));
+    dbg.pr_str(" loop(s)\n");
+    let is i32 as i with mut = 0;
+    while (i < nloops) {
+        let is *vl.VecLoop as L = cast(*vl.VecLoop, cast(i64, loops) + cast(i64, i) * sizeof(vl.VecLoop));
+        dbg.pr_str("  loop hdr=L"); dbg.pr_int(cast(i64, L.header_label));
+        dbg.pr_str(" latch=bb"); dbg.pr_int(cast(i64, L.latch));
+        dbg.pr_str(" pre=bb"); dbg.pr_int(cast(i64, L.preheader));
+        dbg.pr_str(" nbody="); dbg.pr_int(cast(i64, L.nbody));
+        dbg.pr_str(" inner="); dbg.pr_int(cast(i64, L.innermost));
+        dbg.pr_str(" depth="); dbg.pr_int(cast(i64, L.depth));
+        dbg.pr_str("\n");
+        i = i + 1;
+    }
+}
+
+// Unless --cpu=auto, the AVX2 test has a known answer at compile time: the
+// path that cannot run goes, with everything only it reaches. Each loop is
+// `if (!avx2) goto sse; <avx2>; sse: <sse2>`, and all of it is written by now.
+fn resolve_isa(func as *d.IRFunction) as void {
+    if (d.ir_cpu == d.CPU_AUTO || func.vreg_count <= 0) { return; }
+    let is *u8 as is_flag = d.opt_alloc(cast(i64, func.vreg_count));
+    d.memzero(is_flag, cast(i64, func.vreg_count));
+    let is i32 as found with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_HASAVX2 && it.is_dead == 0) {
+            is_flag[it.dest.vreg] = cast(u8, 1);
+            it.is_dead = cast(i8, 1);
+            found = 1;
+        }
+        it = it.next;
+    }
+    if (found == 1) {
+        let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            let is *d.IRInst as nx = it.next;
+            if (it.op == d.IR_JZ && it.is_dead == 0 && it.src1.op_type == cast(i8, d.OP_VREG)
+                && is_flag[it.src1.vreg] == cast(u8, 1)) {
+                if (d.ir_cpu == d.CPU_X86_64) {
+                    // no AVX2: always to the SSE2 path
+                    it.op = d.IR_JMP;
+                    it.src1.op_type = cast(i8, d.OP_NONE);
+                    prev = it;
+                } else {
+                    // AVX2: never. Unlinked, since the CFG follows a dead branch too.
+                    prev.next = nx;
+                }
+            } else {
+                prev = it;
+            }
+            it = nx;
+        }
+        _drop_unreachable(func);
+    }
+    d.opt_free(is_flag);
+}
+
+fn _drop_unreachable(func as *d.IRFunction) as void {
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as li with mut = 0;
+    while (li < lc) { label_to_bb[li] = 0 - 1; li = li + 1; }
+    let is i32 as nblocks with mut = 0;
+    cfg.build_cfg(func, blocks, cap, &nblocks, label_to_bb);
+    if (nblocks > 0) {
+        let is *u8 as seen = d.opt_alloc(cast(i64, nblocks));
+        d.memzero(seen, cast(i64, nblocks));
+        let is *i32 as stack = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+        let is i32 as sp with mut = 1;
+        stack[0] = 0;
+        seen[0] = cast(u8, 1);
+        while (sp > 0) {
+            sp = sp - 1;
+            let is *cfg.BasicBlock as bb = vl.bb_at(blocks, stack[sp]);
+            if (bb.succ0 >= 0 && seen[bb.succ0] == cast(u8, 0)) {
+                seen[bb.succ0] = cast(u8, 1); stack[sp] = bb.succ0; sp = sp + 1;
+            }
+            if (bb.succ1 >= 0 && seen[bb.succ1] == cast(u8, 0)) {
+                seen[bb.succ1] = cast(u8, 1); stack[sp] = bb.succ1; sp = sp + 1;
+            }
+        }
+        let is i32 as b with mut = 0;
+        while (b < nblocks) {
+            if (seen[b] == cast(u8, 0)) {
+                let is *cfg.BasicBlock as bb = vl.bb_at(blocks, b);
+                let is *d.IRInst as x with mut = bb.first;
+                while (cast(i64, x) != 0) {
+                    x.is_dead = cast(i8, 1);
+                    if (x == bb.last) { break; }
+                    x = x.next;
+                }
+            }
+            b = b + 1;
+        }
+        d.opt_free(seen);
+        d.opt_free(cast(*u8, stack));
+    }
+    d.opt_free(cast(*u8, blocks));
+    d.opt_free(cast(*u8, label_to_bb));
+}
+
+fn pass_vectorize2(func as *d.IRFunction) as i32 {
+    // --- build CFG + predecessors + dominators (reuse mem2reg's infra) ---
+    let is i32 as cfg_cap = cfg.count_blocks(func) + 1;
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg_cap) * sizeof(cfg.BasicBlock)));
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as li with mut = 0;
+    while (li < lc) { let is *i32 as p = cast(*i32, cast(i64, label_to_bb) + cast(i64, li) * 4); *p = 0; li = li + 1; }
+    let is i32 as nblocks with mut = 0;
+    cfg.build_cfg(func, blocks, cfg_cap, &nblocks, label_to_bb);
+    if (nblocks <= 1) {
+        d.opt_free(cast(*u8, blocks)); d.opt_free(cast(*u8, label_to_bb));
+        return 0;   // no loops possible in a single block
+    }
+    let is *i32 as preds = cast(*i32, d.opt_alloc(cast(i64, nblocks * 2 + 4) * 4));
+    let is *i32 as pred_starts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is *i32 as pred_counts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    cfg.build_preds(blocks, nblocks, preds, pred_starts, pred_counts);
+    let is *i32 as rpo_order = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is i32 as rpo_count with mut = 0;
+    cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
+    dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds, pred_starts, pred_counts);
+
+    // --- discover natural loops ---
+    let is *vl.VecLoop as loops = cast(*vl.VecLoop, d.opt_alloc(cast(i64, vl.MAX_LOOPS) * sizeof(vl.VecLoop)));
+    let is i32 as nloops = vl.discover_loops(func, blocks, nblocks, preds, pred_starts, pred_counts, loops);
+    // --- analysis + transform: vectorize the first eligible innermost loop (one per
+    //     call; the caller re-invokes to a fixpoint, header marked to avoid re-entry) ---
+    let is i32 as transformed with mut = 0;
+    let is i32 as vc = func.vreg_count;
+    if (vc > 0) {
+        let is *i32 as def_count = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+        let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+        sc.build_def_table(func, vc, def_count, def_inst);
+        if (d.vec_debug == 1) { dump_loops(loops, nloops); }
+        let is i32 as i with mut = 0;
+        while (i < nloops && transformed == 0) {
+            let is *vl.VecLoop as L = cast(*vl.VecLoop, cast(i64, loops) + cast(i64, i) * sizeof(vl.VecLoop));
+            if (L.innermost == 1) {
+                let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+                let is *cfg.BasicBlock as lbk = vl.bb_at(blocks, L.latch);
+                if (cast(i64, hb.first) != 0 && cast(i32, hb.first.is_extern_call) == 0) {
+                    sc.loop_ctx_begin(hb.first, lbk.first, lbk.last, vc, def_count);
+                    let is i32 as iv with mut = cast(i32, 0 - 1);
+                    let is i64 as step with mut = 0;
+                    let is i32 as ivf = find_loop_iv(func, blocks, L, def_inst, def_count, vc, &iv, &step);
+                    let is i64 as maxvf with mut = 0;
+                    let is i32 as rtchk with mut = 0;
+                    let is i32 as cvcode = dep.can_vectorize(func, blocks, L, ivf, iv, step, def_inst, def_count, vc, &maxvf, &rtchk);
+                    if (d.vec_debug == 1) {
+                        dbg.pr_str("  loop hdr=L"); dbg.pr_int(cast(i64, L.header_label)); dbg.pr_str(":\n");
+                        if (ivf == 1) { dump_scev(func, blocks, L, iv, step, def_inst, def_count, vc); }
+                        dump_body(blocks, L);
+                        if (cvcode == dep.CV_OK) { dbg.pr_str("    VECTORIZABLE maxVF="); dbg.pr_int(maxvf); dbg.pr_str(" rt="); dbg.pr_int(cast(i64, rtchk)); dbg.pr_str("\n"); }
+                        else {
+                            dbg.pr_str("    MISSED: ");
+                            if (cvcode == dep.CV_NOT_COUNTABLE) { dbg.pr_str("not-countable\n"); }
+                            else if (cvcode == dep.CV_HAS_BARRIER) { dbg.pr_str("has-call/atomic\n"); }
+                            else if (cvcode == dep.CV_OTHER_EXIT) { dbg.pr_str("other-exit\n"); }
+                            else { dbg.pr_str("unsafe-dependence\n"); }
+                        }
+                    }
+                    if (cvcode == dep.CV_OK && ivf == 1) {
+                        let is rc.RecurrenceDescriptor as red;
+                        if (rc.detect_reduction(func, blocks, L, iv, def_inst, def_count, vc, &red) == 1) {
+                            if (ex.vectorize_reduction(func, blocks, L, iv, step, &red, def_inst, def_count, vc) == 1) {
+                                if (d.vec_debug == 1) { dbg.pr_str("    -> VECTORIZED (reduction)\n"); }
+                                transformed = 1;
+                            }
+                        }
+                        if (transformed == 0) {
+                            let is rc.MapDescriptor as mp;
+                            if (rc.detect_map(func, blocks, L, iv, step, def_inst, def_count, vc, &mp) == 1) {
+                                if (ex.vectorize_map(func, blocks, L, iv, step, &mp, def_inst, def_count, vc) == 1) {
+                                    if (d.vec_debug == 1) { dbg.pr_str("    -> VECTORIZED (map)\n"); }
+                                    transformed = 1;
+                                }
+                            }
+                        }
+                    }
+                    // byte fill: p[i] = k
+                    if (transformed == 0 && ivf == 1 && cvcode == dep.CV_OK) {
+                        let is rc.FillDescriptor as fd;
+                        if (rc.detect_fill(func, blocks, L, iv, step, def_inst, def_count, vc, &fd) == 1) {
+                            if (ex.vectorize_fill(func, blocks, L, iv, step, &fd, def_inst, def_count, vc) == 1) {
+                                if (d.vec_debug == 1) { dbg.pr_str("    -> VECTORIZED (byte fill)\n"); }
+                                transformed = 1;
+                            }
+                        }
+                    }
+                    // byte count: if (p[i] == k) c = c + 1
+                    if (transformed == 0 && ivf == 1 && cvcode == dep.CV_OK) {
+                        let is rc.CountDescriptor as cnd;
+                        if (rc.detect_count(func, blocks, L, iv, step, def_inst, def_count, vc, &cnd) == 1) {
+                            if (ex.vectorize_count(func, blocks, L, iv, step, &cnd, def_inst, def_count, vc) == 1) {
+                                if (d.vec_debug == 1) { dbg.pr_str("    -> VECTORIZED (byte count)\n"); }
+                                transformed = 1;
+                            }
+                        }
+                    }
+                    // anything else straight-line or if-converted: the loop widener
+                    if (transformed == 0 && ivf == 1 && cvcode == dep.CV_OK) {
+                        if (wv.vectorize_widen(func, blocks, L, iv, step, maxvf, def_inst, def_count, vc) == 1) {
+                            transformed = 1;
+                        }
+                    }
+                    // multiply-add: legality again with the wider SCEV view
+                    if (transformed == 0 && ivf == 1) {
+                        sc.sc_ext = 1;
+                        let is i64 as maxvf2 with mut = 0;
+                        let is i32 as rtchk2 with mut = 0;
+                        if (dep.can_vectorize(func, blocks, L, ivf, iv, step, def_inst, def_count, vc, &maxvf2, &rtchk2) == dep.CV_OK) {
+                            let is rc.AxpyDescriptor as ax;
+                            if (rc.detect_axpy(func, blocks, L, iv, step, def_inst, def_count, vc, &ax) == 1) {
+                                if (ex.vectorize_axpy(func, blocks, L, iv, step, &ax, def_inst, def_count, vc) == 1) {
+                                    if (d.vec_debug == 1) { dbg.pr_str("    -> VECTORIZED (axpy)\n"); }
+                                    transformed = 1;
+                                }
+                            }
+                        }
+                        sc.sc_ext = 0;
+                    }
+                    sc.loop_ctx_end();
+                }
+            }
+            i = i + 1;
+        }
+        d.opt_free(cast(*u8, def_inst)); d.opt_free(cast(*u8, def_count));
+    }
+
+    d.opt_free(cast(*u8, loops));
+    d.opt_free(cast(*u8, rpo_order));
+    d.opt_free(cast(*u8, pred_counts)); d.opt_free(cast(*u8, pred_starts)); d.opt_free(cast(*u8, preds));
+    d.opt_free(cast(*u8, label_to_bb)); d.opt_free(cast(*u8, blocks));
+    return transformed;
+}

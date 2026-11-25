@@ -1,0 +1,577 @@
+// =======================================================
+// std/linux.cst
+// Syscalls Essenciais (Linux x86_64 System V ABI)
+// =======================================================
+
+// --- Flags (Argumentos Imutáveis) ---
+
+// File Descriptors
+let is i64 as STDIN  with imut = 0;
+let is i64 as STDOUT with imut = 1;
+let is i64 as STDERR with imut = 2;
+
+// open() flags
+let is i64 as O_RDONLY with imut = 0;
+let is i64 as O_WRONLY with imut = 1;
+let is i64 as O_RDWR   with imut = 2;
+let is i64 as O_CREAT  with imut = 64;  // 0x40
+let is i64 as O_TRUNC  with imut = 512; // 0x200
+let is i64 as O_APPEND    with imut = 1024;   // 0x400
+let is i64 as O_EXCL      with imut = 128;     // 0x80
+let is i64 as O_NONBLOCK  with imut = 2048;    // 0x800
+let is i64 as O_DIRECTORY with imut = 65536;   // 0x10000
+let is i64 as O_CLOEXEC   with imut = 524288;  // 0x80000
+
+// lseek() whence
+let is i64 as SEEK_SET with imut = 0;
+let is i64 as SEEK_CUR with imut = 1;
+let is i64 as SEEK_END with imut = 2;
+
+// mmap() prot & flags
+let is i64 as PROT_READ     with imut = 1;
+let is i64 as PROT_WRITE    with imut = 2;
+let is i64 as PROT_EXEC     with imut = 4;
+let is i64 as MAP_SHARED    with imut = 1;
+let is i64 as MAP_PRIVATE   with imut = 2;
+let is i64 as MAP_ANONYMOUS with imut = 32;
+let is i64 as PROT_NONE     with imut = 0;
+let is i64 as MAP_FIXED     with imut = 16;
+let is i64 as MAP_FAILED    with imut = 0 - 1;  // (void*)-1
+
+// clock_gettime() clk_id
+let is i64 as CLOCK_REALTIME  with imut = 0;
+let is i64 as CLOCK_MONOTONIC with imut = 1;
+
+// socket() domain
+let is i64 as AF_UNIX   with imut = 1;
+let is i64 as AF_INET   with imut = 2;
+let is i64 as AF_INET6  with imut = 10;
+
+// socket() type
+let is i64 as SOCK_STREAM with imut = 1;
+let is i64 as SOCK_DGRAM  with imut = 2;
+
+// socket() protocol
+let is i64 as IPPROTO_TCP with imut = 6;
+let is i64 as IPPROTO_UDP with imut = 17;
+
+// setsockopt() levels/options
+let is i64 as SOL_SOCKET    with imut = 1;
+let is i64 as SO_REUSEADDR  with imut = 2;
+let is i64 as SO_REUSEPORT  with imut = 15;
+
+// access() mode
+let is i64 as F_OK with imut = 0;
+let is i64 as R_OK with imut = 4;
+let is i64 as W_OK with imut = 2;
+let is i64 as X_OK with imut = 1;
+
+// openat/fstatat
+let is i64 as AT_FDCWD with imut = 0 - 100;
+
+// fcntl() commands
+let is i64 as F_GETFD with imut = 1;
+let is i64 as F_SETFD with imut = 2;
+let is i64 as F_GETFL with imut = 3;
+let is i64 as F_SETFL with imut = 4;
+let is i64 as FD_CLOEXEC with imut = 1;
+
+// poll() events
+let is i64 as POLLIN   with imut = 1;
+let is i64 as POLLOUT  with imut = 4;
+let is i64 as POLLERR  with imut = 8;
+let is i64 as POLLHUP  with imut = 16;
+let is i64 as POLLNVAL with imut = 32;
+
+// File permissions
+let is i64 as PERM_755 with imut = 493;
+let is i64 as PERM_700 with imut = 448;
+let is i64 as PERM_644 with imut = 420;
+let is i64 as PERM_600 with imut = 384;
+
+// Signals
+let is i64 as SIGHUP  with imut = 1;
+let is i64 as SIGINT  with imut = 2;
+let is i64 as SIGKILL with imut = 9;
+let is i64 as SIGTERM with imut = 15;
+let is i64 as SIGCHLD with imut = 17;
+
+// wait flags
+let is i64 as WNOHANG with imut = 1;
+
+// --- Wrappers (Ordem Numérica) ---
+
+// Linux keeps one source-level API across x86_64 and AArch64 even though the
+// raw syscall tables differ. This helper folds to the selected architecture.
+fn _nr(x86_64 as i64, aarch64 as i64) as i64 with imut {
+    if (__target_is_aarch64 == 1) { return aarch64; }
+    return x86_64;
+}
+
+// 0: READ - Ler de arquivo/stream
+fn read(fd as i64, buf as *u8, count as i64) as i64 {
+    return syscall(_nr(0, 63), fd, buf, count);
+}
+
+// 1: WRITE - Escrever em arquivo/stream
+fn write(fd as i64, buf as *u8, count as i64) as i64 {
+    return syscall(_nr(1, 64), fd, buf, count);
+}
+
+// 2: OPEN - Abrir arquivo
+fn open(path as *u8, flags as i64, mode as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(56, AT_FDCWD, path, flags, mode); }
+    return syscall(2, path, flags, mode);
+}
+
+// 3: CLOSE - Fechar descritor
+fn close(fd as i64) as i64 {
+    return syscall(_nr(3, 57), fd);
+}
+
+// 8: LSEEK - Mover cursor (útil para pegar tamanho de arquivo)
+fn lseek(fd as i64, offset as i64, whence as i64) as i64 {
+    return syscall(_nr(8, 62), fd, offset, whence);
+}
+
+// 9: MMAP - Alocar páginas de memória
+fn mmap(addr as *u8, len as i64, prot as i64, flags as i64, fd as i64, off as i64) as *u8 {
+    let is i64 as got = syscall(_nr(9, 222), addr, len, prot, flags, fd, off);
+    if (motor_maps != 0 && got > 0 && motor_nmaps < MOTOR_MAX_MAPS) {
+        *cast(*i64, motor_maps + motor_nmaps * 16) = got;
+        *cast(*i64, motor_maps + motor_nmaps * 16 + 8) = len;
+        motor_nmaps = motor_nmaps + 1;
+    }
+    return cast(*u8, got);
+}
+// For the browser: all the compiler mapped, so that all of it can be given back.
+let is i64 as MOTOR_MAX_MAPS with imut = 131072;
+let is i64 as motor_maps with mut = 0;
+let is i64 as motor_nmaps with mut = 0;
+fn motor_track() as void {
+    motor_maps = syscall(_nr(9, 222), 0, MOTOR_MAX_MAPS * 16, 3, 34, 0 - 1, 0);
+    motor_nmaps = 0;
+}
+fn motor_release() as void {
+    let is i64 as i with mut = 0;
+    while (i < motor_nmaps) {
+        let is i64 as a = *cast(*i64, motor_maps + i * 16);
+        if (a != 0) { syscall(_nr(11, 215), a, *cast(*i64, motor_maps + i * 16 + 8)); }
+        i = i + 1;
+    }
+    syscall(_nr(11, 215), motor_maps, MOTOR_MAX_MAPS * 16);
+    motor_maps = 0;
+}
+
+// 11: MUNMAP - Desalocar páginas
+fn munmap(addr as *u8, len as i64) as i64 {
+    if (motor_maps != 0) {
+        let is i64 as i with mut = motor_nmaps - 1;
+        while (i >= 0) {
+            if (*cast(*i64, motor_maps + i * 16) == cast(i64, addr)) {
+                *cast(*i64, motor_maps + i * 16) = 0;
+                break;
+            }
+            i = i - 1;
+        }
+    }
+    return syscall(_nr(11, 215), addr, len);
+}
+
+// 12: BRK - Ajustar topo da heap (alocador simples)
+fn brk(addr as *u8) as *u8 {
+    return cast(*u8, syscall(_nr(12, 214), addr));
+}
+
+// 231: EXIT_GROUP - Terminar processo (todos os threads)
+fn exit(code as i64) as void {
+    syscall(_nr(231, 94), code);
+}
+
+// 4: STAT - Info sobre arquivo (preenche statbuf de 144 bytes)
+// st_mtime offset = 88 (8 bytes)
+fn stat(path as *u8, statbuf as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(79, AT_FDCWD, path, statbuf, 0); }
+    return syscall(4, path, statbuf);
+}
+
+// 82: RENAME - Renomear arquivo
+fn rename(oldpath as *u8, newpath as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(38, AT_FDCWD, oldpath, AT_FDCWD, newpath); }
+    return syscall(82, oldpath, newpath);
+}
+
+// 83: MKDIR - Criar diretorio
+fn mkdir(path as *u8, mode as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(34, AT_FDCWD, path, mode); }
+    return syscall(83, path, mode);
+}
+
+// 87: UNLINK - Deletar arquivo
+fn unlink(path as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(35, AT_FDCWD, path, 0); }
+    return syscall(87, path);
+}
+
+// 89: READLINK - Ler link simbólico
+fn readlink(path as *u8, buf as *u8, bufsiz as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(78, AT_FDCWD, path, buf, bufsiz); }
+    return syscall(89, path, buf, bufsiz);
+}
+
+// --- Processos ---
+
+// 39: GETPID
+fn getpid() as i64 {
+    return syscall(_nr(39, 172));
+}
+
+// 110: GETPPID
+fn getppid() as i64 {
+    return syscall(_nr(110, 173));
+}
+
+// 57: FORK
+fn fork() as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(220, SIGCHLD, 0, 0, 0, 0); }
+    return syscall(57);
+}
+
+// 59: EXECVE
+fn execve(path as *u8, argv as *u8, envp as *u8) as i64 {
+    return syscall(_nr(59, 221), path, argv, envp);
+}
+
+// 61: WAIT4
+fn wait4(pid as i64, status as *i32, options as i64, rusage as *u8) as i64 {
+    return syscall(_nr(61, 260), pid, status, options, rusage);
+}
+
+// 22: PIPE
+fn pipe(pipefd as *i32) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(59, pipefd, 0); }
+    return syscall(22, pipefd);
+}
+
+// 293: PIPE2
+fn pipe2(pipefd as *i32, flags as i64) as i64 {
+    return syscall(_nr(293, 59), pipefd, flags);
+}
+
+// 33: DUP2
+fn dup2(oldfd as i64, newfd as i64) as i64 {
+    if (__target_is_aarch64 == 1) {
+        if (oldfd == newfd) { return oldfd; }
+        return syscall(24, oldfd, newfd, 0);
+    }
+    return syscall(33, oldfd, newfd);
+}
+
+// 292: DUP3
+fn dup3(oldfd as i64, newfd as i64, flags as i64) as i64 {
+    return syscall(_nr(292, 24), oldfd, newfd, flags);
+}
+
+// --- Filesystem ---
+
+// 5: FSTAT
+fn fstat(fd as i64, statbuf as *u8) as i64 {
+    return syscall(_nr(5, 80), fd, statbuf);
+}
+
+// 77: FTRUNCATE
+fn ftruncate(fd as i64, length as i64) as i64 {
+    return syscall(_nr(77, 46), fd, length);
+}
+
+// 84: RMDIR
+fn rmdir(path as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(35, AT_FDCWD, path, 512); }
+    return syscall(84, path);
+}
+
+// 217: GETDENTS64
+fn getdents64(fd as i64, dirp as *u8, count as i64) as i64 {
+    return syscall(_nr(217, 61), fd, dirp, count);
+}
+
+// 79: GETCWD
+fn getcwd(buf as *u8, size as i64) as i64 {
+    return syscall(_nr(79, 17), buf, size);
+}
+
+// 80: CHDIR
+fn chdir(path as *u8) as i64 {
+    return syscall(_nr(80, 49), path);
+}
+
+// 21: ACCESS
+fn access(path as *u8, mode as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(48, AT_FDCWD, path, mode); }
+    return syscall(21, path, mode);
+}
+
+// 90: CHMOD
+fn chmod(path as *u8, mode as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(53, AT_FDCWD, path, mode); }
+    return syscall(90, path, mode);
+}
+
+// 88: SYMLINK
+fn symlink(target as *u8, linkpath as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(36, target, AT_FDCWD, linkpath); }
+    return syscall(88, target, linkpath);
+}
+
+// 86: LINK
+fn link(oldpath as *u8, newpath as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return syscall(37, AT_FDCWD, oldpath, AT_FDCWD, newpath, 0); }
+    return syscall(86, oldpath, newpath);
+}
+
+// --- Tempo ---
+
+// 228: CLOCK_GETTIME
+fn clock_gettime(clk_id as i64, tp as *u8) as i64 {
+    return syscall(_nr(228, 113), clk_id, tp);
+}
+
+// 35: NANOSLEEP
+fn nanosleep(req as *u8, rem as *u8) as i64 {
+    return syscall(_nr(35, 101), req, rem);
+}
+
+// --- Memória ---
+
+// 10: MPROTECT
+fn mprotect(addr as *u8, len as i64, prot as i64) as i64 {
+    return syscall(_nr(10, 226), addr, len, prot);
+}
+
+// 25: MREMAP
+fn mremap(old_addr as *u8, old_size as i64, new_size as i64, flags as i64, new_addr as *u8) as *u8 {
+    return cast(*u8, syscall(_nr(25, 216), old_addr, old_size, new_size, flags, new_addr));
+}
+
+// --- Networking ---
+
+// 41: SOCKET
+fn socket(domain as i64, sock_type as i64, protocol as i64) as i64 {
+    return syscall(_nr(41, 198), domain, sock_type, protocol);
+}
+
+// 53: SOCKETPAIR — two connected sockets in sv[0], sv[1]
+fn socketpair(domain as i64, sock_type as i64, protocol as i64, sv as *i32) as i64 {
+    return syscall(_nr(53, 199), domain, sock_type, protocol, sv);
+}
+
+// 42: CONNECT
+fn connect(sockfd as i64, addr as *u8, addrlen as i64) as i64 {
+    return syscall(_nr(42, 203), sockfd, addr, addrlen);
+}
+
+// 43: ACCEPT
+fn accept(sockfd as i64, addr as *u8, addrlen as *u32) as i64 {
+    return syscall(_nr(43, 202), sockfd, addr, addrlen);
+}
+
+// 44: SENDTO
+fn sendto(sockfd as i64, buf as *u8, len as i64, flags as i64, dest_addr as *u8, addrlen as i64) as i64 {
+    return syscall(_nr(44, 206), sockfd, buf, len, flags, dest_addr, addrlen);
+}
+
+// 45: RECVFROM
+fn recvfrom(sockfd as i64, buf as *u8, len as i64, flags as i64, src_addr as *u8, addrlen as *u32) as i64 {
+    return syscall(_nr(45, 207), sockfd, buf, len, flags, src_addr, addrlen);
+}
+
+// 49: BIND
+fn bind(sockfd as i64, addr as *u8, addrlen as i64) as i64 {
+    return syscall(_nr(49, 200), sockfd, addr, addrlen);
+}
+
+// 50: LISTEN
+fn listen(sockfd as i64, backlog as i64) as i64 {
+    return syscall(_nr(50, 201), sockfd, backlog);
+}
+
+// 54: SETSOCKOPT
+fn setsockopt(sockfd as i64, level as i64, optname as i64, optval as *u8, optlen as i64) as i64 {
+    return syscall(_nr(54, 208), sockfd, level, optname, optval, optlen);
+}
+
+// --- Outros ---
+
+// 318: GETRANDOM
+fn getrandom(buf as *u8, buflen as i64, flags as i64) as i64 {
+    return syscall(_nr(318, 278), buf, buflen, flags);
+}
+
+// 16: IOCTL
+fn ioctl(fd as i64, request as i64, arg as *u8) as i64 {
+    return syscall(_nr(16, 29), fd, request, arg);
+}
+
+// 73: FLOCK
+fn flock(fd as i64, op as i64) as i64 {
+    return syscall(_nr(73, 32), fd, op);
+}
+
+// 280: UTIMENSAT, with the times of now: a file's date without touching its content.
+fn touch_now(path as *u8) as i64 {
+    return syscall(_nr(280, 88), 0 - 100, path, cast(*u8, 0), 0);
+}
+
+// 72: FCNTL
+fn fcntl(fd as i64, cmd as i64, arg as i64) as i64 {
+    return syscall(_nr(72, 25), fd, cmd, arg);
+}
+
+// 7: POLL
+fn poll(fds as *u8, nfds as i64, timeout as i64) as i64 {
+    if (__target_is_aarch64 == 1) {
+        if (timeout < 0) { return syscall(73, fds, nfds, cast(*u8, 0), cast(*u8, 0), 0); }
+        let is [2]i64 as ts;
+        ts[0] = timeout / 1000;
+        ts[1] = (timeout % 1000) * 1000000;
+        return syscall(73, fds, nfds, &ts, cast(*u8, 0), 0);
+    }
+    return syscall(7, fds, nfds, timeout);
+}
+
+// --- epoll ---
+//
+// poll(2) hands the kernel the whole descriptor set on every call and the
+// kernel walks all of it; epoll registers the set once and returns only what
+// fired. Linux-only: there is no kqueue or IOCP wrapper here, so code calling
+// these directly is Linux-only by construction. `net.cst` wraps them in a
+// portable poller that falls back to poll(2) elsewhere.
+//
+// struct epoll_event is `packed` on x86_64 (u32 events + u64 data = 12) but
+// naturally aligned on aarch64 (u32 + 4 pad + u64 = 16). Callers must use
+// EPOLL_EVENT_SIZE / EPOLL_DATA_OFF instead of assuming a layout.
+let is i64 as EPOLL_EVENT_SIZE with imut = (__target_is_x86_64 * 12) + (__target_is_aarch64 * 16);
+let is i64 as EPOLL_DATA_OFF   with imut = (__target_is_x86_64 * 4)  + (__target_is_aarch64 * 8);
+
+let is i64 as EPOLL_CTL_ADD with imut = 1;
+let is i64 as EPOLL_CTL_DEL with imut = 2;
+let is i64 as EPOLL_CTL_MOD with imut = 3;
+
+let is i64 as EPOLLIN    with imut = 1;
+let is i64 as EPOLLOUT   with imut = 4;
+let is i64 as EPOLLERR   with imut = 8;
+let is i64 as EPOLLHUP   with imut = 16;
+let is i64 as EPOLLRDHUP with imut = 8192;
+
+// 291 / 20: EPOLL_CREATE1
+fn epoll_create1(flags as i64) as i64 {
+    return syscall(_nr(291, 20), flags);
+}
+
+// 233 / 21: EPOLL_CTL
+fn epoll_ctl(epfd as i64, op as i64, fd as i64, event as *u8) as i64 {
+    return syscall(_nr(233, 21), epfd, op, fd, event);
+}
+
+// 281 / 22: EPOLL_PWAIT. aarch64 has no plain epoll_wait, so both arches go
+// through pwait with a null sigmask — same semantics, one code path.
+fn epoll_wait(epfd as i64, events as *u8, maxevents as i64, timeout as i64) as i64 {
+    return syscall(_nr(281, 22), epfd, events, maxevents, timeout, cast(*u8, 0), 0);
+}
+
+// Write one epoll_event into `buf` at the arch's layout. `data` is the value
+// epoll_wait hands back for this registration — this stdlib stores the fd.
+fn epoll_event_set(buf as *u8, events as i64, data as i64) as void {
+    let is *u32 as ev = cast(*u32, buf);
+    *ev = cast(u32, events);
+    let is *i64 as dp = cast(*i64, cast(i64, buf) + EPOLL_DATA_OFF);
+    *dp = data;
+}
+
+fn epoll_event_events(buf as *u8, idx as i64) as i64 {
+    let is *u32 as ev = cast(*u32, cast(i64, buf) + idx * EPOLL_EVENT_SIZE);
+    return cast(i64, *ev);
+}
+
+fn epoll_event_data(buf as *u8, idx as i64) as i64 {
+    let is *i64 as dp = cast(*i64, cast(i64, buf) + idx * EPOLL_EVENT_SIZE + EPOLL_DATA_OFF);
+    return *dp;
+}
+
+// --- Threads (B3) ---
+//
+// clone() itself is NOT wrapped here: invoking it via syscall() would let
+// codegen run normal frame code in the child (which wakes on a fresh stack
+// inside this very function, rbp still pointing into the parent frame under
+// CLONE_VM). The clone is issued only from the `with naked` trampoline in
+// std/thread/linux.cst. These wrappers are the safe, frame-agnostic pieces.
+
+// clone(2) flags (x86-64). Thread set = musl/NPTL minus DETACHED (obsolete).
+let is i64 as CLONE_VM             with imut = 256;       // 0x00000100
+let is i64 as CLONE_FS             with imut = 512;       // 0x00000200
+let is i64 as CLONE_FILES          with imut = 1024;      // 0x00000400
+let is i64 as CLONE_SIGHAND        with imut = 2048;      // 0x00000800
+let is i64 as CLONE_THREAD         with imut = 65536;     // 0x00010000
+let is i64 as CLONE_SYSVSEM        with imut = 262144;    // 0x00040000
+let is i64 as CLONE_SETTLS         with imut = 524288;    // 0x00080000
+let is i64 as CLONE_PARENT_SETTID  with imut = 1048576;   // 0x00100000
+let is i64 as CLONE_CHILD_CLEARTID with imut = 2097152;   // 0x00200000
+// Thread spawn flag set: VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID
+let is i64 as CLONE_THREAD_FLAGS   with imut = 4001536;   // 0x003D0F00
+
+// futex(2) ops
+let is i64 as FUTEX_WAIT           with imut = 0;
+let is i64 as FUTEX_WAKE           with imut = 1;
+let is i64 as FUTEX_PRIVATE_FLAG   with imut = 128;       // 0x80
+let is i64 as FUTEX_WAIT_PRIVATE   with imut = 128;       // FUTEX_WAIT | PRIVATE
+let is i64 as FUTEX_WAKE_PRIVATE   with imut = 129;       // FUTEX_WAKE | PRIVATE
+
+// mmap flags for thread stacks. PROT_NONE/READ/WRITE and
+// MAP_PRIVATE/ANONYMOUS are declared with the other mmap flags near the top of
+// this file; they were repeated here and each one became a SECOND definition
+// of the same name in .data. The values matched, so nothing ever misbehaved —
+// but the assembler resolved every reference to whichever copy it saw first,
+// which is exactly the machinery that turns a name collision into a silent
+// wrong answer instead of an error.
+let is i64 as MAP_STACK            with imut = 131072;    // 0x20000
+let is i64 as MAP_FAILED_PTR       with imut = 0 - 1;     // mmap returns -1 on failure
+
+// arch_prctl subfunctions (fs/gs base)
+let is i64 as ARCH_SET_FS          with imut = 4098;      // 0x1002
+let is i64 as ARCH_GET_FS          with imut = 4099;      // 0x1003
+
+// 202: FUTEX — uaddr is a *u32. NOTE: the join wait must NOT set PRIVATE: the
+// kernel's CLONE_CHILD_CLEARTID wake at thread death is a NON-private FUTEX_WAKE,
+// so a private waiter hashes to a different bucket and misses it.
+fn futex(uaddr as *u8, op as i64, val as i64, timeout as *u8, uaddr2 as *u8, val3 as i64) as i64 {
+    return syscall(_nr(202, 98), uaddr, op, val, timeout, uaddr2, val3);
+}
+
+// 186: GETTID — kernel thread id (== pid for the main thread).
+fn gettid() as i64 {
+    return syscall(_nr(186, 178));
+}
+
+// 24: SCHED_YIELD
+fn sched_yield() as i64 {
+    return syscall(_nr(24, 124));
+}
+
+// 204: SCHED_GETAFFINITY — fills `mask` with online-CPU bits for `pid` (0=self).
+// Returns the number of bytes written (popcount the mask for the CPU count).
+fn sched_getaffinity(pid as i64, size as i64, mask as *u8) as i64 {
+    return syscall(_nr(204, 123), pid, size, mask);
+}
+
+// 60: EXIT — terminate THIS thread only (NOT exit_group/231 which kills the
+// whole process). Worker threads must end via this (the trampoline emits it).
+fn exit_thread(code as i64) as void {
+    syscall(_nr(60, 93), code);
+}
+
+// 158: ARCH_PRCTL — set/get fs or gs base. Used to install the main thread's
+// TCB pointer (thread.slot()) ; spawned threads get fs via CLONE_SETTLS instead.
+fn arch_prctl(code as i64, addr as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return 0 - 38; }
+    return syscall(158, code, addr);
+}

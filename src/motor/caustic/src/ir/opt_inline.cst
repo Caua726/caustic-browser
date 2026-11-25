@@ -1,0 +1,1467 @@
+use "defs.cst" as d;
+use "../codegen/target.cst" as tgt;
+use "../../std/mem/core.cst" as core;
+
+// === Function inlining at -O2: a cost model instead of fixed limits ===
+//
+// -O1 keeps its own inliner (opt_loop.cst, pass_inline). This one decides per
+// call site, from an estimate of what the callee costs once optimized, and it
+// copies callees that keep part of their frame in memory.
+//
+// Which body is copied. In the whole-program path (emit_driver Phase 2) every
+// function was optimized before inlining starts and functions are visited
+// callees first (inline_order), so the callee's own record holds an optimized
+// body with its calls already inlined. The parallel path keeps every body as
+// the frontend produced it, unoptimized, so that each object file depends on
+// nothing but the program; there the callee is judged by an estimate of its
+// raw body and, once a site is taken, copied from an optimized copy of it made
+// once per process (_src_of). Copying the raw body instead would hand all of
+// its locals' frame traffic to the caller's mem2reg, which promotes a bounded
+// number of slots and would leave the rest in memory.
+//
+// The size estimate (_measure) counts what survives optimization: it leaves
+// out argument reads, moves, constants, labels, code after a return, and the
+// frame loads and stores of locals whose address is never taken. On the raw
+// body it lands within 20% of the same estimate on the optimized body for most
+// functions, so both paths use the same thresholds.
+//
+// Cost model, in estimated instructions:
+//   threshold  INL_BASE
+//            + INL_LOOP_BONUS for a call inside a loop (+ INL_LOOP2_BONUS if
+//              the loop is itself in a loop)
+//            + INL_SINGLE_BONUS when this is the only reference to the callee
+//              in the program (the out-of-line copy then serves nobody)
+//            + INL_DOUBLE_BONUS when it is one of two (at most one copy more)
+//            + INL_CONST_BONUS per constant argument
+//   inline when the estimate is at most the threshold; a callee no bigger
+//   than the call itself (arguments + call + result) always goes in.
+// Each caller has a growth budget (INL_GROWTH_*) the inlined copies draw on,
+// a second one (INL_LOOP_GROWTH_*) that only sites inside a loop draw on, and
+// hard caps on virtual registers and on the stack bytes the copies add.
+// Calls inside a copied body are considered again, up to INL_MAX_DEPTH levels,
+// never re-entering a function already on the chain that led to them.
+//
+// Within one round, call sites are taken in priority order — the ones costing
+// nothing first, then sites in loops, then the smallest callees — so an early,
+// cold call does not spend the budget a later loop needed.
+//
+// Frames: a copied callee's locals live at frame offsets [48, ext]; they are
+// moved past the caller's (all by one multiple of 16, which keeps each object's
+// alignment and every relative position), and its alloca area past the
+// caller's. The frame grows to cover them. After the caller is optimized,
+// compact_frame slides every copied region down over the regions nothing
+// references any more — most of them, once their scalars live in registers.
+
+let is i32 as INL_BASE with imut = 15;
+let is i32 as INL_LOOP_BONUS with imut = 60;
+let is i32 as INL_LOOP2_BONUS with imut = 60;
+let is i32 as INL_SINGLE_BONUS with imut = 100;
+let is i32 as INL_DOUBLE_BONUS with imut = 30;
+let is i32 as INL_CONST_BONUS with imut = 8;
+// A callee that makes no call and is at most this much bigger than the call
+// (an expression in a function: a rotate, a min) goes in for free as well:
+// the call, the argument moves and the frame cost about as much.
+let is i32 as INL_LEAF_FREE with imut = 10;
+let is i32 as INL_MAX_DEPTH with imut = 3;
+// Growth budget of one caller: MIN + PCT% of its own estimate, at most MAX.
+// The budget, more than the thresholds, sets what inlining costs in compile
+// time: the passes after it grow faster than linearly with function size.
+let is i32 as INL_GROWTH_MIN with imut = 30;
+let is i32 as INL_GROWTH_PCT with imut = 25;
+let is i32 as INL_GROWTH_MAX with imut = 200;
+// Sites inside a loop whose callee makes no call have a budget of their own
+// on top of that one, drawn first: the call runs many times for each time the
+// code is copied, and a leaf copied in leaves the loop without a clobber point.
+// Callees that call further are left to the general budget: in a large program
+// most calls in loops are of that kind, and copying them grows code for little.
+// It is largest for a small caller and gone at INL_LOOP_GROWTH_MAX * 2:
+// copying into a small function costs little compile time, into a large one
+// the passes after inlining pay for every instruction added.
+let is i32 as INL_LOOP_GROWTH_MAX with imut = 300;
+// Callees whose cached instruction count is above this are not even sized:
+// nothing that big fits any threshold, raw or optimized.
+let is i32 as INL_RAW_CAP with imut = 1200;
+let is i32 as INL_VREG_CAP with imut = 8192;
+// Stack bytes that stay in memory after optimization (objects whose address is
+// taken, arrays, the alloca area): per copied callee, and per caller.
+let is i32 as INL_FRAME_ONE with imut = 256;
+let is i32 as INL_FRAME_ALL with imut = 1024;
+let is i32 as INL_NEVER with imut = 1073741824;
+
+// === Pointer-keyed hash map (open addressing, keys never 0) ===
+
+struct PMap {
+    keys as *i64;
+    vals as *i64;
+    cap as i64;
+    n as i64;
+}
+
+fn _pm_hash(k as i64, cap as i64) as i64 {
+    let is u64 as h = cast(u64, k) * cast(u64, 6364136223846793005);
+    return cast(i64, h >> 20) & (cap - 1);
+}
+
+fn _pm_alloc(m as *PMap, cap as i64) as void {
+    m.keys = cast(*i64, d.opt_alloc(cap * 8));
+    m.vals = cast(*i64, d.opt_alloc(cap * 8));
+    m.cap = cap;
+    m.n = 0;
+    let is i64 as i with mut = 0;
+    while (i < cap) { m.keys[i] = 0; m.vals[i] = 0; i = i + 1; }
+}
+
+fn _pm_get(m as *PMap, k as i64) as i64 {
+    if (m.cap == 0) { return 0; }
+    let is i64 as i with mut = _pm_hash(k, m.cap);
+    while (m.keys[i] != 0) {
+        if (m.keys[i] == k) { return m.vals[i]; }
+        i = (i + 1) & (m.cap - 1);
+    }
+    return 0;
+}
+
+fn _pm_put(m as *PMap, k as i64, v as i64) as void {
+    if (m.cap == 0) { _pm_alloc(m, 256); }
+    if ((m.n + 1) * 2 > m.cap) {
+        let is *i64 as ok = m.keys;
+        let is *i64 as ov = m.vals;
+        let is i64 as oc = m.cap;
+        _pm_alloc(m, oc * 2);
+        let is i64 as j with mut = 0;
+        while (j < oc) {
+            if (ok[j] != 0) { _pm_put(m, ok[j], ov[j]); }
+            j = j + 1;
+        }
+        d.opt_free(cast(*u8, ok));
+        d.opt_free(cast(*u8, ov));
+    }
+    let is i64 as i with mut = _pm_hash(k, m.cap);
+    while (m.keys[i] != 0) {
+        if (m.keys[i] == k) { m.vals[i] = v; return; }
+        i = (i + 1) & (m.cap - 1);
+    }
+    m.keys[i] = k;
+    m.vals[i] = v;
+    m.n = m.n + 1;
+}
+
+// Removal by tombstone would complicate probing; a removed entry keeps its key
+// with value 0, which every reader treats as absent.
+fn _pm_del(m as *PMap, k as i64) as void {
+    if (m.cap == 0) { return; }
+    let is i64 as i with mut = _pm_hash(k, m.cap);
+    while (m.keys[i] != 0) {
+        if (m.keys[i] == k) { m.vals[i] = 0; return; }
+        i = (i + 1) & (m.cap - 1);
+    }
+}
+
+fn _pm_clear(m as *PMap) as void {
+    if (m.cap == 0) { return; }
+    if (m.n == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < m.cap) { m.keys[i] = 0; m.vals[i] = 0; i = i + 1; }
+    m.n = 0;
+}
+
+// === Program-wide tables, built once per process ===
+//
+// Built from the program as the frontend left it (function records and their
+// cached call targets), so every worker of a parallel build computes the same
+// tables, whatever it emitted before.
+
+let is *u8 as _prog with mut = cast(*u8, 0);
+let is *i64 as _ntab with mut = cast(*i64, 0);     // name hash -> *IRFunction
+let is i64 as _ntab_cap with mut = 0;
+let is PMap as _refs with mut;                      // *IRFunction -> references in the program
+let is PMap as _est with mut;                       // *IRFunction -> estimate + 1
+let is PMap as _stk with mut;                       // *IRFunction -> sticky frame bytes + 1
+let is PMap as _est_raw with mut;                   // *IRFunction -> estimate of the raw body + 1
+let is PMap as _shadow with mut;                    // *IRFunction -> its optimized copy
+let is PMap as _nr_memo with mut;                   // *IRFunction -> 1 returns, 2 does not (_noreturn)
+
+// The parallel path keeps every body as the frontend produced it (unoptimized,
+// so the per-module objects do not depend on emission order). There a callee
+// is copied from an optimized version of it, made once per process from the
+// pristine body: copying the raw body would leave its locals' frame traffic to
+// the caller's mem2reg, which handles a bounded number of slots.
+let is i32 as _raw_bodies with mut = 0;
+let is *u8 as _optimize_cb with mut = cast(*u8, 0);
+
+fn set_raw_bodies(v as i32) as void { _raw_bodies = v; }
+fn set_optimizer(cb as *u8) as void { _optimize_cb = cb; }
+
+fn _name_hash(p as *u8, n as i32) as i64 {
+    let is u64 as h with mut = 14695981039346656037;
+    let is i32 as i with mut = 0;
+    while (i < n) { h = (h ^ cast(u64, p[i])) * cast(u64, 1099511628211); i = i + 1; }
+    return cast(i64, h >> 1);
+}
+
+fn _lookup_raw(p as *u8, n as i32) as *d.IRFunction {
+    if (_ntab_cap == 0) { return cast(*d.IRFunction, 0); }
+    let is i64 as i with mut = _name_hash(p, n) & (_ntab_cap - 1);
+    while (_ntab[i] != 0) {
+        let is *d.IRFunction as f = cast(*d.IRFunction, _ntab[i]);
+        if (d.str_eq(f.asm_name_ptr, f.asm_name_len, p, n) == 1) { return f; }
+        i = (i + 1) & (_ntab_cap - 1);
+    }
+    return cast(*d.IRFunction, 0);
+}
+
+// A function whose body is about to be read.
+fn _lookup(p as *u8, n as i32) as *d.IRFunction {
+    let is *d.IRFunction as f = _lookup_raw(p, n);
+    d.func_open(f);
+    return f;
+}
+
+fn _ensure_tables(prog as *u8) as void {
+    if (cast(i64, _prog) == cast(i64, prog)) { return; }
+    _prog = prog;
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    let is i64 as nf with mut = 0;
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) { nf = nf + 1; f = f.next; }
+    let is i64 as cap with mut = 64;
+    while (cap < nf * 2) { cap = cap * 2; }
+    if (cast(i64, _ntab) != 0) { d.opt_free(cast(*u8, _ntab)); }
+    _ntab = cast(*i64, d.opt_alloc(cap * 8));
+    _ntab_cap = cap;
+    let is i64 as i with mut = 0;
+    while (i < cap) { _ntab[i] = 0; i = i + 1; }
+    // First record of a name wins, as the linear lookup it replaces did.
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.asm_name_len > 0 && cast(i64, _lookup_raw(f.asm_name_ptr, f.asm_name_len)) == 0) {
+            let is i64 as j with mut = _name_hash(f.asm_name_ptr, f.asm_name_len) & (cap - 1);
+            while (_ntab[j] != 0) { j = (j + 1) & (cap - 1); }
+            _ntab[j] = cast(i64, f);
+        }
+        f = f.next;
+    }
+    // References: every call, function address or global address naming a
+    // function, over every function the program keeps.
+    _pm_clear(&_refs);
+    _pm_clear(&_est);
+    _pm_clear(&_stk);
+    _pm_clear(&_est_raw);
+    _pm_clear(&_shadow);
+    _pm_clear(&_nr_memo);
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && cast(i64, f.call_targets) != 0) {
+            let is i32 as k with mut = 0;
+            while (k < f.call_target_count) {
+                let is *i64 as pp = cast(*i64, cast(i64, f.call_targets) + cast(i64, k) * 12);
+                let is *i32 as pl = cast(*i32, cast(i64, f.call_targets) + cast(i64, k) * 12 + 8);
+                let is *d.IRFunction as t = _lookup_raw(cast(*u8, *pp), *pl);
+                if (cast(i64, t) != 0) { _pm_put(&_refs, cast(i64, t), _pm_get(&_refs, cast(i64, t)) + 1); }
+                k = k + 1;
+            }
+        }
+        f = f.next;
+    }
+    // Read off the bodies as they are now, before any copy changes one.
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        _noreturn(f);
+        d.func_trim_opened();
+        f = f.next;
+    }
+    d.func_close_opened();
+}
+
+// What the inliner sees of a function besides its body, for the object cache.
+fn refs_of(f as *d.IRFunction) as i64 { return _pm_get(&_refs, cast(i64, f)); }
+fn noreturn_of(f as *d.IRFunction) as i64 { return _pm_get(&_nr_memo, cast(i64, f)); }
+fn lookup_quiet(p as *u8, n as i32) as *d.IRFunction { return _lookup_raw(p, n); }
+
+// Before a fork: the workers inherit the tables instead of each building them.
+fn prepare_tables(prog as *u8) as void { _ensure_tables(prog); }
+
+// === Callee size estimate ===
+
+fn _is_stack_adjust(i as *d.IRInst) as i32 { return d.is_stack_adjust(i); }
+
+fn _addr_taken(offs as *i64, n as i32, off as i64) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) { if (offs[i] == off) { return 1; } i = i + 1; }
+    return 0;
+}
+
+// Estimated instruction count once optimized, and the stack bytes that will
+// stay in memory (address-taken objects and arrays up to the deepest such
+// offset, plus the alloca area). INL_NEVER marks a body that cannot be copied.
+// Frame objects (kind 0: &[rbp-N], kind 1: the alloca area) reached only by
+// loads and stores at constant offsets and by block copies: opt_sroa splits
+// them into scalars (a struct passed or returned by value), so their
+// addresses, their accesses and a copy between two of them cost nothing.
+let is i32 as MS_MAXOBJ with imut = 32;
+
+fn _ms_dest_read(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+        || op == d.IR_CMOV || op == d.IR_COPY) { return 1; }
+    return 0;
+}
+
+// The object (index + 1) whose address vreg o holds, 0 when none.
+fn _ms_obj(o as *d.Operand, ak as *i32, vc as i32) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= vc) { return 0; }
+    return ak[o.vreg];
+}
+
+fn _ms_const(o as *d.Operand, isimm as *u8, vc as i32) as i32 {
+    if (o.op_type == d.OP_IMM) { return 1; }
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc && isimm[o.vreg] == cast(u8, 1)) { return 1; }
+    return 0;
+}
+
+fn _ms_objects(f as *d.IRFunction, ak as *i32, okey as *i64, bad as *i32) as i32 {
+    let is i32 as vc = f.vreg_count;
+    let is *i32 as nd = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
+    let is *u8 as isimm = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as v with mut = 0;
+    while (v < vc) { nd[v] = 0; ak[v] = 0; isimm[v] = cast(u8, 0); v = v + 1; }
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0 && i.dest.op_type == d.OP_VREG && i.dest.vreg >= 0 && i.dest.vreg < vc
+            && _ms_dest_read(i.op) == 0) {
+            nd[i.dest.vreg] = nd[i.dest.vreg] + 1;
+            if (i.op == d.IR_IMM) { isimm[i.dest.vreg] = cast(u8, 1); }
+        }
+        i = i.next;
+    }
+    v = 0;
+    while (v < vc) { if (nd[v] != 1) { isimm[v] = cast(u8, 0); } v = v + 1; }
+    let is i32 as no with mut = 0;
+    i = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0 && (i.op == d.IR_ADDR || i.op == d.IR_GET_ALLOC_ADDR) && i.src1.op_type == d.OP_IMM
+            && i.dest.op_type == d.OP_VREG && i.dest.vreg >= 0 && i.dest.vreg < vc) {
+            let is i64 as key = i.src1.imm * 2 + cast(i64, i.op == d.IR_GET_ALLOC_ADDR);
+            let is i32 as j with mut = 0;
+            let is i32 as found with mut = 0;
+            while (j < no) { if (okey[j] == key) { found = j + 1; } j = j + 1; }
+            if (found == 0 && no < MS_MAXOBJ) { okey[no] = key; bad[no] = 0; no = no + 1; found = no; }
+            if (found != 0) {
+                if (nd[i.dest.vreg] != 1) { bad[found - 1] = 1; }
+                ak[i.dest.vreg] = found;
+            }
+        }
+        i = i.next;
+    }
+    // addresses at a constant distance (ADD of an immediate), in list order
+    i = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0 && i.op == d.IR_ADD && _ms_const(&i.src2, isimm, vc) == 1 && i.dest.op_type == d.OP_VREG
+            && i.dest.vreg >= 0 && i.dest.vreg < vc) {
+            let is i32 as ob = _ms_obj(&i.src1, ak, vc);
+            if (ob != 0) {
+                if (nd[i.dest.vreg] != 1) { bad[ob - 1] = 1; }
+                ak[i.dest.vreg] = ob;
+            }
+        }
+        i = i.next;
+    }
+    // every other use of an address keeps its object in memory
+    i = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            let is i32 as o1 = _ms_obj(&i.src1, ak, vc);
+            let is i32 as o2 = _ms_obj(&i.src2, ak, vc);
+            let is i32 as od with mut = 0;
+            if (_ms_dest_read(op) == 1) { od = _ms_obj(&i.dest, ak, vc); }
+            if (op == d.IR_LOAD) { if (o2 != 0) { bad[o2 - 1] = 1; } }
+            else if (op == d.IR_STORE) { if (o1 != 0) { bad[o1 - 1] = 1; } if (o2 != 0) { bad[o2 - 1] = 1; } }
+            else if (op == d.IR_ADD && _ms_const(&i.src2, isimm, vc) == 1 && o1 != 0) { }
+            else if (op == d.IR_COPY && i.src2.op_type == d.OP_IMM && i.src2.imm <= 64 && o1 != od) { }
+            else {
+                if (o1 != 0) { bad[o1 - 1] = 1; }
+                if (o2 != 0) { bad[o2 - 1] = 1; }
+                if (od != 0) { bad[od - 1] = 1; }
+            }
+        }
+        i = i.next;
+    }
+    d.opt_free(cast(*u8, nd));
+    d.opt_free(isimm);
+    return no;
+}
+
+fn _ms_split(o as *d.Operand, ak as *i32, vc as i32, bad as *i32) as i32 {
+    let is i32 as ob = _ms_obj(o, ak, vc);
+    if (ob == 0) { return 0; }
+    if (bad[ob - 1] != 0) { return 0; }
+    return 1;
+}
+
+// === Calls that never return ===
+//
+// A function whose first straight run of code ends the process, or calls one
+// that does: `fail("...")`, a usage message. The path to such a call runs at
+// most once, so it costs an inlined copy nothing (the size estimate leaves it
+// out, and it does not make its function a caller), it is not itself worth
+// copying, and no value is live past it (pass_noreturn_cut).
+
+fn _name_ends(f as *d.IRFunction, s as *u8, n as i32) as i32 {
+    if (f.asm_name_len < n) { return 0; }
+    let is *u8 as t = cast(*u8, cast(i64, f.asm_name_ptr) + cast(i64, f.asm_name_len - n));
+    let is i32 as k with mut = 0;
+    while (k < n) {
+        if (t[k] != s[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _noreturn(f as *d.IRFunction) as i32 {
+    if (cast(i64, f) == 0 || f.is_naked != 0) { return 0; }
+    let is i64 as m = _pm_get(&_nr_memo, cast(i64, f));
+    if (m != 0) { return cast(i32, m - 1); }
+    d.func_open(f);
+    if (cast(i64, f.instructions) == 0) { return 0; }
+    _pm_put(&_nr_memo, cast(i64, f), 1);            // a cycle proves nothing
+    let is i32 as r with mut = 0;
+    // std/os/linux.cst's exit wrappers: their one syscall does not come back
+    if (_name_ends(f, "_std_os_linux_cst_exit", 22) == 1 || _name_ends(f, "_std_os_linux_cst_exit_thread", 29) == 1) { r = 1; }
+    let is *d.IRInst as i with mut = f.instructions;
+    let is i32 as go with mut = 1;
+    while (r == 0 && go == 1 && cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { go = 0; }
+            else if (_noreturn_call(i) == 1) { r = 1; }
+        }
+        i = i.next;
+    }
+    _pm_put(&_nr_memo, cast(i64, f), cast(i64, r) + 1);
+    return r;
+}
+
+// Calls opt_libcall.cst reads for what they mean: they stay calls until every
+// function has had its first round, and only then go in (late_inline_func).
+let is i32 as _late_round with mut = 0;
+
+fn set_late_round(v as i32) as void { _late_round = v; }
+
+fn _is_late(f as *d.IRFunction) as i32 {
+    if (_name_ends(f, "_std_mem_bins_cst_bins_alloc", 28) == 1 || _name_ends(f, "_std_mem_bins_cst_bins_free", 27) == 1
+        || _name_ends(f, "_std_string_cst_strcpy", 22) == 1 || _name_ends(f, "_std_string_cst_strlen", 22) == 1) { return 1; }
+    return 0;
+}
+
+// Does the function still call one of them?
+fn has_late_call(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as i with mut = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0 && i.op == d.IR_CALL && i.is_extern_call == 0) {
+            let is *d.IRFunction as g = _lookup(i.call_name_ptr, i.call_name_len);
+            if (cast(i64, g) != 0 && _is_late(g) == 1) { return 1; }
+        }
+        i = i.next;
+    }
+    return 0;
+}
+
+fn _noreturn_call(i as *d.IRInst) as i32 {
+    if (i.op != d.IR_CALL || i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
+    return _noreturn(_lookup(i.call_name_ptr, i.call_name_len));
+}
+
+// A function that goes straight to formatting output: its time is the variadic
+// call's. Taking it in saves next to nothing, and the registers it holds across
+// that call land on the caller's hot path when it reports an error.
+fn _reports(f as *d.IRFunction) as i32 {
+    if (cast(i64, f) == 0) { return 0; }
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { return 0; }
+            if (op == d.IR_CALL && i.is_variadic_call != 0) { return 1; }
+        }
+        i = i.next;
+    }
+    return 0;
+}
+
+// A call of one, on a path that goes on: that path is the cold one.
+fn _report_call(i as *d.IRInst) as i32 {
+    if (i.op != d.IR_CALL || i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
+    return _reports(_lookup(i.call_name_ptr, i.call_name_len));
+}
+
+// Nothing runs after a call that never returns: a RET right after it, marked
+// (is_extern_call = 1) for ic.pass_cold_sink, ends the block and takes with it
+// the code up to the next label. What was live only past the call no longer
+// keeps a callee-saved register or a slot across it.
+fn pass_noreturn_cut(func as *d.IRFunction) as void {
+    if (func.is_naked != 0) { return; }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && _noreturn_call(w) == 1) {
+            let is *d.IRInst as r = d.new_inst(d.IR_RET);
+            r.line = w.line;
+            r.is_extern_call = cast(i8, 1);
+            r.next = w.next;
+            w.next = r;
+            let is *d.IRInst as x with mut = r.next;
+            while (cast(i64, x) != 0 && (x.is_dead == 1 || x.op != d.IR_LABEL)) {
+                x.is_dead = 1;
+                x = x.next;
+            }
+            w = r;
+        }
+        w = w.next;
+    }
+}
+
+fn _measure(f as *d.IRFunction, out_sticky as *i32) as i32 {
+    *out_sticky = 0;
+    if (f.is_noinline == 1) { return INL_NEVER; }
+    let is i32 as vc = f.vreg_count;
+    let is *i32 as ak = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
+    let is [32]i64 as okey;
+    let is [32]i32 as bad;
+    let is i32 as _no = _ms_objects(f, ak, &okey[0], &bad[0]);
+    let is i32 as nat with mut = 0;
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_ADDR && i.src1.op_type == d.OP_IMM) { nat = nat + 1; }
+            if (op == d.IR_ASM && _is_stack_adjust(i) == 0) { return INL_NEVER; }
+            if (op == d.IR_VA_START || op == d.IR_PHI) { return INL_NEVER; }
+        }
+        i = i.next;
+    }
+    let is *i64 as offs = cast(*i64, d.opt_alloc(cast(i64, nat) * 8 + 8));
+    let is i32 as k with mut = 0;
+    let is i64 as addr_max with mut = 0;
+    let is i64 as al_max with mut = 0;
+    i = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            if (i.op == d.IR_ADDR && i.src1.op_type == d.OP_IMM && _ms_split(&i.dest, ak, vc, &bad[0]) == 0) {
+                offs[k] = i.src1.imm; k = k + 1;
+                if (i.src1.imm > addr_max) { addr_max = i.src1.imm; }
+            }
+            if (i.op == d.IR_GET_ALLOC_ADDR && i.src1.imm > al_max && _ms_split(&i.dest, ak, vc, &bad[0]) == 0) { al_max = i.src1.imm; }
+        }
+        i = i.next;
+    }
+    let is i32 as n with mut = 0;
+    let is i32 as unreachable with mut = 0;
+    let is i32 as run_start with mut = 0;
+    i = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL) { unreachable = 0; run_start = n; }
+            else if (unreachable == 1) { }
+            else if (op == d.IR_RET) { unreachable = 1; }
+            else if (op == d.IR_JMP) { unreachable = 1; n = n + 1; }
+            else if (op == d.IR_JZ || op == d.IR_JNZ) { n = n + 1; run_start = n; }
+            // a path that ends in a call that never returns: cold, it costs nothing
+            else if (_noreturn_call(i) == 1) { n = run_start; unreachable = 1; }
+            else if (_report_call(i) == 1) { n = run_start; }
+            else if (op == d.IR_GET_ARG || op == d.IR_MOV || op == d.IR_IMM || op == d.IR_SET_CTX) { }
+            else if (op == d.IR_LOAD && i.src1.op_type == d.OP_IMM && _addr_taken(offs, k, i.src1.imm) == 0) { }
+            else if (op == d.IR_STORE && i.dest.op_type == d.OP_IMM && _addr_taken(offs, k, i.dest.imm) == 0) { }
+            // a split object: its addresses and what goes through them
+            else if ((op == d.IR_ADDR || op == d.IR_GET_ALLOC_ADDR || op == d.IR_ADD)
+                     && _ms_split(&i.dest, ak, vc, &bad[0]) == 1) { }
+            else if (op == d.IR_LOAD && _ms_split(&i.src1, ak, vc, &bad[0]) == 1) { }
+            else if (op == d.IR_STORE && _ms_split(&i.dest, ak, vc, &bad[0]) == 1) { }
+            else if (op == d.IR_COPY) {
+                if (_ms_split(&i.dest, ak, vc, &bad[0]) == 0 || _ms_split(&i.src1, ak, vc, &bad[0]) == 0) { n = n + 2; }
+            }
+            else { n = n + 1; }
+        }
+        i = i.next;
+    }
+    d.opt_free(cast(*u8, offs));
+    d.opt_free(cast(*u8, ak));
+    let is i64 as sticky with mut = al_max;
+    if (addr_max > 48) { sticky = sticky + addr_max - 48; }
+    if (sticky > cast(i64, INL_NEVER)) { sticky = cast(i64, INL_NEVER); }
+    *out_sticky = cast(i32, sticky);
+    return n;
+}
+
+fn _makes_call(f as *d.IRFunction) as i32 {
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0 && (i.op == d.IR_CALL || i.op == d.IR_CALL_INDIRECT || i.op == d.IR_FFI_CALL
+                               || i.op == d.IR_SYSCALL) && _noreturn_call(i) == 0 && _report_call(i) == 0) { return 1; }
+        i = i.next;
+    }
+    return 0;
+}
+
+// 1 when f's body makes no call once copied: no call at all, or only calls of
+// tiny functions that make none (a raw body still calls the helpers its
+// optimized copy has taken in).
+fn _is_leaf(f as *d.IRFunction) as i32 {
+    if (cast(i64, f.instructions) == 0) { return 0; }
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            if (i.op == d.IR_CALL_INDIRECT || i.op == d.IR_FFI_CALL || i.op == d.IR_SYSCALL) { return 0; }
+            if (i.op == d.IR_CALL && _noreturn_call(i) == 0 && _report_call(i) == 0) {
+                if (i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
+                let is *d.IRFunction as g = _lookup(i.call_name_ptr, i.call_name_len);
+                if (cast(i64, g) == 0 || cast(i64, g) == cast(i64, f) || cast(i64, g.instructions) == 0) { return 0; }
+                if (g.is_recursive != 0 || _makes_call(g) == 1 || _est_raw_of(g) > INL_BASE) { return 0; }
+            }
+        }
+        i = i.next;
+    }
+    return 1;
+}
+
+fn _est_of(f as *d.IRFunction, out_sticky as *i32) as i32 {
+    let is i64 as e = _pm_get(&_est, cast(i64, f));
+    if (e != 0) {
+        *out_sticky = cast(i32, _pm_get(&_stk, cast(i64, f)) - 1);
+        return cast(i32, e - 1);
+    }
+    let is i32 as st with mut = 0;
+    let is i32 as n = _measure(f, &st);
+    _pm_put(&_est, cast(i64, f), cast(i64, n) + 1);
+    _pm_put(&_stk, cast(i64, f), cast(i64, st) + 1);
+    *out_sticky = st;
+    return n;
+}
+
+// A function's body changed (it was inlined into and optimized again): what
+// was measured from it no longer holds.
+fn forget(f as *d.IRFunction) as void {
+    _pm_del(&_est, cast(i64, f));
+    _pm_del(&_stk, cast(i64, f));
+}
+
+// The body to copy for callee f: f itself, or (raw bodies) its optimized copy.
+fn _src_of(f as *d.IRFunction) as *d.IRFunction {
+    if (_raw_bodies == 0 || cast(i64, _optimize_cb) == 0) { return f; }
+    let is i64 as sh = _pm_get(&_shadow, cast(i64, f));
+    if (sh != 0) {
+        d.func_open(cast(*d.IRFunction, sh));
+        return cast(*d.IRFunction, sh);
+    }
+    let is *d.IRFunction as c = d.new_irfunc();
+    core.memcpy(cast(*u8, c), cast(*u8, f), sizeof(d.IRFunction));
+    c.next = cast(*d.IRFunction, 0);
+    c.vreg_class = cast(*i32, 0);
+    c.instructions = d.clone_insts(f.instructions);
+    call(_optimize_cb, cast(*u8, c));
+    _pm_put(&_shadow, cast(i64, f), cast(i64, c));
+    // Kept for every later caller in this process, so it goes in packed as well.
+    if (d.ir_pack == 1) {
+        d.func_pack(c);
+        d.func_open(c);
+    }
+    return c;
+}
+
+fn _est_raw_of(f as *d.IRFunction) as i32 {
+    let is i64 as e = _pm_get(&_est_raw, cast(i64, f));
+    if (e != 0) { return cast(i32, e - 1); }
+    let is i32 as st with mut = 0;
+    let is i32 as n = _measure(f, &st);
+    _pm_put(&_est_raw, cast(i64, f), cast(i64, n) + 1);
+    return n;
+}
+
+// A chosen site whose body is still unknown (raw bodies): make the optimized
+// copy now and size it for real. 0 when the copy turns out not to fit after all.
+fn _take(s as *Site) as i32 {
+    if (cast(i64, s.src) != 0) { return 1; }
+    let is *d.IRFunction as src = _src_of(s.callee);
+    if (src.is_recursive != 0) { return 0; }
+    let is i32 as st with mut = 0;
+    let is i64 as est = cast(i64, _est_of(src, &st));
+    if (est >= cast(i64, INL_NEVER)) { return 0; }
+    // Optimization may come out a little bigger than the raw estimate said.
+    if (s.prio != 0 && est > s.thr + s.thr / 4 + 2) { return 0; }
+    // A callee the raw estimate called free that comes out bigger than the
+    // call is judged like any other site: by its threshold, and from then on
+    // it draws on the budget (prio != 0).
+    let is i64 as free_lim with mut = s.cost + 2;
+    if (_makes_call(src) == 0) { free_lim = free_lim + cast(i64, INL_LEAF_FREE); }
+    if (s.prio == 0 && est > free_lim) {
+        if (est > s.thr + s.thr / 4 + 2) { return 0; }
+        s.prio = 2;
+        if (s.inloop == 1) { s.prio = 1; }
+    }
+    s.src = src;
+    s.est = est;
+    s.sticky = cast(i64, st);
+    return 1;
+}
+
+// === Call sites ===
+
+struct Site {
+    callsite as *d.IRInst;
+    run as *d.IRInst;        // first SET_ARG feeding the call (0 = none)
+    pre as *d.IRInst;        // live instruction before the run, or 0
+    callee as *d.IRFunction;
+    src as *d.IRFunction;    // the body copied: the callee, or its optimized copy
+    chain as i64;            // index + 1 into the chain table, 0 = the caller's own call
+    est as i64;
+    sticky as i64;
+    thr as i64;
+    cost as i64;             // what the call itself costs: arguments + call + result
+    prio as i64;             // 0 = free, 1 = in a loop, 2 = elsewhere
+    pos as i64;
+    allow as i64;            // what calls inside this copy may still add
+    inloop as i64;           // 1: the call is inside a loop
+}
+
+// Chain of callees a copied call came through: entry k = (callee, parent,
+// depth, allowance). The allowance is what the copy may still grow by through
+// its own calls: inlining B (estimate b) at a site whose threshold is T leaves
+// T - b, so B's calls together stay within what B with them inlined would have
+// had to fit — the decision a callee-first order would have made.
+let is *i64 as _chain with mut = cast(*i64, 0);
+let is i64 as _chain_n with mut = 0;
+let is i64 as _chain_cap with mut = 0;
+let is PMap as _depth with mut;                     // *IRInst (copied call) -> chain index + 1
+
+let is *Site as _sites with mut = cast(*Site, 0);
+let is i64 as _sites_cap with mut = 0;
+
+fn _chain_add(callee as *d.IRFunction, parent as i64, depth as i64, allow as i64) as i64 {
+    if (_chain_n >= _chain_cap) {
+        let is i64 as nc with mut = _chain_cap * 2;
+        if (nc < 64) { nc = 64; }
+        let is *i64 as nb = cast(*i64, d.opt_alloc(nc * 32));
+        let is i64 as j with mut = 0;
+        while (j < _chain_n * 4) { nb[j] = _chain[j]; j = j + 1; }
+        if (cast(i64, _chain) != 0) { d.opt_free(cast(*u8, _chain)); }
+        _chain = nb;
+        _chain_cap = nc;
+    }
+    _chain[_chain_n * 4] = cast(i64, callee);
+    _chain[_chain_n * 4 + 1] = parent;
+    _chain[_chain_n * 4 + 2] = depth;
+    _chain[_chain_n * 4 + 3] = allow;
+    _chain_n = _chain_n + 1;
+    return _chain_n;
+}
+
+fn _chain_depth(c as i64) as i64 {
+    if (c == 0) { return 0; }
+    return _chain[(c - 1) * 4 + 2];
+}
+
+fn _chain_allow(c as i64) as i64 {
+    if (c == 0) { return cast(i64, INL_NEVER); }
+    return _chain[(c - 1) * 4 + 3];
+}
+
+fn _chain_has(c as i64, f as *d.IRFunction) as i32 {
+    let is i64 as k with mut = c;
+    while (k != 0) {
+        if (_chain[(k - 1) * 4] == cast(i64, f)) { return 1; }
+        k = _chain[(k - 1) * 4 + 1];
+    }
+    return 0;
+}
+
+fn _site_at(k as i64) as *Site {
+    return cast(*Site, cast(i64, _sites) + k * sizeof(Site));
+}
+
+fn _site_new(n as i64) as *Site {
+    if (n >= _sites_cap) {
+        let is i64 as nc with mut = _sites_cap * 2;
+        if (nc < 64) { nc = 64; }
+        let is *Site as nb = cast(*Site, d.opt_alloc(nc * sizeof(Site)));
+        let is i64 as j with mut = 0;
+        while (j < n * sizeof(Site)) {
+            let is *u8 as dp = cast(*u8, cast(i64, nb) + j);
+            let is *u8 as sp = cast(*u8, cast(i64, _sites) + j);
+            *dp = *sp;
+            j = j + 1;
+        }
+        if (cast(i64, _sites) != 0) { d.opt_free(cast(*u8, _sites)); }
+        _sites = nb;
+        _sites_cap = nc;
+    }
+    let is *Site as s = _site_at(n);
+    d.memzero(cast(*u8, s), sizeof(Site));
+    return s;
+}
+
+// Can f's body be copied into a caller at all?
+fn _callee_ok(f as *d.IRFunction, caller as *d.IRFunction) as i32 {
+    if (f.is_noinline == 1) { return 0; }
+    if (cast(i64, f) == 0 || cast(i64, f) == cast(i64, caller)) { return 0; }
+    if (cast(i64, f.instructions) == 0) { return 0; }
+    if (f.is_variadic != 0 || f.is_naked != 0 || f.is_recursive != 0) { return 0; }
+    if (f.live_inst_count <= 0 || f.live_inst_count > INL_RAW_CAP) { return 0; }
+    if (d.inline_callee_ok(f) == 0) { return 0; }
+    if (_noreturn(f) == 1) { return 0; }
+    if (_late_round == 0 && _is_late(f) == 1) { return 0; }
+    if (_reports(f) == 1) { return 0; }
+    return 1;
+}
+
+// Gather this round's call sites into _sites (in list order) and return their
+// count. *out_size receives the caller's own estimate (round 0 only matters).
+fn _collect(func as *d.IRFunction, round as i64, out_size as *i64) as i64 {
+    // Pass 1: positions of labels, loop extents (back edges), single defs.
+    let is i64 as ninst with mut = 0;
+    let is *d.IRInst as i with mut = func.instructions;
+    while (cast(i64, i) != 0) { ninst = ninst + 1; i = i.next; }
+    let is i64 as lc = cast(i64, func.label_count) + 1;
+    let is *i64 as lpos = cast(*i64, d.opt_alloc(lc * 8));
+    let is i64 as k with mut = 0;
+    while (k < lc) { lpos[k] = 0 - 1; k = k + 1; }
+    let is *i32 as loopd = cast(*i32, d.opt_alloc(ninst * 4 + 8));
+    k = 0;
+    while (k <= ninst) { loopd[k] = 0; k = k + 1; }
+    let is i64 as vc = cast(i64, func.vreg_count) + 1;
+    // def op of each vreg: -1 none, -2 several, else the opcode
+    let is *i32 as defop = cast(*i32, d.opt_alloc(vc * 4));
+    k = 0;
+    while (k < vc) { defop[k] = 0 - 1; k = k + 1; }
+    let is i64 as pos with mut = 0;
+    let is i64 as size with mut = 0;
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL && i.dest.label >= 0 && cast(i64, i.dest.label) < lc) { lpos[i.dest.label] = pos; }
+            if ((op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) && i.dest.op_type == d.OP_LABEL
+                && i.dest.label >= 0 && cast(i64, i.dest.label) < lc) {
+                let is i64 as h = lpos[i.dest.label];
+                if (h >= 0 && h < pos) { loopd[h] = loopd[h] + 1; loopd[pos] = loopd[pos] - 1; }
+            }
+            if (i.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY
+                && i.dest.vreg >= 0 && cast(i64, i.dest.vreg) < vc) {
+                if (defop[i.dest.vreg] == 0 - 1) { defop[i.dest.vreg] = op; } else { defop[i.dest.vreg] = 0 - 2; }
+            }
+            let is i32 as frame_traffic with mut = 0;
+            if (op == d.IR_LOAD && i.src1.op_type == d.OP_IMM) { frame_traffic = 1; }
+            if (op == d.IR_STORE && i.dest.op_type == d.OP_IMM) { frame_traffic = 1; }
+            if (op != d.IR_LABEL && op != d.IR_MOV && op != d.IR_IMM && op != d.IR_GET_ARG && frame_traffic == 0) { size = size + 1; }
+        }
+        pos = pos + 1;
+        i = i.next;
+    }
+    *out_size = size;
+
+    // Pass 2: the calls of this round, with their argument runs.
+    let is i64 as n with mut = 0;
+    let is i64 as depth_now with mut = 0;
+    let is *d.IRInst as run with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as before with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as last with mut = cast(*d.IRInst, 0);
+    pos = 0;
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        depth_now = depth_now + cast(i64, loopd[pos]);
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_SET_ARG) {
+                if (cast(i64, run) == 0) { run = i; before = last; }
+            } else if (op == d.IR_CALL) {
+                let is i64 as ch = _pm_get(&_depth, cast(i64, i));
+                if (_chain_depth(ch) == round && i.is_variadic_call == 0 && i.is_extern_call == 0
+                    && i.dest.op_type == d.OP_VREG) {
+                    let is *d.IRFunction as callee = _lookup(i.call_name_ptr, i.call_name_len);
+                    if (_callee_ok(callee, func) == 1 && _chain_has(ch, callee) == 0
+                        && (_late_round == 0 || round > 0 || _is_late(callee) == 1)) {
+                        let is i64 as nconst with mut = 0;
+                        let is *d.IRInst as a with mut = run;
+                        while (cast(i64, a) != 0 && cast(i64, a) != cast(i64, i)) {
+                            if (a.is_dead == 0 && a.src1.op_type == d.OP_VREG && a.src1.vreg >= 0
+                                && cast(i64, a.src1.vreg) < vc) {
+                                let is i32 as dop = defop[a.src1.vreg];
+                                if (dop == d.IR_IMM || dop == d.IR_ADDR_GLOBAL || dop == d.IR_FN_ADDR) { nconst = nconst + 1; }
+                            }
+                            a = a.next;
+                        }
+                        // a recursive function's body runs as often as a loop's
+                        let is i64 as hot with mut = depth_now;
+                        if (func.is_recursive != 0) { hot = hot + 1; }
+                        let is i64 as thr with mut = cast(i64, INL_BASE);
+                        if (hot >= 1) { thr = thr + cast(i64, INL_LOOP_BONUS); }
+                        if (hot >= 2) { thr = thr + cast(i64, INL_LOOP2_BONUS); }
+                        let is i64 as nrefs = _pm_get(&_refs, cast(i64, callee));
+                        if (nrefs == 1) { thr = thr + cast(i64, INL_SINGLE_BONUS); }
+                        if (nrefs == 2) { thr = thr + cast(i64, INL_DOUBLE_BONUS); }
+                        thr = thr + nconst * cast(i64, INL_CONST_BONUS);
+                        let is i64 as cost = cast(i64, callee.num_args) + 2;
+                        // Raw bodies are judged by the estimate of the raw body:
+                        // it leaves out what optimization removes, and it lands
+                        // within 20% of the optimized body's for most functions.
+                        // The optimized copy is only made for a site that is
+                        // taken (_take), not for every callee looked at.
+                        let is *d.IRFunction as src with mut = callee;
+                        let is i32 as st with mut = 0;
+                        let is i32 as est with mut = INL_NEVER;
+                        if (_raw_bodies == 1) { est = _est_raw_of(callee); src = cast(*d.IRFunction, 0); }
+                        else { est = _est_of(callee, &st); }
+                        if (est < INL_NEVER) {
+                            let is *Site as s = _site_new(n);
+                            s.callsite = i;
+                            s.run = run;
+                            s.pre = before;
+                            s.callee = callee;
+                            s.src = src;
+                            s.chain = ch;
+                            s.est = cast(i64, est);
+                            s.sticky = cast(i64, st);
+                            s.cost = cost;
+                            s.pos = pos;
+                            s.thr = thr;
+                            s.inloop = 0;
+                            if (hot >= 1) { s.inloop = 1; }
+                            if (s.est <= s.cost || (s.est <= s.cost + cast(i64, INL_LEAF_FREE) && _makes_call(callee) == 0)) { s.prio = 0; }
+                            else if (hot >= 1) { s.prio = 1; }
+                            else { s.prio = 2; }
+                            let is i64 as grow with mut = s.est - s.cost;
+                            if (grow < 0) { grow = 0; }
+                            let is i64 as pa = _chain_allow(ch);
+                            s.allow = s.thr - s.est;
+                            if (pa - grow < s.allow) { s.allow = pa - grow; }
+                            if (s.allow < 0) { s.allow = 0; }
+                            if (s.prio == 0 || (s.est <= s.thr && grow <= pa)) { n = n + 1; }
+                        }
+                    }
+                }
+                run = cast(*d.IRInst, 0);
+            } else {
+                run = cast(*d.IRInst, 0);
+            }
+            last = i;
+        }
+        pos = pos + 1;
+        i = i.next;
+    }
+    d.opt_free(cast(*u8, lpos));
+    d.opt_free(cast(*u8, loopd));
+    d.opt_free(cast(*u8, defop));
+    return n;
+}
+
+fn _site_before(a as *Site, b as *Site) as i32 {
+    if (a.prio != b.prio) { if (a.prio < b.prio) { return 1; } return 0; }
+    let is i64 as ga = a.est - a.cost;
+    let is i64 as gb = b.est - b.cost;
+    if (ga != gb) { if (ga < gb) { return 1; } return 0; }
+    if (a.pos < b.pos) { return 1; }
+    return 0;
+}
+
+// Order of the n collected sites (indices into _sites), by priority. Insertion
+// sort: the order must be total and stable for the output to be reproducible.
+fn _sort_sites(n as i64) as *i64 {
+    let is *i64 as ord = cast(*i64, d.opt_alloc(n * 8 + 8));
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is i64 as j with mut = k;
+        while (j > 0 && _site_before(_site_at(k), _site_at(ord[j - 1])) == 1) {
+            ord[j] = ord[j - 1];
+            j = j - 1;
+        }
+        ord[j] = k;
+        k = k + 1;
+    }
+    return ord;
+}
+
+// === Copying one callee in place of one call ===
+
+fn _align16(x as i64) as i64 { return (x + 15) & (0 - 16); }
+
+fn _next_live(i as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as k with mut = i.next;
+    while (cast(i64, k) != 0 && k.is_dead == 1) { k = k.next; }
+    return k;
+}
+
+fn _remap(o as *d.Operand, voff as i32, loff as i32) as void {
+    if (o.op_type == d.OP_VREG) { o.vreg = o.vreg + voff; }
+    else if (o.op_type == d.OP_LABEL) { o.label = o.label + loff; }
+}
+
+// Frame regions the copies were given, for compact_frame: (lo, hi] in frame
+// offsets below rbp (locals) or in the alloca area, in the order they were made
+// (ascending). The caller's own objects lie below _rg_base_loc / _rg_base_al.
+let is *d.IRFunction as _rg_func with mut = cast(*d.IRFunction, 0);
+let is *i64 as _rg with mut = cast(*i64, 0);       // (kind, lo, hi) triples; kind 0 = locals, 1 = alloca
+let is i64 as _rg_n with mut = 0;
+let is i64 as _rg_cap with mut = 0;
+let is i64 as _rg_base_loc with mut = 0;
+let is i64 as _rg_base_al with mut = 0;
+
+fn _rg_add(kind as i64, lo as i64, hi as i64) as void {
+    if (_rg_n >= _rg_cap) {
+        let is i64 as nc with mut = _rg_cap * 2;
+        if (nc < 32) { nc = 32; }
+        let is *i64 as nb = cast(*i64, d.opt_alloc(nc * 24));
+        let is i64 as j with mut = 0;
+        while (j < _rg_n * 3) { nb[j] = _rg[j]; j = j + 1; }
+        if (cast(i64, _rg) != 0) { d.opt_free(cast(*u8, _rg)); }
+        _rg = nb;
+        _rg_cap = nc;
+    }
+    _rg[_rg_n * 3] = kind;
+    _rg[_rg_n * 3 + 1] = lo;
+    _rg[_rg_n * 3 + 2] = hi;
+    _rg_n = _rg_n + 1;
+}
+
+fn _inline_site(func as *d.IRFunction, s as *Site) as i32 {
+    let is *d.IRFunction as g = s.src;
+    let is *d.IRInst as callinst = s.callsite;
+    let is i32 as na = g.num_args;
+
+    // What the copy needs, checked on the body as it is now.
+    let is i64 as loc_max with mut = 0;
+    let is i64 as loc_min with mut = 0;
+    let is i64 as al_max with mut = 0;
+    // Label ids are program-wide (the generator numbers on across functions),
+    // so label_count is a bound, not a count: the copy takes the span its
+    // labels really use, renumbered from the caller's bound.
+    let is i32 as lab_lo with mut = 0 - 1;
+    let is i32 as lab_hi with mut = 0 - 1;
+    let is *d.IRInst as ci with mut = g.instructions;
+    while (cast(i64, ci) != 0) {
+        if (ci.is_dead == 0) {
+            let is i32 as op = ci.op;
+            if (ci.dest.op_type == d.OP_LABEL) {
+                if (lab_lo < 0 || ci.dest.label < lab_lo) { lab_lo = ci.dest.label; }
+                if (ci.dest.label > lab_hi) { lab_hi = ci.dest.label; }
+            }
+            if (ci.src1.op_type == d.OP_LABEL) {
+                if (lab_lo < 0 || ci.src1.label < lab_lo) { lab_lo = ci.src1.label; }
+                if (ci.src1.label > lab_hi) { lab_hi = ci.src1.label; }
+            }
+            if (ci.src2.op_type == d.OP_LABEL) {
+                if (lab_lo < 0 || ci.src2.label < lab_lo) { lab_lo = ci.src2.label; }
+                if (ci.src2.label > lab_hi) { lab_hi = ci.src2.label; }
+            }
+            let is i64 as off with mut = 0 - 1;
+            if (op == d.IR_LOAD && ci.src1.op_type == d.OP_IMM) { off = ci.src1.imm; }
+            if (op == d.IR_STORE && ci.dest.op_type == d.OP_IMM) { off = ci.dest.imm; }
+            if (op == d.IR_ADDR && ci.src1.op_type == d.OP_IMM) { off = ci.src1.imm; }
+            if (off >= 0) {
+                if (off > loc_max) { loc_max = off; }
+                if (loc_min == 0 || off < loc_min) { loc_min = off; }
+            }
+            if (op == d.IR_GET_ALLOC_ADDR) {
+                if (ci.src1.op_type != d.OP_IMM || ci.src1.imm <= 0) { return 0; }
+                if (ci.src1.imm > al_max) { al_max = ci.src1.imm; }
+            }
+            if (op == d.IR_ASM && _is_stack_adjust(ci) == 0) { return 0; }
+            if (op == d.IR_VA_START || op == d.IR_PHI) { return 0; }
+            if (op == d.IR_GET_ARG && (ci.src1.imm < 0 || ci.src1.imm >= cast(i64, na))) { return 0; }
+        }
+        ci = ci.next;
+    }
+    // Offsets 0..48 hold the callee-saved pushes; nothing of the body lives there.
+    if (loc_max > 0 && loc_min <= 48) { return 0; }
+    // -g keeps locals in memory for the debugger; leave such bodies out of line.
+    if ((loc_max > 0 || al_max > 0) && tgt.debug_get() == 1) { return 0; }
+
+    // The arguments: one SET_ARG per parameter, in the run right before the call.
+    let is *i32 as argv = cast(*i32, d.opt_alloc(cast(i64, na) * 4 + 8));
+    let is *d.IRInst as kill_pre with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as kill_post with mut = cast(*d.IRInst, 0);
+    let is i32 as ok with mut = 1;
+    let is i32 as a with mut = 0;
+    while (a < na) { argv[a] = 0 - 1; a = a + 1; }
+    let is i32 as seen with mut = 0;
+    let is *d.IRInst as r with mut = s.run;
+    while (cast(i64, r) != 0 && cast(i64, r) != cast(i64, callinst)) {
+        if (r.is_dead == 0) {
+            let is i64 as idx = r.dest.imm;
+            if (r.op != d.IR_SET_ARG || r.dest.op_type != d.OP_IMM || idx < 0 || idx >= cast(i64, na)
+                || r.src1.op_type != d.OP_VREG) { ok = 0; }
+            else if (argv[idx] >= 0) { ok = 0; }
+            else { argv[idx] = r.src1.vreg; seen = seen + 1; }
+        }
+        r = r.next;
+    }
+    if (seen != na) { ok = 0; }
+    // More than six arguments: the extra ones went on the machine stack, between
+    // a `sub rsp, 8` (odd count) and the `add rsp, N` after the call.
+    // With a float argument the stack ones are those placed there (src2 6..99,
+    // see g.abi_codes), not every position past the sixth.
+    let is i32 as stk with mut = 0;
+    if (na > 6) { stk = na - 6; }
+    let is i32 as placed with mut = 0;
+    let is *d.IRInst as sp with mut = s.pre;
+    while (cast(i64, sp) != 0 && cast(i64, sp) != cast(i64, callinst)) {
+        if (sp.is_dead == 0 && sp.op == d.IR_SET_ARG && sp.src2.op_type == d.OP_IMM) {
+            if (placed == 0) { stk = 0; placed = 1; }
+            if (sp.src2.imm >= 6 && sp.src2.imm < 100) { stk = stk + 1; }
+        }
+        sp = sp.next;
+    }
+    if (ok == 1 && stk > 0) {
+        let is i32 as pad = stk % 2;
+        let is *d.IRInst as nx = _next_live(callinst);
+        if (cast(i64, nx) == 0 || nx.op != d.IR_ASM || _is_stack_adjust(nx) == 0) { ok = 0; }
+        else {
+            let is i64 as want = cast(i64, (stk + pad) * 8);
+            let is i64 as got with mut = 0;
+            let is i32 as q with mut = 9;
+            if (nx.asm_str_len <= 9 || nx.asm_str_ptr[0] != 97) { ok = 0; }
+            while (ok == 1 && q < nx.asm_str_len) { got = got * 10 + cast(i64, nx.asm_str_ptr[q]) - 48; q = q + 1; }
+            if (got != want) { ok = 0; }
+            kill_post = nx;
+        }
+        if (ok == 1 && pad == 1) {
+            let is *d.IRInst as pr = s.pre;
+            if (cast(i64, pr) == 0 || pr.op != d.IR_ASM || pr.asm_str_len != 10 || _is_stack_adjust(pr) == 0) { ok = 0; }
+            kill_pre = pr;
+        }
+    }
+    if (ok == 0) { d.opt_free(cast(*u8, argv)); return 0; }
+
+    // Room in the caller's frame.
+    let is i64 as shift_loc with mut = 0;
+    if (loc_max > 0) {
+        let is i64 as lo = _align16(cast(i64, func.stack_size));
+        shift_loc = lo - 48;
+        func.stack_size = cast(i32, loc_max + shift_loc);
+        _rg_add(0, lo, loc_max + shift_loc);
+    }
+    let is i64 as shift_al with mut = 0;
+    if (al_max > 0) {
+        shift_al = _align16(cast(i64, func.alloc_stack_size));
+        func.alloc_stack_size = cast(i32, _align16(al_max + shift_al));
+        _rg_add(1, shift_al, al_max + shift_al);
+    }
+
+    let is i32 as voff = func.vreg_count;
+    let is i32 as span with mut = 0;
+    if (lab_lo >= 0) { span = lab_hi - lab_lo + 1; }
+    else { lab_lo = 0; }
+    let is i32 as loff = func.label_count - lab_lo;
+    let is i32 as after = func.label_count + span;
+    func.label_count = after + 1;
+    func.vreg_count = func.vreg_count + g.vreg_count;
+    let is i64 as ndepth = _chain_depth(s.chain) + 1;
+    let is i64 as nchain = _chain_add(s.callee, s.chain, ndepth, s.allow);
+
+    // The last live instruction: a return there falls into `after` by itself.
+    let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
+    ci = g.instructions;
+    while (cast(i64, ci) != 0) { if (ci.is_dead == 0) { tail = ci; } ci = ci.next; }
+
+    let is *d.IRInst as ch with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as ct with mut = cast(*d.IRInst, 0);
+    ci = g.instructions;
+    while (cast(i64, ci) != 0) {
+        if (ci.is_dead == 0) {
+            let is *d.IRInst as x with mut = cast(*d.IRInst, 0);
+            if (ci.op == d.IR_GET_ARG) {
+                x = d.new_inst(d.IR_MOV);
+                x.dest = d.op_vreg(ci.dest.vreg + voff);
+                x.src1 = d.op_vreg(argv[cast(i32, ci.src1.imm)]);
+                x.cast_to = ci.cast_to;
+                x.line = ci.line;
+            } else if (ci.op == d.IR_RET) {
+                if (ci.src1.op_type == d.OP_VREG) {
+                    x = d.new_inst(d.IR_MOV);
+                    x.dest = d.op_vreg(callinst.dest.vreg);
+                    x.src1 = d.op_vreg(ci.src1.vreg + voff);
+                    x.line = ci.line;
+                } else if (ci.src1.op_type == d.OP_IMM) {
+                    x = d.new_inst(d.IR_IMM);
+                    x.dest = d.op_vreg(callinst.dest.vreg);
+                    x.src1 = d.op_imm(ci.src1.imm);
+                    x.line = ci.line;
+                }
+                if (cast(i64, x) != 0) {
+                    if (cast(i64, ch) == 0) { ch = x; } else { ct.next = x; }
+                    ct = x;
+                }
+                x = cast(*d.IRInst, 0);
+                if (cast(i64, ci) != cast(i64, tail)) {
+                    x = d.new_inst(d.IR_JMP);
+                    x.dest = d.op_label(after);
+                    x.line = ci.line;
+                }
+            } else {
+                x = d.new_inst(d.IR_IMM);
+                _copy_inst(x, ci);
+                _remap(&x.dest, voff, loff);
+                _remap(&x.src1, voff, loff);
+                _remap(&x.src2, voff, loff);
+                let is i32 as op = ci.op;
+                if (op == d.IR_LOAD && ci.src1.op_type == d.OP_IMM) { x.src1.imm = ci.src1.imm + shift_loc; }
+                if (op == d.IR_STORE && ci.dest.op_type == d.OP_IMM) { x.dest.imm = ci.dest.imm + shift_loc; }
+                if (op == d.IR_ADDR && ci.src1.op_type == d.OP_IMM) { x.src1.imm = ci.src1.imm + shift_loc; }
+                if (op == d.IR_GET_ALLOC_ADDR) { x.src1.imm = ci.src1.imm + shift_al; }
+                if (op == d.IR_CALL) { _pm_put(&_depth, cast(i64, x), nchain); }
+            }
+            if (cast(i64, x) != 0) {
+                if (cast(i64, ch) == 0) { ch = x; } else { ct.next = x; }
+                ct = x;
+            }
+        }
+        ci = ci.next;
+    }
+    let is *d.IRInst as lbl = d.new_inst(d.IR_LABEL);
+    lbl.dest = d.op_label(after);
+    lbl.line = callinst.line;
+    if (cast(i64, ch) == 0) { ch = lbl; } else { ct.next = lbl; }
+    ct = lbl;
+
+    // The argument run, the stack adjustments and the call itself go dead; the
+    // copy goes right after the (dead) call.
+    r = s.run;
+    while (cast(i64, r) != 0 && cast(i64, r) != cast(i64, callinst)) { r.is_dead = 1; r = r.next; }
+    if (cast(i64, kill_pre) != 0) { kill_pre.is_dead = 1; }
+    if (cast(i64, kill_post) != 0) { kill_post.is_dead = 1; }
+    callinst.is_dead = 1;
+    ct.next = callinst.next;
+    callinst.next = ch;
+    d.opt_free(cast(*u8, argv));
+    return 1;
+}
+
+// Copy every field of an instruction (whatever the struct holds), then make
+// it a fresh, live, unlinked node.
+fn _copy_inst(dst as *d.IRInst, src as *d.IRInst) as void {
+    core.memcpy(cast(*u8, dst), cast(*u8, src), sizeof(d.IRInst));
+    dst.next = cast(*d.IRInst, 0);
+    dst.is_dead = 0;
+}
+
+fn pass_inline_o2(func as *d.IRFunction, prog as *u8) as void {
+    _rg_func = func;
+    _rg_n = 0;
+    _rg_base_loc = cast(i64, func.stack_size);
+    _rg_base_al = cast(i64, func.alloc_stack_size);
+    if (func.is_naked != 0 || cast(i64, func.instructions) == 0) { return; }
+    _ensure_tables(prog);
+    _pm_clear(&_depth);
+    _chain_n = 0;
+
+    let is i64 as budget with mut = 0;
+    let is i64 as lbudget with mut = 0;
+    let is i64 as frame_used with mut = 0;
+    let is i64 as round with mut = 0;
+    while (round <= cast(i64, INL_MAX_DEPTH)) {
+        let is i64 as size with mut = 0;
+        let is i64 as n = _collect(func, round, &size);
+        if (round == 0) {
+            budget = cast(i64, INL_GROWTH_MIN) + size * cast(i64, INL_GROWTH_PCT) / 100;
+            if (budget > cast(i64, INL_GROWTH_MAX)) { budget = cast(i64, INL_GROWTH_MAX); }
+            lbudget = cast(i64, INL_LOOP_GROWTH_MAX) - size / 2;
+            if (lbudget < 0) { lbudget = 0; }
+        }
+        if (n == 0) { round = cast(i64, INL_MAX_DEPTH) + 1; }
+        else {
+            let is *i64 as ord = _sort_sites(n);
+            let is i64 as done with mut = 0;
+            let is i64 as k with mut = 0;
+            while (k < n) {
+                let is *Site as s = _site_at(ord[k]);
+                let is i64 as grow with mut = s.est - s.cost;
+                if (grow < 0) { grow = 0; }
+                let is i32 as go with mut = 1;
+                let is i64 as avail with mut = budget;
+                if (s.prio == 1) { avail = budget + lbudget; }
+                if (s.prio != 0 && grow > avail) { go = 0; }
+                if (go == 1 && _take(s) == 0) { go = 0; }
+                if (go == 1) {
+                    grow = s.est - s.cost;
+                    if (grow < 0) { grow = 0; }
+                    avail = budget;
+                    if (s.prio == 1 && _is_leaf(s.src) == 1) { avail = budget + lbudget; }
+                    if (s.prio != 0 && grow > avail) { go = 0; }
+                    if (cast(i64, func.vreg_count) + cast(i64, s.src.vreg_count) > cast(i64, INL_VREG_CAP)) { go = 0; }
+                    if (s.sticky > 0 && (s.sticky > cast(i64, INL_FRAME_ONE) || frame_used + s.sticky > cast(i64, INL_FRAME_ALL))) { go = 0; }
+                }
+                if (go == 1 && _inline_site(func, s) == 1) {
+                    let is i64 as rest with mut = grow;
+                    if (s.prio == 1 && _is_leaf(s.src) == 1) {
+                        if (rest > lbudget) { rest = rest - lbudget; lbudget = 0; }
+                        else { lbudget = lbudget - rest; rest = 0; }
+                    }
+                    budget = budget - rest;
+                    if (budget < 0) { budget = 0; }
+                    frame_used = frame_used + s.sticky;
+                    done = done + 1;
+                }
+                k = k + 1;
+            }
+            d.opt_free(cast(*u8, ord));
+            if (done == 0) { round = cast(i64, INL_MAX_DEPTH) + 1; }
+            else { round = round + 1; }
+        }
+    }
+}
+
+// === Frame compaction after the caller is optimized ===
+//
+// Each copied callee got a region of its own; once the caller is optimized,
+// most of them are referenced by nothing (their scalars became registers).
+// Slide the live regions down over the dead ones, each by a multiple of 16,
+// and shrink the frame to what is left. The caller's own region stays as is.
+
+fn _region_of(kind as i64, off as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < _rg_n) {
+        if (_rg[k * 3] == kind && off > _rg[k * 3 + 1] && off <= _rg[k * 3 + 2]) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+fn compact_frame(func as *d.IRFunction) as void {
+    if (cast(i64, _rg_func) != cast(i64, func) || _rg_n == 0) { return; }
+    // Deepest live reference in each region.
+    let is *i64 as top = cast(*i64, d.opt_alloc(_rg_n * 8));
+    let is *i64 as shift = cast(*i64, d.opt_alloc(_rg_n * 8));
+    let is i64 as k with mut = 0;
+    while (k < _rg_n) { top[k] = 0; shift[k] = 0; k = k + 1; }
+    let is i64 as free_top with mut = 0;
+    let is *d.IRInst as i with mut = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            let is i64 as kind with mut = 0 - 1;
+            let is i64 as off with mut = 0;
+            if (op == d.IR_LOAD && i.src1.op_type == d.OP_IMM) { kind = 0; off = i.src1.imm; }
+            if (op == d.IR_STORE && i.dest.op_type == d.OP_IMM) { kind = 0; off = i.dest.imm; }
+            if (op == d.IR_ADDR && i.src1.op_type == d.OP_IMM) { kind = 0; off = i.src1.imm; }
+            if (op == d.IR_GET_ALLOC_ADDR && i.src1.op_type == d.OP_IMM) { kind = 1; off = i.src1.imm; }
+            if (kind >= 0) {
+                let is i64 as rg = _region_of(kind, off);
+                if (rg >= 0 && off > top[rg]) { top[rg] = off; }
+                // a slot past every region (opt_sroa gives an object of the
+                // alloca area slots there) stays where it is
+                if (rg < 0 && kind == 0 && off > free_top) { free_top = off; }
+            }
+        }
+        i = i.next;
+    }
+    // New placement, region by region in the order they were made (ascending).
+    let is i64 as end_loc with mut = _rg_base_loc;
+    let is i64 as end_al with mut = _rg_base_al;
+    k = 0;
+    while (k < _rg_n) {
+        let is i64 as lo = _rg[k * 3 + 1];
+        if (top[k] > 0) {
+            if (_rg[k * 3] == 0) {
+                let is i64 as nlo = _align16(end_loc);
+                shift[k] = nlo - lo;
+                end_loc = top[k] + shift[k];
+            } else {
+                let is i64 as nlo = _align16(end_al);
+                shift[k] = nlo - lo;
+                end_al = top[k] + shift[k];
+            }
+        }
+        k = k + 1;
+    }
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LOAD && i.src1.op_type == d.OP_IMM) {
+                let is i64 as rg = _region_of(0, i.src1.imm);
+                if (rg >= 0) { i.src1.imm = i.src1.imm + shift[rg]; }
+            }
+            if (op == d.IR_STORE && i.dest.op_type == d.OP_IMM) {
+                let is i64 as rg = _region_of(0, i.dest.imm);
+                if (rg >= 0) { i.dest.imm = i.dest.imm + shift[rg]; }
+            }
+            if (op == d.IR_ADDR && i.src1.op_type == d.OP_IMM) {
+                let is i64 as rg = _region_of(0, i.src1.imm);
+                if (rg >= 0) { i.src1.imm = i.src1.imm + shift[rg]; }
+            }
+            if (op == d.IR_GET_ALLOC_ADDR && i.src1.op_type == d.OP_IMM) {
+                let is i64 as rg = _region_of(1, i.src1.imm);
+                if (rg >= 0) { i.src1.imm = i.src1.imm + shift[rg]; }
+            }
+        }
+        i = i.next;
+    }
+    if (free_top > end_loc) { end_loc = free_top; }
+    func.stack_size = cast(i32, end_loc);
+    if (end_al > _rg_base_al) { func.alloc_stack_size = cast(i32, _align16(end_al)); }
+    else { func.alloc_stack_size = cast(i32, _rg_base_al); }
+    d.opt_free(cast(*u8, top));
+    d.opt_free(cast(*u8, shift));
+    _rg_n = 0;
+    _rg_func = cast(*d.IRFunction, 0);
+}
+
+// === Bottom-up order for the whole-program inline phase ===
+//
+// Callees before their callers (depth-first post-order over the call graph,
+// roots in program order), so a function is copied with its own calls already
+// inlined. Functions on a cycle come out in DFS order. Returns an array of the
+// reachable functions; *out_n receives its length.
+fn inline_order(prog as *u8, out_n as *i32) as **d.IRFunction {
+    _ensure_tables(prog);
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    let is i64 as nf with mut = 0;
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) { nf = nf + 1; f = f.next; }
+    let is **d.IRFunction as out = cast(**d.IRFunction, d.opt_alloc(nf * 8 + 8));
+    let is i64 as no with mut = 0;
+    // state: absent = unseen, 1 = on the stack, 2 = done
+    let is PMap as st with mut;
+    st.cap = 0; st.n = 0;
+    _pm_alloc(&st, 64);
+    // explicit stack of (function, next call-target index)
+    let is *i64 as stk_f = cast(*i64, d.opt_alloc(nf * 8 + 8));
+    let is *i64 as stk_k = cast(*i64, d.opt_alloc(nf * 8 + 8));
+    let is i64 as sp with mut = 0;
+    let is *d.IRFunction as root with mut = p.functions;
+    while (cast(i64, root) != 0) {
+        if (root.is_reachable == 1 && _pm_get(&st, cast(i64, root)) == 0) {
+            _pm_put(&st, cast(i64, root), 1);
+            stk_f[0] = cast(i64, root); stk_k[0] = 0; sp = 1;
+            while (sp > 0) {
+                let is *d.IRFunction as cur = cast(*d.IRFunction, stk_f[sp - 1]);
+                let is i64 as kk = stk_k[sp - 1];
+                if (cast(i64, cur.call_targets) != 0 && kk < cast(i64, cur.call_target_count)) {
+                    stk_k[sp - 1] = kk + 1;
+                    let is *i64 as pp = cast(*i64, cast(i64, cur.call_targets) + kk * 12);
+                    let is *i32 as pl = cast(*i32, cast(i64, cur.call_targets) + kk * 12 + 8);
+                    let is *d.IRFunction as t = _lookup(cast(*u8, *pp), *pl);
+                    if (cast(i64, t) != 0 && t.is_reachable == 1 && _pm_get(&st, cast(i64, t)) == 0 && sp < nf) {
+                        _pm_put(&st, cast(i64, t), 1);
+                        stk_f[sp] = cast(i64, t); stk_k[sp] = 0; sp = sp + 1;
+                    }
+                } else {
+                    _pm_put(&st, cast(i64, cur), 2);
+                    out[no] = cur; no = no + 1;
+                    sp = sp - 1;
+                }
+            }
+        }
+        root = root.next;
+    }
+    d.opt_free(cast(*u8, stk_f));
+    d.opt_free(cast(*u8, stk_k));
+    d.opt_free(cast(*u8, st.keys));
+    d.opt_free(cast(*u8, st.vals));
+    *out_n = cast(i32, no);
+    return out;
+}
+
+// A new program: every table describes the old one.
+fn reset() as void {
+    _prog = cast(*u8, 0);
+    _rg_n = 0;
+    _rg_func = cast(*d.IRFunction, 0);
+}

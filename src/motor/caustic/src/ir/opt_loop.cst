@@ -1,0 +1,245 @@
+use "defs.cst" as d;
+
+// === Function Inlining (-O1) ===
+
+// Check if callee has stack ops that survived mem2reg.
+// After mem2reg, only address-taken vars, arrays, and large structs keep stack references.
+// Inlining such functions would corrupt stack offsets (callee offsets clash with caller frame).
+fn inline_has_stack_ops(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) { return 1; }
+            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) { return 1; }
+            if (inst.op == d.IR_ADDR && inst.src1.op_type == d.OP_IMM) { return 1; }
+            if (inst.op == d.IR_GET_ALLOC_ADDR) { return 1; }
+        }
+        inst = inst.next;
+    }
+    return 0;
+}
+
+// Check if the callee's body contains inline asm.
+//
+// An `asm` body cannot be duplicated. Two reasons, and either one alone is
+// fatal:
+//
+//   * A label defined inside the asm text (`.Lhop:`) becomes a label defined
+//     TWICE in the emitted .s. The assembler's symbol table is keyed by name
+//     with no per-function scope, so the first definition wins in silence and
+//     every later jump to that name lands in the other copy — usually inside a
+//     different function entirely.
+//   * The text is written against the callee's own entry conditions: arguments
+//     in rdi/rsi/..., and a `ret` that is supposed to return from the CALLEE.
+//     Inlined, that `ret` returns from the caller, mid-expression.
+//
+// This is what made every threaded program segfault at -O1: std/thread's
+// `_clone_thread` is a `naked` asm trampoline, and `alloc_stack_size == 0`
+// below — meant to exclude functions with a frame — is precisely what a naked
+// function satisfies no matter how many arguments it takes.
+fn inline_has_asm(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_ASM) { return 1; }
+        inst = inst.next;
+    }
+    return 0;
+}
+
+fn inline_count_insts(func as *d.IRFunction) as i32 {
+    let is i32 as count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) { count = count + 1; }
+        inst = inst.next;
+    }
+    return count;
+}
+
+fn inline_name_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+
+    // Pre-scan: count calls per callee name for per-callee limit.
+    // inline_counts[i] = count of inlines for callee i (tracked by ptr).
+    // Using parallel arrays: ic_ptrs[i] = callee ptr, ic_counts[i] = count, max 64.
+    let is [512]u8 as ic_ptrs;
+    let is [256]u8 as ic_cnts;
+    let is i32 as ic_len with mut = 0;
+
+    let is *d.IRInst as inst with mut = func.instructions;
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    while (cast(i64, inst) != 0) {
+        let is *d.IRInst as next_inst with mut = inst.next;
+        if (inst.is_dead == 0 && inst.op == d.IR_CALL && inst.is_variadic_call == 0) {
+            // Find callee
+            let is *d.IRFunction as callee with mut = p.functions;
+            let is *d.IRFunction as found with mut = cast(*d.IRFunction, 0);
+            while (cast(i64, callee) != 0) {
+                if (inline_name_eq(callee.asm_name_ptr, callee.asm_name_len, inst.call_name_ptr, inst.call_name_len) == 1) {
+                    found = callee;
+                    callee = cast(*d.IRFunction, 0);
+                } else { callee = callee.next; }
+            }
+            // `is_naked` AND `has_asm`, not one or the other. A naked function
+            // whose asm carries no label still ends its body with a `ret` that
+            // belongs to the callee; an ordinary function with a labelled asm
+            // still duplicates the label. Both were reproduced.
+            if (cast(i64, found) != 0 && cast(i64, found) != cast(i64, func) && found.is_variadic == 0 && found.is_naked == 0 && found.has_asm == 0 && found.alloc_stack_size == 0 && found.num_args <= 6 && found.has_stack_ops == 0 && d.inline_callee_ok(found) == 1) {
+                let is i32 as callee_size = found.live_inst_count;
+                if (callee_size > 0 && callee_size <= 60) {
+                    let is i32 as is_recursive = found.is_recursive;
+                    // Per-callee limit: lookup count in ic arrays (O(1) per call, not O(n) rescan)
+                    let is i32 as already_inlined with mut = 0;
+                    let is i64 as fptr = cast(i64, found);
+                    let is i32 as ic_i with mut = 0;
+                    while (ic_i < ic_len) {
+                        let is *i64 as kp = cast(*i64, cast(i64, &ic_ptrs) + cast(i64, ic_i) * 8);
+                        if (*kp == fptr) { let is *i32 as cp = cast(*i32, cast(i64, &ic_cnts) + cast(i64, ic_i) * 4); already_inlined = *cp; ic_i = ic_len; }
+                        else { ic_i = ic_i + 1; }
+                    }
+                    let is i32 as max_inline with mut = 4;
+                    if (callee_size <= 15) { max_inline = 8; }
+                    if (is_recursive == 0 && already_inlined < max_inline && func.vreg_count + found.vreg_count <= 512) {
+                        let is i32 as vreg_off = func.vreg_count;
+                        let is i32 as label_off = func.label_count;
+                        let is i32 as after_lbl = func.label_count;
+                        func.label_count = func.label_count + 1 + found.label_count;
+                        func.vreg_count = func.vreg_count + found.vreg_count;
+
+                        // Collect SET_ARG feeding this CALL
+                        let is [6]i32 as arg_vregs;
+                        let is i32 as ai with mut = 0;
+                        while (ai < 6) { arg_vregs[ai] = cast(i32, 0 - 1); ai = ai + 1; }
+                        let is *d.IRInst as sa with mut = func.instructions;
+                        while (cast(i64, sa) != 0) {
+                            if (sa.is_dead == 0 && sa.op == d.IR_SET_ARG) {
+                                let is *d.IRInst as sn with mut = sa.next;
+                                let is i32 as feeds with mut = 0;
+                                while (cast(i64, sn) != 0 && feeds == 0) {
+                                    if (sn.is_dead == 0) {
+                                        if (cast(i64, sn) == cast(i64, inst)) { feeds = 1; }
+                                        else if (sn.op != d.IR_SET_ARG) { sn = cast(*d.IRInst, 0); }
+                                        else { sn = sn.next; }
+                                    } else { sn = sn.next; }
+                                }
+                                if (feeds == 1) {
+                                    let is i32 as idx = cast(i32, sa.dest.imm);
+                                    if (idx >= 0 && idx < 6) { arg_vregs[idx] = sa.src1.vreg; }
+                                    sa.is_dead = 1;
+                                }
+                            }
+                            sa = sa.next;
+                        }
+
+                        // Clone callee body
+                        let is *d.IRInst as ch with mut = cast(*d.IRInst, 0);
+                        let is *d.IRInst as ct with mut = cast(*d.IRInst, 0);
+                        d.func_open(found);
+                        let is *d.IRInst as ci with mut = found.instructions;
+                        while (cast(i64, ci) != 0) {
+                            if (ci.is_dead == 0) {
+                                if (ci.op == d.IR_GET_ARG) {
+                                    let is i32 as aidx = cast(i32, ci.src1.imm);
+                                    if (aidx >= 0 && aidx < 6 && arg_vregs[aidx] >= 0) {
+                                        let is *d.IRInst as m = d.new_inst(d.IR_MOV);
+                                        m.dest = d.op_vreg(ci.dest.vreg + vreg_off);
+                                        m.src1 = d.op_vreg(arg_vregs[aidx]);
+                                        m.line = ci.line;
+                                        if (cast(i64, ch) == 0) { ch = m; ct = m; } else { ct.next = m; ct = m; }
+                                    }
+                                } else if (ci.op == d.IR_RET) {
+                                    if (ci.src1.op_type == d.OP_VREG) {
+                                        let is *d.IRInst as mr = d.new_inst(d.IR_MOV);
+                                        mr.dest = d.op_vreg(inst.dest.vreg);
+                                        mr.src1 = d.op_vreg(ci.src1.vreg + vreg_off);
+                                        mr.line = ci.line;
+                                        if (cast(i64, ch) == 0) { ch = mr; ct = mr; } else { ct.next = mr; ct = mr; }
+                                    } else if (ci.src1.op_type == d.OP_IMM) {
+                                        let is *d.IRInst as mi = d.new_inst(d.IR_IMM);
+                                        mi.dest = d.op_vreg(inst.dest.vreg);
+                                        mi.src1 = d.op_imm(ci.src1.imm);
+                                        mi.line = ci.line;
+                                        if (cast(i64, ch) == 0) { ch = mi; ct = mi; } else { ct.next = mi; ct = mi; }
+                                    }
+                                    let is *d.IRInst as ja = d.new_inst(d.IR_JMP);
+                                    ja.dest = d.op_label(after_lbl);
+                                    ja.line = ci.line;
+                                    if (cast(i64, ch) == 0) { ch = ja; ct = ja; } else { ct.next = ja; ct = ja; }
+                                } else {
+                                    let is *d.IRInst as cl = d.new_inst(ci.op);
+                                    cl.line = ci.line;
+                                    cl.asm_str_ptr = ci.asm_str_ptr;
+                                    cl.asm_str_len = ci.asm_str_len;
+                                    cl.call_name_ptr = ci.call_name_ptr;
+                                    cl.call_name_len = ci.call_name_len;
+                                    cl.is_variadic_call = ci.is_variadic_call;
+                                    cl.is_extern_call = ci.is_extern_call;
+                                    cl.global_name_ptr = ci.global_name_ptr;
+                                    cl.global_name_len = ci.global_name_len;
+                                    cl.is_extern_global = ci.is_extern_global;
+                                    cl.cast_to = ci.cast_to;
+                                    cl.cast_from = ci.cast_from;
+                                    cl.dest.op_type = ci.dest.op_type;
+                                    if (ci.dest.op_type == d.OP_VREG) { cl.dest.vreg = ci.dest.vreg + vreg_off; }
+                                    else if (ci.dest.op_type == d.OP_IMM) { cl.dest.imm = ci.dest.imm; }
+                                    else if (ci.dest.op_type == d.OP_LABEL) { cl.dest.label = ci.dest.label + label_off + 1; }
+                                    cl.src1.op_type = ci.src1.op_type;
+                                    if (ci.src1.op_type == d.OP_VREG) { cl.src1.vreg = ci.src1.vreg + vreg_off; }
+                                    else if (ci.src1.op_type == d.OP_IMM) { cl.src1.imm = ci.src1.imm; }
+                                    else if (ci.src1.op_type == d.OP_LABEL) { cl.src1.label = ci.src1.label + label_off + 1; }
+                                    cl.src2.op_type = ci.src2.op_type;
+                                    if (ci.src2.op_type == d.OP_VREG) { cl.src2.vreg = ci.src2.vreg + vreg_off; }
+                                    else if (ci.src2.op_type == d.OP_IMM) { cl.src2.imm = ci.src2.imm; }
+                                    else if (ci.src2.op_type == d.OP_LABEL) { cl.src2.label = ci.src2.label + label_off + 1; }
+                                    if ((ci.op == d.IR_STORE || ci.op == d.IR_COPY) && ci.dest.op_type == d.OP_VREG) { cl.dest.vreg = ci.dest.vreg + vreg_off; }
+                                    if (cast(i64, ch) == 0) { ch = cl; ct = cl; } else { ct.next = cl; ct = cl; }
+                                }
+                            }
+                            ci = ci.next;
+                        }
+
+                        if (cast(i64, ch) != 0) {
+                            let is *d.IRInst as lbl = d.new_inst(d.IR_LABEL);
+                            lbl.dest = d.op_label(after_lbl);
+                            ct.next = lbl;
+                            ct = lbl;
+                            ct.next = inst.next;
+                            if (cast(i64, prev) != 0) { prev.next = ch; } else { func.instructions = ch; }
+                            inst.is_dead = 1;
+                            inst = ct;
+                            next_inst = inst.next;
+                            // Update per-callee counter
+                            let is i32 as ic_found with mut = 0;
+                            ic_i = 0;
+                            while (ic_i < ic_len) {
+                                let is *i64 as kp = cast(*i64, cast(i64, &ic_ptrs) + cast(i64, ic_i) * 8);
+                                if (*kp == fptr) {
+                                    let is *i32 as cp = cast(*i32, cast(i64, &ic_cnts) + cast(i64, ic_i) * 4);
+                                    *cp = *cp + 1;
+                                    ic_found = 1;
+                                    ic_i = ic_len;
+                                } else { ic_i = ic_i + 1; }
+                            }
+                            if (ic_found == 0 && ic_len < 64) {
+                                let is *i64 as kp = cast(*i64, cast(i64, &ic_ptrs) + cast(i64, ic_len) * 8);
+                                *kp = fptr;
+                                let is *i32 as cp = cast(*i32, cast(i64, &ic_cnts) + cast(i64, ic_len) * 4);
+                                *cp = 1;
+                                ic_len = ic_len + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        prev = inst;
+        inst = next_inst;
+    }
+}

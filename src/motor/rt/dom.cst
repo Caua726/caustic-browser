@@ -1,0 +1,1102 @@
+// ── The document, through a table of the browser's functions ──
+let is *i64 as host_t with mut = cast(*i64, 0);
+let is i64 as H_QUERY with imut = 1;
+let is i64 as H_QUERY_ALL with imut = 2;
+let is i64 as H_SET_HTML with imut = 3;
+let is i64 as H_SET_TEXT with imut = 4;
+let is i64 as H_GET_TEXT with imut = 5;
+let is i64 as H_GET_ATTR with imut = 6;
+let is i64 as H_SET_ATTR with imut = 7;
+let is i64 as H_CREATE with imut = 8;
+let is i64 as H_APPEND with imut = 9;
+let is i64 as H_TAG with imut = 10;
+let is i64 as H_ROOT with imut = 11;
+let is i64 as H_PARENT with imut = 12;
+let is i64 as H_REMOVE with imut = 13;
+let is i64 as H_LINK with imut = 14;        // first, last, next, prev by number
+let is i64 as H_KIND with imut = 15;
+let is i64 as H_TEXT_NODE with imut = 16;
+let is i64 as H_INSERT with imut = 17;
+let is i64 as H_DEL_ATTR with imut = 18;
+let is i64 as H_GET_HTML with imut = 19;
+let is i64 as H_CLONE with imut = 20;
+let is i64 as H_NS with imut = 21;
+let is i64 as H_CREATE_NS with imut = 22;
+let is i64 as H_SET_DATA with imut = 23;
+let is i64 as H_URL with imut = 25;
+let is i64 as H_VIEWPORT with imut = 26;
+let is i64 as H_RECT with imut = 27;
+let is i64 as H_FRAGMENT with imut = 28;
+let is i64 as H_COMMENT with imut = 29;
+let is i64 as H_STATE with imut = 30;
+let is i64 as H_FETCH with imut = 31;
+let is i64 as H_EVAL with imut = 32;
+let is i64 as H_COOKIE with imut = 33;
+let is i64 as H_NAV with imut = 34;
+let is i64 as H_FRAME with imut = 35;
+let is i64 as H_ATTR with imut = 36;
+let is i64 as H_SUBMIT with imut = 37;
+let is i64 as H_COMPUTED with imut = 24;
+fn hc(i as i64) as *u8 { return cast(*u8, host_t[i]); }
+
+let is i64 as P_NODE with mut = 10;
+let is i64 as P_ELEMENT with mut = 10;
+let is i64 as P_DOCUMENT with mut = 10;
+let is i64 as P_EVENT with mut = 10;
+let is i64 as P_STYLE with mut = 10;
+let is i64 as doc_node with mut = 0;
+let is i64 as wrap_tab with mut = 0;
+let is i64 as wrap_sz with mut = 0;
+let is i64 as wrap_n with mut = 0;
+let is i64 as S_listeners with mut = 0;
+let is i64 as S_stop with mut = 0;
+let is i64 as S_stop_now with mut = 0;
+let is i64 as S_prevented with mut = 0;
+let is i64 as S_target with mut = 0;
+let is i64 as S_currentTarget with mut = 0;
+let is i64 as S_type with mut = 0;
+let is i64 as S_phase with mut = 0;
+let is i64 as S_bubbles with mut = 0;
+let is i64 as S_style_cache with mut = 0;
+let is i64 as S_cssText with mut = 0;
+let is i64 as S_title with mut = 0;
+let is i64 as V_relList with mut = 10;
+let is i64 as V_location with mut = 10;
+
+// Every name an element answers itself, as a table of interned strings. A name starting
+// with * is a boolean attribute; with -, one that is null when absent.
+let is [64]i64 as an_key with mut;
+let is [64]*u8 as an_attr with mut;
+let is i64 as an_n with mut = 0;
+fn an(prop as *u8, attr as *u8) as void { an_key[an_n] = lit(prop); an_attr[an_n] = attr; an_n = an_n + 1; }
+let is i64 as NK_MAX with imut = 40;
+let is [40]i64 as nk with mut;
+fn node_of(v as i64) as i64 {
+    if (is_ptr(v) == 0 || kind_of(v) != K_HOST) { rt_error("TypeError", "not a DOM node"); return 0; }
+    return cast(i64, cast(*Obj, v).env);
+}
+fn wrap_grow() as void {
+    let is i64 as oldt = wrap_tab;
+    let is i64 as olds = wrap_sz;
+    wrap_sz = olds * 2;
+    wrap_tab = os_map(wrap_sz * 16);
+    let is i64 as i with mut = 0;
+    while (i < olds) {
+        let is i64 as k = *cast(*i64, oldt + i * 16);
+        if (k != 0) {
+            let is i64 as j with mut = ((k >> 4) * 2654435761) & (wrap_sz - 1);
+            while (*cast(*i64, wrap_tab + j * 16) != 0) { j = (j + 1) & (wrap_sz - 1); }
+            *cast(*i64, wrap_tab + j * 16) = k;
+            *cast(*i64, wrap_tab + j * 16 + 8) = *cast(*i64, oldt + i * 16 + 8);
+        }
+        i = i + 1;
+    }
+    syscall(11, oldt, olds * 16);
+}
+fn wrap(node as i64) as i64 {
+    if (node == 0) { return NULLV; }
+    if (wrap_n * 2 >= wrap_sz) { wrap_grow(); }
+    let is i64 as i with mut = ((node >> 4) * 2654435761) & (wrap_sz - 1);
+    while (1 == 1) {
+        let is i64 as k = *cast(*i64, wrap_tab + i * 16);
+        if (k == node) { return *cast(*i64, wrap_tab + i * 16 + 8); }
+        if (k == 0) { break; }
+        i = (i + 1) & (wrap_sz - 1);
+    }
+    let is i64 as pr with mut = P_ELEMENT;
+    if (node == doc_node) { pr = P_DOCUMENT; }
+    else if (call(hc(H_KIND), node) != 1) { pr = P_NODE; }
+    let is i64 as v = obj_with(pr, root_for(pr));
+    let is *Obj as o = cast(*Obj, v);
+    o.kind = K_HOST;
+    o.env = cast(*i64, node);
+    *cast(*i64, wrap_tab + i * 16) = node;
+    *cast(*i64, wrap_tab + i * 16 + 8) = v;
+    wrap_n = wrap_n + 1;
+    return v;
+}
+fn attr_value(node as i64, name as *u8, none as i64) as i64 {
+    let is i64 as out with mut = 0;
+    let is i64 as n = call(hc(H_GET_ATTR), node, cast(i64, name), cstrlen(name), cast(i64, &out));
+    if (n < 0) { return none; }
+    return str_new(out, n);
+}
+fn attr_set(node as i64, name as *u8, v as i64) as void {
+    let is *Str as s = str_of(v);
+    call(hc(H_SET_ATTR), node, cast(i64, name), cstrlen(name), cast(i64, s.bytes), s.len);
+}
+fn query_one(root as i64, sel as *u8) as i64 {
+    return wrap(call(hc(H_QUERY), root, cast(i64, sel), cstrlen(sel)));
+}
+fn node_list(node as i64, elements as i64) as i64 {
+    let is i64 as r = arr_new(8);
+    let is i64 as c with mut = call(hc(H_LINK), node, 0);
+    while (c != 0) {
+        if (elements == 0 || call(hc(H_KIND), c) == 1) { arr_push(r, wrap(c)); }
+        c = call(hc(H_LINK), c, 2);
+    }
+    return r;
+}
+fn kin(node as i64, which as i64, elements as i64) as i64 {
+    let is i64 as c with mut = call(hc(H_LINK), node, which);
+    if (elements == 1) {
+        let is i64 as step with mut = which;
+        if (which == 0) { step = 2; }
+        if (which == 1) { step = 3; }
+        while (c != 0 && call(hc(H_KIND), c) != 1) { c = call(hc(H_LINK), c, step); }
+    }
+    return wrap(c);
+}
+fn host_str(fnum as i64, node as i64) as i64 {
+    let is i64 as out with mut = 0;
+    let is i64 as n = call(hc(fnum), node, cast(i64, &out));
+    return str_new(out, n);
+}
+fn host_str_op(fnum as i64, op as i64) as i64 {
+    let is i64 as out with mut = 0;
+    let is i64 as n = call(hc(fnum), op, cast(i64, &out), 0);
+    return str_new(out, n);
+}
+fn n_navigate(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // __navigate(url, replace): where the page goes once this script has finished.
+    let is *Str as u = str_of(a);
+    call(hc(H_NAV), cast(i64, u.bytes), u.len, cast(i64, rt_truthy(b)));
+    return UNDEF;
+}
+fn n_attrs(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // __attrs(element): [name, value] of each attribute, in order.
+    let is i64 as out = arr_new(4);
+    let is i64 as node = node_of(a);
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is [4]i64 as at;
+        if (call(hc(H_ATTR), node, i, cast(i64, &at)) == 0) { break; }
+        let is i64 as pair = arr_new(2);
+        arr_push(pair, str_new(at[0], at[1]));
+        arr_push(pair, str_new(at[2], at[3]));
+        arr_push(out, pair);
+        i = i + 1;
+    }
+    return out;
+}
+fn n_form_submit(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    call(hc(H_SUBMIT), node_of(a));
+    return UNDEF;
+}
+fn n_random_u32(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is [1]i64 as r;
+    r[0] = 0;
+    if (syscall(318, &r, 4, 0) != 4) { return rt_error("Error", "no random source"); }
+    return box_d(cast(f64, r[0] & 4294967295));
+}
+fn n_run_slot(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // __runScriptSlot(number): one of this page's big scripts, compiled by itself, now.
+    let is i64 as r = call(hc(H_FRAME), 7, int_of(a));
+    if (r == 0) { return UNDEF; }
+    let is *i64 as ans = cast(*i64, r);
+    eval_text(cast(*Str, str_new(ans[0], ans[1])));
+    return UNDEF;
+}
+fn n_frame(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // __frame(what, argument): a number. 5 is the window of an <iframe> element.
+    let is i64 as op = int_of(a);
+    let is i64 as arg with mut = 0;
+    if (op == 5 || op == 14 || op == 15) { arg = node_of(b); }
+    else if (op == 4 || op == 8 || op == 9 || op == 10 || op == 12) { arg = int_of(b); }
+    // Its name, of the window with this number: a string, "" for none.
+    if (op == 12) {
+        let is *i64 as r = cast(*i64, call(hc(H_FRAME), op, arg));
+        if (cast(i64, r) == 0) { return lit(""); }
+        return str_new(r[0], r[1]);
+    }
+    return box_i(call(hc(H_FRAME), op, arg));
+}
+fn n_frame_post(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // __framePost(window number, text, target origin).
+    let is *Str as text = str_of(b);
+    let is *Str as want = str_of(c);
+    let is [5]i64 as info;
+    info[0] = int_of(a); info[1] = cast(i64, text.bytes); info[2] = text.len; info[3] = cast(i64, want.bytes); info[4] = want.len;
+    call(hc(H_FRAME), 6, cast(i64, &info));
+    return UNDEF;
+}
+fn style_of(ov as i64) as i64 {
+    let is *Obj as o = cast(*Obj, ov);
+    let is i64 as i = shape_find(o.shape, S_style_cache);
+    if (i >= 0) { return o.slots[i]; }
+    let is i64 as st = obj_with(P_STYLE, root_for(P_STYLE));
+    let is *Obj as so = cast(*Obj, st);
+    so.kind = K_STYLE;
+    so.env = o.env;
+    obj_add_flags(o, S_style_cache, st, P_NONENUM);
+    return st;
+}
+// 0 when this name is not one the element answers itself.
+// document.f is the form named f, and form.q the field named q: what the name finds, if a
+// property of that name has not already been found. 0 for nothing.
+fn named_item(ov as i64, node as i64, key as i64) as i64 {
+    if (is_ptr(key) == 0 || kind_of(key) != K_STR) { return 0; }
+    let is *Str as ks = cast(*Str, key);
+    if (ks.len == 0 || ks.len > 200) { return 0; }
+    let is i64 as q with mut = 0;
+    while (q < ks.len) {
+        let is i64 as ch = cast(i64, ks.bytes[q]);
+        let is i64 as plain = cast(i64, (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95 || ch == 45);
+        if (plain == 0) { return 0; }
+        q = q + 1;
+    }
+    // A method of the object is found after this, and is what is nearly always being asked for.
+    let is i64 as pw with mut = ov;
+    while (is_ptr(pw) == 1 && is_obj(pw) == 1) {
+        if (shape_find(cast(*Obj, pw).shape, key) >= 0) { return 0; }
+        pw = cast(*Obj, pw).proto;
+    }
+    let is i64 as sel with mut = 0;
+    if (node == doc_node) {
+        sel = str_concat(str_concat(lit("form[name=\""), key), lit("\"],img[name=\""));
+        sel = str_concat(str_concat(sel, key), lit("\"],embed[name=\""));
+        sel = str_concat(str_concat(sel, key), lit("\"],iframe[name=\""));
+        sel = str_concat(str_concat(sel, key), lit("\"]"));
+    } else {
+        let is *Str as tn = cast(*Str, str_lower_tag(node));
+        if (tn.len != 4 || tn.bytes[0] != 102 || tn.bytes[1] != 111 || tn.bytes[2] != 114 || tn.bytes[3] != 109) { return 0; }
+        sel = str_concat(str_concat(lit("[name=\""), key), lit("\"],[id=\""));
+        sel = str_concat(str_concat(sel, key), lit("\"]"));
+    }
+    let is *Str as ss = cast(*Str, sel);
+    let is [1024]u8 as big;
+    let is i64 as i with mut = 0;
+    while (i < ss.len && i < 1023) { big[i] = ss.bytes[i]; i = i + 1; }
+    big[i] = 0;
+    let is i64 as found = call(hc(H_QUERY), node, cast(i64, &big), i);
+    if (found == 0) { return 0; }
+    return wrap(found);
+}
+fn str_lower_tag(node as i64) as i64 {
+    if (call(hc(H_KIND), node) != 1) { return lit(""); }
+    return host_str(H_TAG, node);
+}
+fn host_get(ov as i64, key as i64) as i64 {
+    let is i64 as node = node_of(ov);
+    if (node == doc_node && key == S_title) { return host_str(H_URL, 1); }
+    let is i64 as i with mut = 0;
+    while (i < an_n) {
+        if (an_key[i] == key) {
+            let is *u8 as at0 = an_attr[i];
+            if (cast(i64, at0[0]) == 42) {
+                let is i64 as out with mut = 0;
+                return box_b(cast(i32, call(hc(H_GET_ATTR), node, cast(i64, at0) + 1, cstrlen(at0) - 1, cast(i64, &out)) >= 0));
+            }
+            if (cast(i64, at0[0]) == 45) { return attr_value(node, cast(*u8, cast(i64, at0) + 1), NULLV); }
+            if (cast(i64, at0[0]) == 61) {
+                // A URL reads back absolute, as the base makes it.
+                let is i64 as raw = attr_value(node, cast(*u8, cast(i64, at0) + 1), lit(""));
+                let is *Str as rs = cast(*Str, raw);
+                if (rs.len == 0) { return raw; }
+                let is i64 as abs = rt_global_or_undef(lit("__abs"));
+                if (abs == UNDEF) { return raw; }
+                return rt_fcall(abs, UNDEF, 1, raw, UNDEF, UNDEF, UNDEF);
+            }
+            return attr_value(node, at0, lit(""));
+        }
+        i = i + 1;
+    }
+    let is i64 as w with mut = 0;
+    while (w < NK_MAX) { if (nk[w] == key) { break; } w = w + 1; }
+    if (w == NK_MAX) { return named_item(ov, node, key); }
+    if (w == 0) {                                                      // textContent
+        if (node == doc_node) { return NULLV; }
+        return host_str(H_GET_TEXT, node);
+    }
+    if (w == 1) { return host_str(H_GET_HTML, node); }                 // innerHTML
+    if (w == 2 || w == 3 || w == 4) {                                  // tagName, nodeName, localName
+        let is i64 as kd = call(hc(H_KIND), node);
+        if (kd == 3) { return lit("#text"); }
+        if (kd == 8) { return lit("#comment"); }
+        if (kd == 9) { return lit("#document"); }
+        if (kd == 11) { return lit("#document-fragment"); }
+        let is i64 as s = host_str(H_TAG, node);
+        if (w == 4 || call(hc(H_NS), node) != 0) { return s; }
+        return map_case(cast(*Str, s), 97, 122, -32);
+    }
+    if (w == 5) { return V_relList; }
+    if (w == 6) { return wrap(call(hc(H_PARENT), node)); }             // parentNode
+    if (w == 7) {                                                      // parentElement
+        let is i64 as p = call(hc(H_PARENT), node);
+        if (p != 0 && call(hc(H_KIND), p) == 1) { return wrap(p); }
+        return NULLV;
+    }
+    if (w == 8) { return box_i(call(hc(H_KIND), node)); }              // nodeType
+    if (w == 9) { return kin(node, 0, 0); }                            // firstChild
+    if (w == 10) { return kin(node, 1, 0); }                           // lastChild
+    if (w == 11) { return kin(node, 2, 0); }                           // nextSibling
+    if (w == 12) { return kin(node, 3, 0); }                           // previousSibling
+    if (w == 13) { return kin(node, 0, 1); }                           // firstElementChild
+    if (w == 14) { return kin(node, 1, 1); }                           // lastElementChild
+    if (w == 15) { return kin(node, 2, 1); }                           // nextElementSibling
+    if (w == 16) { return kin(node, 3, 1); }                           // previousElementSibling
+    if (w == 17) { return node_list(node, 0); }                        // childNodes
+    if (w == 18) { return node_list(node, 1); }                        // children
+    if (w == 19) {                                                     // ownerDocument
+        if (node == doc_node) { return NULLV; }
+        return wrap(doc_node);
+    }
+    if (w == 20) {                                                     // namespaceURI
+        let is i64 as ns = call(hc(H_NS), node);
+        if (call(hc(H_KIND), node) != 1) { return NULLV; }
+        if (ns == 1) { return lit("http://www.w3.org/2000/svg"); }
+        if (ns == 2) { return lit("http://www.w3.org/1998/Math/MathML"); }
+        return lit("http://www.w3.org/1999/xhtml");
+    }
+    if (w == 21) { return style_of(ov); }
+    if (w == 22 || w == 23) {                                          // nodeValue, data
+        let is i64 as kd = call(hc(H_KIND), node);
+        if (kd == 3 || kd == 8) { return host_str(H_GET_TEXT, node); }
+        return NULLV;
+    }
+    if (w == 24) {                                                     // isConnected
+        let is i64 as x with mut = node;
+        while (x != 0) { if (x == doc_node) { return TRUEV; } x = call(hc(H_PARENT), x); }
+        return FALSEV;
+    }
+    if (w == 25) {                                                     // classList
+        let is i64 as ctor = rt_global_or_undef(lit("__ClassList"));
+        rt_argc = 1;
+        return rt_new(ctor, ov, UNDEF, UNDEF, UNDEF);
+    }
+    if (w == 26) { return G_global; }                                  // defaultView
+    if (node == doc_node) {
+        if (w == 27) { return query_one(node, "body"); }
+        if (w == 28) { return query_one(node, "head"); }
+        if (w == 29) { return query_one(node, "html"); }
+        if (w == 30) { return lit("complete"); }                       // readyState
+        if (w == 31) {                                                 // activeElement
+            let is i64 as fo = call(hc(H_STATE), 0, 0);
+            if (fo != 0) { return wrap(fo); }
+            return query_one(node, "body");
+        }
+        if (w == 32) { return V_location; }                            // location
+        if (w == 34) { return host_str(H_URL, 0); }                    // URL
+        if (w == 35) { return host_str_op(H_COOKIE, 0); }              // cookie
+    }
+    if (w == 36) { return box_i(call(hc(H_RECT), node, 2)); }          // offsetWidth
+    if (w == 37) { return box_i(call(hc(H_RECT), node, 3)); }          // offsetHeight
+    return 0;
+}
+fn host_set(ov as i64, key as i64, v as i64) as i32 {
+    let is i64 as node = node_of(ov);
+    if (node == doc_node && key == nk[35]) {
+        let is *Str as cv = str_of(v);
+        call(hc(H_COOKIE), 1, cast(i64, cv.bytes), cv.len);
+        return 1;
+    }
+    if (node == doc_node && key == S_title) { return 1; }
+    let is i64 as i with mut = 0;
+    while (i < an_n) {
+        if (an_key[i] == key) {
+            let is *u8 as at0 = an_attr[i];
+            if (cast(i64, at0[0]) == 42) {
+                let is *u8 as nm = cast(*u8, cast(i64, at0) + 1);
+                if (rt_truthy(v) == 1) { call(hc(H_SET_ATTR), node, cast(i64, nm), cstrlen(nm), cast(i64, nm), 0); }
+                else { call(hc(H_DEL_ATTR), node, cast(i64, nm), cstrlen(nm)); }
+                return 1;
+            }
+            if (cast(i64, at0[0]) == 45 || cast(i64, at0[0]) == 61) { attr_set(node, cast(*u8, cast(i64, at0) + 1), v); return 1; }
+            attr_set(node, at0, v);
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (key == nk[1]) {
+        let is *Str as s = str_of(v);
+        call(hc(H_SET_HTML), node, cast(i64, s.bytes), s.len);
+        return 1;
+    }
+    if (key == nk[0]) {
+        let is *Str as s with mut = cast(*Str, lit(""));
+        if (v != NULLV && v != UNDEF) { s = str_of(v); }
+        call(hc(H_SET_TEXT), node, cast(i64, s.bytes), s.len);
+        return 1;
+    }
+    if (key == nk[22] || key == nk[23]) {
+        let is *Str as s = str_of(v);
+        call(hc(H_SET_DATA), node, cast(i64, s.bytes), s.len);
+        return 1;
+    }
+    return 0;
+}
+// style: the style attribute, read and written one property at a time.
+fn css_name(key as i64) as i64 {
+    // backgroundColor to background-color.
+    let is *Str as s = cast(*Str, key);
+    let is i64 as out with mut = lit("");
+    let is i64 as st with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.len) {
+        let is i64 as c = cast(i64, s.bytes[i]);
+        if (c >= 65 && c <= 90) {
+            out = str_concat(out, sub_str(s, st, i));
+            let is [2]u8 as b;
+            b[0] = cast(u8, 45); b[1] = cast(u8, c + 32);
+            out = str_concat(out, str_new(cast(i64, &b), 2));
+            st = i + 1;
+        }
+        i = i + 1;
+    }
+    return str_concat(out, sub_str(s, st, s.len));
+}
+fn style_find(sv as *Str, name as *Str, a_out as *i64, b_out as *i64, vs_out as *i64) as i32 {
+    // The declaration of a name in the attribute's text: its span, and where its value starts.
+    let is i64 as i with mut = 0;
+    while (i < sv.len) {
+        let is i64 as st = i;
+        while (i < sv.len && cast(i64, sv.bytes[i]) != 59) { i = i + 1; }
+        let is i64 as en = i;
+        let is i64 as a with mut = st;
+        while (a < en && is_space(cast(i64, sv.bytes[a])) == 1) { a = a + 1; }
+        let is i64 as c with mut = a;
+        while (c < en && cast(i64, sv.bytes[c]) != 58) { c = c + 1; }
+        let is i64 as ne with mut = c;
+        while (ne > a && is_space(cast(i64, sv.bytes[ne - 1])) == 1) { ne = ne - 1; }
+        if (ne - a == name.len) {
+            let is i64 as j with mut = 0;
+            while (j < name.len && fold(cast(i64, sv.bytes[a + j])) == cast(i64, name.bytes[j])) { j = j + 1; }
+            if (j == name.len) { *a_out = st; *b_out = en; *vs_out = c + 1; return 1; }
+        }
+        i = en + 1;
+    }
+    return 0;
+}
+fn style_read(node as i64, name as i64) as i64 {
+    let is i64 as text = attr_value(node, "style", lit(""));
+    let is *Str as sv = cast(*Str, text);
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    let is i64 as vs with mut = 0;
+    if (style_find(sv, cast(*Str, name), &a, &b, &vs) == 0) { return lit(""); }
+    return trim_ws(cast(*Str, sub_str(sv, vs, b)), 1, 1);
+}
+fn style_write(node as i64, name as i64, val as i64) as void {
+    let is i64 as text = attr_value(node, "style", lit(""));
+    let is *Str as sv = cast(*Str, text);
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    let is i64 as vs with mut = 0;
+    let is i64 as out with mut = lit("");
+    let is i64 as found = cast(i64, style_find(sv, cast(*Str, name), &a, &b, &vs));
+    if (found == 1) {
+        out = sub_str(sv, 0, a);
+        let is i64 as next0 with mut = b;
+        if (next0 < sv.len) { next0 = next0 + 1; }
+        out = str_concat(out, sub_str(sv, next0, sv.len));
+    } else { out = text; }
+    let is *Str as v = cast(*Str, val);
+    if (v.len > 0) {
+        let is *Str as o = cast(*Str, out);
+        if (o.len > 0 && cast(i64, o.bytes[o.len - 1]) != 59) { out = str_concat(out, lit(";")); }
+        out = str_concat(out, name);
+        out = str_concat(out, lit(":"));
+        out = str_concat(out, val);
+        out = str_concat(out, lit(";"));
+    }
+    attr_set(node, "style", out);
+}
+fn style_get(ov as i64, key as i64) as i64 {
+    if (kind_of(key) != K_STR) { return 0; }
+    let is *Obj as o = cast(*Obj, ov);
+    if (shape_find(cast(*Obj, P_STYLE).shape, key) >= 0) { return 0; }
+    if (key == S_cssText) { return attr_value(cast(i64, o.env), "style", lit("")); }
+    return style_read(cast(i64, o.env), css_name(key));
+}
+fn style_set(ov as i64, key as i64, v as i64) as i32 {
+    if (kind_of(key) != K_STR) { return 0; }
+    let is *Obj as o = cast(*Obj, ov);
+    if (key == S_cssText) { attr_set(cast(i64, o.env), "style", v); return 1; }
+    let is i64 as text with mut = lit("");
+    if (v != UNDEF && v != NULLV) { text = to_str(v); }
+    style_write(cast(i64, o.env), css_name(key), text);
+    return 1;
+}
+fn n_set_property(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    style_write(cast(i64, cast(*Obj, t).env), to_str(a), to_str(b));
+    return UNDEF;
+}
+fn n_get_property(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return style_read(cast(i64, cast(*Obj, t).env), to_str(a)); }
+fn n_remove_property(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    style_write(cast(i64, cast(*Obj, t).env), to_str(a), lit(""));
+    return UNDEF;
+}
+fn n_query(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    return wrap(call(hc(H_QUERY), node_of(t), cast(i64, s.bytes), s.len));
+}
+fn n_query_all(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    let is i64 as cap = 16384;
+    let is i64 as buf = alloc(cap * 8);
+    let is i64 as n = call(hc(H_QUERY_ALL), node_of(t), cast(i64, s.bytes), s.len, buf, cap);
+    let is i64 as r = arr_new(n);
+    let is i64 as i with mut = 0;
+    while (i < n) { arr_push(r, wrap(*cast(*i64, buf + i * 8))); i = i + 1; }
+    return r;
+}
+fn n_by_id(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = cast(*Str, str_concat(lit("#"), to_str(a)));
+    return wrap(call(hc(H_QUERY), node_of(t), cast(i64, s.bytes), s.len));
+}
+fn n_by_tag(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return n_query_all(e, t, map_case(str_of(a), 65, 90, 32), UNDEF, UNDEF, UNDEF); }
+fn n_by_class(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return n_query_all(e, t, str_concat(lit("."), to_str(a)), UNDEF, UNDEF, UNDEF); }
+fn n_create_el(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    return wrap(call(hc(H_CREATE), cast(i64, s.bytes), s.len));
+}
+fn n_create_ns(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(b);
+    let is i64 as ns with mut = 0;
+    if (a != NULLV && a != UNDEF) {
+        let is *Str as u = str_of(a);
+        if (find_bytes(u, cast(*Str, lit("svg")), 0) >= 0) { ns = 1; }
+        else if (find_bytes(u, cast(*Str, lit("MathML")), 0) >= 0) { ns = 2; }
+    }
+    return wrap(call(hc(H_CREATE_NS), ns, cast(i64, s.bytes), s.len));
+}
+fn n_create_text(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    return wrap(call(hc(H_TEXT_NODE), cast(i64, s.bytes), s.len));
+}
+fn n_create_comment(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    return wrap(call(hc(H_COMMENT), cast(i64, s.bytes), s.len));
+}
+fn n_create_fragment(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return wrap(call(hc(H_FRAGMENT))); }
+fn n_append(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    call(hc(H_APPEND), node_of(t), node_of(a));
+    return a;
+}
+fn n_insert_before(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as ref with mut = 0;
+    if (b != NULLV && b != UNDEF) { ref = node_of(b); }
+    call(hc(H_INSERT), node_of(t), node_of(a), ref);
+    return a;
+}
+fn n_remove_child(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (call(hc(H_PARENT), node_of(a)) != node_of(t)) { return rt_error("Error", "NotFoundError: not a child of this node"); }
+    call(hc(H_REMOVE), node_of(a));
+    return a;
+}
+fn n_replace_child(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    call(hc(H_INSERT), node_of(t), node_of(a), node_of(b));
+    call(hc(H_REMOVE), node_of(b));
+    return b;
+}
+fn n_remove(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { call(hc(H_REMOVE), node_of(t)); return UNDEF; }
+fn n_contains(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (a == NULLV || a == UNDEF) { return FALSEV; }
+    let is i64 as root = node_of(t);
+    let is i64 as x with mut = node_of(a);
+    while (x != 0) { if (x == root) { return TRUEV; } x = call(hc(H_PARENT), x); }
+    return FALSEV;
+}
+fn n_clone(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return wrap(call(hc(H_CLONE), node_of(t), cast(i64, rt_truthy(a)))); }
+fn n_get_attr(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    let is i64 as out with mut = 0;
+    let is i64 as n = call(hc(H_GET_ATTR), node_of(t), cast(i64, s.bytes), s.len, cast(i64, &out));
+    if (n < 0) { return NULLV; }
+    return str_new(out, n);
+}
+fn n_has_attr(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    let is i64 as out with mut = 0;
+    return box_b(cast(i32, call(hc(H_GET_ATTR), node_of(t), cast(i64, s.bytes), s.len, cast(i64, &out)) >= 0));
+}
+fn n_set_attr(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    let is *Str as v = str_of(b);
+    call(hc(H_SET_ATTR), node_of(t), cast(i64, s.bytes), s.len, cast(i64, v.bytes), v.len);
+    return UNDEF;
+}
+fn n_set_attr_ns(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return n_set_attr(e, t, b, c, UNDEF, UNDEF); }
+fn n_del_attr(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Str as s = str_of(a);
+    call(hc(H_DEL_ATTR), node_of(t), cast(i64, s.bytes), s.len);
+    return UNDEF;
+}
+fn n_del_attr_ns(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return n_del_attr(e, t, b, UNDEF, UNDEF, UNDEF); }
+fn n_focus(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { call(hc(H_STATE), 1, node_of(t)); return UNDEF; }
+fn n_blur(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { call(hc(H_STATE), 1, 0); return UNDEF; }
+fn n_rect(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as node = node_of(t);
+    let is i64 as r = obj_new();
+    let is i64 as x = call(hc(H_RECT), node, 0);
+    let is i64 as y = call(hc(H_RECT), node, 1);
+    let is i64 as w = call(hc(H_RECT), node, 2);
+    let is i64 as h = call(hc(H_RECT), node, 3);
+    rt_seti(r, lit("x"), box_i(x)); rt_seti(r, lit("y"), box_i(y)); rt_seti(r, lit("width"), box_i(w)); rt_seti(r, lit("height"), box_i(h));
+    rt_seti(r, lit("left"), box_i(x)); rt_seti(r, lit("top"), box_i(y)); rt_seti(r, lit("right"), box_i(x + w)); rt_seti(r, lit("bottom"), box_i(y + h));
+    return r;
+}
+fn capture_of(c as i64) as i64 {
+    if (c == TRUEV) { return TRUEV; }
+    if (is_obj(c) == 1 && rt_truthy(get_slow(c, lit("capture"), NOIC())) == 1) { return TRUEV; }
+    return FALSEV;
+}
+// A listener: type, function, capture.
+fn n_listen(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (b == NULLV || b == UNDEF) { return UNDEF; }
+    // addEventListener(...), with nothing before it, is the window's.
+    let is *Obj as o with mut = cast(*Obj, G_global);
+    if (is_obj(t) == 1) { o = cast(*Obj, t); }
+    let is i64 as i = shape_find(o.shape, S_listeners);
+    let is i64 as l with mut = 0;
+    if (i >= 0) { l = o.slots[i]; }
+    else { l = arr_new(4); obj_add_flags(o, S_listeners, l, P_NONENUM); }
+    let is i64 as cap = capture_of(c);
+    let is *Arr as la = cast(*Arr, l);
+    let is i64 as ty = intern(to_str(a));
+    let is i64 as j with mut = 0;
+    while (j < la.len) {
+        if (la.data[j] == ty && la.data[j + 1] == b && la.data[j + 2] == cap) { return UNDEF; }
+        j = j + 3;
+    }
+    arr_push(l, ty);
+    arr_push(l, b);
+    arr_push(l, cap);
+    return UNDEF;
+}
+fn n_unlisten(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is *Obj as o with mut = cast(*Obj, G_global);
+    if (is_obj(t) == 1) { o = cast(*Obj, t); }
+    let is i64 as i = shape_find(o.shape, S_listeners);
+    if (i < 0) { return UNDEF; }
+    let is *Arr as la = cast(*Arr, o.slots[i]);
+    let is i64 as ty = intern(to_str(a));
+    let is i64 as cap = capture_of(c);
+    let is i64 as j with mut = 0;
+    while (j < la.len) {
+        if (la.data[j] == ty && la.data[j + 1] == b && la.data[j + 2] == cap) {
+            let is i64 as k with mut = j + 3;
+            while (k < la.len) { la.data[k - 3] = la.data[k]; k = k + 1; }
+            la.len = la.len - 3;
+            return UNDEF;
+        }
+        j = j + 3;
+    }
+    return UNDEF;
+}
+fn n_noop(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return UNDEF; }
+fn n_supports(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_b(rt_seq(to_str(a), lit("modulepreload"))); }
+fn n_prevent(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { set_slow(t, S_prevented, TRUEV, NOIC()); return UNDEF; }
+fn n_stop(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { set_slow(t, S_stop, TRUEV, NOIC()); return UNDEF; }
+fn n_stop_now(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { set_slow(t, S_stop, TRUEV, NOIC()); set_slow(t, S_stop_now, TRUEV, NOIC()); return UNDEF; }
+fn n_dispatch(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // A script's own event. The path is the same one a real one takes.
+    fire_event(t, a);
+    return box_b(cast(i32, get_slow(a, S_prevented, NOIC()) != TRUEV));
+}
+// On the window itself there is no path: it is the target and the end of it.
+fn n_dispatch_window(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as ty = intern(to_str(get_slow(a, S_type, NOIC())));
+    set_slow(a, S_target, G_global, NOIC());
+    listeners_run(G_global, a, ty, 2, 1);
+    listeners_run(G_global, a, ty, 2, 0);
+    return box_b(cast(i32, get_slow(a, S_prevented, NOIC()) != TRUEV));
+}
+fn n_click(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    fire_event(t, event_new(lit("click"), t));
+    return UNDEF;
+}
+fn n_event(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as ev = event_new(to_str(a), NULLV);
+    if (is_obj(b) == 1) { rt_obj_spread(ev, b); }
+    return ev;
+}
+fn n_get_computed(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // What the cascade made of the properties scripts ask about most, as they stand now.
+    let is i64 as node = node_of(a);
+    let is i64 as r = obj_with(P_COMPUTED, root_for(P_COMPUTED));
+    let is i64 as i with mut = 0;
+    while (i < 9) {
+        let is i64 as out with mut = 0;
+        let is i64 as n = call(hc(H_COMPUTED), node, i, cast(i64, &out));
+        if (n > 0) { obj_add(cast(*Obj, r), computed_key[i], str_new(out, n)); }
+        i = i + 1;
+    }
+    return r;
+}
+let is i64 as P_COMPUTED with mut = 10;
+let is [9]i64 as computed_key with mut;
+fn n_computed_prop(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // background-color to backgroundColor.
+    let is *Str as s = str_of(a);
+    let is i64 as out with mut = lit("");
+    let is i64 as st with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.len) {
+        if (cast(i64, s.bytes[i]) == 45 && i + 1 < s.len) {
+            out = str_concat(out, sub_str(s, st, i));
+            let is [1]u8 as up;
+            up[0] = cast(u8, cast(i64, s.bytes[i + 1]) - 32);
+            out = str_concat(out, str_new(cast(i64, &up), 1));
+            i = i + 1;
+            st = i + 1;
+        }
+        i = i + 1;
+    }
+    out = str_concat(out, sub_str(s, st, s.len));
+    let is i64 as v = get_slow(t, intern(out), NOIC());
+    if (v == UNDEF) { return lit(""); }
+    return v;
+}
+fn n_fetch_raw(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    // __fetchRaw(url, method, body, type): a number, which __fetchDone hears about later.
+    let is *Str as u = str_of(a);
+    let is i64 as post = cast(i64, rt_seq(to_str(b), lit("GET")) == 0);
+    let is *Str as body with mut = cast(*Str, lit(""));
+    // Bytes go as they are: a Uint8Array has no string to be turned into on the way.
+    let is i64 as bin_p with mut = 0;
+    let is i64 as bin_n with mut = 0 - 1;
+    if (is_ptr(c) == 1 && kind_of(c) == K_TYPED) {
+        let is *Arr as ta = cast(*Arr, c);
+        bin_n = ta.len;
+        let is *u8 as out = cast(*u8, alloc(bin_n + 8));
+        let is i64 as ti with mut = 0;
+        while (ti < bin_n) { out[ti] = cast(u8, int_of(arr_at(ta, ti)) & 255); ti = ti + 1; }
+        bin_p = cast(i64, out);
+    }
+    else if (c != UNDEF && c != NULLV) { body = str_of(c); }
+    let is *Str as ty with mut = cast(*Str, lit(""));
+    if (d != UNDEF && d != NULLV) { ty = str_of(d); }
+    let is [8]i64 as info;
+    fetch_id = fetch_id + 1;
+    info[0] = fetch_id; info[1] = cast(i64, u.bytes); info[2] = u.len; info[3] = post;
+    info[4] = cast(i64, body.bytes); info[5] = body.len; info[6] = cast(i64, ty.bytes); info[7] = ty.len;
+    if (bin_n >= 0) { info[4] = bin_p; info[5] = bin_n; }
+    if (call(hc(H_FETCH), cast(i64, &info)) == 0) { return box_i(-1); }
+    return box_i(fetch_id);
+}
+let is i64 as fetch_id with mut = 0;
+fn n_match_media(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as r = obj_new();
+    rt_seti(r, lit("matches"), FALSEV);
+    rt_seti(r, lit("media"), to_str(a));
+    def_n(r, "addEventListener", fn_ptr(n_noop));
+    def_n(r, "removeEventListener", fn_ptr(n_noop));
+    return r;
+}
+fn n_event_path(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as r = arr_new(8);
+    let is i64 as w = get_slow(t, S_target, NOIC());
+    if (is_ptr(w) == 1 && kind_of(w) == K_HOST) {
+        let is i64 as node with mut = node_of(w);
+        while (node != 0) { arr_push(r, wrap(node)); node = call(hc(H_PARENT), node); }
+    }
+    arr_push(r, G_global);
+    return r;
+}
+fn n_get_selection(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return NULLV; }
+fn event_new(ty as i64, target as i64) as i64 {
+    let is i64 as ev = obj_with(P_EVENT, root_for(P_EVENT));
+    let is *Obj as o = cast(*Obj, ev);
+    obj_add(o, S_type, ty);
+    obj_add(o, S_target, target);
+    obj_add(o, S_currentTarget, NULLV);
+    obj_add(o, S_phase, box_i(0));
+    obj_add(o, S_bubbles, TRUEV);
+    obj_add(o, lit("cancelable"), TRUEV);
+    obj_add(o, S_prevented, FALSEV);
+    obj_add(o, lit("isTrusted"), TRUEV);
+    obj_add(o, lit("timeStamp"), box_d(clock_ms(1) - t_origin));
+    return ev;
+}
+fn call_guarded(f as i64, w as i64, evt as i64) as void {
+    let is ex.Frame as fr;
+    let is i64 as code = ex.begin(&fr);
+    if (code != 0) { report_uncaught(code); }
+    else {
+        ex.enter(&fr);
+        rt_fcall(f, w, 1, evt, UNDEF, UNDEF, UNDEF);
+        ex.leave(&fr);
+    }
+    run_micro();
+}
+fn listeners_run(w as i64, evt as i64, ty as i64, phase as i64, capture as i64) as i64 {
+    let is *Obj as o = cast(*Obj, w);
+    if (phase >= 2 && capture == 0) {
+        // el.onclick and its kin, when something set one.
+        let is i64 as hi = shape_find(o.shape, intern(str_concat(lit("on"), ty)));
+        if (hi >= 0 && is_ptr(o.slots[hi]) == 1 && kind_of(o.slots[hi]) == K_FN) {
+            set_slow(evt, S_currentTarget, w, NOIC());
+            set_slow(evt, S_phase, box_i(phase), NOIC());
+            call_guarded(o.slots[hi], w, evt);
+        }
+    }
+    let is i64 as i = shape_find(o.shape, S_listeners);
+    if (i < 0) { return 0; }
+    let is *Arr as l = cast(*Arr, o.slots[i]);
+    set_slow(evt, S_currentTarget, w, NOIC());
+    set_slow(evt, S_phase, box_i(phase), NOIC());
+    let is i64 as ran with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as n = l.len;
+    while (j < n && j < l.len) {
+        let is i64 as is_cap = cast(i64, l.data[j + 2] == TRUEV);
+        if (l.data[j] == ty && is_cap == capture) {
+            ran = 1;
+            call_guarded(l.data[j + 1], w, evt);
+            if (get_slow(evt, S_stop_now, NOIC()) == TRUEV) { break; }
+        }
+        j = j + 3;
+    }
+    return ran;
+}
+// Capture from the window down, the target, bubbling back up.
+fn fire_event(target_w as i64, evt as i64) as i64 {
+    let is i64 as ty = intern(to_str(get_slow(evt, S_type, NOIC())));
+    set_slow(evt, S_target, target_w, NOIC());
+    let is i64 as path = arr_new(16);
+    let is i64 as node with mut = node_of(target_w);
+    while (node != 0) { arr_push(path, wrap(node)); node = call(hc(H_PARENT), node); }
+    arr_push(path, G_global);
+    let is *Arr as pa = cast(*Arr, path);
+    let is i64 as bubbles = cast(i64, rt_truthy(get_slow(evt, S_bubbles, NOIC())));
+    let is i64 as ran with mut = 0;
+    let is i64 as i with mut = pa.len - 1;
+    while (i > 0) {
+        ran = ran | listeners_run(pa.data[i], evt, ty, 1, 1);
+        if (get_slow(evt, S_stop, NOIC()) == TRUEV) { return ran; }
+        i = i - 1;
+    }
+    ran = ran | listeners_run(pa.data[0], evt, ty, 2, 1);
+    if (get_slow(evt, S_stop_now, NOIC()) != TRUEV) { ran = ran | listeners_run(pa.data[0], evt, ty, 2, 0); }
+    if (bubbles == 0) { return ran; }
+    i = 1;
+    while (i < pa.len) {
+        if (get_slow(evt, S_stop, NOIC()) == TRUEV) { return ran; }
+        ran = ran | listeners_run(pa.data[i], evt, ty, 3, 0);
+        i = i + 1;
+    }
+    return ran;
+}
+fn dom_init() as void {
+    wrap_sz = 65536;
+    wrap_tab = os_map(wrap_sz * 16);
+    S_listeners = lit("__listeners"); S_stop = lit("__stop"); S_stop_now = lit("__stopNow"); S_prevented = lit("defaultPrevented");
+    S_target = lit("target"); S_currentTarget = lit("currentTarget"); S_type = lit("type"); S_phase = lit("eventPhase"); S_bubbles = lit("bubbles");
+    S_style_cache = lit("__style"); S_cssText = lit("cssText"); S_title = lit("title");
+    an("id", "id"); an("className", "class"); an("rel", "rel"); an("href", "=href"); an("src", "=src"); an("srcdoc", "srcdoc"); an("type", "type");
+    an("value", "value"); an("integrity", "integrity"); an("referrerPolicy", "referrerpolicy"); an("crossOrigin", "-crossorigin");
+    an("alt", "alt"); an("title", "title"); an("name", "name"); an("placeholder", "placeholder"); an("htmlFor", "for");
+    an("defaultValue", "value"); an("frameBorder", "frameborder"); an("scrolling", "scrolling"); an("allow", "allow"); an("sandbox", "sandbox"); an("allowFullscreen", "allowfullscreen"); an("lang", "lang"); an("dir", "dir"); an("action", "=action"); an("method", "method"); an("role", "role");
+    an("tabIndex", "tabindex"); an("width", "width"); an("height", "height"); an("download", "download"); an("min", "min"); an("max", "max");
+    an("disabled", "*disabled"); an("checked", "*checked"); an("selected", "*selected"); an("hidden", "*hidden"); an("readOnly", "*readonly");
+    an("required", "*required"); an("multiple", "*multiple"); an("autofocus", "*autofocus"); an("open", "*open"); an("defaultChecked", "*checked");
+    let is [40]*u8 as names;
+    names[0] = "textContent"; names[1] = "innerHTML"; names[2] = "tagName"; names[3] = "nodeName"; names[4] = "localName"; names[5] = "relList";
+    names[6] = "parentNode"; names[7] = "parentElement"; names[8] = "nodeType"; names[9] = "firstChild"; names[10] = "lastChild"; names[11] = "nextSibling";
+    names[12] = "previousSibling"; names[13] = "firstElementChild"; names[14] = "lastElementChild"; names[15] = "nextElementSibling"; names[16] = "previousElementSibling";
+    names[17] = "childNodes"; names[18] = "children"; names[19] = "ownerDocument"; names[20] = "namespaceURI"; names[21] = "style"; names[22] = "nodeValue"; names[23] = "data";
+    names[24] = "isConnected"; names[25] = "classList"; names[26] = "defaultView"; names[27] = "body"; names[28] = "head"; names[29] = "documentElement"; names[30] = "readyState";
+    names[31] = "activeElement"; names[32] = "location"; names[33] = "%unused"; names[34] = "URL"; names[35] = "cookie"; names[36] = "offsetWidth"; names[37] = "offsetHeight";
+    names[38] = "%unused2"; names[39] = "%unused3";
+    let is i64 as i with mut = 0;
+    while (i < NK_MAX) { nk[i] = lit(names[i]); i = i + 1; }
+    P_NODE = obj_new();
+    def_n(P_NODE, "appendChild", fn_ptr(n_append)); def_n(P_NODE, "insertBefore", fn_ptr(n_insert_before)); def_n(P_NODE, "removeChild", fn_ptr(n_remove_child));
+    def_n(P_NODE, "replaceChild", fn_ptr(n_replace_child)); def_n(P_NODE, "remove", fn_ptr(n_remove)); def_n(P_NODE, "contains", fn_ptr(n_contains));
+    def_n(P_NODE, "cloneNode", fn_ptr(n_clone)); def_n(P_NODE, "addEventListener", fn_ptr(n_listen)); def_n(P_NODE, "removeEventListener", fn_ptr(n_unlisten));
+    def_n(P_NODE, "dispatchEvent", fn_ptr(n_dispatch)); def_n(P_NODE, "querySelector", fn_ptr(n_query)); def_n(P_NODE, "querySelectorAll", fn_ptr(n_query_all));
+    def_n(P_NODE, "getElementsByTagName", fn_ptr(n_by_tag)); def_n(P_NODE, "getElementsByClassName", fn_ptr(n_by_class));
+    P_ELEMENT = obj_with(P_NODE, root_for(P_NODE));
+    def_n(P_ELEMENT, "getAttribute", fn_ptr(n_get_attr)); def_n(P_ELEMENT, "hasAttribute", fn_ptr(n_has_attr)); def_n(P_ELEMENT, "setAttribute", fn_ptr(n_set_attr));
+    def_n(P_ELEMENT, "setAttributeNS", fn_ptr(n_set_attr_ns)); def_n(P_ELEMENT, "removeAttribute", fn_ptr(n_del_attr)); def_n(P_ELEMENT, "removeAttributeNS", fn_ptr(n_del_attr_ns));
+    def_n(P_ELEMENT, "focus", fn_ptr(n_focus)); def_n(P_ELEMENT, "blur", fn_ptr(n_blur)); def_n(P_ELEMENT, "click", fn_ptr(n_click));
+    def_n(P_ELEMENT, "getBoundingClientRect", fn_ptr(n_rect));
+    P_DOCUMENT = obj_with(P_NODE, root_for(P_NODE));
+    def_n(P_DOCUMENT, "createElement", fn_ptr(n_create_el)); def_n(P_DOCUMENT, "createElementNS", fn_ptr(n_create_ns)); def_n(P_DOCUMENT, "createTextNode", fn_ptr(n_create_text));
+    def_n(P_DOCUMENT, "createComment", fn_ptr(n_create_comment)); def_n(P_DOCUMENT, "createDocumentFragment", fn_ptr(n_create_fragment));
+    def_n(P_DOCUMENT, "getElementById", fn_ptr(n_by_id));
+    P_EVENT = obj_new();
+    def_n(P_EVENT, "preventDefault", fn_ptr(n_prevent)); def_n(P_EVENT, "stopPropagation", fn_ptr(n_stop)); def_n(P_EVENT, "stopImmediatePropagation", fn_ptr(n_stop_now));
+    def_n(P_EVENT, "initEvent", fn_ptr(n_noop));
+    def_prop(P_EVENT, "ctrlKey", FALSEV); def_prop(P_EVENT, "shiftKey", FALSEV); def_prop(P_EVENT, "altKey", FALSEV); def_prop(P_EVENT, "metaKey", FALSEV);
+    def_prop(P_EVENT, "clientX", box_i(0)); def_prop(P_EVENT, "clientY", box_i(0)); def_prop(P_EVENT, "pageX", box_i(0)); def_prop(P_EVENT, "pageY", box_i(0));
+    def_prop(P_EVENT, "screenX", box_i(0)); def_prop(P_EVENT, "screenY", box_i(0)); def_prop(P_EVENT, "button", box_i(0)); def_prop(P_EVENT, "buttons", box_i(0));
+    def_prop(P_EVENT, "detail", box_i(0)); def_prop(P_EVENT, "relatedTarget", NULLV); def_prop(P_EVENT, "key", lit("")); def_prop(P_EVENT, "code", lit(""));
+    def_prop(P_EVENT, "which", box_i(0)); def_prop(P_EVENT, "keyCode", box_i(0)); def_prop(P_EVENT, "composed", TRUEV);
+    def_n(P_EVENT, "composedPath", fn_ptr(n_event_path));
+    P_COMPUTED = obj_new();
+    def_n(P_COMPUTED, "getPropertyValue", fn_ptr(n_computed_prop));
+    computed_key[0] = lit("display"); computed_key[1] = lit("position"); computed_key[2] = lit("visibility"); computed_key[3] = lit("width"); computed_key[4] = lit("height");
+    computed_key[5] = lit("opacity"); computed_key[6] = lit("fontSize"); computed_key[7] = lit("color"); computed_key[8] = lit("backgroundColor");
+    P_STYLE = obj_new();
+    def_n(P_STYLE, "setProperty", fn_ptr(n_set_property)); def_n(P_STYLE, "getPropertyValue", fn_ptr(n_get_property)); def_n(P_STYLE, "removeProperty", fn_ptr(n_remove_property));
+    V_relList = obj_new();
+    def_n(V_relList, "supports", fn_ptr(n_supports));
+    doc_node = call(hc(H_ROOT));
+    let is i64 as g = G_global;
+    // The names scripts test with instanceof and read prototypes from.
+    def_prop(g, "Node", fn_with_proto(fn_ptr(n_noop), P_NODE));
+    let is i64 as c_el = fn_with_proto(fn_ptr(n_noop), P_ELEMENT);
+    def_prop(g, "Element", c_el); def_prop(g, "HTMLElement", c_el); def_prop(g, "SVGElement", c_el);
+    def_prop(g, "Document", fn_with_proto(fn_ptr(n_noop), P_DOCUMENT));
+    let is i64 as p_iframe = obj_new();
+    def_prop(g, "HTMLIFrameElement", fn_with_proto(fn_ptr(n_noop), p_iframe));
+    def_prop(g, "document", wrap(doc_node));
+    def_n(g, "dispatchEvent", fn_ptr(n_dispatch_window)); def_n(g, "addEventListener", fn_ptr(n_listen)); def_n(g, "removeEventListener", fn_ptr(n_unlisten));
+    def_n(g, "__fetchRaw", fn_ptr(n_fetch_raw));
+    def_n(g, "getComputedStyle", fn_ptr(n_get_computed)); def_n(g, "matchMedia", fn_ptr(n_match_media)); def_n(g, "getSelection", fn_ptr(n_get_selection));
+    let is i64 as ev_ctor = fn_with_proto(fn_ptr(n_event), P_EVENT);
+    def_prop(g, "Event", ev_ctor);
+    def_prop(g, "innerWidth", box_i(call(hc(H_VIEWPORT), 0)));
+    def_prop(g, "innerHeight", box_i(call(hc(H_VIEWPORT), 1)));
+    def_prop(g, "devicePixelRatio", box_i(1));
+    let is i64 as nav = obj_new();
+    if (cast(i64, host_t) != 0) { rt_seti(nav, lit("userAgent"), host_str(H_URL, 2)); }
+    else { rt_seti(nav, lit("userAgent"), lit("CausticBrowser")); }
+    rt_seti(nav, lit("language"), lit("en"));
+    rt_seti(nav, lit("platform"), lit("Linux"));
+    def_prop(g, "navigator", nav);
+    if (cast(i64, host_t) != 0) {
+        def_n(g, "__navigate", fn_ptr(n_navigate));
+        def_n(g, "__frame", fn_ptr(n_frame));
+        def_n(g, "__curScript", fn_ptr(n_cur_script));
+        def_n(g, "__runScriptSlot", fn_ptr(n_run_slot));
+        def_n(g, "__attrs", fn_ptr(n_attrs));
+        def_n(g, "__formSubmit", fn_ptr(n_form_submit));
+        def_n(g, "__randomU32", fn_ptr(n_random_u32));
+        def_n(g, "__framePost", fn_ptr(n_frame_post));
+    }
+    V_location = obj_new();
+    rt_seti(V_location, lit("href"), host_str(H_URL, 0));
+    def_prop(g, "location", V_location);
+}
+
+// ── What the browser calls ──
+fn js_main(host as *i64) as i64 {
+    host_t = host;
+    let is i64 as anchor = 0;
+    gc_stack_top = cast(i64, &anchor) + 1024;
+    rt_init();
+    js_strs();
+    let is ex.Frame as f;
+    let is i64 as code = ex.begin(&f);
+    if (code != 0) { report_uncaught(code); run_micro(); flush(); return 1; }
+    ex.enter(&f);
+    js_top();
+    ex.leave(&f);
+    run_micro();
+    if (cast(i64, host_t) != 0) {
+        // The document is as parsed as it will get by the time scripts run here.
+        let is i64 as dw = wrap(doc_node);
+        fire_event(dw, event_new(lit("DOMContentLoaded"), dw));
+        let is i64 as lv = event_new(lit("load"), dw);
+        listeners_run(G_global, lv, lit("load"), 2, 0);
+    }
+    flush();
+    return 0;
+}
+// The event at a node: 1 when a listener ran, 2 more if it stopped the default.
+// info, when there is one: x, y, button, the key's text and its length, its number.
+fn js_dispatch(node as i64, tp as i64, tn as i64, info as *i64) as i64 {
+    let is i64 as anchor = 0;
+    gc_stack_top = cast(i64, &anchor) + 1024;
+    let is ex.Frame as f;
+    let is i64 as code = ex.begin(&f);
+    if (code != 0) { report_uncaught(code); flush(); return 1; }
+    ex.enter(&f);
+    let is i64 as w = wrap(node);
+    let is i64 as evt = event_new(str_new(tp, tn), w);
+    if (cast(i64, info) != 0) {
+        let is *Obj as eo = cast(*Obj, evt);
+        obj_add(eo, lit("clientX"), box_i(info[0])); obj_add(eo, lit("clientY"), box_i(info[1]));
+        obj_add(eo, lit("pageX"), box_i(info[0])); obj_add(eo, lit("pageY"), box_i(info[1]));
+        obj_add(eo, lit("button"), box_i(info[2]));
+        if (info[4] > 0) {
+            let is i64 as kt = str_new(info[3], info[4]);
+            obj_add(eo, lit("key"), kt); obj_add(eo, lit("code"), kt);
+            obj_add(eo, lit("keyCode"), box_i(info[5])); obj_add(eo, lit("which"), box_i(info[5]));
+        }
+    }
+    let is i64 as ran = fire_event(w, evt);
+    let is i64 as prevented = cast(i64, get_slow(evt, S_prevented, NOIC()) == TRUEV);
+    ex.leave(&f);
+    run_micro();
+    flush();
+    if (prevented == 1) { return ran | 2; }
+    return ran;
+}
+// A fetch came back: status 0 when it could not be had.
+// A script added by a script: the text run as a script of this page, then load or error on it.
+let is i64 as cur_script with mut = 0;
+fn n_cur_script(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return wrap(cur_script); }
+fn js_run_script(data as i64, n as i64, node as i64, ok as i64) as i64 {
+    let is i64 as anchor = 0;
+    gc_stack_top = cast(i64, &anchor) + 1024;
+    let is i64 as w = wrap(node);
+    let is i64 as was = cur_script;
+    if (ok != 0) {
+        cur_script = node;
+        let is ex.Frame as f;
+        let is i64 as code = ex.begin(&f);
+        if (code != 0) { report_uncaught(code); }
+        else {
+            ex.enter(&f);
+            eval_text(cast(*Str, str_new(data, n)));
+            ex.leave(&f);
+        }
+        cur_script = was;
+    }
+    if (ok != 2) {
+        let is ex.Frame as g;
+        let is i64 as code2 = ex.begin(&g);
+        if (code2 != 0) { report_uncaught(code2); }
+        else {
+            ex.enter(&g);
+            if (ok == 1) { fire_event(w, event_new(lit("load"), w)); }
+            else { fire_event(w, event_new(lit("error"), w)); }
+            ex.leave(&g);
+        }
+    }
+    run_micro();
+    flush();
+    return 1;
+}
+// A message from another window, as JSON, for this window's listeners.
+fn js_message(data as i64, n as i64, origin as i64, from as i64) as i64 {
+    let is i64 as anchor = 0;
+    gc_stack_top = cast(i64, &anchor) + 1024;
+    let is ex.Frame as f;
+    let is i64 as code = ex.begin(&f);
+    if (code != 0) { report_uncaught(code); flush(); return 0; }
+    ex.enter(&f);
+    // What came for a port goes to the port; __msgIn has nothing for the window then.
+    let is i64 as got = rt_fcall(rt_global_or_undef(lit("__msgIn")), UNDEF, 2, str_new(data, n), box_i(from), UNDEF, UNDEF);
+    if (got == NULLV) { ex.leave(&f); run_micro(); flush(); return 1; }
+    let is i64 as ev = event_new(lit("message"), G_global);
+    rt_seti(ev, lit("data"), get_slow(got, lit("data"), NOIC()));
+    rt_seti(ev, lit("origin"), str_new(origin, cstrlen(cast(*u8, origin))));
+    rt_seti(ev, lit("source"), rt_fcall(rt_global_or_undef(lit("__win")), UNDEF, 1, box_i(from), UNDEF, UNDEF, UNDEF));
+    rt_seti(ev, lit("lastEventId"), lit(""));
+    rt_seti(ev, lit("ports"), get_slow(got, lit("ports"), NOIC()));
+    listeners_run(G_global, ev, lit("message"), 2, 0);
+    ex.leave(&f);
+    run_micro();
+    flush();
+    return 1;
+}
+fn js_fetch_done(id as i64, status as i64, data as i64, n as i64, ctype as i64) as i64 {
+    let is i64 as anchor = 0;
+    gc_stack_top = cast(i64, &anchor) + 1024;
+    let is ex.Frame as f;
+    let is i64 as code = ex.begin(&f);
+    if (code != 0) { report_uncaught(code); flush(); return 0; }
+    ex.enter(&f);
+    let is i64 as text = str_new(data, n);
+    let is i64 as ty = str_new(ctype, cstrlen(cast(*u8, ctype)));
+    rt_fcall(rt_global_or_undef(lit("__fetchDone")), UNDEF, 4, box_i(id), box_i(status), text, ty);
+    ex.leave(&f);
+    run_micro();
+    flush();
+    return 1;
+}

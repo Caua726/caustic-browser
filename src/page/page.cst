@@ -18,9 +18,11 @@ use "../css/sheet.cst" as sh;
 use "../css/style.cst" as style;
 use "../css/ua.cst" as ua;
 use "./anim.cst" as anim;
+use "../motor/host.cst" as jshost;
 use "../dom/dom.cst" as dom;
 use "../dom/tags.cst" as tg;
 use "../dom/shadow.cst" as shadow;
+use "../paint/svg.cst" as paint_svg;
 use "../html/tree.cst" as tree;
 use "../layout/box.cst" as bx;
 use "../layout/layout.cst" as layout;
@@ -32,6 +34,7 @@ use "./forms.cst" as forms;
 use "../loader/svg_image.cst" as svg_image;
 use "../loader/net.cst" as net;
 use "../loader/fetcher.cst" as fetcher;
+use "../loader/webfont.cst" as webfont;
 use "../loader/url.cst" as url;
 use "../paint/display_list.cst" as dl;
 use "../paint/paint.cst" as paint;
@@ -62,7 +65,48 @@ struct Loaded {
     next as *Loaded;
 }
 
+struct ScriptSlot {
+    text   as *u8;
+    n      as i64;
+    module as i64;
+    next   as *ScriptSlot;
+}
+
+// An <iframe>'s page, and what it last drew, to go into its parent's list.
+struct Frame {
+    node as *dom.Node;
+    pg   as *Page;
+    list as dl.List;
+    next as *Frame;
+    w    as f64;
+    h    as f64;
+    sy   as f64;         // how far it is scrolled
+    m    as [6]f64;      // where its list goes in its parent's
+    src  as [MAX_URL]u8; // what the element asks for, to see when that changes
+    synth as i64;        // about:blank or srcdoc still to be made: there is nothing to fetch
+    fired as i64;        // its element has heard its load event
+    seen  as i64;
+    worker as i64;       // no element shows it: a worker's page
+}
+
 struct Page {
+    id     as i64;       // for scripts, which know other windows by number
+    parent as *Page;
+    frame  as *Frame;    // this page's own, in its parent
+    depth  as i64;
+    frames as *Frame;
+    js_msg as i64;
+    js_script as i64;
+    scripts_first as *ScriptSlot;
+    scripts_last  as *ScriptSlot;
+    scripts_out   as i64;
+    js_dispatch   as i64;
+    js_next       as i64;
+    js_tick       as i64;
+    js_done       as i64;
+    scripts_ran   as i64;
+    fetches_out   as i64;
+    js_list       as dl.List;
     loaded as i64;          // has a document
     url    as [MAX_URL]u8;  // where it came from, after redirects
     base   as [MAX_URL]u8;  // what its relative URLs mean: the URL, or its <base>
@@ -74,6 +118,11 @@ struct Page {
     style_a  as arena.Arena;
     box_a    as arena.Arena;
     tmp_a    as arena.Arena;
+    style_held as arena.Arena;  // the styles the boxes still point at, until they are made again
+    held     as i64;
+    gone_box as i64;     // the round of _gone its boxes, what it painted, and its styles last went into
+    gone_paint as i64;
+    gone_style as i64;
     paint_a  as arena.Arena;   // what a frame painted without a layout holds on to
     motion   as anim.Anim;
 
@@ -103,10 +152,14 @@ struct Page {
 }
 
 // A Page for the program to keep, or null when there is no memory for it.
+let is i64 as next_id with mut = 0;
 fn create() as *Page {
     let is *u8 as m = mem.core.mmap_anon(sizeof(Page));
     let is i64 as v = cast(i64, m);
     if (v == 0 || v == 0 - 1) { return cast(*Page, 0); }
+    dl.init(&cast(*Page, m).js_list);
+    next_id = next_id + 1;
+    cast(*Page, m).id = next_id;
     return cast(*Page, m);
 }
 
@@ -122,6 +175,7 @@ fn _copy_url(to as *u8, from as *u8) as void {
 // Everything a page holds, so it can be loaded again or thrown away. Its images' textures
 // have to be gone before this, by whoever made them.
 fn unload(p as *Page) as void {
+    _drop_frames(p);
     if (p.started == 0) { return; }
     forms.files_forget(&p.doc);
     let is *Loaded as l with mut = p.images;
@@ -137,12 +191,13 @@ fn unload(p as *Page) as void {
     p.focus = cast(*dom.Node, 0);
     p.target = cast(*dom.Node, 0);
     p.dirty = 0;
-    dom.free(&p.doc);
-    arena.free(&p.docs_a);
-    arena.free(&p.style_a);
-    arena.free(&p.box_a);
-    arena.free(&p.tmp_a);
-    arena.free(&p.paint_a);
+    _retire_doc(&p.doc);
+    _retire(&p.docs_a);
+    _retire(&p.style_a);
+    if (p.held == 1) { _retire(&p.style_held); p.held = 0; }
+    _retire(&p.box_a);
+    _retire(&p.tmp_a);
+    _retire(&p.paint_a);
     anim.free(&p.motion);
     p.loaded = 0;
     p.started = 0;
@@ -374,6 +429,19 @@ fn _fetch_image(p as *Page, u as *u8, n as i64) as void {
     l.next = p.images;
     p.images = l;
     p.nimages = p.nimages + 1;
+    // A data: address is the picture itself, and is often far longer than an address may be.
+    if (n > 5 && u[0] == 100 && u[1] == 97 && u[2] == 116 && u[3] == 97 && u[4] == 58) {
+        let is net.Resource as r with mut;
+        r.data = cast(*u8, 0);
+        r.len = 0;
+        r.cap = 0;
+        if (net.get_data(l.url, &r) == 0 && r.len > 0) {
+            l.ok = image.decode(r.data, r.len, &l.img);
+            if (l.ok == 0) { l.ok = svg_image.decode(r.data, r.len, &l.img); }
+        }
+        net.free(&r);
+        return;
+    }
     p.images_out = p.images_out + 1;
     fetcher.get(cast(*u8, p), p.era, TAG_IMAGE, cast(*u8, l), l.url, 0);
 }
@@ -386,7 +454,8 @@ fn _image_for(user as *u8, u as *u8, n as i64) as *dl.Image {
     // src of one whose choice failed. The layout after it arrives will find it.
     if (l == null) {
         _fetch_image(p, u, n);
-        return cast(*dl.Image, 0);
+        l = _find(p, u, n);
+        if (l == null) { return cast(*dl.Image, 0); }
     }
     if (l.ok == 0) { return cast(*dl.Image, 0); }
     return &l.img;
@@ -399,10 +468,35 @@ fn _value_url(st as *style.Style, prop as i64) as *u8 {
 }
 
 // Everything visible that names an image. Only after styling is it known what is visible.
+// The other files <use> points at: each once, and the page draws again when one comes.
+fn _ask_use_file(p as *Page, x as *dom.Node) as void {
+    let is *dom.Attr as h with mut = dom.find_attr(x, "href", 4);
+    if (h == null) { h = dom.find_attr(x, "xlink:href", 10); }
+    if (h == null) { return; }
+    let is i64 as fl = paint_svg.href_file_len(h.value, h.value_len);
+    if (fl == 0) { return; }
+    let is *u8 as slot = paint_svg.ext_ask(p.doc.node, h.value, fl);
+    if (slot == null) { return; }
+    let is [MAX_URL]u8 as abs with mut;
+    if (url.resolve(cast(*u8, &p.base), h.value, fl, cast(*u8, &abs), MAX_URL) < 0) { return; }
+    p.images_out = p.images_out + 1;
+    fetcher.get(cast(*u8, p), p.era, TAG_SVG_FILE, slot, cast(*u8, &abs), 0);
+}
+fn _svg_file_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.images_out = p.images_out - 1;
+    if (j.ok == 0 || j.r.status < 200 || j.r.status >= 300 || j.r.len == 0) { return; }
+    // Lasts as long as the program: a picture may be drawn from it at any time.
+    let is *dom.Document as d = cast(*dom.Document, mem.core.mmap_anon(sizeof(dom.Document)));
+    dom.init(d);
+    if (tree.parse(d, j.r.data, j.r.len) != 0) { return; }
+    paint_svg.ext_loaded(j.data, d.node);
+    jshost.dirty = 1;
+}
 fn _load_images(p as *Page) as void {
     let is *dom.Node as root = p.doc.node;
     let is *dom.Node as x with mut = _next_element(root, root);
     while (x != null) {
+        if (x.ns == dom.NS_SVG && x.name_len == 3 && decl.eq(x.name, 3, "use") == 1) { _ask_use_file(p, x); }
         let is *style.Style as st = style.of(x);
         if (st != null && st.v.i[pr.P_DISPLAY] != pr.K_NONE) {
             let is *u8 as bg = _value_url(st, pr.P_BACKGROUND_IMAGE);
@@ -416,9 +510,13 @@ fn _load_images(p as *Page) as void {
                 let is f64 as density with mut = 1.0;
                 let is *u8 as u = source.pick(&p.docs_a, x, p.vw, p.vh, &un, &density);
                 if (u != cast(*u8, 0)) {
-                    let is [MAX_URL]u8 as abs with mut;
-                    let is i64 as m = url.resolve(cast(*u8, &p.base), u, un, cast(*u8, &abs), MAX_URL);
-                    if (m >= 0) { _fetch_image(p, cast(*u8, &abs), m); }
+                    if (un > 5 && u[0] == 100 && u[1] == 97 && u[2] == 116 && u[3] == 97 && u[4] == 58) {
+                        _fetch_image(p, u, un);
+                    } else {
+                        let is [MAX_URL]u8 as abs with mut;
+                        let is i64 as m = url.resolve(cast(*u8, &p.base), u, un, cast(*u8, &abs), MAX_URL);
+                        if (m >= 0) { _fetch_image(p, cast(*u8, &abs), m); }
+                    }
                 }
             }
         }
@@ -517,6 +615,10 @@ fn _start_document(p as *Page) as void {
     arena.init(&p.style_a);
     arena.init(&p.box_a);
     arena.init(&p.paint_a);
+    p.held = 0;
+    p.gone_box = 0;
+    p.gone_paint = 0;
+    p.gone_style = 0;
     arena.init(&p.tmp_a);
     p.started = 1;
     p.images = cast(*Loaded, 0);
@@ -524,6 +626,15 @@ fn _start_document(p as *Page) as void {
     p.root = cast(*bx.Box, 0);
     p.title_n = 0;
     p.title[0] = cast(u8, 0);
+    p.scripts_first = cast(*ScriptSlot, 0);
+    p.scripts_last = cast(*ScriptSlot, 0);
+    p.scripts_out = 0;
+    p.js_dispatch = 0;
+    p.js_next = 0;
+    p.js_tick = 0;
+    p.js_done = 0;
+    p.scripts_ran = 0;
+    p.fetches_out = 0;
 }
 
 // After the bytes are a tree: what only the tree can say.
@@ -559,6 +670,12 @@ fn _read_head(p as *Page) as void {
 let is i64 as TAG_DOC   with imut = 1;
 let is i64 as TAG_SHEET with imut = 2;
 let is i64 as TAG_IMAGE with imut = 3;
+let is i64 as TAG_FONT  with imut = 4;
+let is i64 as TAG_SCRIPT with imut = 5;
+let is i64 as TAG_FETCH with imut = 6;
+let is i64 as TAG_SVG_FILE with imut = 7;
+let is i64 as TAG_JS_SCRIPT with imut = 8;
+let is i64 as BIG_SCRIPT with imut = 32768;
 
 // Asks for a page. Until the answer comes, what was showing stays as it was.
 fn begin(p as *Page, u as *u8, vw as f64, vh as f64) as void {
@@ -597,13 +714,152 @@ fn _sheets_in(p as *Page) as void {
     p.c.a = &p.box_a;
     p.c.e = &p.engine;
     p.c.images = fn_ptr(_image_for);
+    p.c.frames = cast(*u8, fn_ptr(_frame_paint));
     p.c.user = cast(*u8, p);
     p.c.base = cast(*u8, &p.base);
     p.loaded = 1;
     _load_images(p);
+    _ask_fonts(p);
+}
+
+let is i64 as MAX_FONTS_ASKED with imut = 32;
+let is i64 as MAX_LOOKS with imut = 256;
+
+// Which characters of the first plane this page has, and how its text is set. A page says
+// how to find many more fonts than it uses, and each is a download.
+let is [8192]u8 as _chars with mut;
+let is [MAX_LOOKS]*u8 as _look_family with mut;
+let is [MAX_LOOKS]f64 as _look_weight with mut;
+let is [MAX_LOOKS]i64 as _look_italic with mut;
+let is i64 as _nlooks with mut = 0;
+
+fn _note_look(st as *style.Style) as void {
+    let is *u8 as family = cast(*u8, st.v.i[pr.P_FONT_FAMILY]);
+    let is f64 as weight = st.v.f[pr.P_FONT_WEIGHT];
+    let is i64 as italic = cast(i64, st.v.i[pr.P_FONT_STYLE] != pr.K_NORMAL);
+    let is i64 as i with mut = 0;
+    while (i < _nlooks) {
+        if (_look_family[i] == family && _look_weight[i] == weight && _look_italic[i] == italic) { return; }
+        i = i + 1;
+    }
+    if (_nlooks >= MAX_LOOKS) { return; }
+    _look_family[_nlooks] = family;
+    _look_weight[_nlooks] = weight;
+    _look_italic[_nlooks] = italic;
+    _nlooks = _nlooks + 1;
+}
+
+fn _note_chars(s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        let is i64 as cp with mut = c;
+        let is i64 as more with mut = 0;
+        if (c >= 0xE0 && c < 0xF0) { cp = c & 15; more = 2; }
+        else if (c >= 0xC0 && c < 0xE0) { cp = c & 31; more = 1; }
+        else if (c >= 0xF0) { cp = 0x10000; more = 3; }
+        i = i + 1;
+        while (more > 0 && i < n) {
+            cp = (cp << 6) | (cast(i64, s[i]) & 63);
+            i = i + 1;
+            more = more - 1;
+        }
+        if (cp < 65536) { _chars[cp >> 3] = cast(u8, cast(i64, _chars[cp >> 3]) | (1 << (cp & 7))); }
+    }
+}
+
+fn _range_used(f as *sh.FontFace) as i64 {
+    if (f.nranges == 0) { return 1; }
+    let is i64 as r with mut = 0;
+    while (r < f.nranges) {
+        let is i64 as cp with mut = f.ranges[r * 2];
+        let is i64 as last = f.ranges[r * 2 + 1];
+        // Nothing is known above the first plane, and whatever is there may be wanted.
+        if (last >= 65536) { return 1; }
+        while (cp <= last) {
+            if ((cast(i64, _chars[cp >> 3]) & (1 << (cp & 7))) != 0) { return 1; }
+            cp = cp + 1;
+        }
+        r = r + 1;
+    }
+    return 0;
+}
+
+fn _same_name_ci(a as *u8, an as i64, b as *u8, bn as i64) as i64 { return webfont.same_ci(a, an, b, bn); }
+
+// Whether some look of the page would pick this face: it names the family, and nothing else
+// of that family is nearer what it asks.
+fn _face_wanted(p as *Page, f as *sh.FontFace) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < _nlooks) {
+        let is *u8 as name with mut = cast(*u8, 0);
+        let is i64 as nn with mut = 0;
+        let is i64 as at with mut = webfont.next_name(_look_family[k], 0, &name, &nn);
+        while (at >= 0) {
+            if (_same_name_ci(name, nn, f.family, f.flen) == 1) {
+                let is f64 as mine = webfont.distance(f.wlo, f.whi, f.italic, _look_weight[k], _look_italic[k]);
+                let is i64 as nearest with mut = 1;
+                let is *sh.FontFace as o with mut = p.engine.faces;
+                while (o != null) {
+                    if (_same_name_ci(o.family, o.flen, f.family, f.flen) == 1 &&
+                        webfont.distance(o.wlo, o.whi, o.italic, _look_weight[k], _look_italic[k]) < mine) { nearest = 0; }
+                    o = o.next;
+                }
+                if (nearest == 1) { return 1; }
+            }
+            at = webfont.next_name(_look_family[k], at, &name, &nn);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn _ask_fonts(p as *Page) as void {
+    if (p.engine.faces == null) { return; }
+    mem.core.memset(cast(*u8, &_chars), 0, 8192);
+    _nlooks = 0;
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        let is *style.Style as st = style.of(x);
+        if (st != null && st.v.i[pr.P_DISPLAY] != pr.K_NONE) {
+            _note_look(st);
+            if (st.before != null) { _note_look(st.before); }
+            if (st.after != null) { _note_look(st.after); }
+            let is *dom.Node as t with mut = x.first;
+            while (t != null) {
+                if (t.kind == dom.TEXT) { _note_chars(t.text, t.text_len); }
+                t = t.next;
+            }
+        }
+        x = _next_element(root, x);
+    }
+    let is i64 as asked with mut = 0;
+    let is *sh.FontFace as f with mut = p.engine.faces;
+    while (f != null && asked < MAX_FONTS_ASKED) {
+        if (_face_wanted(p, f) == 1 && _range_used(f) == 1) {
+            let is [MAX_URL]u8 as abs with mut;
+            let is i64 as m = url.resolve(f.base, f.url, f.ulen, cast(*u8, &abs), MAX_URL);
+            if (m >= 0 && webfont.have(cast(*u8, &abs), m) == 0) {
+                p.images_out = p.images_out + 1;
+                asked = asked + 1;
+                fetcher.get_font(cast(*u8, p), p.era, TAG_FONT, cast(*u8, f), cast(*u8, &abs));
+            }
+        }
+        f = f.next;
+    }
+}
+
+fn _font_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.images_out = p.images_out - 1;
+    if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) {
+        let is *u8 as u = cast(*u8, &j.url);
+        webfont.add(cast(*sh.FontFace, j.data), u, url.len_of(u), j.r.data, j.r.len);
+    }
 }
 
 fn _doc_arrived(p as *Page, j as *fetcher.Job) as void {
+    _net_note("net: document ", cast(*u8, &j.url), j.r.status);
     unload(p);
     _start_document(p);
     p.waiting_doc = 0;
@@ -626,6 +882,7 @@ fn _doc_arrived(p as *Page, j as *fetcher.Job) as void {
             n = r.len;
         }
     }
+    if (p.parent != null && j.ok == 1 && _frame_refused(p, &j.r) == 1) { src = ""; n = 0; }
     if (tree.parse(&p.doc, src, n) != 0) { n = 0; }
     shadow.flatten(&p.doc);
     _read_head(p);
@@ -637,15 +894,506 @@ fn _doc_arrived(p as *Page, j as *fetcher.Job) as void {
     ua.load(s);
     style.add_sheet(&p.engine, s);
     _ask_sheets(p);
-    if (p.sheets_out == 0) { _sheets_in(p); }
+    _ask_scripts(p);
+    _all_in(p);
 }
 
 fn _sheet_arrived(p as *Page, j as *fetcher.Job) as void {
     p.sheets_out = p.sheets_out - 1;
     if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) {
         _fill_slot(p, cast(*SheetSlot, j.data), j.r.data, j.r.len, cast(*u8, &j.r.final));
+        // One a script added after the first style: the rules join, and the page looks again.
+        if (p.loaded == 1) { _apply_slots(p, cast(*SheetSlot, j.data)); jshost.dirty = 1; }
     }
-    if (p.sheets_out == 0) { _sheets_in(p); }
+    _all_in(p);
+}
+
+// Scripts run once every sheet and script has come, before the first style: what they
+// write to the document is then seen by the first layout and asks for its own images.
+fn _ask_scripts(p as *Page) as void {
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        if (x.ns == dom.NS_HTML && x.tag == tg.SCRIPT) {
+            let is *dom.Attr as ty = dom.find_attr(x, "type", 4);
+            let is i64 as wanted with mut = 0;
+            if (ty == null || ty.value_len == 0) { wanted = 1; }
+            else if (decl.eq(ty.value, ty.value_len, "module") == 1) { wanted = 2; }
+            else if (decl.eq(ty.value, ty.value_len, "text/javascript") == 1) { wanted = 1; }
+            if (wanted != 0) {
+                let is *ScriptSlot as sl = cast(*ScriptSlot, arena.alloc(&p.docs_a, sizeof(ScriptSlot)));
+                sl.text = cast(*u8, 0);
+                sl.n = 0;
+                sl.module = cast(i64, wanted == 2);
+                sl.next = cast(*ScriptSlot, 0);
+                if (p.scripts_last == null) { p.scripts_first = sl; } else { p.scripts_last.next = sl; }
+                p.scripts_last = sl;
+                let is *dom.Attr as src = dom.find_attr(x, "src", 3);
+                if (src != null) {
+                    let is [MAX_URL]u8 as abs with mut;
+                    if (url.resolve(cast(*u8, &p.base), src.value, src.value_len, cast(*u8, &abs), MAX_URL) >= 0) {
+                        p.scripts_out = p.scripts_out + 1;
+                        fetcher.get(cast(*u8, p), p.era, TAG_SCRIPT, cast(*u8, sl), cast(*u8, &abs), 0);
+                    }
+                } else {
+                    let is i64 as n with mut = 0;
+                    sl.text = _element_text(&p.docs_a, x, &n);
+                    sl.n = n;
+                }
+            }
+        }
+        x = _next_element(root, x);
+    }
+}
+
+fn _script_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.scripts_out = p.scripts_out - 1;
+    if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) {
+        let is *ScriptSlot as sl = cast(*ScriptSlot, j.data);
+        sl.text = arena.alloc(&p.docs_a, j.r.len + 1);
+        mem.memcpy(sl.text, j.r.data, j.r.len);
+        sl.n = j.r.len;
+    }
+    _all_in(p);
+}
+
+// Scripts in document order. A module's names are its own, so each sits in a function.
+fn _run_scripts(p as *Page) as void {
+    if (p.scripts_first == null) { return; }
+    _js_mark_sheets(p);
+    let is i64 as total with mut = 0;
+    let is *ScriptSlot as s with mut = p.scripts_first;
+    while (s != null) { total = total + s.n + 96; s = s.next; }
+    let is *u8 as b = arena.alloc(&p.docs_a, total + 1);
+    let is i64 as at with mut = 0;
+    let is i64 as pass with mut = 0;
+    while (pass < 2) {
+        s = p.scripts_first;
+        while (s != null) {
+            if (s.module == pass && s.text != null && s.n > BIG_SCRIPT) {
+                // Compiled by itself, so that it is kept whatever else this page has in it, and
+                // run from here, in its place among the others.
+                if (pass == 1) {
+                    let is *u8 as w = arena.alloc(&p.docs_a, s.n + 20);
+                    mem.memcpy(w, "(function(){", 12);
+                    mem.memcpy(cast(*u8, cast(i64, w) + 12), s.text, s.n);
+                    mem.memcpy(cast(*u8, cast(i64, w) + 12 + s.n), "\n})();", 6);
+                    s.text = w;
+                    s.n = s.n + 18;
+                    s.module = 2;
+                }
+                let is i64 as idx with mut = 0;
+                let is *ScriptSlot as c with mut = p.scripts_first;
+                while (c != s) { idx = idx + 1; c = c.next; }
+                let is [64]u8 as line;
+                let is *u8 as pre = "__script__;\n__runScriptSlot(";
+                let is i64 as ln with mut = 0;
+                while (pre[ln] != 0) { line[ln] = pre[ln]; ln = ln + 1; }
+                let is [20]u8 as dg;
+                let is i64 as dn with mut = 0;
+                let is i64 as dv with mut = idx;
+                if (dv == 0) { dg[0] = 48; dn = 1; }
+                while (dv > 0) { dg[dn] = cast(u8, 48 + dv % 10); dv = dv / 10; dn = dn + 1; }
+                while (dn > 0) { dn = dn - 1; line[ln] = dg[dn]; ln = ln + 1; }
+                line[ln] = 41; line[ln + 1] = 59; line[ln + 2] = 10;
+                ln = ln + 3;
+                mem.memcpy(cast(*u8, cast(i64, b) + at), cast(*u8, &line), ln);
+                at = at + ln;
+            } else if (s.module == pass && s.text != null) {
+                mem.memcpy(cast(*u8, cast(i64, b) + at), "__script__;\n", 12);
+                at = at + 12;
+                if (pass == 1) { mem.memcpy(cast(*u8, cast(i64, b) + at), "(function(){", 12); at = at + 12; }
+                mem.memcpy(cast(*u8, cast(i64, b) + at), s.text, s.n);
+                at = at + s.n;
+                if (pass == 1) { mem.memcpy(cast(*u8, cast(i64, b) + at), "\n})();", 6); at = at + 6; }
+                mem.memcpy(cast(*u8, cast(i64, b) + at), "\n", 1);
+                at = at + 1;
+            }
+            s = s.next;
+        }
+        pass = pass + 1;
+    }
+    _js_own(p);
+    p.js_dispatch = jshost.run(&p.doc, b, at);
+    if (p.js_dispatch != 0) { p.js_next = jshost.last_next; p.js_tick = jshost.last_tick; p.js_msg = jshost.last_msg; p.js_script = jshost.last_script; p.js_done = jshost.last_done; }
+}
+
+fn _all_in(p as *Page) as void {
+    if (p.sheets_out != 0 || p.scripts_out != 0 || p.loaded == 1) { return; }
+    if (p.scripts_ran == 0) {
+        p.scripts_ran = 1;
+        _run_scripts(p);
+        _js_sheets(p);
+        if (p.sheets_out != 0) { return; }
+    }
+    _sheets_in(p);
+}
+
+// Where an element is, from the layout as of now: what scripts changed has to be laid out first.
+fn _js_rect(user as *u8, node as *dom.Node, which as i64) as i64 {
+    let is *Page as p = cast(*Page, user);
+    if (p.loaded == 0) { return 0; }
+    if (jshost.dirty == 1 || p.root == null) {
+        _style_again(p, p.engine.vw, p.engine.vh);
+        relayout(p, p.vw, p.vh, &p.js_list);
+        jshost.dirty = 2;
+        // What is showing did not come from this, and has to be made again.
+        p.dirty = 1;
+    }
+    if (p.root == null) { return 0; }
+    let is *bx.Box as b = layout.box_of(p.root, node);
+    if (b == null) { return 0; }
+    if (which == 0) { return cast(i64, b.ax); }
+    if (which == 1) { return cast(i64, b.ay); }
+    if (which == 2) { return cast(i64, b.p[bx.LEFT] + b.b[bx.LEFT] + b.w + b.p[bx.RIGHT] + b.b[bx.RIGHT]); }
+    return cast(i64, b.p[bx.TOP] + b.b[bx.TOP] + b.h + b.p[bx.BOTTOM] + b.b[bx.BOTTOM]);
+}
+let is [64]u8 as _cs with mut;
+fn _cs_word(out as i64, w as *u8) as i64 {
+    *cast(*i64, out) = cast(i64, w);
+    let is i64 as n with mut = 0;
+    while (w[n] != 0) { n = n + 1; }
+    return n;
+}
+fn _cs_num(out as i64, v as f64, unit as *u8) as i64 {
+    let is i64 as neg = cast(i64, v < 0.0);
+    let is f64 as a with mut = v;
+    if (neg == 1) { a = 0.0 - a; }
+    let is i64 as cents = cast(i64, a * 100.0 + 0.5);
+    let is i64 as n with mut = 0;
+    if (neg == 1) { _cs[n] = cast(u8, 45); n = 1; }
+    let is [24]u8 as d;
+    let is i64 as k with mut = 0;
+    let is i64 as ip with mut = cents / 100;
+    if (ip == 0) { d[0] = cast(u8, 48); k = 1; }
+    while (ip > 0) { d[k] = cast(u8, 48 + ip % 10); ip = ip / 10; k = k + 1; }
+    while (k > 0) { k = k - 1; _cs[n] = d[k]; n = n + 1; }
+    let is i64 as fr = cents % 100;
+    if (fr != 0) {
+        _cs[n] = cast(u8, 46); n = n + 1;
+        _cs[n] = cast(u8, 48 + fr / 10); n = n + 1;
+        if (fr % 10 != 0) { _cs[n] = cast(u8, 48 + fr % 10); n = n + 1; }
+    }
+    let is i64 as u with mut = 0;
+    while (unit[u] != 0) { _cs[n] = unit[u]; n = n + 1; u = u + 1; }
+    *cast(*i64, out) = cast(i64, &_cs);
+    return n;
+}
+fn _cs_color(out as i64, c as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as al = (c >> 24) & 255;
+    let is *u8 as head with mut = "rgba(";
+    if (al == 255) { head = "rgb("; }
+    while (head[n] != 0) { _cs[n] = head[n]; n = n + 1; }
+    let is i64 as pass with mut = 0;
+    while (pass < 3) {
+        let is i64 as v with mut = 0;
+        if (pass == 0) { v = (c >> 16) & 255; }
+        if (pass == 1) { v = (c >> 8) & 255; }
+        if (pass == 2) { v = c & 255; }
+        if (v >= 100) { _cs[n] = cast(u8, 48 + v / 100); n = n + 1; }
+        if (v >= 10) { _cs[n] = cast(u8, 48 + (v / 10) % 10); n = n + 1; }
+        _cs[n] = cast(u8, 48 + v % 10); n = n + 1;
+        if (pass < 2) { _cs[n] = cast(u8, 44); _cs[n + 1] = cast(u8, 32); n = n + 2; }
+        pass = pass + 1;
+    }
+    if (al != 255) {
+        _cs[n] = cast(u8, 44); _cs[n + 1] = cast(u8, 32); n = n + 2;
+        if (al == 0) { _cs[n] = cast(u8, 48); n = n + 1; }
+        else {
+            _cs[n] = cast(u8, 48); _cs[n + 1] = cast(u8, 46); n = n + 2;
+            let is i64 as t = al * 100 / 255;
+            _cs[n] = cast(u8, 48 + t / 10); _cs[n + 1] = cast(u8, 48 + t % 10); n = n + 2;
+        }
+    }
+    _cs[n] = cast(u8, 41);
+    *cast(*i64, out) = cast(i64, &_cs);
+    return n + 1;
+}
+// One of the properties getComputedStyle reports, by its number in the script's list.
+fn _js_computed(user as *u8, node as *dom.Node, which as i64, out as i64) as i64 {
+    let is *Page as p = cast(*Page, user);
+    if (p.loaded == 0 || node.kind != dom.ELEMENT) { return 0; }
+    if (jshost.dirty == 1) { _style_again(p, p.engine.vw, p.engine.vh); jshost.dirty = 2; p.dirty = 1; }
+    let is *style.Style as st = style.of(node);
+    if (st == null) { return 0; }
+    if (which == 0) {
+        let is i64 as v = st.v.i[pr.P_DISPLAY];
+        if (v == pr.K_BLOCK) { return _cs_word(out, "block"); }
+        if (v == pr.K_INLINE) { return _cs_word(out, "inline"); }
+        if (v == pr.K_INLINE_BLOCK) { return _cs_word(out, "inline-block"); }
+        if (v == pr.K_NONE) { return _cs_word(out, "none"); }
+        if (v == pr.K_FLEX) { return _cs_word(out, "flex"); }
+        if (v == pr.K_INLINE_FLEX) { return _cs_word(out, "inline-flex"); }
+        if (v == pr.K_GRID) { return _cs_word(out, "grid"); }
+        if (v == pr.K_INLINE_GRID) { return _cs_word(out, "inline-grid"); }
+        if (v == pr.K_LIST_ITEM) { return _cs_word(out, "list-item"); }
+        if (v == pr.K_TABLE) { return _cs_word(out, "table"); }
+        if (v == pr.K_CONTENTS) { return _cs_word(out, "contents"); }
+        return _cs_word(out, "block");
+    }
+    if (which == 1) {
+        let is i64 as v = st.v.i[pr.P_POSITION];
+        if (v == pr.K_RELATIVE) { return _cs_word(out, "relative"); }
+        if (v == pr.K_ABSOLUTE) { return _cs_word(out, "absolute"); }
+        if (v == pr.K_FIXED) { return _cs_word(out, "fixed"); }
+        if (v == pr.K_STICKY) { return _cs_word(out, "sticky"); }
+        return _cs_word(out, "static");
+    }
+    if (which == 2) {
+        let is i64 as v = st.v.i[pr.P_VISIBILITY];
+        if (v == pr.K_HIDDEN) { return _cs_word(out, "hidden"); }
+        if (v == pr.K_COLLAPSE) { return _cs_word(out, "collapse"); }
+        return _cs_word(out, "visible");
+    }
+    if (which == 3 || which == 4) {
+        if (p.root == null || p.dirty == 1) { relayout(p, p.vw, p.vh, &p.js_list); }
+        if (p.root == null) { return 0; }
+        let is *bx.Box as b = layout.box_of(p.root, node);
+        if (b == null) { return _cs_word(out, "auto"); }
+        if (which == 3) { return _cs_num(out, b.w, "px"); }
+        return _cs_num(out, b.h, "px");
+    }
+    if (which == 5) { return _cs_num(out, st.v.f[pr.P_OPACITY], ""); }
+    if (which == 6) { return _cs_num(out, st.v.f[pr.P_FONT_SIZE], "px"); }
+    if (which == 7) { return _cs_color(out, st.v.i[pr.P_COLOR]); }
+    return _cs_color(out, st.v.i[pr.P_BACKGROUND_COLOR]);
+}
+// fetch from a script. info: its number, the address and length, whether to post, the body
+// and length, its type and length.
+fn _js_fetch(user as *u8, info as *i64) as i64 {
+    let is *Page as p = cast(*Page, user);
+    let is [MAX_URL]u8 as abs with mut;
+    if (url.resolve(cast(*u8, &p.base), cast(*u8, info[1]), info[2], cast(*u8, &abs), MAX_URL) < 0) { return 0; }
+    p.fetches_out = p.fetches_out + 1;
+    if (info[3] == 1) {
+        let is [256]u8 as ty with mut;
+        let is i64 as tn with mut = info[7];
+        if (tn > 255) { tn = 255; }
+        let is i64 as i with mut = 0;
+        while (i < tn) { ty[i] = *cast(*u8, info[6] + i); i = i + 1; }
+        ty[tn] = cast(u8, 0);
+        fetcher.post(cast(*u8, p), p.era, TAG_FETCH, cast(*u8, info[0]), cast(*u8, &abs), cast(*u8, &ty), cast(*u8, info[4]), info[5], cast(*u8, &p.base), cast(*u8, &p.base));
+    } else {
+        fetcher.get(cast(*u8, p), p.era, TAG_FETCH, cast(*u8, info[0]), cast(*u8, &abs), 0);
+    }
+    return 1;
+}
+fn _js_own(p as *Page) as void {
+    jshost.owner = cast(*u8, p);
+    jshost.rect_fn = cast(*u8, fn_ptr(_js_rect));
+    jshost.computed_fn = cast(*u8, fn_ptr(_js_computed));
+    jshost.fetch_fn = cast(*u8, fn_ptr(_js_fetch));
+    jshost.frame_fn = cast(*u8, fn_ptr(_js_frame));
+    jshost.page_url = cast(*u8, &p.base);
+    jshost.page_url_n = url.len_of(cast(*u8, &p.base));
+    jshost.view_w = cast(i64, p.vw);
+    jshost.view_h = cast(i64, p.vh);
+}
+// Sheets a script added since the last look.
+let is i64 as FLAG_SHEET_SEEN with imut = 1048576;
+fn _js_mark_sheets(p as *Page) as void {
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        if (x.tag == tg.STYLE || x.tag == tg.LINK || x.tag == tg.SCRIPT) { x.flags = x.flags | FLAG_SHEET_SEEN; }
+        x = _next_element(root, x);
+    }
+}
+// A <script> a script added: fetched and run in the same runtime, in the order it arrives, or
+// run now if the text is here. Scripts it runs in turn can add more.
+fn _js_script_found(p as *Page, x as *dom.Node) as void {
+    let is *dom.Attr as ty = dom.find_attr(x, "type", 4);
+    if (ty != null && ty.value_len != 0 && decl.eq(ty.value, ty.value_len, "text/javascript") == 0
+        && decl.eq(ty.value, ty.value_len, "application/javascript") == 0) { return; }
+    let is *dom.Attr as src = dom.find_attr(x, "src", 3);
+    if (src != null) {
+        x.flags = x.flags | FLAG_SHEET_SEEN;
+        let is [MAX_URL]u8 as abs with mut;
+        if (url.resolve(cast(*u8, &p.base), src.value, src.value_len, cast(*u8, &abs), MAX_URL) < 0) { return; }
+        p.fetches_out = p.fetches_out + 1;
+        fetcher.get(cast(*u8, p), p.era, TAG_JS_SCRIPT, cast(*u8, x), cast(*u8, &abs), 0);
+        return;
+    }
+    if (x.first == null) { return; }
+    x.flags = x.flags | FLAG_SHEET_SEEN;
+    let is i64 as n with mut = 0;
+    let is *u8 as text = _element_text(&p.docs_a, x, &n);
+    let is i64 as was = jshost.dirty;
+    jshost.script(&p.doc, p.js_script, text, n, x, 2);
+    if (was != 0) { jshost.dirty = 1; }
+}
+fn _js_script_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.fetches_out = p.fetches_out - 1;
+    _js_own(p);
+    jshost.dirty = 0;
+    let is i64 as ok with mut = 0;
+    if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) { ok = 1; }
+    let is *u8 as data with mut = j.r.data;
+    let is i64 as n with mut = j.r.len;
+    if (ok == 0 || cast(i64, data) == 0) { data = ""; n = 0; }
+    jshost.script(&p.doc, p.js_script, data, n, cast(*dom.Node, j.data), ok);
+    _js_sheets(p);
+    if (jshost.dirty != 0) { _load_images(p); }
+}
+fn _js_sheets(p as *Page) as void {
+    while (jshost.sheets_touched != 0) {
+        jshost.sheets_touched = 0;
+        _js_sheets_once(p);
+    }
+}
+fn _js_sheets_once(p as *Page) as void {
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        if (x.ns == dom.NS_HTML && x.tag == tg.SCRIPT && (x.flags & FLAG_SHEET_SEEN) == 0 && p.js_script != 0) { _js_script_found(p, x); }
+        if (x.ns == dom.NS_HTML && (x.flags & FLAG_SHEET_SEEN) == 0 && (x.tag == tg.STYLE || x.tag == tg.LINK)) {
+            if (x.tag == tg.STYLE && x.first != null) {
+                x.flags = x.flags | FLAG_SHEET_SEEN;
+                let is i64 as n with mut = 0;
+                let is *u8 as text = _element_text(&p.docs_a, x, &n);
+                let is *SheetSlot as sl = _new_slot(p, cast(*SheetSlot, 0), 0, 0);
+                _fill_slot(p, sl, text, n, cast(*u8, &p.base));
+                if (p.loaded == 1) { _apply_slots(p, sl); jshost.dirty = 1; }
+            }
+            if (x.tag == tg.LINK) {
+                let is *dom.Attr as rel = dom.find_attr(x, "rel", 3);
+                let is *dom.Attr as href = dom.find_attr(x, "href", 4);
+                if (rel != null && href != null && decl.eq(rel.value, rel.value_len, "stylesheet") == 1) {
+                    x.flags = x.flags | FLAG_SHEET_SEEN;
+                    let is *SheetSlot as sl = _new_slot(p, cast(*SheetSlot, 0), 0, 0);
+                    _ask_sheet(p, sl, href.value, href.value_len, cast(*u8, &p.base));
+                }
+            }
+        }
+        x = _next_element(root, x);
+    }
+}
+// What was asked of the network and what came, when someone is looking into a page.
+fn _net_note(what as *u8, u as *u8, status as i64) as void {
+    if (env.getenv("CAUSTIC_JS_TRACE") == null) { return; }
+    let is i64 as n with mut = 0;
+    while (what[n] != 0) { n = n + 1; }
+    syscall(1, 2, what, n);
+    n = 0;
+    while (u[n] != 0 && n < 160) { n = n + 1; }
+    syscall(1, 2, u, n);
+    let is [24]u8 as t;
+    let is i64 as i with mut = 23;
+    let is i64 as v with mut = status;
+    t[23] = 10;
+    if (v <= 0) { i = i - 1; t[i] = 48; }
+    while (v > 0) { i = i - 1; t[i] = cast(u8, 48 + v % 10); v = v / 10; }
+    i = i - 1;
+    t[i] = 32;
+    syscall(1, 2, cast(i64, &t) + i, 24 - i);
+}
+fn _fetch_arrived(p as *Page, j as *fetcher.Job) as void {
+    p.fetches_out = p.fetches_out - 1;
+    if (j.ok == 1) { _net_note("net: fetch ", cast(*u8, &j.url), j.r.status); } else { _net_note("net: FAILED ", cast(*u8, &j.url), 0); }
+    _js_own(p);
+    jshost.dirty = 0;
+    let is i64 as st with mut = 0;
+    if (j.ok == 1) { st = j.r.status; }
+    let is *u8 as data with mut = j.r.data;
+    let is i64 as n with mut = j.r.len;
+    if (j.ok == 0 || cast(i64, data) == 0) { data = ""; n = 0; }
+    jshost.deliver(&p.doc, p.js_done, cast(i64, j.data), st, data, n, cast(*u8, &j.r.ctype));
+    _js_sheets(p);
+    if (jshost.dirty != 0) { _load_images(p); }
+}
+
+// A click for the page's scripts. Bit 1: something ran. Bit 2: stop the default.
+fn js_event(p as *Page, n as *dom.Node, type_s as *u8, tn as i64, info as *i64) as i64 {
+    if (p.js_dispatch == 0) { return 0; }
+    _js_own(p);
+    jshost.dirty = 0;
+    let is i64 as r = jshost.fire(&p.doc, p.js_dispatch, n, type_s, tn, info);
+    _js_sheets(p);
+    if (jshost.dirty != 0) { _load_images(p); }
+    return r;
+}
+fn js_changed() as i64 { if (jshost.dirty != 0) { return 1; } return 0; }
+fn js_clear() as void { jshost.dirty = 0; }
+fn first_of(p as *Page, name as *u8) as *dom.Node {
+    let is i64 as n with mut = 0;
+    while (name[n] != 0) { n = n + 1; }
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as x with mut = _next_element(root, root);
+    while (x != null) {
+        if (dom._same(x.name, x.name_len, name, n) == 1) { return x; }
+        x = _next_element(root, x);
+    }
+    return cast(*dom.Node, 0);
+}
+fn js_on(p as *Page) as i64 { return cast(i64, p.js_dispatch != 0); }
+// How long until the page's next timer, in ms, or -1.
+// When something is next due here or in a frame, in ms, or -1.
+fn js_wait(p as *Page) as i64 {
+    let is i64 as w with mut = jshost.next_timer(p.js_next);
+    if (_msg_ready(p) == 1) { return 0; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.synth == 1) { return 0; }
+        if (fr.fired == 0 && _frame_loaded(fr) == 1) { return 0; }
+        let is i64 as c = js_wait(fr.pg);
+        if (c >= 0 && (w < 0 || c < w)) { w = c; }
+        fr = fr.next;
+    }
+    return w;
+}
+// Runs what is due. 1 when the document changed.
+// Bit 1: this page changed. Bit 2: a frame did, and only its parent's list has to take that up.
+fn js_step(p as *Page) as i64 {
+    let is i64 as r with mut = 0;
+    _js_own(p);
+    jshost.dirty = 0;
+    jshost.tick(&p.doc, p.js_tick);
+    _deliver_messages(p);
+    _js_sheets(p);
+    if (jshost.dirty != 0) { _load_images(p); r = 1; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        let is *Frame as next = fr.next;
+        let is [MAX_URL]u8 as to with mut;
+        _frame_wanted(p, fr.node, cast(*u8, &to));
+        if (_same_c(cast(*u8, &to), cast(*u8, &fr.src)) == 0) { _frame_go(p, fr); }
+        if (fr.synth == 1) { _frame_make(p, fr); r = r | 2; }
+        let is i64 as c = js_step(fr.pg);
+        if ((c & 1) != 0) { fr.pg.dirty = 1; }
+        if (c != 0) { r = r | 2; }
+        if (fr.fired == 0 && _frame_loaded(fr) == 1) {
+            fr.fired = 1;
+            _js_own(p);
+            jshost.dirty = 0;
+            js_event(p, fr.node, "load", 4, cast(*i64, 0));
+            if (jshost.dirty != 0) { r = r | 1; }
+        }
+        fr = next;
+    }
+    jshost.dirty = 0;
+    return r;
+}
+fn write_document(p as *Page) as void {
+    jshost.cur_doc = &p.doc;
+    let is i64 as out with mut = 0;
+    let is i64 as n = jshost.h_get_html(cast(i64, p.doc.node), cast(i64, &out));
+    let is i64 as off with mut = 0;
+    while (off < n) {
+        let is i64 as w = syscall(1, 1, out + off, n - off);
+        if (w <= 0) { break; }
+        off = off + w;
+    }
+}
+// Nothing more on its way for this page.
+fn settled(p as *Page) as i64 {
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.synth == 1 || settled(fr.pg) == 0) { return 0; }
+        fr = fr.next;
+    }
+    if (p.loaded == 0 || p.sheets_out != 0 || p.scripts_out != 0 || p.images_out != 0 || p.fetches_out != 0) { return 0; }
+    return 1;
 }
 
 fn _image_arrived(p as *Page, j as *fetcher.Job) as void {
@@ -663,6 +1411,11 @@ fn arrived(p as *Page, j as *fetcher.Job) as void {
     if (j.tag == TAG_DOC) { _doc_arrived(p, j); }
     else if (j.tag == TAG_SHEET) { _sheet_arrived(p, j); }
     else if (j.tag == TAG_IMAGE) { _image_arrived(p, j); }
+    else if (j.tag == TAG_FONT) { _font_arrived(p, j); }
+    else if (j.tag == TAG_SCRIPT) { _script_arrived(p, j); }
+    else if (j.tag == TAG_FETCH) { _fetch_arrived(p, j); }
+    else if (j.tag == TAG_JS_SCRIPT) { _js_script_arrived(p, j); }
+    else if (j.tag == TAG_SVG_FILE) { _svg_file_arrived(p, j); }
 }
 
 fn images_waiting(p as *Page) as i64 { return p.images_out; }
@@ -673,9 +1426,8 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     if (p.loaded == 0) { return; }
     let is i64 as resized = cast(i64, vw != p.engine.vw || vh != p.engine.vh);
     if (resized == 1 && p.engine.viewport == 1) { _style_again(p, vw, vh); }
-    arena.free(&p.box_a);
-    arena.free(&p.tmp_a);
-    arena.free(&p.paint_a);
+    _retire_boxes(p);
+    _retire_paint(p);
     p.c.hits = cast(*bx.HitItem, 0);
     p.c.nhits = 0;
     p.c.caphits = 0;
@@ -684,6 +1436,7 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     p.c.vw = vw;
     p.c.vh = vh;
     p.root = layout.run(&p.c, &p.doc);
+    _let_go_of_styles(p);
     // A style that asks how big its container is can only be answered from a layout, and
     // its answer can change what the next layout finds. Twice more settles what pages do.
     let is i64 as rounds with mut = 0;
@@ -696,6 +1449,7 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
         p.c.nhits = 0;
         p.c.caphits = 0;
         p.root = layout.run(&p.c, &p.doc);
+        _let_go_of_styles(p);
     }
     if (env.getenv("CAUSTIC_BOXES") != null) { boxdump.boxes(p.root); }
     let is f64 as w with mut = vw;
@@ -705,7 +1459,68 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     p.doc_w = w;
     p.doc_h = h;
     anim.after_layout(&p.motion, p.root);
+    _sync_frames(p);
     paint.paint(&p.c, p.root, l, w, h, &p.tmp_a);
+}
+
+// What a page lets go of stays until the list on the screen has been made again, because that
+// list, frames' commands and all, points into it: its text, gradients and matrices. A script
+// asking where something is lays the page out with no new list at all. One generation is
+// what a list can be pointing at; the ones after it are nobody's and go at once.
+struct Gone {
+    a      as arena.Arena;
+    blocks as *dom.Block;
+    next   as *Gone;
+}
+let is arena.Arena as _gone_a with mut;
+let is *Gone as _gone with mut = cast(*Gone, 0);
+let is i64 as _gone_gen with mut = 1;
+fn _gone_new() as *Gone {
+    let is *Gone as g = cast(*Gone, arena.alloc(&_gone_a, sizeof(Gone)));
+    g.next = _gone;
+    _gone = g;
+    return g;
+}
+fn _retire(a as *arena.Arena) as void {
+    if (cast(i64, a.blocks) == 0) { return; }
+    let is *Gone as g = _gone_new();
+    g.a = *a;
+    arena.init(a);
+}
+fn _retire_doc(d as *dom.Document) as void {
+    if (d.blocks == null) { return; }
+    let is *Gone as g = _gone_new();
+    g.blocks = dom.take_blocks(d);
+}
+fn _retire_boxes(p as *Page) as void {
+    if (p.gone_box == _gone_gen) { arena.free(&p.box_a); return; }
+    p.gone_box = _gone_gen;
+    _retire(&p.box_a);
+}
+fn _retire_paint(p as *Page) as void {
+    if (p.gone_paint == _gone_gen) { arena.free(&p.tmp_a); arena.free(&p.paint_a); return; }
+    p.gone_paint = _gone_gen;
+    _retire(&p.tmp_a);
+    _retire(&p.paint_a);
+}
+// The list on the screen has just been made: nothing is left pointing at what went before.
+fn list_made() as void {
+    let is *Gone as g with mut = _gone;
+    while (g != null) {
+        arena.free(&g.a);
+        if (g.blocks != null) { dom.free_blocks(g.blocks); }
+        g = g.next;
+    }
+    _gone = cast(*Gone, 0);
+    arena.free(&_gone_a);
+    _gone_gen = _gone_gen + 1;
+}
+fn _let_go_of_styles(p as *Page) as void {
+    if (p.held == 0) { return; }
+    p.held = 0;
+    if (p.gone_style == _gone_gen) { arena.free(&p.style_held); return; }
+    p.gone_style = _gone_gen;
+    _retire(&p.style_held);
 }
 
 // New styles for everything, with the old ones kept until what changed has been seen.
@@ -714,17 +1529,27 @@ fn _style_again(p as *Page, vw as f64, vh as f64) as void {
     arena.init(&p.style_a);
     style.style_document(&p.engine, &p.doc, vw, vh);
     anim.after_restyle(&p.motion, &p.doc, time.now_ms());
-    arena.free(&old);
+    // The boxes are made a while after this, when a script has done it, and can be asked things until then.
+    if (p.held == 0) { p.style_held = old; p.held = 1; }
+    else { arena.free(&old); }
 }
 
 // A frame of what is moving: what it looks like now, with nothing laid out. 1 when the
 // list has been made again.
 fn tick(p as *Page, l as *dl.List, sy as f64) as i64 {
     if (p.loaded == 0 || p.root == null) { return 0; }
-    if (anim.wants_frame(&p.motion, sy, p.vh) == 0) { return 0; }
+    // Styled again and not laid out yet: its boxes hold the frame this would free.
+    if (p.dirty == 1) { return 0; }
+    let is i64 as framed with mut = 0;
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.pg.dirty == 1) { refresh(fr.pg, &fr.list); framed = 1; }
+        else if (tick(fr.pg, &fr.list, fr.sy) == 1) { framed = 1; }
+        fr = fr.next;
+    }
+    if (anim.wants_frame(&p.motion, sy, p.vh) == 0 && framed == 0) { return 0; }
     anim.tick(&p.motion, time.now_ms());
-    arena.free(&p.tmp_a);
-    arena.free(&p.paint_a);
+    _retire_paint(p);
     p.c.a = &p.paint_a;
     p.c.hits = cast(*bx.HitItem, 0);
     p.c.nhits = 0;
@@ -736,12 +1561,14 @@ fn tick(p as *Page, l as *dl.List, sy as f64) as i64 {
 
 // What the last frame changed, in the page: 1, or 0 when that is all of it.
 fn moved_area(p as *Page, x0 as *f64, y0 as *f64, x1 as *f64, y1 as *f64) as i64 {
+    if (p.frames != null) { return 0; }
     return anim.area(&p.motion, x0, y0, x1, y1);
 }
 
 // Whether anything on the page is still to move.
 fn moving(p as *Page) as i64 {
     if (p.loaded == 0) { return 0; }
+    if (css_moving(p) == 1) { return 1; }
     if (anim.active(&p.motion) == 1) { return 1; }
     return _has_moving_image(p);
 }
@@ -749,6 +1576,11 @@ fn moving(p as *Page) as i64 {
 // Whether CSS has anything moving, which is what costs a new list every frame.
 fn css_moving(p as *Page) as i64 {
     if (p.loaded == 0) { return 0; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (css_moving(fr.pg) == 1) { return 1; }
+        fr = fr.next;
+    }
     return anim.active(&p.motion);
 }
 
@@ -876,6 +1708,7 @@ fn focused(p as *Page) as *dom.Node { return p.focus; }
 // Styles and everything after them again, for what changed in the document or its state.
 fn refresh(p as *Page, l as *dl.List) as void {
     if (p.loaded == 0) { return; }
+    _refresh_frames(p);
     _style_again(p, p.engine.vw, p.engine.vh);
     p.dirty = 0;
     relayout(p, p.vw, p.vh, l);
@@ -949,4 +1782,604 @@ fn next_image(l as *Loaded) as *Loaded { return l.next; }
 fn pixels_of(l as *Loaded) as *dl.Image {
     if (l.ok == 0) { return cast(*dl.Image, 0); }
     return &l.img;
+}
+
+// --- Frames ---
+//
+// An <iframe> is a page of its own, with its own document, runtime and memory, so that nothing
+// in one can reach into another. What they share goes by number: postMessage, and the windows
+// scripts name. Its display list is copied into its parent's at the box, so any change to what
+// the list points at has to be followed by a paint of the parent before anything is drawn.
+
+// Textures go before the pixels, and only the browser has them: it says how, once.
+let is *u8 as image_release with mut = cast(*u8, 0);
+let is i64 as MAX_FRAME_DEPTH with imut = 5;
+let is i64 as MAX_FRAMES with imut = 64;
+
+fn top_of(p as *Page) as *Page {
+    let is *Page as t with mut = p;
+    while (t.parent != null) { t = t.parent; }
+    return t;
+}
+fn is_frame(p as *Page) as i64 { return cast(i64, p.parent != null); }
+fn holds(p as *Page, c as *Page) as i64 {
+    if (p == c) { return 1; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (holds(fr.pg, c) == 1) { return 1; }
+        fr = fr.next;
+    }
+    return 0;
+}
+fn frame_of(p as *Page, n as *dom.Node) as *Frame {
+    if (n == null) { return cast(*Frame, 0); }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.node == n) { return fr; }
+        fr = fr.next;
+    }
+    return cast(*Frame, 0);
+}
+fn _frame_loaded(fr as *Frame) as i64 {
+    let is *Page as c = fr.pg;
+    if (fr.synth == 1 || c.loaded == 0 || c.sheets_out != 0 || c.scripts_out != 0 || c.images_out != 0) { return 0; }
+    return 1;
+}
+fn _release_images_of(c as *Page) as void {
+    if (cast(i64, image_release) == 0) { return; }
+    let is *Loaded as l with mut = c.images;
+    while (l != null) {
+        let is *dl.Image as im = pixels_of(l);
+        if (cast(i64, im) != 0) { call(image_release, cast(i64, im)); }
+        l = l.next;
+    }
+}
+fn _drop_frame(p as *Page, fr as *Frame) as void {
+    let is *Page as c = fr.pg;
+    cancel(c);
+    _release_images_of(c);
+    unload(c);
+    _forget_messages(c.id);
+    dl.free(&fr.list);
+    dl.free(&c.js_list);
+    mem.core.munmap(cast(*u8, c), sizeof(Page));
+    mem.core.munmap(cast(*u8, fr), sizeof(Frame));
+}
+fn _drop_frames(p as *Page) as void {
+    let is *Frame as fr with mut = p.frames;
+    p.frames = cast(*Frame, 0);
+    while (fr != null) {
+        let is *Frame as next = fr.next;
+        _drop_frame(p, fr);
+        fr = next;
+    }
+}
+// What the element asks for. 1 when that is a page to fetch, 0 for one made here.
+fn _frame_wanted(p as *Page, n as *dom.Node, out as *u8) as i64 {
+    if (dom.find_attr(n, "srcdoc", 6) != null) { _copy_url(out, "about:srcdoc"); return 0; }
+    let is *dom.Attr as a = dom.find_attr(n, "src", 3);
+    if (a == null || a.value_len == 0 || url.resolve(cast(*u8, &p.base), a.value, a.value_len, out, MAX_URL) < 0) {
+        _copy_url(out, "about:blank");
+        return 0;
+    }
+    if (out[0] == 97 && out[1] == 98 && out[2] == 111 && out[3] == 117 && out[4] == 116 && out[5] == 58) { return 0; }
+    return 1;
+}
+fn _same_c(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i64, a[i] == b[i]);
+}
+fn _frame_go(p as *Page, fr as *Frame) as void {
+    let is [MAX_URL]u8 as to with mut;
+    let is i64 as fetched = _frame_wanted(p, fr.node, cast(*u8, &to));
+    _copy_url(cast(*u8, &fr.src), cast(*u8, &to));
+    fr.fired = 0;
+    fr.sy = 0.0;
+    if (fetched == 1) { fr.synth = 0; begin(fr.pg, cast(*u8, &to), fr.w, fr.h); }
+    else { cancel(fr.pg); fr.synth = 1; }
+}
+// The frame for an element in this page, made if it is not there yet. Null when too deep.
+fn _frame_for(p as *Page, n as *dom.Node) as *Frame {
+    let is *Frame as have = frame_of(p, n);
+    if (have != null) { return have; }
+    if (p.depth >= MAX_FRAME_DEPTH) { return cast(*Frame, 0); }
+    let is i64 as count with mut = 0;
+    let is *Frame as x with mut = p.frames;
+    while (x != null) { count = count + 1; x = x.next; }
+    if (count >= MAX_FRAMES) { return cast(*Frame, 0); }
+    let is *u8 as m = mem.core.mmap_anon(sizeof(Frame));
+    let is i64 as v = cast(i64, m);
+    if (v == 0 || v == 0 - 1) { return cast(*Frame, 0); }
+    let is *Frame as fr = cast(*Frame, m);
+    fr.pg = create();
+    if (fr.pg == null) { mem.core.munmap(m, sizeof(Frame)); return cast(*Frame, 0); }
+    dl.init(&fr.list);
+    fr.node = n;
+    fr.pg.parent = p;
+    fr.pg.frame = fr;
+    fr.pg.depth = p.depth + 1;
+    fr.w = 300.0;
+    fr.h = 150.0;
+    let is *dom.Attr as aw = dom.find_attr(n, "width", 5);
+    let is *dom.Attr as ah = dom.find_attr(n, "height", 6);
+    if (aw != null) { let is f64 as tw = _attr_px(aw); if (tw > 0.0) { fr.w = tw; } }
+    if (ah != null) { let is f64 as th = _attr_px(ah); if (th > 0.0) { fr.h = th; } }
+    fr.next = p.frames;
+    p.frames = fr;
+    _frame_go(p, fr);
+    return fr;
+}
+fn _attr_px(a as *dom.Attr) as f64 {
+    let is i64 as i with mut = 0;
+    let is i64 as v with mut = 0;
+    while (i < a.value_len && a.value[i] >= 48 && a.value[i] <= 57) { v = v * 10 + cast(i64, a.value[i]) - 48; i = i + 1; }
+    return cast(f64, v);
+}
+// Frames as the document now has them, at the size layout gave them.
+let is i64 as sync_round with mut = 0;
+fn _sync_frames(p as *Page) as void {
+    sync_round = sync_round + 1;
+    let is i64 as round = sync_round;
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as n with mut = _next_element(root, root);
+    while (n != null) {
+        if (n.tag == tg.IFRAME && n.ns == dom.NS_HTML) {
+            let is *Frame as fr = _frame_for(p, n);
+            if (fr != null) {
+                fr.seen = round;
+                let is [MAX_URL]u8 as to with mut;
+                _frame_wanted(p, n, cast(*u8, &to));
+                if (_same_c(cast(*u8, &to), cast(*u8, &fr.src)) == 0) { _frame_go(p, fr); }
+                let is *bx.Box as b = layout.box_of(p.root, n);
+                if (b != null && b.w > 0.0 && b.h > 0.0 && (b.w != fr.w || b.h != fr.h)) {
+                    fr.w = b.w;
+                    fr.h = b.h;
+                    if (fr.pg.loaded == 1) { relayout(fr.pg, fr.w, fr.h, &fr.list); }
+                    else { fr.pg.vw = fr.w; fr.pg.vh = fr.h; }
+                }
+            }
+        }
+        n = _next_element(root, n);
+    }
+    // sync_round moves on inside a child's layout, so each frame keeps the number it was given.
+    let is **Frame as link with mut = &p.frames;
+    while (*link != null) {
+        let is *Frame as fr = *link;
+        if (fr.seen != round && fr.worker == 0) {
+            *link = fr.next;
+            _drop_frame(p, fr);
+        } else {
+            link = &fr.next;
+        }
+    }
+}
+fn _refresh_frames(p as *Page) as void {
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.pg.dirty == 1) { refresh(fr.pg, &fr.list); fr.pg.dirty = 0; }
+        else { _refresh_frames(fr.pg); }
+        fr = fr.next;
+    }
+}
+fn any_dirty(p as *Page) as i64 {
+    if (p.dirty == 1) { return 1; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (any_dirty(fr.pg) == 1) { return 1; }
+        fr = fr.next;
+    }
+    return 0;
+}
+// The list made again, for what changed in a frame: nothing of this page moved.
+fn repaint(p as *Page, l as *dl.List) as void {
+    if (p.loaded == 0 || p.root == null) { return; }
+    if (p.dirty == 1) { refresh(p, l); return; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.pg.dirty == 1) { refresh(fr.pg, &fr.list); fr.pg.dirty = 0; }
+        else { repaint(fr.pg, &fr.list); }
+        fr = fr.next;
+    }
+    _retire_paint(p);
+    p.c.a = &p.paint_a;
+    p.c.hits = cast(*bx.HitItem, 0);
+    p.c.nhits = 0;
+    p.c.caphits = 0;
+    paint.paint(&p.c, p.root, l, p.doc_w, p.doc_h, &p.tmp_a);
+    p.c.a = &p.box_a;
+}
+// Its document is about to go: its parent's list has to stop being drawn from it, which the
+// paint that follows does.
+fn frame_answer(c as *Page, j as *fetcher.Job) as void {
+    let is *Frame as fr = c.frame;
+    let is i64 as was_doc = is_document(j);
+    if (was_doc == 1) {
+        _release_images_of(c);
+        dl.clear(&fr.list);
+        fr.fired = 0;
+        fr.sy = 0.0;
+    }
+    let is i64 as shown = c.loaded;
+    jshost.dirty = 0;
+    arrived(c, j);
+    if (c.loaded == 0) { return; }
+    if (shown == 0 || was_doc == 1) { relayout(c, fr.w, fr.h, &fr.list); }
+    else { c.dirty = 1; }
+}
+// about:blank or srcdoc: the document, as if it had come, at the address of the page it is in.
+fn _frame_make(p as *Page, fr as *Frame) as void {
+    fr.synth = 0;
+    let is *u8 as m = mem.core.mmap_anon(sizeof(fetcher.Job));
+    let is i64 as v = cast(i64, m);
+    if (v == 0 || v == 0 - 1) { return; }
+    let is *fetcher.Job as j = cast(*fetcher.Job, m);
+    j.owner = cast(*u8, fr.pg);
+    j.era = fr.pg.era;
+    j.tag = TAG_DOC;
+    j.ok = 1;
+    j.r.status = 200;
+    _copy_url(cast(*u8, &j.url), cast(*u8, &p.base));
+    _copy_url(cast(*u8, &j.r.final), cast(*u8, &p.base));
+    let is *u8 as ty = "text/html";
+    let is i64 as ti with mut = 0;
+    while (ty[ti] != 0) { j.r.ctype[ti] = ty[ti]; ti = ti + 1; }
+    let is *dom.Attr as a = dom.find_attr(fr.node, "srcdoc", 6);
+    j.r.data = "";
+    if (a != null) { j.r.data = a.value; j.r.len = a.value_len; }
+    frame_answer(fr.pg, j);
+    mem.core.munmap(m, sizeof(fetcher.Job));
+}
+// Where a frame's box puts it in its parent's page.
+fn _frame_box_at(b as *bx.Box, x as *f64, y as *f64) as void {
+    *x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
+    *y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
+}
+fn _frame_paint(user as *u8, b as *bx.Box, l as *dl.List, fixed as i64) as void {
+    let is *Page as p = cast(*Page, user);
+    let is *Frame as fr = frame_of(p, b.node);
+    if (fr == null || fr.pg.loaded == 0) { return; }
+    let is f64 as x with mut = 0.0;
+    let is f64 as y with mut = 0.0;
+    _frame_box_at(b, &x, &y);
+    let is *dl.Cmd as c0 = dl.clip(l, x, y, b.w, b.h);
+    if (c0 != null) { c0.fixed = fixed; }
+    fr.m[0] = 1.0; fr.m[1] = 0.0; fr.m[2] = 0.0; fr.m[3] = 1.0; fr.m[4] = x; fr.m[5] = y - fr.sy;
+    let is *dl.Cmd as c1 = dl.moved(l, x, y, b.w, b.h, cast(*f64, &fr.m));
+    if (c1 != null) { c1.fixed = fixed; }
+    let is i64 as i with mut = 0;
+    let is i64 as n = dl.count(&fr.list);
+    while (i < n) {
+        let is *dl.Cmd as from = dl.at(&fr.list, i);
+        let is *dl.Cmd as to = dl.box(l, 0.0, 0.0, 0.0, 0.0, 0, 1.0);
+        if (to != null) {
+            mem.memcpy(cast(*u8, to), cast(*u8, from), sizeof(dl.Cmd));
+            to.fixed = fixed;
+        }
+        i = i + 1;
+    }
+    let is *dl.Cmd as c2 = dl.unmoved(l);
+    if (c2 != null) { c2.fixed = fixed; }
+    let is *dl.Cmd as c3 = dl.unclip(l);
+    if (c3 != null) { c3.fixed = fixed; }
+}
+// The point (x, y) of a page, in the frame whose box it is in.
+fn frame_local(fr as *Frame, b as *bx.Box, x as *f64, y as *f64) as void {
+    let is f64 as bx0 with mut = 0.0;
+    let is f64 as by0 with mut = 0.0;
+    _frame_box_at(b, &bx0, &by0);
+    *x = *x - bx0;
+    *y = *y - by0 + fr.sy;
+}
+// Where a frame's page starts in its top page.
+fn frame_offset(c as *Page, x as *f64, y as *f64) as void {
+    let is *Page as q with mut = c;
+    while (q.parent != null) {
+        let is *bx.Box as b = layout.box_of(q.parent.root, q.frame.node);
+        if (b != null) {
+            let is f64 as bx0 with mut = 0.0;
+            let is f64 as by0 with mut = 0.0;
+            _frame_box_at(b, &bx0, &by0);
+            *x = *x + bx0;
+            *y = *y + by0 - q.frame.sy;
+        }
+        q = q.parent;
+    }
+}
+fn frame_scroll(c as *Page, dy as f64) as i64 {
+    let is *Frame as fr = c.frame;
+    let is f64 as most with mut = c.doc_h - fr.h;
+    if (most < 0.0) { most = 0.0; }
+    let is f64 as to with mut = fr.sy + dy;
+    if (to < 0.0) { to = 0.0; }
+    if (to > most) { to = most; }
+    if (to == fr.sy) { return 0; }
+    fr.sy = to;
+    return 1;
+}
+fn clear_active_in_frames(p as *Page) as void {
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.pg.loaded == 1) { set_active(fr.pg, cast(*dom.Node, 0)); }
+        clear_active_in_frames(fr.pg);
+        fr = fr.next;
+    }
+}
+
+// Whether a page may be shown in a frame here, by what it said about that.
+fn _origin_len(u as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (u[i] != 0 && u[i] != 58) { i = i + 1; }
+    if (u[i] != 58 || u[i + 1] != 47 || u[i + 2] != 47) { return 0; }
+    i = i + 3;
+    while (u[i] != 0 && u[i] != 47 && u[i] != 63 && u[i] != 35) { i = i + 1; }
+    return i;
+}
+fn _same_n(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) {
+        let is i64 as x with mut = cast(i64, a[i]);
+        let is i64 as y with mut = cast(i64, b[i]);
+        if (x >= 65 && x <= 90) { x = x + 32; }
+        if (y >= 65 && y <= 90) { y = y + 32; }
+        if (x != y) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+// One source of a frame-ancestors list against the origin of one ancestor.
+fn _fa_source(t as *u8, tn as i64, o as *u8, on as i64, own as *u8, ownn as i64) as i64 {
+    if (tn == 1 && t[0] == 42) { return 1; }
+    if (_same_n(t, tn, "'self'", 6) == 1) { return _same_n(o, on, own, ownn); }
+    if (t[0] == 39) { return 0; }
+    if (tn > 1 && t[tn - 1] == 58) {
+        let is i64 as k with mut = 0;
+        while (k < tn && k < on && t[k] == o[k]) { k = k + 1; }
+        return cast(i64, k == tn);
+    }
+    // The host of the ancestor, and of the source with or without its scheme.
+    let is i64 as hs with mut = 0;
+    while (hs + 2 < on && (o[hs] != 58 || o[hs + 1] != 47)) { hs = hs + 1; }
+    hs = hs + 3;
+    let is i64 as ts with mut = 0;
+    let is i64 as ti with mut = 0;
+    while (ti + 2 < tn) {
+        if (t[ti] == 58 && t[ti + 1] == 47 && t[ti + 2] == 47) {
+            if (_same_n(t, ti, o, hs - 3) == 0) { return 0; }
+            ts = ti + 3;
+            break;
+        }
+        ti = ti + 1;
+    }
+    let is *u8 as th = cast(*u8, cast(i64, t) + ts);
+    let is i64 as thn = tn - ts;
+    let is *u8 as oh = cast(*u8, cast(i64, o) + hs);
+    let is i64 as ohn = on - hs;
+    if (thn > 2 && th[0] == 42 && th[1] == 46) {
+        let is i64 as tail = thn - 1;
+        if (ohn <= tail) { return 0; }
+        return _same_n(cast(*u8, cast(i64, th) + 1), tail, cast(*u8, cast(i64, oh) + ohn - tail), tail);
+    }
+    return _same_n(th, thn, oh, ohn);
+}
+fn _fa_allows(fa as *u8, o as *u8, on as i64, own as *u8, ownn as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (fa[i] != 0) {
+        while (fa[i] == 32 || fa[i] == 9) { i = i + 1; }
+        let is i64 as s = i;
+        while (fa[i] != 0 && fa[i] != 32 && fa[i] != 9) { i = i + 1; }
+        if (i > s && _fa_source(cast(*u8, cast(i64, fa) + s), i - s, o, on, own, ownn) == 1) { return 1; }
+    }
+    return 0;
+}
+fn _frame_refused(p as *Page, r as *net.Resource) as i64 {
+    let is *u8 as own = cast(*u8, &r.final);
+    let is i64 as ownn = _origin_len(own);
+    let is *Page as a with mut = p.parent;
+    while (a != null) {
+        let is *u8 as o = cast(*u8, &a.url);
+        let is i64 as on = _origin_len(o);
+        if (r.fa[0] != 0) {
+            if (_fa_allows(cast(*u8, &r.fa), o, on, own, ownn) == 0) { return 1; }
+        } else if (r.xfo[0] == 100) {
+            return 1;                                       // deny
+        } else if (r.xfo[0] == 115 && _same_n(o, on, own, ownn) == 0) {
+            return 1;                                       // sameorigin
+        }
+        a = a.parent;
+    }
+    return 0;
+}
+
+// postMessage, in order, from one window to another of the same tree.
+struct Msg {
+    from   as i64;
+    to     as i64;
+    text   as *u8;
+    n      as i64;
+    size   as i64;
+    next   as *Msg;
+    origin as [256]u8;
+    want   as [256]u8;   // the target origin it was sent for: "*", or one to match
+}
+let is *Msg as msg_first with mut = cast(*Msg, 0);
+let is *Msg as msg_last with mut = cast(*Msg, 0);
+fn _msg_free(m as *Msg) as void { mem.core.munmap(cast(*u8, m), m.size); }
+fn _forget_messages(id as i64) as void {
+    let is *Msg as prev with mut = cast(*Msg, 0);
+    let is *Msg as m with mut = msg_first;
+    while (m != null) {
+        let is *Msg as next = m.next;
+        if (m.to == id) {
+            if (prev == null) { msg_first = next; } else { prev.next = next; }
+            if (msg_last == m) { msg_last = prev; }
+            _msg_free(m);
+        } else {
+            prev = m;
+        }
+        m = next;
+    }
+}
+fn _msg_ready(p as *Page) as i64 {
+    if (p.loaded == 0 || p.js_msg == 0) { return 0; }
+    let is *Msg as m with mut = msg_first;
+    while (m != null) {
+        if (m.to == p.id) { return 1; }
+        m = m.next;
+    }
+    return 0;
+}
+fn _deliver_messages(p as *Page) as void {
+    while (_msg_ready(p) == 1) {
+        let is *Msg as prev with mut = cast(*Msg, 0);
+        let is *Msg as m with mut = msg_first;
+        while (m.to != p.id) { prev = m; m = m.next; }
+        if (prev == null) { msg_first = m.next; } else { prev.next = m.next; }
+        if (msg_last == m) { msg_last = prev; }
+        let is *u8 as here = cast(*u8, &p.url);
+        let is i64 as hn = _origin_len(here);
+        let is i64 as wn with mut = 0;
+        while (m.want[wn] != 0) { wn = wn + 1; }
+        if ((wn == 1 && m.want[0] == 42) || _same_n(cast(*u8, &m.want), wn, here, hn) == 1) {
+            jshost.message(&p.doc, p.js_msg, m.text, m.n, cast(*u8, &m.origin), m.from);
+        }
+        _msg_free(m);
+    }
+}
+fn _origin_copy(u as *u8, out as *u8, cap as i64) as void {
+    let is i64 as n with mut = _origin_len(u);
+    if (n == 0) { let is *u8 as nul = "null"; let is i64 as i with mut = 0; while (nul[i] != 0) { out[i] = nul[i]; i = i + 1; } out[i] = 0; return; }
+    if (n > cap - 1) { n = cap - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { out[i] = u[i]; i = i + 1; }
+    out[n] = 0;
+}
+// Windows by number, for the page whose script is running. A page's own origin comes from
+// here, not from the script, so that nobody can sign a message as someone else.
+let is [2]i64 as slot_answer with mut;
+// What a document has now, in its order: scripts run before any layout. How many, for
+// a below 0, or else the number of the window of that one.
+fn _frame_count_or_at(p as *Page, a as i64) as i64 {
+    let is i64 as count with mut = 0;
+    let is *dom.Node as root = p.doc.node;
+    let is *dom.Node as n with mut = _next_element(root, root);
+    while (n != null) {
+        if (n.tag == tg.IFRAME && n.ns == dom.NS_HTML) {
+            let is *Frame as fr = _frame_for(p, n);
+            if (fr != null) {
+                if (count == a) { return fr.pg.id; }
+                count = count + 1;
+            }
+        }
+        n = _next_element(root, n);
+    }
+    if (a < 0) { return count; }
+    return 0;
+}
+fn _js_frame(user as *u8, op as i64, a as i64) as i64 {
+    let is *Page as p = cast(*Page, user);
+    if (op == 0) { return p.id; }
+    if (op == 1) { if (p.parent == null) { return 0; } return p.parent.id; }
+    if (op == 2) { return top_of(p).id; }
+    if (op == 7) {
+        let is *ScriptSlot as sl with mut = p.scripts_first;
+        let is i64 as k with mut = a;
+        while (sl != null && k > 0) { sl = sl.next; k = k - 1; }
+        if (sl == null || sl.text == null) { return 0; }
+        slot_answer[0] = cast(i64, sl.text);
+        slot_answer[1] = sl.n;
+        return cast(i64, &slot_answer);
+    }
+    // 14: a page for a worker, held by an element in no document. 15: it goes.
+    if (op == 14) {
+        let is *Frame as fr = _frame_for(p, cast(*dom.Node, a));
+        if (fr == null) { return 0; }
+        fr.worker = 1;
+        return fr.pg.id;
+    }
+    if (op == 15) {
+        let is **Frame as link with mut = &p.frames;
+        while (*link != null) {
+            let is *Frame as fr = *link;
+            if (fr.node == cast(*dom.Node, a)) { *link = fr.next; _drop_frame(p, fr); return 1; }
+            link = &fr.next;
+        }
+        return 0;
+    }
+    if (op == 3) { return _frame_count_or_at(p, 0 - 1); }
+    if (op == 4) { return _frame_count_or_at(p, a); }
+    // Asked of another window, which only says how it stands to the others.
+    if (op == 8) {
+        let is *Page as q = _page_by_id(top_of(p), a);
+        if (q == null || q.parent == null) { return 0; }
+        return q.parent.id;
+    }
+    if (op == 9) {
+        let is *Page as q = _page_by_id(top_of(p), a);
+        if (q == null) { return 0; }
+        return _frame_count_or_at(q, 0 - 1);
+    }
+    // 10: window number * 65536 + which of its frames.
+    if (op == 10) {
+        let is *Page as q = _page_by_id(top_of(p), a / 65536);
+        if (q == null) { return 0; }
+        return _frame_count_or_at(q, a % 65536);
+    }
+    // 12: what a window's <iframe> is named.
+    if (op == 12) {
+        let is *Page as q = _page_by_id(top_of(p), a);
+        if (q == null || q.frame == null) { return 0; }
+        let is *dom.Attr as at = dom.find_attr(q.frame.node, "name", 4);
+        if (at == null) { return 0; }
+        slot_answer[0] = cast(i64, at.value);
+        slot_answer[1] = at.value_len;
+        return cast(i64, &slot_answer);
+    }
+    if (op == 5) {
+        let is *Frame as fr = _frame_for(p, cast(*dom.Node, a));
+        if (fr == null) { return 0; }
+        return fr.pg.id;
+    }
+    if (op == 6) {
+        let is *i64 as info = cast(*i64, a);
+        let is *Page as top = top_of(p);
+        if (_page_by_id(top, info[0]) == null) { return 0; }
+        let is i64 as n = info[2];
+        let is i64 as size = sizeof(Msg) + n + 1;
+        let is *u8 as mm = mem.core.mmap_anon(size);
+        let is i64 as v = cast(i64, mm);
+        if (v == 0 || v == 0 - 1) { return 0; }
+        let is *Msg as m = cast(*Msg, mm);
+        m.from = p.id;
+        m.to = info[0];
+        m.size = size;
+        m.n = n;
+        m.text = cast(*u8, v + sizeof(Msg));
+        mem.memcpy(m.text, cast(*u8, info[1]), n);
+        _origin_copy(cast(*u8, &p.url), cast(*u8, &m.origin), 256);
+        let is i64 as wn with mut = info[4];
+        // "/" is the sender's own origin.
+        if (wn == 1 && *cast(*u8, info[3]) == 47) {
+            _origin_copy(cast(*u8, &p.url), cast(*u8, &m.want), 256);
+        } else {
+            if (wn > 255) { wn = 255; }
+            mem.memcpy(cast(*u8, &m.want), cast(*u8, info[3]), wn);
+            m.want[wn] = 0;
+        }
+        if (msg_last == null) { msg_first = m; } else { msg_last.next = m; }
+        msg_last = m;
+        return 1;
+    }
+    return 0;
+}
+fn _page_by_id(p as *Page, id as i64) as *Page {
+    if (p.id == id) { return p; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        let is *Page as r = _page_by_id(fr.pg, id);
+        if (r != null) { return r; }
+        fr = fr.next;
+    }
+    return cast(*Page, 0);
 }

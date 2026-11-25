@@ -1,0 +1,360 @@
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "../parser/ast.cst" as ast;
+
+// === Binary IR cache format ===
+//
+// Header (28 bytes):
+//   magic(i32) version(i32) func_count(i32) global_count(i32)
+//   string_count(i32) hash_lo(i32) hash_hi(i32)
+//
+// String pool: pool_size(i32) + pool_data(pool_size bytes)
+//
+// Globals: global_count * 36 bytes each
+// String literals: string_count * 12 bytes each
+// Functions: variable size (44-byte header + inst_count(i32) + insts)
+// Instructions: 120 bytes each
+
+let is i32 as CACHE_MAGIC   with imut = 1129337155; // 0x43495250 = "CIRP"
+let is i32 as CACHE_VERSION with imut = 2;
+
+// Per-instruction serialized size:
+//   op(4) + 3*operand(20 each = 60) + line(4) + is_dead(4)
+//   + asm(4+4) + call(4+4+4) + global(4+4+4) + cast(4+4+4+4) = 120
+let is i32 as INST_SIZE with imut = 120;
+
+// ===================================================================
+// Write helpers
+// ===================================================================
+
+fn write_i32(buf as *u8, off as i32, val as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, buf) + cast(i64, off));
+    *p = val;
+}
+
+fn write_i64(buf as *u8, off as i32, val as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + cast(i64, off));
+    *p = val;
+}
+
+fn read_i32(buf as *u8, off as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, buf) + cast(i64, off));
+    return *p;
+}
+
+fn read_i64(buf as *u8, off as i32) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + cast(i64, off));
+    return *p;
+}
+
+// ===================================================================
+// String pool builder
+// ===================================================================
+
+fn add_to_pool(pool as *u8, pool_pos as *i32, str_ptr as *u8, str_len as i32) as i32 {
+    if (str_len <= 0 || cast(i64, str_ptr) == 0) {
+        return 0;
+    }
+    let is i32 as pos = *pool_pos;
+    mem.memcpy(cast(*u8, cast(i64, pool) + cast(i64, pos)), str_ptr, cast(i64, str_len));
+    *pool_pos = pos + str_len;
+    return pos;
+}
+
+// ===================================================================
+// Count pass: count functions, globals, strings, total pool size
+// ===================================================================
+
+fn count_pool_str(total as *i32, ptr as *u8, len as i32) as void {
+    if (len > 0 && cast(i64, ptr) != 0) {
+        *total = *total + len;
+    }
+}
+
+fn count_all(prog as *d.IRProgram, out_fc as *i32, out_gc as *i32, out_sc as *i32, out_pool as *i32) as void {
+    let is i32 as fc with mut = 0;
+    let is i32 as gc with mut = 0;
+    let is i32 as sc with mut = 0;
+    let is i32 as pool with mut = 0;
+
+    // Count functions and instruction strings
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        fc = fc + 1;
+        count_pool_str(&pool, f.name_ptr, f.name_len);
+        count_pool_str(&pool, f.asm_name_ptr, f.asm_name_len);
+
+        let is *d.IRInst as inst with mut = f.instructions;
+        while (cast(i64, inst) != 0) {
+            count_pool_str(&pool, inst.asm_str_ptr, inst.asm_str_len);
+            count_pool_str(&pool, inst.call_name_ptr, inst.call_name_len);
+            count_pool_str(&pool, inst.global_name_ptr, inst.global_name_len);
+            inst = inst.next;
+        }
+        f = f.next;
+    }
+
+    // Count globals
+    let is *d.IRGlobal as g with mut = prog.globals;
+    while (cast(i64, g) != 0) {
+        gc = gc + 1;
+        count_pool_str(&pool, g.name_ptr, g.name_len);
+        g = g.next;
+    }
+
+    // Count string literals
+    let is *d.StringEntry as s with mut = prog.strings;
+    while (cast(i64, s) != 0) {
+        sc = sc + 1;
+        count_pool_str(&pool, s.ptr, s.len);
+        s = s.next;
+    }
+
+    *out_fc = fc;
+    *out_gc = gc;
+    *out_sc = sc;
+    *out_pool = pool;
+}
+
+// ===================================================================
+// Count instructions in a function
+// ===================================================================
+
+fn count_insts(f as *d.IRFunction) as i32 {
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as inst with mut = f.instructions;
+    while (cast(i64, inst) != 0) {
+        n = n + 1;
+        inst = inst.next;
+    }
+    return n;
+}
+
+// ===================================================================
+// Serialize operand (20 bytes) into buffer at offset
+// ===================================================================
+
+fn write_operand(buf as *u8, off as i32, op as *d.Operand) as void {
+    write_i32(buf, off, op.op_type);
+    write_i32(buf, off + 4, op.vreg);
+    write_i64(buf, off + 8, op.imm);
+    write_i32(buf, off + 16, op.label);
+}
+
+// ===================================================================
+// Write: serialize a single instruction (120 bytes)
+// ===================================================================
+
+fn write_inst(buf as *u8, pos as i32, inst as *d.IRInst, pool_buf as *u8, pool_pos as *i32) as void {
+    let is i32 as ip with mut = pos;
+
+    write_i32(buf, ip, inst.op);
+    ip = ip + 4;
+
+    write_operand(buf, ip, &inst.dest);
+    ip = ip + 20;
+    write_operand(buf, ip, &inst.src1);
+    ip = ip + 20;
+    write_operand(buf, ip, &inst.src2);
+    ip = ip + 20;
+
+    write_i32(buf, ip, inst.line);
+    write_i32(buf, ip + 4, inst.is_dead);
+    ip = ip + 8;
+
+    let is i32 as asm_off = add_to_pool(pool_buf, pool_pos, inst.asm_str_ptr, inst.asm_str_len);
+    write_i32(buf, ip, asm_off);
+    write_i32(buf, ip + 4, inst.asm_str_len);
+    ip = ip + 8;
+
+    let is i32 as call_off = add_to_pool(pool_buf, pool_pos, inst.call_name_ptr, inst.call_name_len);
+    write_i32(buf, ip, call_off);
+    write_i32(buf, ip + 4, inst.call_name_len);
+    write_i32(buf, ip + 8, inst.is_variadic_call);
+    ip = ip + 12;
+
+    let is i32 as gn_off = add_to_pool(pool_buf, pool_pos, inst.global_name_ptr, inst.global_name_len);
+    write_i32(buf, ip, gn_off);
+    write_i32(buf, ip + 4, inst.global_name_len);
+    write_i32(buf, ip + 8, inst.is_extern_global);
+    ip = ip + 12;
+
+    if (cast(i64, inst.cast_to) != 0) {
+        let is *ast.Type as ct = cast(*ast.Type, inst.cast_to);
+        write_i32(buf, ip, ct.kind);
+        write_i32(buf, ip + 4, ct.size);
+    } else {
+        write_i32(buf, ip, 0);
+        write_i32(buf, ip + 4, 0);
+    }
+    ip = ip + 8;
+
+    if (cast(i64, inst.cast_from) != 0) {
+        let is *ast.Type as cf = cast(*ast.Type, inst.cast_from);
+        write_i32(buf, ip, cf.kind);
+        write_i32(buf, ip + 4, cf.size);
+    } else {
+        write_i32(buf, ip, 0);
+        write_i32(buf, ip + 4, 0);
+    }
+}
+
+// ===================================================================
+// Write: serialize globals into buffer, returns new pos
+// ===================================================================
+
+fn write_globals(buf as *u8, pos as i32, prog as *d.IRProgram, pool_buf as *u8, pool_pos as *i32) as i32 {
+    let is i32 as p with mut = pos;
+    let is *d.IRGlobal as g with mut = prog.globals;
+    while (cast(i64, g) != 0) {
+        let is i32 as name_off = add_to_pool(pool_buf, pool_pos, g.name_ptr, g.name_len);
+        write_i32(buf, p, name_off);
+        write_i32(buf, p + 4, g.name_len);
+        write_i32(buf, p + 8, g.size);
+        write_i64(buf, p + 12, g.init_value);
+        write_i32(buf, p + 20, g.is_initialized);
+        write_i32(buf, p + 24, g.is_reachable);
+        write_i32(buf, p + 28, g.is_string_init);
+        write_i32(buf, p + 32, g.is_string_const);
+        p = p + 36;
+        g = g.next;
+    }
+    return p;
+}
+
+// ===================================================================
+// Write: serialize string literals into buffer, returns new pos
+// ===================================================================
+
+fn write_strings(buf as *u8, pos as i32, prog as *d.IRProgram, pool_buf as *u8, pool_pos as *i32) as i32 {
+    let is i32 as p with mut = pos;
+    let is *d.StringEntry as se with mut = prog.strings;
+    while (cast(i64, se) != 0) {
+        let is i32 as data_off = add_to_pool(pool_buf, pool_pos, se.ptr, se.len);
+        write_i32(buf, p, se.id);
+        write_i32(buf, p + 4, data_off);
+        write_i32(buf, p + 8, se.len);
+        p = p + 12;
+        se = se.next;
+    }
+    return p;
+}
+
+// ===================================================================
+// Write: serialize a single function header + instructions, returns new pos
+// ===================================================================
+
+fn write_function(buf as *u8, pos as i32, func as *d.IRFunction, pool_buf as *u8, pool_pos as *i32) as i32 {
+    let is i32 as p with mut = pos;
+
+    let is i32 as fn_name_off = add_to_pool(pool_buf, pool_pos, func.name_ptr, func.name_len);
+    let is i32 as fn_asm_off = add_to_pool(pool_buf, pool_pos, func.asm_name_ptr, func.asm_name_len);
+
+    write_i32(buf, p, fn_name_off);
+    write_i32(buf, p + 4, func.name_len);
+    write_i32(buf, p + 8, fn_asm_off);
+    write_i32(buf, p + 12, func.asm_name_len);
+    write_i32(buf, p + 16, func.vreg_count);
+    write_i32(buf, p + 20, func.label_count);
+    write_i32(buf, p + 24, func.is_reachable);
+    write_i32(buf, p + 28, func.alloc_stack_size);
+    write_i32(buf, p + 32, func.stack_size);
+    write_i32(buf, p + 36, func.num_args);
+    write_i32(buf, p + 40, func.is_variadic);
+    p = p + 44;
+
+    let is i32 as ic = count_insts(func);
+    write_i32(buf, p, ic);
+    p = p + 4;
+
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        write_inst(buf, p, inst, pool_buf, pool_pos);
+        p = p + INST_SIZE;
+        inst = inst.next;
+    }
+    return p;
+}
+
+// ===================================================================
+// Write: serialize header, returns new pos
+// ===================================================================
+
+fn write_header(buf as *u8, fc as i32, gc as i32, sc as i32, source_hash as i64) as i32 {
+    let is i64 as mask32 = cast(i64, 65535) * 65536 + 65535; // 0xFFFFFFFF
+    write_i32(buf, 0, CACHE_MAGIC);
+    write_i32(buf, 4, CACHE_VERSION);
+    write_i32(buf, 8, fc);
+    write_i32(buf, 12, gc);
+    write_i32(buf, 16, sc);
+    write_i32(buf, 20, cast(i32, source_hash & mask32));
+    write_i32(buf, 24, cast(i32, ((source_hash >> 16) >> 16) & mask32));
+    return 28;
+}
+
+// ===================================================================
+// write_ir_cache
+// ===================================================================
+
+fn write_ir_cache(path as *u8, prog_ptr as *u8, source_hash as i64) as i32 {
+    let is *d.IRProgram as prog = cast(*d.IRProgram, prog_ptr);
+
+    // Count everything
+    let is i32 as func_count with mut = 0;
+    let is i32 as global_count with mut = 0;
+    let is i32 as string_count with mut = 0;
+    let is i32 as pool_size with mut = 0;
+    count_all(prog, &func_count, &global_count, &string_count, &pool_size);
+
+    // Count total instructions for buffer sizing
+    let is i32 as total_insts with mut = 0;
+    let is *d.IRFunction as ff with mut = prog.functions;
+    while (cast(i64, ff) != 0) {
+        total_insts = total_insts + count_insts(ff);
+        ff = ff.next;
+    }
+
+    // Calculate total buffer size
+    let is i64 as buf_size =
+        28 + 4 + cast(i64, pool_size)
+        + cast(i64, global_count) * 36
+        + cast(i64, string_count) * 12
+        + cast(i64, func_count) * 48
+        + cast(i64, total_insts) * cast(i64, INST_SIZE);
+
+    let is *u8 as buf = d.opt_alloc(buf_size);
+
+    // Header
+    let is i32 as pos with mut = write_header(buf, func_count, global_count, string_count, source_hash);
+
+    // String pool placeholder
+    write_i32(buf, pos, pool_size);
+    pos = pos + 4;
+    let is i32 as pool_start = pos;
+    let is i32 as pool_pos with mut = 0;
+    let is *u8 as pool_buf = cast(*u8, cast(i64, buf) + cast(i64, pool_start));
+    pos = pos + pool_size;
+
+    // Globals, strings, functions
+    pos = write_globals(buf, pos, prog, pool_buf, &pool_pos);
+    pos = write_strings(buf, pos, prog, pool_buf, &pool_pos);
+
+    let is *d.IRFunction as func with mut = prog.functions;
+    while (cast(i64, func) != 0) {
+        pos = write_function(buf, pos, func, pool_buf, &pool_pos);
+        func = func.next;
+    }
+
+    // Write the file atomically — see io.write_file_atomic. The return of the
+    // write was also being dropped here, so a short write left a truncated
+    // image that the next build read back as real.
+    let is i32 as rc = io.write_file_atomic(path, buf, cast(i64, pos));
+    d.opt_free(buf);
+    if (rc != 0) { return 1; }
+    return 0;
+}
+
+// ===================================================================
+// read_ir_cache
+// ===================================================================

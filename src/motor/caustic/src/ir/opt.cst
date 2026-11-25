@@ -1,0 +1,363 @@
+use "../../std/io.cst" as io;
+use "../../std/time.cst" as time;
+use "defs.cst" as d;
+use "ssa.cst" as ssa;
+use "phi.cst" as phi;
+use "opt_sccp.cst" as sccp;
+use "opt_adce.cst" as adce;
+use "opt_licm.cst" as licm;
+use "opt_helpers.cst" as helpers;
+use "opt_prop.cst" as prop;
+use "opt_loop.cst" as loop;
+use "opt_sr.cst" as sr;
+use "opt_libcall.cst" as lib;
+use "opt_jt.cst" as jt;
+use "opt_cse.cst" as cse;
+use "opt_reassoc.cst" as reassoc;
+use "opt_gvn.cst" as gvn;
+use "opt_tre.cst" as tre;
+use "opt_bits.cst" as bits;
+use "opt_selfinline.cst" as si;
+use "opt_inline.cst" as inl;
+use "opt_unroll.cst" as unroll;
+use "opt_sroa.cst" as sroa;
+use "opt_sincos.cst" as sinc;
+use "../codegen/target.cst" as tgt;
+
+let is *u8 as opt_prog_ptr with mut;
+
+// === Per-pass profiling ===
+let is i32 as opt_prof_on with mut = 0;
+let is [16]i64 as opt_prof_times with mut;
+// 0=addr_fusion 1=mem2reg 2=ccp 3=slf 4=fold 5=licm 6=sr 7=dce 8=resolve 9=inline 10=alloc_init
+
+fn opt_prof_time() as i64 {
+    return time.now_us();
+}
+
+fn opt_prof_init() as void {
+    opt_prof_on = 1;
+    let is i32 as i with mut = 0;
+    while (i < 16) { opt_prof_times[i] = 0; i = i + 1; }
+}
+
+fn opt_prof_print() as void {
+    if (opt_prof_on == 0) { return; }
+    let is i64 as total with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < 10) { total = total + opt_prof_times[i]; i = i + 1; }
+    if (total == 0) { return; }
+
+    io.write_str(io.STDOUT, "\n--- optimizer passes ---\n");
+
+    let is [10]i64 as names;
+    names[0] = cast(i64, "addr_fusion");
+    names[1] = cast(i64, "mem2reg");
+    names[2] = cast(i64, "const_copy_prop");
+    names[3] = cast(i64, "store_load_fwd");
+    names[4] = cast(i64, "fold_imm");
+    names[5] = cast(i64, "licm");
+    names[6] = cast(i64, "strength_red");
+    names[7] = cast(i64, "dce");
+    names[8] = cast(i64, "ssa_destroy");
+    names[9] = cast(i64, "inline");
+
+    i = 0;
+    while (i < 10) {
+        let is i64 as ms = opt_prof_times[i] / 1000;
+        let is i32 as pct with mut = 0;
+        if (total > 0) { pct = cast(i32, opt_prof_times[i] * 100 / total); }
+        io.write_str(io.STDOUT, "  ");
+
+        // pad name to 18 chars
+        let is *u8 as nm = cast(*u8, names[i]);
+        let is i32 as nl with mut = 0;
+        while (nm[nl] != cast(u8, 0)) { nl = nl + 1; }
+        io._write_fd(io.STDOUT, nm, cast(i64, nl));
+        let is i32 as pad with mut = 18 - nl;
+        while (pad > 0) { io.write_str(io.STDOUT, " "); pad = pad - 1; }
+
+        // pad ms to 6 chars
+        let is i32 as digits with mut = 1;
+        let is i64 as tmp with mut = ms;
+        while (tmp >= 10) { tmp = tmp / 10; digits = digits + 1; }
+        let is i32 as sp with mut = 6 - digits;
+        while (sp > 0) { io.write_str(io.STDOUT, " "); sp = sp - 1; }
+        io.write_int(io.STDOUT, ms);
+        io.write_str(io.STDOUT, "ms ");
+
+        // pad pct
+        if (pct < 10) { io.write_str(io.STDOUT, " "); }
+        io.write_int(io.STDOUT, cast(i64, pct));
+        io.write_str(io.STDOUT, "%");
+
+        // bar
+        let is i32 as blen with mut = cast(i32, opt_prof_times[i] * 20 / total);
+        if (blen == 0 && opt_prof_times[i] > 0) { blen = 1; }
+        io.write_str(io.STDOUT, " ");
+        let is i32 as bi with mut = 0;
+        while (bi < blen) { io.write_str(io.STDOUT, "#"); bi = bi + 1; }
+        io.write_str(io.STDOUT, "\n");
+
+        i = i + 1;
+    }
+    io.write_str(io.STDOUT, "  ────────────────────────────────────────────\n");
+    io.write_str(io.STDOUT, "  total             ");
+    let is i64 as tms = total / 1000;
+    let is i32 as td with mut = 1;
+    let is i64 as tt with mut = tms;
+    while (tt >= 10) { tt = tt / 10; td = td + 1; }
+    let is i32 as tsp with mut = 6 - td;
+    while (tsp > 0) { io.write_str(io.STDOUT, " "); tsp = tsp - 1; }
+    io.write_int(io.STDOUT, tms);
+    io.write_str(io.STDOUT, "ms\n");
+}
+
+// Set while optimize_func runs itself again (the unroll / SROA round).
+let is i32 as opt_nest with mut = 0;
+
+fn optimize_func(func as *d.IRFunction) as void {
+    let is i32 as vc with mut = func.vreg_count;
+    if (vc == 0) { return; }
+    let is i32 as vc_alloc with mut = vc + 512;
+
+    if (d.ir_opt_level >= 2) { helpers.pass_dead_ctx(func); helpers.pass_void_ret(func); }
+    let is i64 as t0 with mut = 0;
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    prop.pass_addr_fusion(func, vc_alloc);
+    if (opt_prof_on == 1) { opt_prof_times[0] = opt_prof_times[0] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    // With -g, keep locals in their stack slots: mem2reg promotes them to SSA
+    // registers and the slot goes stale, so the DWARF's DW_OP_fbreg location
+    // would read an unwritten slot. Correct debug info wins over the pass; a
+    // location list per live range is the alternative, and is not done.
+    let is i32 as promote with mut = 1;
+    if (tgt.debug_get() != 0) { promote = 0; }
+    ssa.build(func, promote);
+    // On the SSA form: constants through phis and branches, dead paths gone.
+    sccp.pass_sccp(func);
+    // Code with no effect, and the loops that provably end around it.
+    adce.pass_adce(func);
+    if (opt_prof_on == 1) { opt_prof_times[1] = opt_prof_times[1] + opt_prof_time() - t0; }
+
+    vc = func.vreg_count;
+    vc_alloc = vc + 512;
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    let is *i32 as is_const with mut = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
+    let is *i64 as imm_val with mut = cast(*i64, d.opt_alloc(cast(i64, vc_alloc) * 8));
+    let is *i32 as copy_of with mut = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc_alloc) {
+        let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, i) * 4); *cp = 0;
+        let is *i64 as ip = cast(*i64, cast(i64, imm_val) + cast(i64, i) * 8); *ip = 0;
+        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, i) * 4); *pp = 0 - 1;
+        i = i + 1;
+    }
+    if (opt_prof_on == 1) { opt_prof_times[10] = opt_prof_times[10] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    prop.pass_const_copy_prop(func, is_const, imm_val, copy_of, vc);
+    if (opt_prof_on == 1) { opt_prof_times[2] = opt_prof_times[2] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    prop.pass_store_load_fwd(func);
+    if (opt_prof_on == 1) { opt_prof_times[3] = opt_prof_times[3] + opt_prof_time() - t0; }
+
+    // Local CSE on pure arithmetic — catches duplicate i*7*8 style address
+    // computations that show up in array-of-struct access patterns.
+    cse.pass_cse_local(func);
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    helpers.pass_fold_immediates(func, is_const, imm_val);
+    if (opt_prof_on == 1) { opt_prof_times[4] = opt_prof_times[4] + opt_prof_time() - t0; }
+
+    helpers.pass_algebraic_identity(func, copy_of, vc);
+    prop.pass_const_copy_prop(func, is_const, imm_val, copy_of, vc);
+
+    // Collapse chained constant add/mul (canonicalizer; exposes more CSE/GVN).
+    reassoc.pass_reassoc(func, vc);
+    prop.pass_const_copy_prop(func, is_const, imm_val, copy_of, vc);
+
+    // Invariant pure work out of loops, from any block of the loop.
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    licm.pass_licm_ssa(func);
+    if (opt_prof_on == 1) { opt_prof_times[5] = opt_prof_times[5] + opt_prof_time() - t0; }
+
+    // Every use reads the end of its copy chain; the passes below take
+    // operands as they find them.
+    helpers.pass_final_resolve(func, copy_of);
+    phi.resolve_phi_args(func, copy_of, vc_alloc);
+    d.opt_free(cast(*u8, is_const));
+    d.opt_free(cast(*u8, imm_val));
+    d.opt_free(cast(*u8, copy_of));
+
+    if (d.ir_opt_level >= 2) { prop.pass_add_chain(func); }
+
+    // Induction variables are the header phis.
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    sr.pass_strength_reduction(func);
+    if (opt_prof_on == 1) { opt_prof_times[6] = opt_prof_times[6] + opt_prof_time() - t0; }
+
+    helpers.pass_lea_fusion(func, func.vreg_count);
+    if (d.ir_opt_level >= 2) { helpers.pass_lea_const(func); }
+
+    // -O2: global value numbering (cross-block CSE). Gated >=2 so -O1/self-host
+    // is byte-identical. DCE below cleans the now-dead redundant computations.
+    if (d.ir_opt_level >= 2) { prop.pass_local_copy_prop(func); }
+    if (d.ir_opt_level >= 2) { gvn.pass_gvn(func); }
+    // The MOVs GVN leaves in place of the redundant computations: their
+    // readers in the same block read the earlier value directly.
+    if (d.ir_opt_level >= 2) { prop.pass_local_copy_prop(func); }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    helpers.pass_dce(func);
+    if (opt_prof_on == 1) { opt_prof_times[7] = opt_prof_times[7] + opt_prof_time() - t0; }
+
+    // -O2: a division by 2^k whose low bits are known zero becomes a shift.
+    if (d.ir_opt_level >= 2) { bits.pass_exact_div(func); }
+
+    // -O2: a self call in tail position becomes a jump back to a loop head
+    // whose phis are the parameters.
+    if (d.ir_opt_level >= 2) { tre.pass_tre(func); }
+
+    // End of the SSA form: nothing after this point (the inliner's metadata
+    // below, self-inlining, the IR cache, code generation) reads a phi.
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    phi.ssa_destroy(func);
+    if (opt_prof_on == 1) { opt_prof_times[8] = opt_prof_times[8] + opt_prof_time() - t0; }
+    // -O2: a copy of a value defined once, read in another block, reads the
+    // value itself.
+    if (d.ir_opt_level >= 2) { prop.pass_single_copy_prop(func); helpers.pass_lea_const(func); }
+
+    // Compact vregs into a dense range: kills the dead-vreg holes left by the
+    // passes above so the O(n^2) register allocator isn't sized by a high-water
+    // mark. Bijective rename — no codegen-quality change. Must run AFTER DCE/
+    // final_resolve (so dead defs are flagged) and BEFORE the metadata cache
+    // below stays vreg-independent anyway.
+    helpers.pass_compact_vregs(func);
+
+    // -O2: small constant-trip loops unrolled, then local arrays and structs
+    // reached only at constant offsets split into scalar slots; each change
+    // gets one more round of the passes above (promotion to registers, the
+    // constants the copies leave behind).
+    if (d.ir_opt_level >= 2 && opt_nest == 0) {
+        opt_nest = 1;
+        if (unroll.pass_unroll_full(func) == 1) { optimize_func(func); }
+        // a split copy can free the object on its other side: one more round
+        let is i32 as srr with mut = 0;
+        while (srr < 3 && sroa.pass_sroa(func) == 1) { optimize_func(func); srr = srr + 1; }
+        if (jt.pass_jump_thread(func) == 1) { optimize_func(func); }
+        opt_nest = 0;
+    }
+
+    // Cache inline metadata
+    func.has_stack_ops = loop.inline_has_stack_ops(func);
+    func.has_asm = loop.inline_has_asm(func);
+    func.live_inst_count = loop.inline_count_insts(func);
+    // Check self-recursive
+    let is i32 as selfr with mut = 0;
+    let is *d.IRInst as ri with mut = func.instructions;
+    while (cast(i64, ri) != 0) {
+        if (ri.op == d.IR_CALL && d.str_eq(ri.call_name_ptr, ri.call_name_len, func.asm_name_ptr, func.asm_name_len) == 1) { selfr = 1; }
+        ri = ri.next;
+    }
+    func.is_recursive = selfr;
+}
+
+fn optimize(prog as *u8) as void {
+    d.opt_bins_init();
+    opt_prog_ptr = prog;
+    inl.reset();
+    inl.set_optimizer(fn_ptr(optimize_func));
+    // Phase 1 now runs per-function inside gen_ir (gen_program.cst)
+}
+
+// Compute ONLY the inline-decision metadata pass_inline reads off a callee
+// (live_inst_count / has_stack_ops / is_recursive), without running the heavy
+// optimize_func. Used in deferred-optimize mode (parallel-exe frontend): the
+// parent skips per-function optimize but still needs these on every function so
+// cross-module inlining can fire in the workers. The numbers reflect the RAW
+// (un-optimized) body — fewer functions clear the size gate than after optimize,
+// so deferred mode inlines a touch less; the workers re-derive the real values
+// when they optimize each function post-inline. Mirrors optimize_func's tail.
+fn inline_refs_of(f as *d.IRFunction) as i64 { return inl.refs_of(f); }
+fn inline_noreturn_of(f as *d.IRFunction) as i64 { return inl.noreturn_of(f); }
+fn inline_lookup(p as *u8, n as i32) as *d.IRFunction { return inl.lookup_quiet(p, n); }
+
+fn prepare_inline(prog as *u8) as void { inl.prepare_tables(prog); }
+
+fn inline_has_asm_of(func as *d.IRFunction) as i32 { return loop.inline_has_asm(func); }
+
+fn compute_inline_meta(func as *d.IRFunction) as void {
+    func.has_stack_ops = loop.inline_has_stack_ops(func);
+    func.has_asm = loop.inline_has_asm(func);
+    func.live_inst_count = loop.inline_count_insts(func);
+    let is i32 as selfr with mut = 0;
+    let is *d.IRInst as ri with mut = func.instructions;
+    while (cast(i64, ri) != 0) {
+        if (ri.op == d.IR_CALL && d.str_eq(ri.call_name_ptr, ri.call_name_len, func.asm_name_ptr, func.asm_name_len) == 1) { selfr = 1; }
+        ri = ri.next;
+    }
+    func.is_recursive = selfr;
+}
+
+// Phase 2+3 per-function: inline → re-optimize → return for codegen
+fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
+    let is i64 as ti with mut = 0;
+    if (opt_prof_on == 1) { ti = opt_prof_time(); }
+    // -O2 decides by cost and copies callees that keep a frame (opt_inline.cst);
+    // -O1, the fast tier, keeps the fixed limits of opt_loop.cst.
+    if (d.ir_opt_level >= 2) { inl.pass_inline_o2(func, prog); inl.pass_noreturn_cut(func); }
+    else { loop.pass_inline(func, prog); }
+    if (opt_prof_on == 1) { opt_prof_times[9] = opt_prof_times[9] + opt_prof_time() - ti; }
+
+    // Phase 3: re-optimize after inlining
+    optimize_func(func);
+    // -O2: calls of std's allocator and string functions, read for what they mean
+    if (d.ir_opt_level >= 2) {
+        let is *d.IRProgram as lp = cast(*d.IRProgram, prog);
+        if (lib.pass_lib_calls(func, lp.strings) == 1) { optimize_func(func); }
+    }
+    // -O2: sin(v) and cos(v) of one value share one call (opt_sincos.cst)
+    if (d.ir_opt_level >= 2 && sinc.pass_sincos(func, prog) == 1) { optimize_func(func); }
+
+    // -O2: a small recursive function expands one level into itself, off its
+    // optimized body (tail recursion already a loop), and is optimized again.
+    if (d.ir_opt_level >= 2) {
+        // The copies' frame regions nothing references any more go away first:
+        // the expansion below leaves a function with a frame alone.
+        inl.compact_frame(func);
+        let is i32 as round with mut = 0;
+        while (round < si.SI_ROUNDS && si.pass_self_inline(func, round) > 0) {
+            optimize_func(func);
+            if (si.pass_acc_seed(func) > 0) { optimize_func(func); }
+            round = round + 1;
+        }
+        // Whatever was measured of this body as a callee no longer holds.
+        inl.forget(func);
+    }
+}
+
+// -O2, after every function's optimize_inline_func: the calls opt_inline kept
+// out for opt_libcall go in where they are still calls.
+fn late_inline_func(func as *d.IRFunction, prog as *u8) as void {
+    if (d.ir_opt_level < 2 || inl.has_late_call(func) == 0) { return; }
+    inl.set_late_round(1);
+    inl.pass_inline_o2(func, prog);
+    inl.pass_noreturn_cut(func);
+    inl.set_late_round(0);
+    optimize_func(func);
+    inl.compact_frame(func);
+    inl.forget(func);
+}
+
+// Bodies stay unoptimized until their function is emitted (parallel path):
+// the -O2 inliner copies callees from optimized copies of them.
+fn set_raw_bodies(v as i32) as void { inl.set_raw_bodies(v); }
+
+// Whole-program inline order at -O2: callees before callers.
+fn inline_order(prog as *u8, out_n as *i32) as **d.IRFunction {
+    return inl.inline_order(prog, out_n);
+}

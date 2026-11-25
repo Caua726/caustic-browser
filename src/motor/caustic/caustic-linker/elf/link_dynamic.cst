@@ -1,0 +1,330 @@
+// link_dynamic.cst — ELF dynamic-linking section builders (.so / -lc).
+// Extracted from linker.cst: builds .interp/.dynstr/.dynsym/.hash/.rela/.dynamic
+// + PLT/GOT stubs from the linker dynsym table. The table + relocation-time
+// lookups (is_dynamic_sym/get_plt_vaddr) stay in linker.cst.
+use "../core/linker.cst" as linker;
+use "../readers/elf_reader.cst" as reader;
+use "../../std/mem.cst" as mem;
+use "../../src/ir/opt_mem.cst" as om;
+
+fn elf_hash(name as *u8, len as i32) as i64 {
+    let is i64 as h with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < len) {
+        h = (h << 4) + cast(i64, name[i]);
+        let is i64 as g = h & cast(i64, 4026531840); // 0xF0000000
+        if (g != 0) {
+            h = h ^ (g >> 24);
+        }
+        h = h & 268435455; // 0x0FFFFFFF
+        i = i + 1;
+    }
+    return h;
+}
+
+// Build .interp section
+fn build_interp(ls as *linker.LinkerState) as void {
+    let is *reader.ByteBuffer as interp = cast(*reader.ByteBuffer, ls.interp_buf);
+    reader.buf_append(interp, "/lib64/ld-linux-x86-64.so.2", 28);
+}
+
+// Build .dynstr section, returns lib name offsets via lib_offsets array
+fn build_dynstr(ls as *linker.LinkerState, lib_offsets as *i32) as void {
+    let is *linker.DynSymTab as dst = linker.get_dynsyms(ls);
+    let is *reader.ByteBuffer as dynstr = cast(*reader.ByteBuffer, ls.dynstr_buf);
+    reader.buf_emit8(dynstr, 0);  // null entry
+
+    // Add library names
+    let is *i64 as lib_arr = cast(*i64, ls.needed_libs);
+    let is i32 as li with mut = 0;
+    while (li < ls.needed_count) {
+        lib_offsets[li] = cast(i32, dynstr.len);
+        let is *u8 as lib_name = cast(*u8, lib_arr[li]);
+        let is i64 as lib_len = reader.strlen(lib_name);
+        reader.buf_append(dynstr, lib_name, lib_len);
+        reader.buf_emit8(dynstr, 0);
+        li = li + 1;
+    }
+
+    // Add symbol names
+    let is i32 as di with mut = 0;
+    while (di < dst.count) {
+        let is *linker.DynSym as d = linker.dynsym_get(dst, di);
+        d.dynstr_offset = cast(i32, dynstr.len);
+        reader.buf_append(dynstr, d.name, cast(i64, d.name_len));
+        reader.buf_emit8(dynstr, 0);
+        di = di + 1;
+    }
+}
+
+// Build .dynsym section entries
+fn build_dynsym_entries(ls as *linker.LinkerState) as void {
+    let is *linker.DynSymTab as dst = linker.get_dynsyms(ls);
+    let is *reader.ByteBuffer as dynsym = cast(*reader.ByteBuffer, ls.dynsym_buf);
+
+    // Null entry (24 bytes)
+    let is i32 as zi with mut = 0;
+    while (zi < 24) { reader.buf_emit8(dynsym, 0); zi = zi + 1; }
+
+    let is i32 as di with mut = 0;
+    while (di < dst.count) {
+        let is *linker.DynSym as d = linker.dynsym_get(dst, di);
+        d.dynsym_index = di + 1; // 1-based (0 is null)
+        reader.buf_emit32_le(dynsym, cast(i64, d.dynstr_offset)); // st_name
+        if (d.is_data == 1) {
+            reader.buf_emit8(dynsym, 17);  // st_info: STB_GLOBAL(1)<<4 | STT_OBJECT(1) = 0x11
+        } else {
+            reader.buf_emit8(dynsym, 18);  // st_info: STB_GLOBAL(1)<<4 | STT_FUNC(2) = 0x12
+        }
+        reader.buf_emit8(dynsym, 0);   // st_other
+        reader.buf_emit16_le(dynsym, 0);  // st_shndx: SHN_UNDEF
+        reader.buf_emit64_le(dynsym, 0);  // st_value
+        reader.buf_emit64_le(dynsym, 0);  // st_size
+        di = di + 1;
+    }
+}
+
+// Write a 32-bit value into a buffer at a given offset
+fn write32_at(buf as *u8, off as i64, val as i32) as void {
+    buf[off]     = cast(u8, val & 255);
+    buf[off + 1] = cast(u8, (val >> 8) & 255);
+    buf[off + 2] = cast(u8, (val >> 16) & 255);
+    buf[off + 3] = cast(u8, (val >> 24) & 255);
+}
+
+// Build .hash section (ELF hash table)
+fn build_hash_section(ls as *linker.LinkerState) as void {
+    let is *linker.DynSymTab as dst = linker.get_dynsyms(ls);
+    let is i32 as ndynsyms = dst.count;
+    let is *reader.ByteBuffer as hash = cast(*reader.ByteBuffer, ls.hash_buf);
+    let is i32 as nchain = ndynsyms + 1; // including null sym
+    let is i32 as nbucket with mut = ndynsyms;
+    if (nbucket < 1) { nbucket = 1; }
+    reader.buf_emit32_le(hash, cast(i64, nbucket));
+    reader.buf_emit32_le(hash, cast(i64, nchain));
+
+    // Init buckets to 0
+    let is i32 as bi with mut = 0;
+    while (bi < nbucket) { reader.buf_emit32_le(hash, 0); bi = bi + 1; }
+    // Init chain to 0
+    let is i32 as ci with mut = 0;
+    while (ci < nchain) { reader.buf_emit32_le(hash, 0); ci = ci + 1; }
+
+    // Populate hash table
+    let is *u8 as hash_data = hash.data;
+    let is i32 as di with mut = 0;
+    while (di < ndynsyms) {
+        let is *linker.DynSym as d = linker.dynsym_get(dst, di);
+        let is i64 as h = elf_hash(d.name, d.name_len);
+        let is i32 as bucket_idx = cast(i32, h % cast(i64, nbucket));
+        let is i32 as sym_idx = di + 1; // 1-based in dynsym
+
+        let is i64 as bucket_off = 8 + cast(i64, bucket_idx) * 4;
+        let is i64 as old_val = reader.read_u32(hash_data, bucket_off);
+
+        if (old_val == 0) {
+            write32_at(hash_data, bucket_off, sym_idx);
+        } else {
+            // Chain: walk to end, then append
+            let is i32 as cur with mut = cast(i32, old_val);
+            let is i64 as chain_off with mut = 8 + cast(i64, nbucket) * 4 + cast(i64, cur) * 4;
+            let is i64 as next with mut = reader.read_u32(hash_data, chain_off);
+            while (next != 0) {
+                cur = cast(i32, next);
+                chain_off = 8 + cast(i64, nbucket) * 4 + cast(i64, cur) * 4;
+                next = reader.read_u32(hash_data, chain_off);
+            }
+            write32_at(hash_data, chain_off, sym_idx);
+        }
+        di = di + 1;
+    }
+}
+
+// Build .rela.plt entries (only function symbols)
+fn build_rela_plt_entries(ls as *linker.LinkerState) as void {
+    let is *linker.DynSymTab as dst = linker.get_dynsyms(ls);
+    let is *reader.ByteBuffer as relaplt = cast(*reader.ByteBuffer, ls.relaplt_buf);
+    let is i32 as di with mut = 0;
+    while (di < dst.count) {
+        let is *linker.DynSym as d = linker.dynsym_get(dst, di);
+        if (d.is_data == 0) {
+            reader.buf_emit64_le(relaplt, d.got_vaddr);
+            let is i64 as r_info = cast(i64, d.dynsym_index) * 4294967296 + 7;
+            reader.buf_emit64_le(relaplt, r_info);
+            reader.buf_emit64_le(relaplt, 0);
+        }
+        di = di + 1;
+    }
+}
+
+// Build .dynamic section
+fn build_dynamic_section(ls as *linker.LinkerState, lib_offsets as *i32,
+                         got_vaddr as i64, dynsym_vaddr as i64,
+                         dynstr_vaddr as i64, hash_vaddr as i64,
+                         relaplt_vaddr as i64, reladyn_vaddr as i64) as void {
+    let is *reader.ByteBuffer as dynamic = cast(*reader.ByteBuffer, ls.dynamic_buf);
+    let is *reader.ByteBuffer as dynstr = cast(*reader.ByteBuffer, ls.dynstr_buf);
+    let is *reader.ByteBuffer as relaplt = cast(*reader.ByteBuffer, ls.relaplt_buf);
+
+    // DT_NEEDED for each lib
+    let is i32 as li with mut = 0;
+    while (li < ls.needed_count) {
+        reader.buf_emit64_le(dynamic, 1);  // DT_NEEDED
+        reader.buf_emit64_le(dynamic, cast(i64, lib_offsets[li]));
+        li = li + 1;
+    }
+
+    reader.buf_emit64_le(dynamic, 4);  // DT_HASH
+    reader.buf_emit64_le(dynamic, hash_vaddr);
+    reader.buf_emit64_le(dynamic, 5);  // DT_STRTAB
+    reader.buf_emit64_le(dynamic, dynstr_vaddr);
+    reader.buf_emit64_le(dynamic, 6);  // DT_SYMTAB
+    reader.buf_emit64_le(dynamic, dynsym_vaddr);
+    reader.buf_emit64_le(dynamic, 10); // DT_STRSZ
+    reader.buf_emit64_le(dynamic, dynstr.len);
+    reader.buf_emit64_le(dynamic, 11); // DT_SYMENT
+    reader.buf_emit64_le(dynamic, 24);
+    reader.buf_emit64_le(dynamic, 3);  // DT_PLTGOT
+    reader.buf_emit64_le(dynamic, got_vaddr);
+    reader.buf_emit64_le(dynamic, 2);  // DT_PLTRELSZ
+    reader.buf_emit64_le(dynamic, relaplt.len);
+    reader.buf_emit64_le(dynamic, 20); // DT_PLTREL = DT_RELA(7)
+    reader.buf_emit64_le(dynamic, 7);
+    reader.buf_emit64_le(dynamic, 23); // DT_JMPREL
+    reader.buf_emit64_le(dynamic, relaplt_vaddr);
+    reader.buf_emit64_le(dynamic, 30); // DT_FLAGS = DF_BIND_NOW(8)
+    reader.buf_emit64_le(dynamic, 8);
+
+    // .rela.dyn entries for data GOT (GLOB_DAT)
+    let is i32 as ndata = linker.count_data_dynsyms(ls);
+    if (ndata > 0) {
+        reader.buf_emit64_le(dynamic, 7);  // DT_RELA
+        reader.buf_emit64_le(dynamic, reladyn_vaddr);
+        reader.buf_emit64_le(dynamic, 8);  // DT_RELASZ
+        reader.buf_emit64_le(dynamic, cast(i64, ndata) * 24);
+        reader.buf_emit64_le(dynamic, 9);  // DT_RELAENT
+        reader.buf_emit64_le(dynamic, 24);
+    }
+
+    // DT_NULL
+    reader.buf_emit64_le(dynamic, 0);
+    reader.buf_emit64_le(dynamic, 0);
+}
+
+// Build all dynamic metadata sections
+// PLT/GOT addresses must be known before calling this (set by layout calc)
+fn build_dynamic_metadata(ls as *linker.LinkerState,
+                          plt_vaddr as i64, got_vaddr as i64,
+                          interp_vaddr as i64, dynsym_vaddr as i64,
+                          dynstr_vaddr as i64, hash_vaddr as i64,
+                          relaplt_vaddr as i64, dynamic_vaddr as i64,
+                          reladyn_vaddr as i64) as void {
+    build_interp(ls);
+
+    // One offset per DT_NEEDED. This was a [32] array, filled for the first 32
+    // libraries only and then read for all of them, so the 33rd and later got
+    // a DT_NEEDED naming whatever offset the stack held.
+    let is *i32 as lib_offsets = cast(*i32, om.opt_alloc(cast(i64, ls.needed_count) * 4 + 4));
+    build_dynstr(ls, lib_offsets);
+    build_dynsym_entries(ls);
+    build_hash_section(ls);
+    build_rela_plt_entries(ls);
+    build_dynamic_section(ls, lib_offsets, got_vaddr, dynsym_vaddr,
+                          dynstr_vaddr, hash_vaddr, relaplt_vaddr,
+                          reladyn_vaddr);
+}
+
+// Emit PLT[0] resolver stub (16 bytes)
+fn emit_plt0_stub(plt as *reader.ByteBuffer, plt0_vaddr as i64, got_base_vaddr as i64) as void {
+    let is i64 as got1_vaddr = got_base_vaddr + 8;
+    let is i64 as got2_vaddr = got_base_vaddr + 16;
+
+    // push QWORD [rip + disp_GOT1]  (FF 35 disp32)
+    let is i64 as disp_got1 = got1_vaddr - (plt0_vaddr + 6);
+    reader.buf_emit8(plt, 255);
+    reader.buf_emit8(plt, 53);
+    reader.buf_emit32_le(plt, disp_got1);
+
+    // jmp QWORD [rip + disp_GOT2]  (FF 25 disp32)
+    let is i64 as disp_got2 = got2_vaddr - (plt0_vaddr + 12);
+    reader.buf_emit8(plt, 255);
+    reader.buf_emit8(plt, 37);
+    reader.buf_emit32_le(plt, disp_got2);
+
+    // 4-byte NOP padding (0F 1F 40 00)
+    reader.buf_emit8(plt, 15);
+    reader.buf_emit8(plt, 31);
+    reader.buf_emit8(plt, 64);
+    reader.buf_emit8(plt, 0);
+}
+
+// Emit a single PLT[n] entry (16 bytes) + corresponding GOT entry
+fn emit_plt_entry(plt as *reader.ByteBuffer, got as *reader.ByteBuffer,
+                  d as *linker.DynSym, plt_base_vaddr as i64, got_base_vaddr as i64,
+                  plt_idx as i32) as void {
+    let is i64 as plt_entry_vaddr = plt_base_vaddr + 16 + cast(i64, plt_idx) * 16;
+    let is i64 as got_entry_vaddr = got_base_vaddr + 24 + cast(i64, plt_idx) * 8;
+
+    d.plt_vaddr = plt_entry_vaddr;
+    d.got_vaddr = got_entry_vaddr;
+
+    // GOT entry initially points to PLT[n]+6 (lazy fallback)
+    reader.buf_emit64_le(got, plt_entry_vaddr + 6);
+
+    // jmp QWORD [rip + disp_GOTn]  (FF 25 disp32)
+    let is i64 as disp_gotn = got_entry_vaddr - (plt_entry_vaddr + 6);
+    reader.buf_emit8(plt, 255);
+    reader.buf_emit8(plt, 37);
+    reader.buf_emit32_le(plt, disp_gotn);
+
+    // push n (relocation index)  (68 imm32)
+    reader.buf_emit8(plt, 104);
+    reader.buf_emit32_le(plt, cast(i64, plt_idx));
+
+    // jmp PLT[0]  (E9 rel32)
+    let is i64 as jmp_site = plt_entry_vaddr + 16;
+    reader.buf_emit8(plt, 233);
+    reader.buf_emit32_le(plt, plt_base_vaddr - jmp_site);
+}
+
+// Build PLT stubs and GOT.PLT entries
+fn build_plt_got(ls as *linker.LinkerState, plt_base_vaddr as i64, got_base_vaddr as i64) as void {
+    let is *linker.DynSymTab as dst = linker.get_dynsyms(ls);
+    let is *reader.ByteBuffer as plt = cast(*reader.ByteBuffer, ls.plt_buf);
+    let is *reader.ByteBuffer as got = cast(*reader.ByteBuffer, ls.got_buf);
+
+    // GOT.PLT: 3 reserved entries
+    reader.buf_emit64_le(got, 0);  // .dynamic vaddr (patched by writer)
+    reader.buf_emit64_le(got, 0);  // link_map (filled by dynamic linker)
+    reader.buf_emit64_le(got, 0);  // _dl_runtime_resolve (filled by dynamic linker)
+
+    emit_plt0_stub(plt, plt_base_vaddr, got_base_vaddr);
+
+    // PLT[n] entries — only for function syms
+    let is i32 as di with mut = 0;
+    let is i32 as plt_idx with mut = 0;
+    while (di < dst.count) {
+        let is *linker.DynSym as d = linker.dynsym_get(dst, di);
+        if (d.is_data == 0) {
+            emit_plt_entry(plt, got, d, plt_base_vaddr, got_base_vaddr, plt_idx);
+            plt_idx = plt_idx + 1;
+        }
+        di = di + 1;
+    }
+}
+
+// Allocate all dynamic section buffers
+fn alloc_dynamic_bufs(ls as *linker.LinkerState) as void {
+    ls.plt_buf = linker.alloc_bytebuf(4096);
+    ls.got_buf = linker.alloc_bytebuf(4096);
+    ls.interp_buf = linker.alloc_bytebuf(64);
+    ls.dynsym_buf = linker.alloc_bytebuf(4096);
+    ls.dynstr_buf = linker.alloc_bytebuf(4096);
+    ls.hash_buf = linker.alloc_bytebuf(4096);
+    ls.relaplt_buf = linker.alloc_bytebuf(4096);
+    ls.dynamic_buf = linker.alloc_bytebuf(4096);
+    ls.data_got_buf = linker.alloc_bytebuf(4096);
+    ls.reladyn_buf = linker.alloc_bytebuf(4096);
+}
+
+// Check if a global symbol is dynamic (should be resolved via PLT)

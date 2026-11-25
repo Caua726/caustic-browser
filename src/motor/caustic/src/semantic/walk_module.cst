@@ -1,0 +1,768 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "types.cst" as ty;
+use "generics.cst" as gn;
+use "modules.cst" as mod;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../parser/top.cst" as top;
+use "walk_types.cst" as wt;
+use "walk.cst" as w;
+use "../codegen/target.cst" as tgt;
+
+// Only-filter state for submodule building
+let is *u8 as current_only_names with mut;
+let is i32 as current_only_count with mut = 0;
+
+fn is_in_only_list(name_ptr as *u8, name_len as i32, only_names as *u8, only_count as i32) as i32 {
+    if (only_count == 0) { return 1; }
+    let is i32 as i with mut = 0;
+    while (i < only_count) {
+        let is *i64 as pp = cast(*i64, cast(i64, only_names) + cast(i64, i) * 12);
+        let is *i32 as lp = cast(*i32, cast(i64, only_names) + cast(i64, i) * 12 + 8);
+        if (d.str_eq(name_ptr, name_len, cast(*u8, *pp), *lp) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Append one SubModule to `target` for each nested `use` in `body` that passes
+// `only`. Pass only_count == 0 to build the COMPLETE list.
+fn build_submodules(target as *d.Module, body as *u8, only_names as *u8, only_count as i32) as void {
+    let is *u8 as prev_only = current_only_names;
+    let is i32 as prev_oc = current_only_count;
+    current_only_names = only_names;
+    current_only_count = only_count;
+    let is *ast.Node as child with mut = cast(*ast.Node, body);
+    while (cast(i64, child) != 0) {
+        if (child.kind == ast.NK_USE && child.member_len > 0) {
+            if (is_in_only_list(child.member_ptr, child.member_len, current_only_names, current_only_count) == 1) {
+                let is i32 as crl with mut = 0;
+                let is *u8 as crp = mod.strip_quotes(child.name_ptr, child.name_len, &crl);
+                let is i32 as cnl with mut = 0;
+                let is *u8 as cn = sc.resolve_module_path(crp, crl, &cnl);
+                let is *u8 as cp = sc.get_mod_prefix(cn, cnl);
+                let is i32 as cpl = sc.get_mod_prefix_len(cn, cnl);
+                // find_module only ever returns the COMPLETE record — alias
+                // records are kept out of the prefix hash for exactly this.
+                let is *d.Module as cm = mod.find_module(cp, cpl);
+                if (cast(i64, cm) != 0) {
+                    let is *d.SubModule as sm = d.new_submodule();
+                    sm.alias_ptr = d.str_dup(child.member_ptr, child.member_len);
+                    sm.alias_len = child.member_len;
+                    sm.module_ref = cast(*u8, cm);
+                    sm.next = target.submodules;
+                    target.submodules = cast(*u8, sm);
+                    target.submodule_count = target.submodule_count + 1;
+                }
+            }
+        }
+        child = child.next;
+    }
+    current_only_names = prev_only;
+    current_only_count = prev_oc;
+}
+
+// The record an `only` import site binds to: its own filtered view of a module
+// everybody else still sees whole. Shares the module's body, source and SCOPE
+// with the complete record — `only` narrows what the IMPORTER can reach through
+// the alias, it does not change the module's own contents.
+fn ensure_alias_module(n as *ast.Node, prefix as *u8, plen as i32) as *d.Module {
+    let is *u8 as onames = ast.nx_only_names(n);
+    let is i32 as ocount = ast.nx_only_count(n);
+    let is *d.Module as found = mod.find_alias_module(prefix, plen, onames, ocount);
+    if (cast(i64, found) != 0) { return found; }
+    let is *d.Module as base = mod.find_module(prefix, plen);
+    if (cast(i64, base) == 0) { return cast(*d.Module, 0); }
+
+    let is *d.Module as am = d.new_module();
+    am.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+    am.name_len = n.member_len;
+    am.prefix_ptr = d.str_dup(prefix, plen);
+    am.prefix_len = plen;
+    am.body = base.body;
+    am.src_ptr = base.src_ptr;
+    am.src_size = base.src_size;
+    am.token_list = base.token_list;
+    am.source_dir_ptr = base.source_dir_ptr;
+    am.source_dir_len = base.source_dir_len;
+    am.path_ptr = base.path_ptr;
+    am.path_len = base.path_len;
+    am.only_names = onames;
+    am.only_count = ocount;
+    // Deliberately NOT _mod_ht_insert: the prefix hash must keep resolving to
+    // the complete record. An alias record inserted there would shadow it (the
+    // table prepends and find_module returns the first match), handing every
+    // later lookup a narrowed view of a module it never asked to narrow.
+    am.next = mod.module_list;
+    mod.module_list = am;
+
+    let is *u8 as old_dir = sc.current_source_dir_ptr;
+    let is i32 as old_dir_len = sc.current_source_dir_len;
+    sc.current_source_dir_ptr = base.source_dir_ptr;
+    sc.current_source_dir_len = base.source_dir_len;
+    build_submodules(am, base.body, onames, ocount);
+    sc.current_source_dir_ptr = old_dir;
+    sc.current_source_dir_len = old_dir_len;
+    return am;
+}
+
+fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
+    let is i32 as raw_len with mut = 0;
+    let is *u8 as raw_path with mut = cast(*u8, 0);
+    if (n.member_len > 0) {
+        raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
+    }
+    if (raw_len == 0) { return; }
+
+    let is i32 as norm_len with mut = 0;
+    let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
+    let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
+    let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
+    // record_dep moved to POST-order (after register_structs recurses into this
+    // module's own imports, below) so --emit-deps lists dependencies BEFORE
+    // dependents — a true topological order. The maker's single-pass then builds
+    // each module's deps' .csti before the module itself, eliminating source
+    // fallbacks. (Pre-order here mis-ordered DAG cross-edges.)
+
+    // Save state
+    let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
+    let is i32 as old_plen = sc.current_mod_prefix_len;
+    let is *u8 as old_dir = sc.current_source_dir_ptr;
+    let is i32 as old_dir_len = sc.current_source_dir_len;
+    sc.current_mod_prefix_ptr = prefix;
+    sc.current_mod_prefix_len = plen;
+
+    // Pass 1: register_structs — load module if not cached
+    if (pass_id == 1) {
+        let is *d.Module as cached = mod.find_module(prefix, plen);
+        if (cast(i64, cached) == 0) {
+            let is *u8 as body = wt.load_module(raw_path, raw_len);
+            n.body = cast(*ast.Node, body);
+            if (n.member_len > 0) {
+                let is *d.Module as mm = d.new_module();
+                mm.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+                mm.name_len = n.member_len;
+                if (norm_len > 0) { mm.path_ptr = d.str_dup(norm, norm_len); mm.path_len = norm_len; }
+                mm.prefix_ptr = d.str_dup(prefix, plen);
+                mm.prefix_len = plen;
+                mm.body = body;
+                mm.src_ptr = mod.last_loaded_src;
+                mm.src_size = mod.last_loaded_src_len;
+                mm.token_list = mod.last_loaded_tl;
+                let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
+                if (sd_len > 0) {
+                    mm.source_dir_ptr = d.str_dup(norm, sd_len);
+                    mm.source_dir_len = sd_len;
+                }
+                mm.next = mod.module_list;
+                mod.module_list = mm;
+                mod._mod_ht_insert(mm);
+                sc.current_source_dir_ptr = mm.source_dir_ptr;
+                sc.current_source_dir_len = mm.source_dir_len;
+            }
+            register_structs(body);
+            // Build the COMPLETE submodule list. This record lives in the
+            // prefix hash and is shared by every importer, so this import
+            // site's `only` must not touch it — the filter is applied to a
+            // per-site record below instead.
+            let is *d.Module as parent_mm = mod.find_module(prefix, plen);
+            if (cast(i64, parent_mm) != 0) {
+                build_submodules(parent_mm, body, cast(*u8, 0), 0);
+            }
+            // POST-order: this module is fully loaded and all its own imports +
+            // submodules were recorded above → record it now, after its deps.
+            mod.record_dep(norm, norm_len);
+        } else {
+            n.body = cast(*ast.Node, cached.body);
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+        }
+        // Whether this is the first import of the module or a re-import, an
+        // `only` site binds to its own filtered record. Doing it on BOTH paths
+        // is the fix: it used to happen only on re-import, so the very first
+        // importer's filter was written straight onto the shared record and
+        // every other file inherited a module narrowed by a clause it never
+        // wrote.
+        if (ast.nx_only_count(n) > 0 && n.member_len > 0) {
+            ensure_alias_module(n, prefix, plen);
+        }
+        sc.current_mod_prefix_ptr = old_prefix;
+        sc.current_mod_prefix_len = old_plen;
+        sc.current_source_dir_ptr = old_dir;
+        sc.current_source_dir_len = old_dir_len;
+        return;
+    }
+
+    // Pass 2: register_aliases — create scope, register module var
+    if (pass_id == 2) {
+        let is *d.Scope as outer_scope = sc.current_scope;
+        let is *d.Scope as mod_scope with mut = outer_scope;
+        let is *d.Module as existing with mut = cast(*d.Module, 0);
+
+        if (n.member_len > 0) {
+            // The binding: an `only` site gets its filtered record, keyed by
+            // (prefix, only list). Keying by ALIAS NAME — as this did — made two
+            // files that import the same module under the same name with
+            // different `only` lists share one record, so whichever the
+            // compiler reached first decided what the other could see.
+            if (ast.nx_only_count(n) > 0) {
+                existing = mod.find_alias_module(prefix, plen, ast.nx_only_names(n), ast.nx_only_count(n));
+            } else {
+                existing = mod.find_module(prefix, plen);
+            }
+            // The SCOPE always comes from the complete record: one module has
+            // one set of declarations. `only` narrows what this importer can
+            // reach through the alias, not what the module itself contains.
+            let is *d.Module as scope_owner with mut = mod.find_module(prefix, plen);
+            if (cast(i64, scope_owner) == 0) { scope_owner = existing; }
+            if (cast(i64, scope_owner) != 0 && cast(i64, scope_owner.scope) != 0) {
+                mod_scope = scope_owner.scope;
+            } else {
+                mod_scope = d.new_scope();
+                mod_scope.next_all = sc.all_scopes;
+                sc.all_scopes = mod_scope;
+                mod_scope.parent = sc.global_scope;
+                mod_scope.is_global = 1;
+                if (cast(i64, scope_owner) != 0) {
+                    scope_owner.scope = mod_scope;
+                }
+            }
+            if (cast(i64, existing) != 0) { existing.scope = mod_scope; }
+            sc.current_scope = mod_scope;
+        }
+
+        let is *d.Module as cached = mod.find_module(prefix, plen);
+        let is *u8 as mod_body with mut = cast(*u8, 0);
+        if (cast(i64, cached) != 0 && cast(i64, cached.body) != 0) {
+            mod_body = cached.body;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+        } else {
+            mod_body = wt.load_module(raw_path, raw_len);
+        }
+        if (n.member_len > 0 && cast(i64, existing) == 0) {
+            let is *d.Module as modd = d.new_module();
+            modd.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+            modd.name_len = n.member_len;
+            if (norm_len > 0) { modd.path_ptr = d.str_dup(norm, norm_len); modd.path_len = norm_len; }
+            modd.prefix_ptr = d.str_dup(prefix, plen);
+            modd.prefix_len = plen;
+            modd.scope = mod_scope;
+            modd.body = mod_body;
+            modd.src_ptr = mod.last_loaded_src;
+            modd.src_size = mod.last_loaded_src_len;
+            modd.token_list = mod.last_loaded_tl;
+            let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
+            if (sd_len > 0) {
+                modd.source_dir_ptr = d.str_dup(norm, sd_len);
+                modd.source_dir_len = sd_len;
+            }
+            mod._mod_ht_insert(modd);
+            modd.next = mod.module_list;
+            mod.module_list = modd;
+            existing = modd;
+            // What went into the hash table is the COMPLETE record. If this site
+            // carries `only`, it binds to a filtered record layered on top —
+            // never to the one everyone else resolves through.
+            if (ast.nx_only_count(n) > 0) {
+                let is *d.Module as am = ensure_alias_module(n, prefix, plen);
+                if (cast(i64, am) != 0) {
+                    am.scope = mod_scope;
+                    existing = am;
+                }
+            }
+        }
+        // Gate by aliases_done — each module's aliases need to register
+        // exactly once even if N modules import it.
+        let is *d.Module as cached_a = mod.find_module(prefix, plen);
+        if (cast(i64, cached_a) == 0 || cached_a.aliases_done == 0) {
+            if (cast(i64, cached_a) != 0) { cached_a.aliases_done = 1; }
+            register_aliases(mod_body);
+        }
+        sc.current_scope = outer_scope;
+        if (n.member_len > 0) {
+            let is *d.Variable as var with mut = sc.lookup_var_here(n.member_ptr, n.member_len);
+            if (cast(i64, var) == 0) {
+                var = sc.declare_var(n.member_ptr, n.member_len, cast(*u8, ast.type_void), ast.VF_NONE, n);
+            }
+            var.is_module = 1;
+            var.module_ref = cast(*u8, existing);
+            if (ast.nx_only_count(n) > 0) { var.has_only = 1; }
+        }
+        sc.current_mod_prefix_ptr = old_prefix;
+        sc.current_mod_prefix_len = old_plen;
+        sc.current_source_dir_ptr = old_dir;
+        sc.current_source_dir_len = old_dir_len;
+        return;
+    }
+
+    // Passes 3-6: switch to module scope, recurse into cached body
+    let is *d.Scope as outer = sc.current_scope;
+    if (n.member_len > 0) {
+        let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
+        if (cast(i64, var) != 0 && var.is_module == 1) {
+            let is *d.Module as _mr = cast(*d.Module, var.module_ref);
+            sc.current_scope = _mr.scope;
+        }
+    }
+
+    let is *d.Module as cached = mod.find_module(prefix, plen);
+
+    // An error raised while walking this module has to be reported against
+    // ITS source, tokens and file — in every pass, not only the bodies. Passes
+    // 3-5 left the importer's in place, so a duplicate top-level `let` in an
+    // imported module was reported as the importer's file at the module's line
+    // and column, quoting whatever the importer had on that line.
+    let is *u8 as old_sem_src = sc.sem_src;
+    let is i64 as old_sem_src_len = sc.sem_src_len;
+    let is *u8 as old_sem_fn = sc.sem_filename;
+    let is *u8 as old_sem_tl = sc.sem_token_list;
+    if (cast(i64, cached) != 0) {
+        if (cast(i64, cached.src_ptr) != 0) {
+            sc.sem_src = cached.src_ptr;
+            sc.sem_src_len = cached.src_size;
+            sc.sem_token_list = cached.token_list;
+        }
+        sc.sem_filename = cached.name_ptr;
+        if (cast(i64, cached.path_ptr) != 0) { sc.sem_filename = cached.path_ptr; }
+    }
+
+    if (pass_id == 3) {
+        if (cast(i64, cached) != 0 && cached.fields_done == 0) {
+            cached.fields_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            // This module's own constants, for the length of its own layout.
+            // Without this a field written `[MAX]u8` folded only in the ROOT
+            // file: every imported module reached resolve_type_ref with the
+            // importer's registry and nothing of its own to look up, and the
+            // field failed to size. Four lines reproduce it — a module that
+            // declares a constant and a struct using it compiles standalone
+            // and fails the moment somebody imports it.
+            let is i32 as dmark = ty.dim_reg_mark();
+            prefold_consts(cached.body);
+            resolve_fields(cached.body);
+            ty.dim_reg_release(dmark);
+        }
+    }
+    if (pass_id == 4) {
+        if (cast(i64, cached) != 0 && cached.vars_done == 0) {
+            cached.vars_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            register_vars(cached.body);
+        }
+    }
+    if (pass_id == 5) {
+        if (cast(i64, cached) != 0 && cached.fns_done == 0) {
+            cached.fns_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            register_fns(cached.body);
+        }
+    }
+    if (pass_id == 6) {
+        if (cast(i64, cached) != 0 && cached.bodies_done == 0) {
+            cached.bodies_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            analyze_bodies(cached.body);
+            if (ast.stream_active == 1) { mod.free_tokens_of(cached); }
+        }
+    }
+    sc.sem_src = old_sem_src;
+    sc.sem_src_len = old_sem_src_len;
+    sc.sem_filename = old_sem_fn;
+    sc.sem_token_list = old_sem_tl;
+
+    sc.current_scope = outer;
+    sc.current_mod_prefix_ptr = old_prefix;
+    sc.current_mod_prefix_len = old_plen;
+    sc.current_source_dir_ptr = old_dir;
+    sc.current_source_dir_len = old_dir_len;
+}
+
+fn register_structs(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 1);
+        } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0) {
+            if (n.ty.kind == ast.TY_STRUCT) {
+                if (n.generic_param_count > 0) {
+                    n.ty.gen_params = n.generic_params;
+                    n.ty.gen_param_count = n.generic_param_count;
+                    n.ty.fields = cast(*u8, n.stmts);
+                    gn.store_template(n.ty.name_ptr, n.ty.name_len, n.generic_params, n.generic_param_count, cast(*u8, 0), cast(*u8, n.ty), 0);
+                } else {
+                    n.ty.fields = cast(*u8, n.stmts);
+                    if (sc.current_mod_prefix_len > 0) {
+                        let is i32 as mlen with mut = 0;
+                        let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.ty.name_ptr, n.ty.name_len, &mlen);
+                        ty.declare_struct(mangled, mlen, cast(*u8, n.ty));
+                    } else {
+                        ty.declare_struct(n.ty.name_ptr, n.ty.name_len, cast(*u8, n.ty));
+                    }
+                }
+            } else if (n.ty.kind == ast.TY_ENUM) {
+                n.ty.fields = cast(*u8, n.stmts);
+                if (n.generic_param_count > 0) {
+                    n.ty.gen_params = n.generic_params;
+                    n.ty.gen_param_count = n.generic_param_count;
+                    gn.store_template(n.ty.name_ptr, n.ty.name_len, n.generic_params, n.generic_param_count, cast(*u8, 0), cast(*u8, n.ty), 0);
+                } else {
+                    if (sc.current_mod_prefix_len > 0) {
+                        let is i32 as mlen with mut = 0;
+                        let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.ty.name_ptr, n.ty.name_len, &mlen);
+                        ty.declare_enum(mangled, mlen, cast(*u8, n.ty));
+                    } else {
+                        ty.declare_enum(n.ty.name_ptr, n.ty.name_len, cast(*u8, n.ty));
+                    }
+                }
+            }
+        }
+        n = n.next;
+    }
+}
+
+// The key an alias is filed under: mangled with the importing module's prefix
+// when we are inside one, bare at the whole-program root. register_aliases (pass
+// 2) and resolve_fields (pass 3) MUST agree on it, so both go through here.
+fn alias_key(n as *ast.Node, out_len as *i32) as *u8 {
+    if (sc.current_mod_prefix_len > 0) {
+        return d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.name_ptr, n.name_len, out_len);
+    }
+    *out_len = n.name_len;
+    return n.name_ptr;
+}
+
+fn register_aliases(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 2);
+        } else if (n.kind == ast.NK_TYPE_ALIAS) {
+            // Publish the NAME only. The right-hand side is deliberately left
+            // unresolved: resolving here would copy the target struct's size
+            // BEFORE resolve_fields computes it, freezing the alias at zero
+            // bytes (and `fields != 0` then blocks every later re-resolution).
+            // Pass 3 resolves it in place — the table holds this same node, so
+            // the fix is visible to everyone that looks the alias up.
+            let is i32 as klen with mut = 0;
+            let is *u8 as key = alias_key(n, &klen);
+            ty.declare_type_alias(key, klen, cast(*u8, n.ty));
+        }
+        n = n.next;
+    }
+}
+
+// Fold the top-level `with imut` globals that are already compile-time
+// integers, BEFORE struct layout needs them.
+//
+// A field written `[MAX]u8` is sized in resolve_fields (pass 3), and globals
+// are const-folded in register_vars (pass 5) — so without this the field
+// reaches resolve_type_ref with nothing to look up, and cannot be sized. The
+// passes cannot simply swap: a global whose TYPE is a struct needs that
+// struct's layout first.
+//
+// Cheap and narrow on purpose. One walk of the top level, keeping only what
+// try_fold_const can evaluate with no symbol table behind it — literals and
+// arithmetic over them. A constant defined in terms of another global is not
+// folded here (the other one is not declared yet) and falls through to the
+// error, which is the honest outcome and better than a size nobody chose.
+// Does NOT reset: the registry is a stack and the caller owns the frame. The
+// root resets once; each imported module pushes before its own layout and pops
+// after, so a name declared in two modules resolves to the right one.
+fn prefold_consts(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_LET && n.flags == ast.VF_IMUT && cast(i64, n.init_expr) != 0) {
+            let is i64 as v with mut = 0;
+            if (w.try_fold_const(n.init_expr, &v, 0) == 1) {
+                ty.dim_reg_add(n.name_ptr, n.name_len, v);
+            }
+        }
+        n = n.next;
+    }
+}
+
+fn resolve_fields(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 3);
+        } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_STRUCT) {
+            if (n.generic_param_count == 0) {
+                let is i32 as offset with mut = 0;
+                let is *ast.Node as f with mut = cast(*ast.Node, n.ty.fields);
+                while (cast(i64, f) != 0) {
+                    wt.resolve_type(cast(*u8, f.ty));
+                    f.var_offset = offset;
+                    offset = offset + f.ty.size;
+                    f = f.next;
+                }
+                n.ty.size = offset;
+            }
+        } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_ENUM) {
+            // Enum layout computed in declare_enum
+        } else if (n.kind == ast.NK_TYPE_ALIAS) {
+            // Now — not in pass 2 — because only here does the target have a
+            // size. `visit_use_module(n, 3)` above recursed into every import
+            // before reaching this node, so a module named on the right-hand
+            // side is already fully laid out; that also makes chained aliases
+            // (`type C = h.C` where h itself aliases) resolve in one sweep.
+            wt.resolve_type(cast(*u8, n.ty));
+            let is i32 as klen with mut = 0;
+            let is *u8 as key = alias_key(n, &klen);
+            ty.update_type_alias(key, klen, cast(*u8, n.ty));
+        }
+        n = n.next;
+    }
+}
+
+// Whether this module already declared a function — plain, extern or generic —
+// named `name`. Functions and globals of one module share its scope and its
+// symbol namespace (`<prefix>_<name>`), so a second one by that name is a
+// duplicate declaration. It used to be dropped without a word when it was an
+// extern, whatever its signature, and to reach the assembler as a label
+// defined twice otherwise — with no file or line to go on.
+fn fn_name_taken(name_ptr as *u8, name_len as i32) as i32 {
+    let is *u8 as pp = sc.current_mod_prefix_ptr;
+    let is i32 as pl = sc.current_mod_prefix_len;
+    if (cast(i64, sc.lookup_fn_qualified(name_ptr, name_len, pp, pl)) != 0) { return 1; }
+    let is *d.GenericTemplate as t with mut = gn.generic_templates;
+    while (cast(i64, t) != 0) {
+        if (t.is_function == 1
+            && d.str_eq(t.name_ptr, t.name_len, name_ptr, name_len) == 1
+            && d.str_eq(t.mod_prefix_ptr, t.mod_prefix_len, pp, pl) == 1) {
+            return 1;
+        }
+        t = t.next;
+    }
+    return 0;
+}
+
+fn register_vars(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 4);
+        } else if (n.kind == ast.NK_LET) {
+            // Every module's functions are registered by now (register_fns
+            // runs first), so a global named like one of them is caught
+            // whichever of the two comes first in the file.
+            if (fn_name_taken(n.name_ptr, n.name_len) == 1) {
+                sc.sem_error_at2(n, "declaracao duplicada no mesmo escopo:", n.name_ptr, n.name_len);
+            }
+            w.walk(n);
+        }
+        n = n.next;
+    }
+}
+
+fn register_fns(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 5);
+        } else if (n.kind == ast.NK_FN) {
+            // These signatures do not declare parameters during body analysis.
+            // Diagnose duplicate names without allocating fake naked/FFI frames.
+            if (ast.nx_is_naked(n) == 1 || n.generic_param_count > 0
+                || cast(i64, n.body) == 0) {
+                let is *ast.Node as param with mut = n.params;
+                while (cast(i64, param) != 0) {
+                    let is *ast.Node as previous with mut = n.params;
+                    while (cast(i64, previous) != cast(i64, param)) {
+                        if (d.str_eq(previous.name_ptr, previous.name_len, param.name_ptr, param.name_len) == 1) {
+                            sc.sem_error_at2(param, "parametro duplicado:", param.name_ptr, param.name_len);
+                        }
+                        previous = previous.next;
+                    }
+                    param = param.next;
+                }
+            }
+            if (fn_name_taken(n.name_ptr, n.name_len) == 1) {
+                sc.sem_error_at2(n, "declaracao duplicada no mesmo escopo:", n.name_ptr, n.name_len);
+            }
+            if (n.generic_param_count == 0) {
+                let is *ast.Node as p with mut = n.params;
+                while (cast(i64, p) != 0) {
+                    wt.resolve_type(cast(*u8, p.ty));
+                    p = p.next;
+                }
+                wt.resolve_type(cast(*u8, n.return_type));
+                let is i32 as pc with mut = 0;
+                p = n.params;
+                while (cast(i64, p) != 0) { pc = pc + 1; p = p.next; }
+                let is *u8 as pt = d.pt_alloc(pc);
+                let is i32 as i with mut = 0;
+                p = n.params;
+                while (cast(i64, p) != 0) {
+                    d.pt_set(pt, i, cast(*u8, p.ty));
+                    i = i + 1;
+                    p = p.next;
+                }
+                // For `extern "dll.dll" fn ...`, the parser stashed the dll
+                // name in impl_ptr/impl_len. Forward it so IR generation can
+                // lower call sites to IR_FFI_CALL.
+                sc.declare_fn_dll(n.name_ptr, n.name_len, cast(*u8, n.return_type), pt, pc, n.is_variadic, n.is_extern, ast.nx_impl_ptr(n), ast.nx_impl_len(n));
+                // Carry `with imut` flag + AST pointer back to the Function
+                // record so the call-site folder can evaluate the body at
+                // parse time when the call has all-literal arguments.
+                if (ast.nx_is_imut(n) == 1) {
+                    let is *d.Function as f_imut = sc.lookup_fn(n.name_ptr, n.name_len);
+                    if (cast(i64, f_imut) != 0) {
+                        f_imut.is_imut = 1;
+                        f_imut.ast_node = cast(*u8, n);
+                    }
+                }
+            } else {
+                gn.store_template(n.name_ptr, n.name_len, n.generic_params, n.generic_param_count, cast(*u8, n), cast(*u8, 0), 1);
+            }
+        }
+        n = n.next;
+    }
+}
+
+// === Streaming: syntax tree to IR, one function at a time ===
+// The function bodies of a large program are most of what a build holds in memory, and
+// they are only ever read between semantic analysis and IR generation. Here a body is
+// parsed at its turn, analyzed, lowered and dropped, with the bodies of the generic
+// instances it caused. `stream_hook` is the IR generator, which this module cannot name.
+let is *u8 as stream_hook with mut = cast(*u8, 0);
+let is *ast.Node as _stream_done with mut = cast(*ast.Node, 0);
+
+fn set_stream_hook(h as *u8) as void { stream_hook = h; }
+
+// Instances are added to the end of the root's chain as they are met.
+fn _stream_instances() as void {
+    if (cast(i64, _stream_done) == 0) { return; }
+    while (cast(i64, _stream_done.next) != 0) {
+        let is *ast.Node as x = _stream_done.next;
+        if (x.kind == ast.NK_FN && ast.nx_walked(x) == 0) { return; }
+        if (x.kind == ast.NK_FN) { call(stream_hook, x); }
+        _stream_done = x;
+    }
+}
+
+fn _stream_fn(n as *ast.Node) as void {
+    if (cast(i64, ast.nx_ir_func(n)) != 0) { return; }
+    top.force_body(n, sc.sem_token_list, sc.sem_src, sc.sem_src_len, sc.sem_filename);
+    w.walk(n);
+    call(stream_hook, n);
+    _stream_instances();
+    // An imut function's body is read again by every call the folder evaluates.
+    if (cast(i64, n.body) != 0 && ast.nx_is_imut(n) == 0) { n.body = top.no_body(); }
+    ast.reset_transient_nodes();
+}
+
+fn analyze_bodies(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 6);
+        } else if (n.kind == ast.NK_FN) {
+            if (n.generic_param_count == 0 && n.is_extern == 0) {
+                if (ast.stream_active == 1) { _stream_fn(n); }
+                else { w.walk(n); }
+            }
+        }
+        n = n.next;
+    }
+}
+
+// === Entry point ===
+
+fn set_stdlib_dir(ptr as *u8, slen as i32) as void {
+    sc.stdlib_dir_ptr = sc.normalize_path(ptr, slen, &sc.stdlib_dir_len);
+    while (sc.stdlib_dir_len > 1
+        && sc.stdlib_dir_ptr[sc.stdlib_dir_len - 1] == 47) {
+        sc.stdlib_dir_len = sc.stdlib_dir_len - 1;
+    }
+    // "." normalizes to an empty path, but still names the current directory.
+    if (sc.stdlib_dir_len == 0 && slen > 0) {
+        sc.stdlib_dir_ptr = ".";
+        sc.stdlib_dir_len = 1;
+    }
+}
+
+fn set_extra_paths(paths as *i64, count as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < count && i < 16) {
+        sc.extra_search_paths[i] = paths[i];
+        i = i + 1;
+    }
+    sc.extra_search_path_count = count;
+}
+
+fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, src_len as i64, tl as *u8) as void {
+    sc.symtab_init();
+    ty.types_init();
+    gn.generics_init();
+    mod.modules_init();
+
+    // Set error reporting context
+    sc.sem_src = src;
+    sc.sem_src_len = src_len;
+    sc.sem_filename = filename_ptr;
+    sc.sem_token_list = tl;
+
+    // Set initial source directory from filename
+    let is i32 as dir_len = sc.get_dir_len(filename_ptr, filename_len);
+    if (dir_len > 0) {
+        sc.current_source_dir_ptr = d.str_dup(filename_ptr, dir_len);
+        sc.current_source_dir_len = dir_len;
+    }
+
+    // Module-only (separate compilation): compile the input file with its
+    // canonical import prefix instead of the unprefixed root convention, so
+    // its symbols (`_path_mangled_<name>`) match what importers reference.
+    // Publish the prefix so codegen can emit ONLY this module's functions.
+    if (tgt.module_only_get() == 1) {
+        let is *u8 as mprefix = sc.get_mod_prefix(filename_ptr, filename_len);
+        let is i32 as mplen = sc.get_mod_prefix_len(filename_ptr, filename_len);
+        sc.current_mod_prefix_ptr = mprefix;
+        sc.current_mod_prefix_len = mplen;
+        tgt.module_prefix_set(mprefix, mplen);
+    }
+
+    // (The entry file records itself AFTER the passes below, so it lands LAST in
+    // the dependency list — it's the final dependent, imported by nobody.)
+
+    // Find ast_tail
+    gn.ast_tail = cast(*ast.Node, root);
+    if (cast(i64, gn.ast_tail) != 0) {
+        while (cast(i64, gn.ast_tail.next) != 0) {
+            gn.ast_tail = gn.ast_tail.next;
+        }
+    }
+
+    _stream_done = gn.ast_tail;
+
+    // register_fns runs before register_vars so globals can reference
+    // functions via fn_ptr() in their initializers, and prefold_consts runs
+    // before resolve_fields so a struct field can be `[MAX]u8`.
+    register_structs(root);
+    register_aliases(root);
+    ty.dim_reg_reset();
+    prefold_consts(root);
+    resolve_fields(root);
+    register_fns(root);
+    register_vars(root);
+    analyze_bodies(root);
+
+    // Record the entry file LAST (post-order): every import is already recorded
+    // above, so the entry — the final dependent — lands at the end of the list.
+    mod.record_dep(filename_ptr, filename_len);
+
+    // --emit-deps: now that every import has been resolved + loaded, write the
+    // full module path list for the maker's incremental driver.
+    if (cast(i64, tgt.write_deps_path_get()) != 0) { mod.emit_deps(tgt.write_deps_path_get()); }
+    let is *u8 as deps_path = tgt.emit_deps_path_get();
+    if (cast(i64, deps_path) != 0) {
+        mod.emit_deps(deps_path);
+    }
+}

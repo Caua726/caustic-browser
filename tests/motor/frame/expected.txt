@@ -1,0 +1,14 @@
+true true 6 true function true 
+7 object
+? http://127.0.0.1:P {"hello":1,"top":true,"self":true,"par":true,"len":0,"fe":null,"org":"http://127.0.0.1:5194","ua":true}
+? http://127.0.0.1:P {"shown":"csp-self"}
+a http://127.0.0.1:P {"back":"right","from":"http://127.0.0.1:5193"}
+a http://127.0.0.1:P {"back":"right","from":"http://127.0.0.1:5193"}
+a http://127.0.0.1:P {"back":"star","from":"http://127.0.0.1:5193"}
+a http://127.0.0.1:P {"back":"star","from":"http://127.0.0.1:5193"}
+a http://127.0.0.1:P {"hello":1,"top":true,"self":true,"par":true,"len":0,"fe":null,"org":"http://127.0.0.1:5194","ua":true}
+s http://127.0.0.1:P {"srcdoc":1,"top":true}
+self http://127.0.0.1:P {"own":1}
+a,dyn,s
+204 104 204
+6

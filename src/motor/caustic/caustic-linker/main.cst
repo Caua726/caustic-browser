@@ -1,0 +1,836 @@
+use "../std/mem.cst" as mem;
+use "../std/io.cst" as io;
+use "../src/ir/opt_mem.cst" as om;
+use "readers/elf_reader.cst" as reader;
+use "readers/coff_reader.cst" as coff_reader;
+use "core/linker.cst" as linker;
+use "core/map_writer.cst" as mapw;
+use "core/relocate.cst" as reloc;
+use "elf/link_dynamic.cst" as ldyn;
+use "elf/elf_writer.cst" as writer;
+use "pe/pe_writer.cst" as pew;
+use "cse/cse_writer.cst" as csew;
+use "../src/codegen/target.cst" as tgt;
+use "version.cst" as ver;
+
+// ============================================================
+// main.cst — CLI parsing and orchestration for caustic-ld
+// ============================================================
+
+// ============================================================
+// CLI helpers
+// ============================================================
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn streq_lit(a as *u8, lit as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (lit[i] != 0) {
+        if (a[i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != 0) { return 0; }
+    return 1;
+}
+
+fn starts_with(a as *u8, prefix as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (prefix[i] != 0) {
+        if (a[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn print_str(s as *u8) as void {
+    io._write_fd(io.STDERR, s, strlen(s));
+}
+
+fn print_out(s as *u8) as void {
+    io._write_fd(io.STDOUT, s, strlen(s));
+}
+
+fn print_int(n as i64) as void {
+    if (n == 0) { io._write_fd(io.STDERR, "0", 1); return; }
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i64 as start = cast(i64, pos) + 1;
+    io._write_fd(io.STDERR, cast(*u8, cast(i64, &buf) + start), 24 - start);
+}
+
+// Parse hex string (after "0x" prefix) to i64
+fn parse_hex(s as *u8) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as i with mut = 0;
+    // Skip "0x" or "0X" prefix
+    if (s[0] == 48 && (s[1] == 120 || s[1] == 88)) {
+        i = 2;
+    }
+    while (s[i] != 0) {
+        let is i64 as c = cast(i64, s[i]);
+        let is i64 as digit with mut = 0;
+        if (c >= 48 && c <= 57) { digit = c - 48; }           // '0'-'9'
+        else if (c >= 97 && c <= 102) { digit = c - 87; }     // 'a'-'f'
+        else if (c >= 65 && c <= 70) { digit = c - 55; }      // 'A'-'F'
+        else { break; }
+        result = result * 16 + digit;
+        i = i + 1;
+    }
+    return result;
+}
+
+fn print_usage() as void {
+    print_out("caustic-ld: linker for Caustic\n\n");
+    print_out("Usage: caustic-ld [options] <input.o ...>\n\n");
+    print_out("Options:\n");
+    print_out("  -o <file>          Output file (default: a.out)\n");
+    print_out("  -l<lib>            Link with shared library (e.g. -lc, -lm)\n");
+    print_out("  --entry=<symbol>   Entry point symbol (default: main)\n");
+    print_out("  --base=<addr>      Base address in hex (default: 0x400000)\n");
+    print_out("  -g, --debug        Include DWARF information from input objects\n");
+    print_out("  --strip            Remove symbol table from output\n");
+    print_out("  --map              Generate map file (<output>.map)\n");
+    print_out("  --keep-empty       Include empty sections in output\n");
+    print_out("  --freestanding     Skip _start stub (for kernels/bare-metal)\n");
+    print_out("  --align-functions  Start each function on a 32-byte boundary (nop-filled)\n");
+    print_out("  -v                 Verbose output\n");
+    print_out("  --version          Print the version\n");
+}
+
+// Build "lib<name>.so" when ver < 0, otherwise "lib<name>.so.<ver>".
+fn build_soname(name as *u8, name_len as i64, ver as i64) as *u8 {
+    let is *u8 as soname = om.opt_alloc(name_len + 9);
+    soname[0] = 108; // 'l'
+    soname[1] = 105; // 'i'
+    soname[2] = 98;  // 'b'
+    let is i64 as i with mut = 0;
+    while (i < name_len) {
+        soname[3 + i] = name[i];
+        i = i + 1;
+    }
+    soname[3 + name_len] = 46;  // '.'
+    soname[4 + name_len] = 115; // 's'
+    soname[5 + name_len] = 111; // 'o'
+    if (ver < 0) {
+        soname[6 + name_len] = 0;
+        return soname;
+    }
+    soname[6 + name_len] = 46;  // '.'
+    soname[7 + name_len] = cast(u8, 48 + ver); // '0' + ver
+    soname[8 + name_len] = 0;
+    return soname;
+}
+
+// Directories the dynamic loader searches by default. Probing only /usr/lib
+// resolved -l<name> on Arch and nowhere else: Debian and Ubuntu keep their
+// libraries under /lib/x86_64-linux-gnu, 64-bit RPM distros under /usr/lib64.
+let is i32 as LIBDIR_COUNT with imut = 6;
+fn libdir_at(i as i32) as *u8 {
+    if (i == 0) { return "/usr/lib/"; }
+    if (i == 1) { return "/usr/lib64/"; }
+    if (i == 2) { return "/lib/x86_64-linux-gnu/"; }
+    if (i == 3) { return "/usr/lib/x86_64-linux-gnu/"; }
+    if (i == 4) { return "/usr/local/lib/"; }
+    return "/lib/";
+}
+
+// 1 when <dir><soname> can be opened for reading.
+fn lib_exists(dir as *u8, soname as *u8) as i32 {
+    let is i64 as dl = strlen(dir);
+    let is i64 as sl = strlen(soname);
+    let is *u8 as path = om.opt_alloc(dl + sl + 1);
+    let is i64 as i with mut = 0;
+    while (i < dl) { path[i] = dir[i]; i = i + 1; }
+    i = 0;
+    while (i < sl) { path[dl + i] = soname[i]; i = i + 1; }
+    path[dl + sl] = 0;
+    let is i64 as fd = io._open_read(path);
+    om.opt_free(path);
+    if (fd < 0) { return 0; }
+    io._close_fd(fd);
+    return 1;
+}
+
+// 1 when the name already contains ".so" — i.e. it is a soname, not an -l stem.
+fn name_is_soname(name as *u8, name_len as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i + 2 < name_len) {
+        if (name[i] == 46 && name[i+1] == 115 && name[i+2] == 111) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Turn a -l<name> stem into the soname that goes into DT_NEEDED.
+fn lib_to_soname(name as *u8) as *u8 {
+    let is i64 as name_len = strlen(name);
+
+    // Already a soname ("libm.so.6", "libfoo.so")? Pass it through untouched
+    // rather than wrapping it into "liblibm.so.6.so".
+    if (name_is_soname(name, name_len) == 1) {
+        let is *u8 as verbatim = om.opt_alloc(name_len + 1);
+        let is i64 as c with mut = 0;
+        while (c < name_len) { verbatim[c] = name[c]; c = c + 1; }
+        verbatim[name_len] = 0;
+        return verbatim;
+    }
+
+    // Versioned first — a library that ships lib<name>.so.<V> names that file
+    // in its own SONAME, and the unversioned link is only a build-time symlink.
+    let is i64 as v with mut = 0;
+    while (v < 10) {
+        let is *u8 as cand = build_soname(name, name_len, v);
+        let is i32 as d with mut = 0;
+        while (d < LIBDIR_COUNT) {
+            if (lib_exists(libdir_at(d), cand) == 1) { return cand; }
+            d = d + 1;
+        }
+        om.opt_free(cand);
+        v = v + 1;
+    }
+
+    let is *u8 as plain = build_soname(name, name_len, 0 - 1);
+    let is i32 as d2 with mut = 0;
+    while (d2 < LIBDIR_COUNT) {
+        if (lib_exists(libdir_at(d2), plain) == 1) { return plain; }
+        d2 = d2 + 1;
+    }
+
+    // Nothing on this machine matches. Emit the unversioned name instead of
+    // inventing a version: the old ".so.6" fallback (a libc-ism) named a file
+    // that existed nowhere, so the link reported success and the program died
+    // at startup with "cannot open shared object file". That is what broke
+    // -lcaustic, whose libcaustic.so is installed outside the loader's path.
+    return plain;
+}
+
+// ============================================================
+// Globals for integrated pipeline (set by compiler before calling link_objs)
+// ============================================================
+
+let is i32 as g_freestanding with mut = 0;
+let is i64 as g_entry_name with mut = 0;   // *u8 or 0 for default ("main")
+let is i64 as g_base_addr with mut = 0;    // 0 = use default (0x400000)
+let is i32 as g_shared with mut = 0;       // 1 = emit shared lib (.so / .dll)
+let is i32 as g_line_layout with mut = 0;  // 1 = LinkState.line_layout
+let is i32 as g_align_funcs with mut = 0;  // >1 = start each function on this boundary
+
+// ============================================================
+// Library entry point (for integrated pipeline)
+// ============================================================
+
+// Peek the first 2 magic bytes of an .o file and dispatch to the right
+// reader. ELF starts with 0x7F 'E', COFF AMD64 with 0x64 0x86.
+fn read_obj_auto(path as *u8, obj as *reader.ObjFile) as i32 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) {
+        return reader.read_obj(path, obj);  // surface its error message
+    }
+    let is [4]u8 as magic;
+    let is i64 as n = io._read_fd(fd, &magic, 4);
+    io._close_fd(fd);
+    if (n < 2) { return reader.read_obj(path, obj); }
+    // 0x8664 = COFF AMD64, 0xAA64 = COFF ARM64 (both little-endian).
+    if (magic[0] == 100 && (magic[1] == 134 || magic[1] == 170)) {
+        return coff_reader.read_coff_obj(path, obj);
+    }
+    return reader.read_obj(path, obj);
+}
+
+// Link object files into an executable.
+// obj_paths: array of *u8 pointers to .o file paths
+// obj_count: number of object files
+// output_path: output executable path
+// lib_names: array of *u8 pointers to library names (e.g. "c", "m")
+// lib_count: number of libraries
+// Caller must have initialized the heap before calling this.
+// Public entry for the compiler driver's one-command CSE polyglot
+// orchestration: weld three finished executables (windows PE + linux ELF +
+// caustic CST) into one tri-format APE. Delegates to the cse_writer combiner.
+// Fuse two finished pure .cse images (one per architecture) into a CST_ v4
+// container. Thin wrapper so the compiler driver does not need to build the
+// path array itself.
+fn cse_fat_files(x64_path as *u8, a64_path as *u8, output_path as *u8) as i32 {
+    let is [2]i64 as paths;
+    paths[0] = cast(i64, x64_path);
+    paths[1] = cast(i64, a64_path);
+    return _link_result(output_path, csew.write_cse_fat(cast(*u8, &paths), 2, output_path));
+}
+
+fn cse_combine_files(pe_path as *u8, elf_path as *u8, elf_a64_path as *u8,
+                     pe_a64_path as *u8, cst_path as *u8, output_path as *u8) as i32 {
+    return _link_result(output_path, csew.write_cse_combine_ape(pe_path, elf_path, elf_a64_path, pe_a64_path,
+                                                               cst_path, output_path));
+}
+
+// A rejected link must not leave a previous success or a partial new image.
+fn _link_result(output_path as *u8, status as i32) as i32 {
+    if (status != 0) { io.unlink(output_path); }
+    return status;
+}
+
+fn link_objs(obj_paths as *u8, obj_count as i32, output_path as *u8,
+             lib_names as *u8, lib_count as i32) as i32 {
+    let is *i64 as paths_arr = cast(*i64, obj_paths);
+
+    // Calculate total file sizes for internal buffers
+    let is i64 as total_file_size with mut = 0;
+    let is i32 as fi with mut = 0;
+    while (fi < obj_count) {
+        let is *u8 as path = cast(*u8, paths_arr[fi]);
+        let is i64 as fd = io._open_read(path);
+        if (fd >= 0) {
+            let is i64 as sz = io._lseek(fd, 0, io._SEEK_END);
+            total_file_size = total_file_size + sz;
+            io._close_fd(fd);
+        }
+        fi = fi + 1;
+    }
+
+    // Initialize linker state. Windows PE uses 0x140000000 by default.
+    let is i64 as init_base with mut = 4194304;  // 0x400000 (Linux ELF default)
+    let is *tgt.Target as t_init = tgt.target_get();
+    if (t_init.arch == tgt.ARCH_AARCH64 && (g_shared == 1 || lib_count > 0)) {
+        print_str("caustic-ld: linux-aarch64 currently supports static linking only\n");
+        return _link_result(output_path, 1);
+    }
+    if (t_init.object_format == 2) { init_base = 5368709120; }  // 0x140000000
+    if (g_base_addr != 0) { init_base = g_base_addr; }
+    // --shared ELF (.so): base 0 (position-independent). Windows .dll keeps base.
+    //
+    // A .csl is neither. The CausticOS loader maps a library at the vaddrs it
+    // was linked for and does not relocate the library itself, so two libraries
+    // built at the same base overlap in every process that uses both — and the
+    // one mapped second wins, silently, with the first one's callers landing
+    // inside it. An explicit --base therefore WINS for the CausticOS target:
+    // that is how the build hands each library its own window. Only an
+    // unspecified base still falls back to 0.
+    if (g_shared == 1 && t_init.object_format != 2) {
+        if (t_init.object_format != 3 || g_base_addr == 0) { init_base = 0; }
+    }
+    let is linker.LinkerState as ls = linker.linker_init(init_base);
+    if (g_entry_name != 0) {
+        ls.entry_name = cast(*u8, g_entry_name);
+    } else {
+        ls.entry_name = "main";
+    }
+    ls.verbose = 0;
+    ls.do_strip = 0;
+    ls.do_map = 0;
+    ls.keep_empty = 0;
+    ls.freestanding = g_freestanding;
+    if (g_shared == 1) { ls.freestanding = 1; }
+    ls.is_shared = g_shared;
+    ls.align_funcs = g_align_funcs;
+    ls.line_layout = g_line_layout;
+
+    // Store needed libs
+    if (lib_count > 0) {
+        let is *i64 as names_arr = cast(*i64, lib_names);
+        ls.needed_libs = om.opt_alloc(cast(i64, lib_count) * 8);
+        let is *i64 as lib_arr = cast(*i64, ls.needed_libs);
+        let is i32 as lci with mut = 0;
+        while (lci < lib_count) {
+            let is *u8 as raw_name = cast(*u8, names_arr[lci]);
+            lib_arr[lci] = cast(i64, lib_to_soname(raw_name));
+            lci = lci + 1;
+        }
+        ls.needed_count = lib_count;
+    }
+
+    // Read all object files
+    ls.objs = om.opt_alloc(cast(i64, obj_count) * 8);
+    ls.obj_count = obj_count;
+
+    fi = 0;
+    while (fi < obj_count) {
+        let is *u8 as path = cast(*u8, paths_arr[fi]);
+        let is *reader.ObjFile as obj = cast(*reader.ObjFile, om.opt_alloc(sizeof(reader.ObjFile)));
+
+        let is i32 as err = read_obj_auto(path, obj);
+        if (err != 0) {
+            print_str("caustic-ld: error: failed to read ");
+            print_str(path);
+            print_str("\n");
+            return _link_result(output_path, 1);
+        }
+
+        let is *i64 as arr = cast(*i64, ls.objs);
+        arr[fi] = cast(i64, obj);
+        fi = fi + 1;
+    }
+
+    // Phase 1: Merge sections
+    linker.merge_sections(&ls);
+
+    // Phase 2: Assign virtual addresses
+    linker.assign_addresses(&ls);
+
+    // ELF: an extern's own library annotation supplies DT_NEEDED, so a program
+    // that names its libraries in source needs no -l on the command line. Runs
+    // before build_symtab so its unresolved-symbol warning knows a shared object
+    // is expected to provide them, and before the dispatch below, which picks
+    // the dynamic writer on needed_count > 0.
+    let is *tgt.Target as t = tgt.target_get();
+    if (t.object_format != 2 && t.object_format != 3) {
+        linker.add_cstimport_needed_libs(&ls);
+    }
+
+    // Phase 3: Build symbol table + patch _start
+    let is i32 as sym_err = linker.build_symtab(&ls);
+    if (sym_err != 0) { return _link_result(output_path, 1); }
+
+    let is i32 as write_err with mut = 0;
+
+    // PE/Windows path: collect .cstimport entries, dispatch to PE writer
+    // which handles apply_relocations internally (it must run AFTER
+    // __imp_<sym> gsyms are registered so PC32 reloc resolves to IAT).
+    if (g_shared == 1 && t.object_format != 2 && t.object_format != 3) {
+        write_err = writer.write_shared_object(&ls, output_path);
+    } else if (t.object_format == 3) {
+        // CSE (Caustic Standard Executable). write_cse runs relocation and
+        // dispatches by --mode internally (like the PE writer).
+        write_err = csew.write_cse(&ls, output_path);
+    } else if (t.object_format == 2) {
+        linker.collect_all_cstimports(&ls);
+        write_err = pew.write_pe_executable(&ls, output_path);
+    } else if (ls.needed_count > 0) {
+        // The dynamic writer builds no .eh_frame: the program's backtrace
+        // falls back to the frame-pointer chain.
+        linker.define_eh_frame_hdr(&ls, 0);
+        linker.collect_dynamic_syms(&ls);
+        ldyn.alloc_dynamic_bufs(&ls);
+        write_err = writer.write_dynamic_executable(&ls, output_path);
+    } else {
+        linker.define_eh_frame_hdr(&ls, writer.eh_frame_hdr_vaddr(&ls));
+        reloc.apply_relocations(&ls);
+        write_err = writer.write_executable(&ls, output_path);
+    }
+
+    return _link_result(output_path, write_err);
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+fn main(argc as i64, argv as i64) as i32 {
+    tgt.target_init();
+    let is *i64 as argv_arr = cast(*i64, argv);
+
+    if (argc < 2) {
+        print_usage();
+        return 1;
+    }
+
+    // Parse CLI args
+    let is *u8 as output_path with mut = "a.out";
+    let is i32 as output_explicit with mut = 0;
+
+    // --cse-combine: weld a windows PE + linux ELF + caustic CST into one
+    // tri-format APE polyglot (no normal linking is performed in this mode).
+    let is i32 as cse_combine with mut = 0;
+    let is *u8 as cse_pe_path with mut = cast(*u8, 0);
+    let is *u8 as cse_elf_path with mut = cast(*u8, 0);
+    let is *u8 as cse_cst_path with mut = cast(*u8, 0);
+    let is *u8 as cse_elf_a64_path with mut = cast(*u8, 0);
+    let is *u8 as cse_pe_a64_path with mut = cast(*u8, 0);
+    // --cse-fat: fuse N finished pure .cse images (one per architecture) into a
+    // single CST_ v4 container. Each --image= is a complete CST_ v3 file; the
+    // arch comes from its own header byte.
+    let is i32 as cse_fat with mut = 0;
+    let is *u8 as cse_fat_paths = om.opt_alloc(8 * 8);
+    let is i32 as cse_fat_count with mut = 0;
+    let is *u8 as entry_name with mut = "main";
+    let is i64 as base_addr with mut = 4194304; // 0x400000
+    let is i32 as verbose with mut = 0;
+    let is i32 as do_strip with mut = 0;
+    let is i32 as do_map with mut = 0;
+    let is i32 as keep_empty with mut = 0;
+    let is i32 as freestanding with mut = 0;
+    let is i32 as align_funcs with mut = 0;
+    let is i32 as shared_mode with mut = 0;   // --shared: emit ET_DYN .so
+
+    // Input paths and -l libraries, each sized by argc — every one of them is
+    // an argument, so neither can outgrow it. These were [256] and [32] on the
+    // stack, filled with no bound check: the 33rd -l or the 257th input wrote
+    // past the array into the rest of main's frame.
+    let is *i64 as input_files = cast(*i64, om.opt_alloc(argc * 8));
+    let is i32 as num_inputs with mut = 0;
+    let is *i64 as needed_libs = cast(*i64, om.opt_alloc(argc * 8));
+    let is i32 as needed_count with mut = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as arg = cast(*u8, argv_arr[ai]);
+
+        if (streq_lit(arg, "-o") == 1) {
+            ai = ai + 1;
+            if (ai < argc) {
+                output_path = cast(*u8, argv_arr[ai]);
+                output_explicit = 1;
+            }
+        }
+        else if (starts_with(arg, "--entry=") == 1) {
+            entry_name = cast(*u8, cast(i64, arg) + 8);
+        }
+        else if (starts_with(arg, "--base=") == 1) {
+            let is *u8 as hex_str = cast(*u8, cast(i64, arg) + 7);
+            base_addr = parse_hex(hex_str);
+        }
+        else if (starts_with(arg, "--target=") == 1) {
+            let is *u8 as triple = cast(*u8, cast(i64, arg) + 9);
+            let is i32 as tlen with mut = 0;
+            while (triple[tlen] != cast(u8, 0)) { tlen = tlen + 1; }
+            let is i32 as ok = tgt.load_target(triple, tlen);
+            if (ok == 0) {
+                print_str("caustic-ld: unknown --target\n");
+                return 1;
+            }
+            // windows-x86_64 dispatches through pe_writer.cst at link time.
+        }
+        else if (streq_lit(arg, "--cse-combine") == 1) {
+            cse_combine = 1;
+        }
+        else if (streq_lit(arg, "--cse-fat") == 1) {
+            cse_fat = 1;
+        }
+        else if (starts_with(arg, "--image=") == 1) {
+            if (cse_fat_count >= 8) {
+                print_str("caustic-ld: --cse-fat takes at most 8 --image=\n");
+                return 1;
+            }
+            let is *i64 as fp = cast(*i64, cse_fat_paths);
+            fp[cse_fat_count] = cast(i64, cast(*u8, cast(i64, arg) + 8));
+            cse_fat_count = cse_fat_count + 1;
+        }
+        else if (starts_with(arg, "--pe=") == 1) {
+            cse_pe_path = cast(*u8, cast(i64, arg) + 5);
+        }
+        else if (starts_with(arg, "--elf=") == 1) {
+            cse_elf_path = cast(*u8, cast(i64, arg) + 6);
+        }
+        else if (starts_with(arg, "--elf-arm64=") == 1) {
+            cse_elf_a64_path = cast(*u8, cast(i64, arg) + 12);
+        }
+        else if (starts_with(arg, "--pe-arm64=") == 1) {
+            cse_pe_a64_path = cast(*u8, cast(i64, arg) + 11);
+        }
+        else if (starts_with(arg, "--cst=") == 1) {
+            cse_cst_path = cast(*u8, cast(i64, arg) + 6);
+        }
+        else if (starts_with(arg, "--mode=") == 1) {
+            // CSE output mode (only meaningful with --target=caustic-x86_64).
+            let is *u8 as v = cast(*u8, cast(i64, arg) + 7);
+            if (streq_lit(v, "pure") == 1) { tgt.cse_mode_set(0); }
+            else if (streq_lit(v, "compat") == 1) { tgt.cse_mode_set(1); }
+            else if (streq_lit(v, "bundle") == 1) { tgt.cse_mode_set(2); }
+            else { print_str("caustic-ld: unknown --mode (pure|compat|bundle)\n"); return 1; }
+        }
+        else if (starts_with(arg, "--extension=") == 1) {
+            let is *u8 as v = cast(*u8, cast(i64, arg) + 12);
+            tgt.cse_extension_set(v, cast(i32, strlen(v)));
+        }
+        else if (streq_lit(arg, "-g") == 1 || streq_lit(arg, "--debug") == 1) {
+            tgt.debug_set(1);
+        }
+        else if (streq_lit(arg, "--strip") == 1) {
+            do_strip = 1;
+        }
+        else if (streq_lit(arg, "--map") == 1) {
+            do_map = 1;
+        }
+        else if (streq_lit(arg, "--keep-empty") == 1) {
+            keep_empty = 1;
+        }
+        else if (streq_lit(arg, "--freestanding") == 1) {
+            freestanding = 1;
+        }
+        else if (streq_lit(arg, "--align-functions") == 1) {
+            align_funcs = 32;
+        }
+        else if (streq_lit(arg, "--shared") == 1) {
+            shared_mode = 1;
+        }
+        else if (streq_lit(arg, "-v") == 1) {
+            verbose = 1;
+        }
+        else if (streq_lit(arg, "--version") == 1) {
+            // A build from source reports the commit it came from:
+            // install.sh --from-source writes it into version.cst for the build.
+            print_out("caustic-ld ");
+            print_out(ver.VERSION);
+            print_out("\n");
+            return 0;
+        }
+        else if (streq_lit(arg, "--help") == 1 || streq_lit(arg, "-h") == 1) {
+            print_usage();
+            return 0;
+        }
+        else if (arg[0] == 45 && arg[1] == 108 && arg[2] != 0) {  // '-l<lib>'
+            let is *u8 as lib_name = cast(*u8, cast(i64, arg) + 2);
+            needed_libs[needed_count] = cast(i64, lib_name);
+            needed_count = needed_count + 1;
+        }
+        else if (arg[0] == 45) {  // '-' — unknown flag
+            print_str("error: unknown option: ");
+            print_str(arg);
+            print_str("\n");
+            return 1;
+        }
+        else {
+            // Input file
+            input_files[num_inputs] = cast(i64, arg);
+            num_inputs = num_inputs + 1;
+        }
+
+        ai = ai + 1;
+    }
+
+    // --cse-combine: weld three finished executables into one APE polyglot and
+    // exit (no object linking).
+    // --cse-fat: fuse per-arch images into one multi-arch container and exit.
+    if (cse_fat == 1) {
+        if (cse_fat_count == 0) {
+            print_str("caustic-ld: --cse-fat needs at least one --image=<file>\n");
+            return 1;
+        }
+        return _link_result(output_path, csew.write_cse_fat(cse_fat_paths, cse_fat_count, output_path));
+    }
+
+    if (cse_combine == 1) {
+        if (cast(i64, cse_pe_path) == 0 || cast(i64, cse_elf_path) == 0) {
+            print_str("caustic-ld: --cse-combine needs --pe=<file> and --elf=<file> (and optional --cst=<file>)\n");
+            return 1;
+        }
+        return _link_result(output_path, csew.write_cse_combine_ape(cse_pe_path, cse_elf_path, cse_elf_a64_path,
+                                                                   cse_pe_a64_path, cse_cst_path, output_path));
+    }
+
+    if (num_inputs == 0) {
+        print_str("error: no input files\n");
+        return 1;
+    }
+
+    // Calculate total file sizes for heap
+    let is i64 as total_file_size with mut = 0;
+    let is i32 as fi with mut = 0;
+    while (fi < num_inputs) {
+        let is *u8 as path = cast(*u8, input_files[fi]);
+        let is i64 as fd = io._open_read(path);
+        if (fd >= 0) {
+            let is i64 as sz = io._lseek(fd, 0, io._SEEK_END);
+            total_file_size = total_file_size + sz;
+            io._close_fd(fd);
+        }
+        fi = fi + 1;
+    }
+
+    if (verbose == 1) {
+        print_str("caustic-ld: linking ");
+        print_int(cast(i64, num_inputs));
+        print_str(" object file(s)\n");
+    }
+
+    // Initialize linker state. Windows PE uses 0x140000000 as ImageBase
+    // unless --base= was explicitly set; output defaults to a.exe instead
+    // of a.out when -o was not given.
+    let is *tgt.Target as t_main_init = tgt.target_get();
+    if (t_main_init.object_format == 2 && output_explicit == 0) {
+        output_path = "a.exe";
+    }
+    if (t_main_init.arch == tgt.ARCH_AARCH64 && (shared_mode == 1 || needed_count > 0)) {
+        print_str("caustic-ld: linux-aarch64 currently supports static linking only\n");
+        return _link_result(output_path, 1);
+    }
+    if (t_main_init.object_format == 2 && base_addr == 4194304) {
+        base_addr = 5368709120;  // 0x140000000
+    }
+    // --shared: ET_DYN at base 0 (position-independent), no _start stub.
+    if (shared_mode == 1) { base_addr = 0; freestanding = 1; }
+    let is linker.LinkerState as ls = linker.linker_init(base_addr);
+    ls.entry_name = entry_name;
+    ls.verbose = verbose;
+    ls.do_strip = do_strip;
+    ls.do_map = do_map;
+    ls.keep_empty = keep_empty;
+    ls.freestanding = freestanding;
+    ls.is_shared = shared_mode;
+    ls.align_funcs = align_funcs;
+
+    // Store needed libs (convert raw names to sonames)
+    if (needed_count > 0) {
+        ls.needed_libs = om.opt_alloc(cast(i64, needed_count) * 8);
+        let is *i64 as lib_arr = cast(*i64, ls.needed_libs);
+        let is i32 as lci with mut = 0;
+        while (lci < needed_count) {
+            let is *u8 as raw_name = cast(*u8, needed_libs[lci]);
+            lib_arr[lci] = cast(i64, lib_to_soname(raw_name));
+            lci = lci + 1;
+        }
+        ls.needed_count = needed_count;
+    }
+
+    // Read all object files
+    ls.objs = om.opt_alloc(cast(i64, num_inputs) * 8);
+    ls.obj_count = num_inputs;
+
+    fi = 0;
+    while (fi < num_inputs) {
+        let is *u8 as path = cast(*u8, input_files[fi]);
+        let is *reader.ObjFile as obj = cast(*reader.ObjFile, om.opt_alloc(sizeof(reader.ObjFile)));
+
+        let is i32 as err = read_obj_auto(path, obj);
+        if (err != 0) {
+            print_str("error: failed to read ");
+            print_str(path);
+            print_str("\n");
+            return _link_result(output_path, 1);
+        }
+
+        // Store pointer in array
+        let is *i64 as arr = cast(*i64, ls.objs);
+        arr[fi] = cast(i64, obj);
+
+        if (verbose == 1) {
+            print_str("  ");
+            print_str(path);
+            print_str(": text=");
+            print_int(obj.text.size);
+            print_str(" data=");
+            print_int(obj.data_sec.size);
+            print_str(" rodata=");
+            print_int(obj.rodata.size);
+            print_str(" bss=");
+            print_int(obj.bss_size);
+            print_str(" syms=");
+            print_int(cast(i64, obj.sym_count));
+            print_str(" relocs=");
+            print_int(cast(i64, obj.reloc_count));
+            print_str("\n");
+        }
+
+        fi = fi + 1;
+    }
+
+    // Phase 1: Merge sections
+    linker.merge_sections(&ls);
+
+    if (verbose == 1) {
+        print_str("  merged: text=");
+        print_int(ls.text_size);
+        print_str(" rodata=");
+        print_int(ls.rodata_size);
+        print_str(" data=");
+        print_int(ls.data_size);
+        print_str(" bss=");
+        print_int(ls.bss_total);
+        print_str("\n");
+    }
+
+    // Phase 2: Assign virtual addresses
+    linker.assign_addresses(&ls);
+
+    if (verbose == 1) {
+        print_str("  text_vaddr=");
+        reader.print_hex(ls.text_vaddr);
+        print_str(" data_vaddr=");
+        reader.print_hex(ls.data_vaddr);
+        print_str("\n");
+    }
+
+    // See the integrated pipeline above: extern annotations become DT_NEEDED,
+    // and this has to precede build_symtab's unresolved-symbol warning.
+    let is *tgt.Target as t_main = tgt.target_get();
+    if (t_main.object_format != 2 && t_main.object_format != 3) {
+        linker.add_cstimport_needed_libs(&ls);
+    }
+
+    // Phase 3: Build symbol table + patch _start
+    let is i32 as sym_err = linker.build_symtab(&ls);
+    if (sym_err != 0) {
+        return _link_result(output_path, 1);
+    }
+
+    if (verbose == 1) {
+        print_str("  global symbols: ");
+        let is *linker.GlobalSymTab as gsyms_dbg = linker.get_gsyms(&ls);
+        print_int(cast(i64, gsyms_dbg.count));
+        print_str("\n");
+    }
+
+    let is i32 as write_err with mut = 0;
+
+    // PE/Windows path: collect cstimport from objects, dispatch to PE writer.
+    if (shared_mode == 1 && t_main.object_format != 2 && t_main.object_format != 3) {
+        // --shared (ELF): the writer assigns PLT/GOT addresses before relocating.
+        // For Windows (object_format==2), --shared falls through to the PE writer
+        // below, which emits a .dll (export directory) when ls.is_shared==1.
+        write_err = writer.write_shared_object(&ls, output_path);
+    } else if (t_main.object_format == 3) {
+        // CSE (Caustic Standard Executable) — relocation + mode dispatch
+        // happen inside write_cse.
+        write_err = csew.write_cse(&ls, output_path);
+    } else if (t_main.object_format == 2) {
+        linker.collect_all_cstimports(&ls);
+        write_err = pew.write_pe_executable(&ls, output_path);
+    } else if (ls.needed_count > 0) {
+        // Dynamic linking path
+        if (verbose == 1) {
+            print_str("  dynamic linking mode (");
+            print_int(cast(i64, ls.needed_count));
+            print_str(" libs)\n");
+        }
+
+        // Collect undefined symbols as dynamic
+        linker.collect_dynamic_syms(&ls);
+
+        // Allocate dynamic section buffers
+        ldyn.alloc_dynamic_bufs(&ls);
+
+        // The dynamic writer handles address reassignment, PLT/GOT building,
+        // symtab rebuild, relocation application, and metadata generation
+        write_err = writer.write_dynamic_executable(&ls, output_path);
+    } else {
+        // Static linking path (unchanged)
+        // Phase 4: Apply relocations
+        reloc.apply_relocations(&ls);
+
+        // Phase 5: Write ELF executable
+        write_err = writer.write_executable(&ls, output_path);
+    }
+
+    if (write_err != 0) {
+        return _link_result(output_path, 1);
+    }
+
+    // Phase 6: Map file
+    if (do_map == 1) {
+        mapw.write_map(&ls, output_path);
+    }
+
+    if (verbose == 1) {
+        print_str("  output: ");
+        print_str(output_path);
+        print_str("\n");
+    }
+
+    print_str("caustic-ld: ");
+    print_str(output_path);
+    print_str("\n");
+
+    return 0;
+}

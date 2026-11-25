@@ -1,0 +1,1066 @@
+// A page's scripts, from text to running: JS to Caustic text (jsc.cst), the compiler to
+// a .csl, the loader into this process, then the script calls back through a table of
+// these functions, which do what it asks to the document.
+use "embed.cst" as embed;
+use "pack.cst" as pack;
+use "image.cst" as image;
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "../dom/dom.cst" as dom;
+use "../dom/tags.cst" as tg;
+use "../html/tree.cst" as tree;
+use "jsc.cst" as jsc;
+use "../loader/net.cst" as net;
+
+let is *dom.Document as cur_doc with mut = cast(*dom.Document, 0);
+let is i64 as dirty with mut = 0;
+let is [40]i64 as table with mut;
+let is i64 as table_ready with mut = 0;
+let is i64 as runs with mut = 0;
+// The timers of the script that ran last, for its page to keep.
+let is i64 as last_next with mut = 0;
+let is i64 as last_tick with mut = 0;
+let is i64 as last_done with mut = 0;
+let is i64 as last_msg with mut = 0;
+let is i64 as last_script with mut = 0;
+
+fn _now_us() as i64 {
+    let is [2]i64 as ts;
+    syscall(228, 1, &ts);
+    return ts[0] * 1000000 + ts[1] / 1000;
+}
+fn _eq(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) { if (cast(i64, a[i]) != cast(i64, b[i])) { return 0; } i = i + 1; }
+    return 1;
+}
+fn _next(root as *dom.Node, n as *dom.Node) as *dom.Node {
+    if (n.first != null) { return n.first; }
+    let is *dom.Node as x with mut = n;
+    while (x != root && x != null) {
+        if (x.next != null) { return x.next; }
+        x = x.parent;
+    }
+    return cast(*dom.Node, 0);
+}
+
+// One compound selector: tag, #id, .class, [attr] and [attr="value"], in any mix.
+fn _has_word(v as *u8, vn as i64, w as *u8, wn as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < vn) {
+        while (i < vn && cast(i64, v[i]) <= 32) { i = i + 1; }
+        let is i64 as st = i;
+        while (i < vn && cast(i64, v[i]) > 32) { i = i + 1; }
+        if (_eq(cast(*u8, cast(i64, v) + st), i - st, w, wn) == 1) { return 1; }
+    }
+    return 0;
+}
+fn _name_char(c as i64) as i64 {
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95) { return 1; }
+    return 0;
+}
+fn _match(n as *dom.Node, s as *u8, sl as i64) as i64 {
+    if (n.kind != dom.ELEMENT) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < sl) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c == 35 || c == 46) {
+            i = i + 1;
+            let is i64 as st = i;
+            while (i < sl && _name_char(cast(i64, s[i])) == 1) { i = i + 1; }
+            let is *u8 as w = cast(*u8, cast(i64, s) + st);
+            let is *dom.Attr as a with mut = cast(*dom.Attr, 0);
+            if (c == 35) {
+                a = dom.find_attr(n, "id", 2);
+                if (a == null || _eq(a.value, a.value_len, w, i - st) == 0) { return 0; }
+            } else {
+                a = dom.find_attr(n, "class", 5);
+                if (a == null || _has_word(a.value, a.value_len, w, i - st) == 0) { return 0; }
+            }
+        } else if (c == 91) {
+            i = i + 1;
+            let is i64 as st = i;
+            while (i < sl && _name_char(cast(i64, s[i])) == 1) { i = i + 1; }
+            let is *dom.Attr as a = dom.find_attr(n, cast(*u8, cast(i64, s) + st), i - st);
+            if (a == null) { return 0; }
+            if (i < sl && cast(i64, s[i]) == 61) {
+                i = i + 1;
+                let is i64 as q with mut = cast(i64, s[i]);
+                if (q == 34 || q == 39) { i = i + 1; } else { q = 93; }
+                let is i64 as vs = i;
+                while (i < sl && cast(i64, s[i]) != q) { i = i + 1; }
+                if (_eq(a.value, a.value_len, cast(*u8, cast(i64, s) + vs), i - vs) == 0) { return 0; }
+                if (q != 93) { i = i + 1; }
+            }
+            if (i >= sl || cast(i64, s[i]) != 93) { return 0; }
+            i = i + 1;
+        } else if (_name_char(c) == 1) {
+            let is i64 as st = i;
+            while (i < sl && _name_char(cast(i64, s[i])) == 1) { i = i + 1; }
+            if (_eq(n.name, n.name_len, cast(*u8, cast(i64, s) + st), i - st) == 0) { return 0; }
+        } else if (c == 42) {
+            i = i + 1;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+// A compound with pseudo-classes it does not know matches nothing, as a browser's would not.
+fn _compound_end(s as *u8, from as i64, sl as i64) as i64 {
+    // Where the compound ending at sl begins: after the last combinator outside brackets.
+    let is i64 as i with mut = sl - 1;
+    let is i64 as depth with mut = 0;
+    while (i >= from) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c == 93 || c == 41) { depth = depth + 1; }
+        else if (c == 91 || c == 40) { depth = depth - 1; }
+        else if (depth == 0 && (c <= 32 || c == 62 || c == 43 || c == 126)) { return i + 1; }
+        i = i - 1;
+    }
+    return from;
+}
+fn _complex(n as *dom.Node, s as *u8, sl as i64) as i64 {
+    // Right to left: the last compound against this node, the rest against its relatives.
+    let is i64 as e with mut = sl;
+    while (e > 0 && cast(i64, s[e - 1]) <= 32) { e = e - 1; }
+    let is i64 as st = _compound_end(s, 0, e);
+    if (_match(n, cast(*u8, cast(i64, s) + st), e - st) == 0) { return 0; }
+    let is i64 as i with mut = st - 1;
+    let is i64 as comb with mut = 32;
+    while (i >= 0 && (cast(i64, s[i]) <= 32 || cast(i64, s[i]) == 62 || cast(i64, s[i]) == 43 || cast(i64, s[i]) == 126)) {
+        if (cast(i64, s[i]) > 32) { comb = cast(i64, s[i]); }
+        i = i - 1;
+    }
+    if (i < 0) { return 1; }
+    let is i64 as rest = i + 1;
+    if (comb == 62) {
+        let is *dom.Node as p = n.parent;
+        if (p == null) { return 0; }
+        return _complex(p, s, rest);
+    }
+    if (comb == 32) {
+        let is *dom.Node as p with mut = n.parent;
+        while (p != null) {
+            if (_complex(p, s, rest) == 1) { return 1; }
+            p = p.parent;
+        }
+        return 0;
+    }
+    let is *dom.Node as b with mut = n.prev;
+    while (b != null) {
+        if (b.kind == dom.ELEMENT) {
+            if (_complex(b, s, rest) == 1) { return 1; }
+            if (comb == 43) { return 0; }
+        }
+        b = b.prev;
+    }
+    return 0;
+}
+fn _selector(n as *dom.Node, s as *u8, sl as i64) as i64 {
+    // A list: any member of it, split at commas outside brackets.
+    if (n.kind != dom.ELEMENT) { return 0; }
+    let is i64 as st with mut = 0;
+    let is i64 as depth with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i <= sl) {
+        let is i64 as c with mut = 44;
+        if (i < sl) { c = cast(i64, s[i]); }
+        if (c == 91 || c == 40) { depth = depth + 1; }
+        else if (c == 93 || c == 41) { depth = depth - 1; }
+        else if (c == 44 && depth == 0) {
+            let is i64 as a with mut = st;
+            while (a < i && cast(i64, s[a]) <= 32) { a = a + 1; }
+            if (i > a && _complex(n, cast(*u8, cast(i64, s) + a), i - a) == 1) { return 1; }
+            st = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+fn h_query(root as i64, s as i64, sl as i64) as i64 {
+    let is *dom.Node as r = cast(*dom.Node, root);
+    let is *dom.Node as x with mut = _next(r, r);
+    while (x != null) {
+        if (_selector(x, cast(*u8, s), sl) == 1) { return cast(i64, x); }
+        x = _next(r, x);
+    }
+    return 0;
+}
+fn h_query_all(root as i64, s as i64, sl as i64, out as i64, cap as i64) as i64 {
+    let is *dom.Node as r = cast(*dom.Node, root);
+    let is *dom.Node as x with mut = _next(r, r);
+    let is i64 as n with mut = 0;
+    while (x != null && n < cap) {
+        if (_selector(x, cast(*u8, s), sl) == 1) { *cast(*i64, out + n * 8) = cast(i64, x); n = n + 1; }
+        x = _next(r, x);
+    }
+    return n;
+}
+fn _clear(n as *dom.Node) as void {
+    while (n.first != null) { dom.remove(n.first); }
+}
+// Scripts that came in as HTML text are not run, as the standard has it.
+fn _no_run(root as *dom.Node) as void {
+    let is *dom.Node as x with mut = root.first;
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && x.tag == tg.SCRIPT) { x.flags = x.flags | 1048576; }
+        x = _next(root, x);
+    }
+}
+fn h_set_html(node as i64, s as i64, sl as i64) as i64 {
+    let is *dom.Document as d = cur_doc;
+    let is *u8 as head = "<!doctype html><html><body>";
+    let is i64 as hn with mut = 0;
+    while (cast(i64, head[hn]) != 0) { hn = hn + 1; }
+    let is *u8 as b = dom.alloc(d, hn + sl + 1);
+    let is i64 as i with mut = 0;
+    while (i < hn) { b[i] = head[i]; i = i + 1; }
+    i = 0;
+    while (i < sl) { b[hn + i] = *cast(*u8, s + i); i = i + 1; }
+    // The fragment is parsed as a page of its own in the same memory, so its nodes last as
+    // long as the document does. A fragment parser would know its context; this does not.
+    let is *dom.Node as saved = d.node;
+    let is i64 as saved_mode = d.mode;
+    d.node = dom._node(d, dom.DOCUMENT);
+    tree.parse(d, b, hn + sl);
+    let is *dom.Node as frag = d.node;
+    d.node = saved;
+    d.mode = saved_mode;
+    let is *dom.Node as x with mut = _next(frag, frag);
+    while (x != null && !(x.kind == dom.ELEMENT && x.tag == tg.BODY)) { x = _next(frag, x); }
+    let is *dom.Node as target = cast(*dom.Node, node);
+    _clear(target);
+    if (x != null) { dom.move_children(x, target); }
+    dirty = 1;
+    _no_run(cast(*dom.Node, node));
+    return 0;
+}
+fn _set_data(n as *dom.Node, s as i64, sl as i64) as void {
+    let is *u8 as b = dom.alloc(cur_doc, sl + 1);
+    let is i64 as i with mut = 0;
+    while (i < sl) { b[i] = *cast(*u8, s + i); i = i + 1; }
+    n.text = b;
+    n.text_len = sl;
+    n.text_cap = sl;
+}
+fn h_set_data(node as i64, s as i64, sl as i64) as i64 {
+    _set_data(cast(*dom.Node, node), s, sl);
+    dirty = 1;
+    return 0;
+}
+fn h_set_text(node as i64, s as i64, sl as i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    if (n.kind == dom.TEXT || n.kind == dom.COMMENT) { return h_set_data(node, s, sl); }
+    _clear(n);
+    if (sl > 0) { dom.append(n, dom.text(cur_doc, cast(*u8, s), sl)); }
+    dirty = 1;
+    if (n.tag == tg.SCRIPT) { sheets_touched = 1; }
+    return 0;
+}
+fn h_get_text(node as i64, out as i64) as i64 {
+    let is *dom.Node as r = cast(*dom.Node, node);
+    if (r.kind == dom.COMMENT || r.kind == dom.TEXT) {
+        *cast(*i64, out) = cast(i64, r.text);
+        return r.text_len;
+    }
+    let is i64 as total with mut = 0;
+    let is *dom.Node as x with mut = r;
+    while (x != null) { if (x.kind == dom.TEXT) { total = total + x.text_len; } x = _next(r, x); }
+    let is *u8 as b = dom.alloc(cur_doc, total + 1);
+    let is i64 as at with mut = 0;
+    x = r;
+    while (x != null) {
+        if (x.kind == dom.TEXT) {
+            let is i64 as i with mut = 0;
+            while (i < x.text_len) { b[at + i] = x.text[i]; i = i + 1; }
+            at = at + x.text_len;
+        }
+        x = _next(r, x);
+    }
+    *cast(*i64, out) = cast(i64, b);
+    return total;
+}
+// An HTML element's attribute names are in lower case, however a script writes them.
+let is [256]u8 as _attr_lc with mut;
+fn _attr_name(n as *dom.Node, name as i64, nl as i64) as *u8 {
+    if (n.ns != dom.NS_HTML || nl > 255) { return cast(*u8, name); }
+    let is i64 as i with mut = 0;
+    while (i < nl) {
+        let is u8 as c = *cast(*u8, name + i);
+        if (c >= 65 && c <= 90) { _attr_lc[i] = cast(u8, cast(i64, c) + 32); } else { _attr_lc[i] = c; }
+        i = i + 1;
+    }
+    _attr_lc[nl] = cast(u8, 0);
+    return cast(*u8, &_attr_lc);
+}
+fn h_get_attr(node as i64, name as i64, nl as i64, out as i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    if (n.kind != dom.ELEMENT) { return -1; }
+    let is *dom.Attr as a = dom.find_attr(n, _attr_name(n, name, nl), nl);
+    if (a == null) { return -1; }
+    *cast(*i64, out) = cast(i64, a.value);
+    return a.value_len;
+}
+fn h_set_attr(node as i64, name as i64, nl as i64, v as i64, vl as i64) as i64 {
+    dom.set_attr(cur_doc, cast(*dom.Node, node), _attr_name(cast(*dom.Node, node), name, nl), nl, cast(*u8, v), vl);
+    dirty = 1;
+    if (cast(*dom.Node, node).tag == tg.SCRIPT) { sheets_touched = 1; }
+    return 0;
+}
+fn h_del_attr(node as i64, name as i64, nl as i64) as i64 {
+    dom.remove_attr(cast(*dom.Node, node), _attr_name(cast(*dom.Node, node), name, nl), nl);
+    dirty = 1;
+    return 0;
+}
+fn _element(ns as i64, s as i64, sl as i64) as i64 {
+    let is *u8 as nm = dom.alloc(cur_doc, sl + 1);
+    let is i64 as i with mut = 0;
+    while (i < sl) {
+        let is i64 as c with mut = cast(i64, *cast(*u8, s + i));
+        if (ns == dom.NS_HTML && c >= 65 && c <= 90) { c = c + 32; }
+        nm[i] = cast(u8, c);
+        i = i + 1;
+    }
+    tg.ensure();
+    return cast(i64, dom.element(cur_doc, ns, tg.lookup(nm, sl), nm, sl));
+}
+fn h_create(s as i64, sl as i64) as i64 {
+    let is i64 as made = _element(dom.NS_HTML, s, sl);
+    let is *dom.Node as e = cast(*dom.Node, made);
+    if (_eq(e.name, e.name_len, "style", 5) == 1 || _eq(e.name, e.name_len, "link", 4) == 1) { sheets_touched = 1; }
+    return made;
+}
+fn h_create_ns(ns as i64, s as i64, sl as i64) as i64 { return _element(ns, s, sl); }
+fn h_text_node(s as i64, sl as i64) as i64 { return cast(i64, dom.text(cur_doc, cast(*u8, s), sl)); }
+fn h_comment(s as i64, sl as i64) as i64 { return cast(i64, dom.comment(cur_doc, cast(*u8, s), sl)); }
+fn h_fragment() as i64 { return cast(i64, dom.fragment(cur_doc, cast(*dom.Node, 0))); }
+fn h_insert(p as i64, c as i64, ref as i64) as i64 {
+    let is *dom.Node as par = cast(*dom.Node, p);
+    let is *dom.Node as ch = cast(*dom.Node, c);
+    let is *dom.Node as rf = cast(*dom.Node, ref);
+    if (c == ref) { return c; }
+    dirty = 1;
+    sheets_touched = 1;
+    if (ch.kind == dom.FRAGMENT) {
+        // What a fragment holds moves; the fragment stays behind, empty.
+        while (ch.first != null) {
+            let is *dom.Node as x = ch.first;
+            dom.remove(x);
+            if (ref == 0) { dom.append(par, x); } else { dom.insert_before(par, x, rf); }
+        }
+        return c;
+    }
+    if (ch.parent != null) { dom.remove(ch); }
+    if (ref == 0) { dom.append(par, ch); } else { dom.insert_before(par, ch, rf); }
+    return c;
+}
+fn h_append(p as i64, c as i64) as i64 { return h_insert(p, c, 0); }
+fn h_tag(node as i64, out as i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    if (n.kind != dom.ELEMENT) { *cast(*i64, out) = cast(i64, "#node"); return 5; }
+    *cast(*i64, out) = cast(i64, n.name);
+    return n.name_len;
+}
+fn h_root() as i64 { return cast(i64, cur_doc.node); }
+fn h_parent(node as i64) as i64 { return cast(i64, cast(*dom.Node, node).parent); }
+fn h_remove(node as i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    if (n.parent != null) { dom.remove(n); dirty = 1; }
+    return 0;
+}
+fn h_link(node as i64, which as i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    if (which == 0) { return cast(i64, n.first); }
+    if (which == 1) { return cast(i64, n.last); }
+    if (which == 2) { return cast(i64, n.next); }
+    return cast(i64, n.prev);
+}
+fn h_kind(node as i64) as i64 {
+    let is i64 as k = cast(*dom.Node, node).kind;
+    if (k == dom.ELEMENT) { return 1; }
+    if (k == dom.TEXT) { return 3; }
+    if (k == dom.COMMENT) { return 8; }
+    if (k == dom.DOCUMENT) { return 9; }
+    if (k == dom.DOCTYPE) { return 10; }
+    return 11;
+}
+fn h_ns(node as i64) as i64 { return cast(*dom.Node, node).ns; }
+fn _clone(n as *dom.Node, deep as i64) as *dom.Node {
+    let is *dom.Node as c with mut = cast(*dom.Node, 0);
+    if (n.kind == dom.ELEMENT) { c = dom.clone(cur_doc, n); }
+    else if (n.kind == dom.TEXT) { c = dom.text(cur_doc, n.text, n.text_len); }
+    else if (n.kind == dom.COMMENT) { c = dom.comment(cur_doc, n.text, n.text_len); }
+    else { c = dom.fragment(cur_doc, cast(*dom.Node, 0)); }
+    if (deep == 1) {
+        let is *dom.Node as x with mut = n.first;
+        while (x != null) { dom.append(c, _clone(x, 1)); x = x.next; }
+    }
+    return c;
+}
+fn h_clone(node as i64, deep as i64) as i64 { return cast(i64, _clone(cast(*dom.Node, node), deep)); }
+// innerHTML: the children as text, with what would break it escaped.
+let is *u8 as ser_b with mut = cast(*u8, 0);
+let is i64 as ser_n with mut = 0;
+let is i64 as ser_cap with mut = 0;
+fn _ser_byte(c as i64) as void {
+    if (ser_n + 1 >= ser_cap) {
+        let is i64 as nc with mut = ser_cap * 2;
+        if (nc < 4096) { nc = 4096; }
+        let is *u8 as nb = dom.alloc(cur_doc, nc);
+        let is i64 as i with mut = 0;
+        while (i < ser_n) { nb[i] = ser_b[i]; i = i + 1; }
+        ser_b = nb;
+        ser_cap = nc;
+    }
+    ser_b[ser_n] = cast(u8, c);
+    ser_n = ser_n + 1;
+}
+fn _ser_s(s as *u8) as void { let is i64 as i with mut = 0; while (cast(i64, s[i]) != 0) { _ser_byte(cast(i64, s[i])); i = i + 1; } }
+fn _ser_esc(s as *u8, n as i64, attr as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c == 38) { _ser_s("&amp;"); }
+        else if (c == 60 && attr == 0) { _ser_s("&lt;"); }
+        else if (c == 62 && attr == 0) { _ser_s("&gt;"); }
+        else if (c == 34 && attr == 1) { _ser_s("&quot;"); }
+        else { _ser_byte(c); }
+        i = i + 1;
+    }
+}
+fn _is_void(n as *dom.Node) as i64 {
+    let is *u8 as nm = n.name;
+    let is i64 as l = n.name_len;
+    if (_eq(nm, l, "br", 2) == 1 || _eq(nm, l, "hr", 2) == 1 || _eq(nm, l, "img", 3) == 1 || _eq(nm, l, "input", 5) == 1 || _eq(nm, l, "meta", 4) == 1 || _eq(nm, l, "link", 4) == 1) { return 1; }
+    if (_eq(nm, l, "area", 4) == 1 || _eq(nm, l, "base", 4) == 1 || _eq(nm, l, "col", 3) == 1 || _eq(nm, l, "embed", 5) == 1 || _eq(nm, l, "source", 6) == 1 || _eq(nm, l, "track", 5) == 1 || _eq(nm, l, "wbr", 3) == 1) { return 1; }
+    return 0;
+}
+fn _raw_text(n as *dom.Node) as i64 {
+    let is *u8 as nm = n.name;
+    let is i64 as l = n.name_len;
+    if (_eq(nm, l, "script", 6) == 1 || _eq(nm, l, "style", 5) == 1 || _eq(nm, l, "xmp", 3) == 1 || _eq(nm, l, "iframe", 6) == 1 || _eq(nm, l, "noscript", 8) == 1) { return 1; }
+    return 0;
+}
+fn _ser(n as *dom.Node, parent_raw as i64) as void {
+    if (n.kind == dom.TEXT) {
+        if (parent_raw == 1) { let is i64 as i with mut = 0; while (i < n.text_len) { _ser_byte(cast(i64, n.text[i])); i = i + 1; } }
+        else { _ser_esc(n.text, n.text_len, 0); }
+        return;
+    }
+    if (n.kind == dom.COMMENT) {
+        _ser_s("<!--");
+        let is i64 as i with mut = 0;
+        while (i < n.text_len) { _ser_byte(cast(i64, n.text[i])); i = i + 1; }
+        _ser_s("-->");
+        return;
+    }
+    if (n.kind == dom.ELEMENT) {
+        _ser_byte(60);
+        let is i64 as i with mut = 0;
+        while (i < n.name_len) { _ser_byte(cast(i64, n.name[i])); i = i + 1; }
+        i = 0;
+        while (i < n.nattr) {
+            let is *dom.Attr as a = dom.attr_at(n, i);
+            _ser_byte(32);
+            let is i64 as j with mut = 0;
+            while (j < a.name_len) { _ser_byte(cast(i64, a.name[j])); j = j + 1; }
+            _ser_s("=\"");
+            _ser_esc(a.value, a.value_len, 1);
+            _ser_byte(34);
+            i = i + 1;
+        }
+        _ser_byte(62);
+        if (_is_void(n) == 1) { return; }
+        let is i64 as raw = _raw_text(n);
+        let is *dom.Node as x with mut = n.first;
+        while (x != null) { _ser(x, raw); x = x.next; }
+        _ser_s("</");
+        i = 0;
+        while (i < n.name_len) { _ser_byte(cast(i64, n.name[i])); i = i + 1; }
+        _ser_byte(62);
+        return;
+    }
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) { _ser(x, 0); x = x.next; }
+}
+fn h_get_html(node as i64, out as i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    ser_n = 0;
+    ser_cap = 0;
+    ser_b = cast(*u8, 0);
+    let is i64 as raw with mut = 0;
+    if (n.kind == dom.ELEMENT) { raw = _raw_text(n); }
+    let is *dom.Node as x with mut = n.first;
+    while (x != null) { _ser(x, raw); x = x.next; }
+    *cast(*i64, out) = cast(i64, ser_b);
+    return ser_n;
+}
+// Set by whoever owns the document: the address, the title, how big the view is.
+let is *u8 as page_url with mut = "";
+let is i64 as page_url_n with mut = 0;
+let is i64 as view_w with mut = 1280;
+let is i64 as view_h with mut = 800;
+let is *u8 as rect_fn with mut = cast(*u8, 0);
+let is *u8 as computed_fn with mut = cast(*u8, 0);
+let is *u8 as fetch_fn with mut = cast(*u8, 0);
+let is *u8 as owner with mut = cast(*u8, 0);
+// A <style> or <link> a script made, for the page to look for.
+let is i64 as sheets_touched with mut = 0;
+fn h_url(which as i64, out as i64) as i64 {
+    if (which == 2) {
+        *cast(*i64, out) = cast(i64, net.USER_AGENT);
+        let is i64 as un with mut = 0;
+        while (net.USER_AGENT[un] != 0) { un = un + 1; }
+        return un;
+    }
+    if (which == 0) { *cast(*i64, out) = cast(i64, page_url); return page_url_n; }
+    *cast(*i64, out) = cast(i64, "");
+    let is *dom.Node as x with mut = _next(cur_doc.node, cur_doc.node);
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && _eq(x.name, x.name_len, "title", 5) == 1) { return h_get_text(cast(i64, x), out); }
+        x = _next(cur_doc.node, x);
+    }
+    return 0;
+}
+fn h_viewport(which as i64) as i64 { if (which == 0) { return view_w; } return view_h; }
+fn h_rect(node as i64, which as i64) as i64 {
+    if (cast(i64, rect_fn) == 0) { return 0; }
+    return call(rect_fn, owner, node, which);
+}
+fn h_computed(node as i64, which as i64, out as i64) as i64 {
+    if (cast(i64, computed_fn) == 0) { return 0; }
+    return call(computed_fn, owner, node, which, out);
+}
+// document.cookie. The page's address, terminated, for the jar.
+let is [4096]u8 as cookie_url with mut;
+let is [8192]u8 as cookie_text with mut;
+fn _cookie_url() as *u8 {
+    let is i64 as n with mut = page_url_n;
+    if (n > 4095) { n = 4095; }
+    let is i64 as i with mut = 0;
+    while (i < n) { cookie_url[i] = page_url[i]; i = i + 1; }
+    cookie_url[n] = 0;
+    return cast(*u8, &cookie_url);
+}
+fn h_cookie(op as i64, a as i64, n as i64) as i64 {
+    if (op == 0) {
+        *cast(*i64, a) = cast(i64, &cookie_text);
+        return net.script_cookies(_cookie_url(), cast(*u8, &cookie_text), 8192);
+    }
+    if (n > 8191) { return 0; }
+    let is i64 as i with mut = 0;
+    let is *u8 as t = cast(*u8, a);
+    while (i < n) { cookie_text[i] = t[i]; i = i + 1; }
+    cookie_text[n] = 0;
+    net.script_set_cookie(_cookie_url(), cast(*u8, &cookie_text));
+    return 0;
+}
+// Where a script asked to go, for the browser to do once the script is done.
+let is [4096]u8 as nav_url with mut;
+let is i64 as nav_wanted with mut = 0;
+let is i64 as nav_replace with mut = 0;
+let is *u8 as nav_owner with mut = cast(*u8, 0);
+// form.submit(): for the browser, which knows how a form is sent, once the script is done.
+let is *dom.Node as submit_form with mut = cast(*dom.Node, 0);
+let is *u8 as submit_owner with mut = cast(*u8, 0);
+fn h_submit(node as i64) as i64 {
+    submit_form = cast(*dom.Node, node);
+    submit_owner = owner;
+    return 1;
+}
+fn h_attr(node as i64, i as i64, out as *i64) as i64 {
+    let is *dom.Node as n = cast(*dom.Node, node);
+    if (i >= n.nattr) { return 0; }
+    let is *dom.Attr as a = cast(*dom.Attr, cast(i64, n.attrs) + i * sizeof(dom.Attr));
+    out[0] = cast(i64, a.name); out[1] = a.name_len; out[2] = cast(i64, a.value); out[3] = a.value_len;
+    return 1;
+}
+// Frames, as the page knows them.
+let is *u8 as frame_fn with mut = cast(*u8, 0);
+fn h_frame(op as i64, a as i64) as i64 {
+    if (cast(i64, frame_fn) == 0) { return 0; }
+    return call(frame_fn, owner, op, a);
+}
+// A script element's text, for its page's runtime. ok: 0 it could not be had, 1 fetched, 2 inline.
+fn script(d as *dom.Document, f as i64, text as *u8, n as i64, node as *dom.Node, ok as i64) as void {
+    if (f == 0) { return; }
+    cur_doc = d;
+    call(cast(*u8, f), cast(i64, text), n, cast(i64, node), ok);
+}
+fn message(d as *dom.Document, f as i64, text as *u8, n as i64, origin as *u8, from as i64) as void {
+    if (f == 0) { return; }
+    cur_doc = d;
+    call(cast(*u8, f), cast(i64, text), n, cast(i64, origin), from);
+}
+fn h_nav(u as i64, n as i64, replace as i64) as i64 {
+    if (n > 4095) { return 0; }
+    let is i64 as i with mut = 0;
+    let is *u8 as t = cast(*u8, u);
+    while (i < n) { nav_url[i] = t[i]; i = i + 1; }
+    nav_url[n] = 0;
+    nav_replace = replace;
+    nav_owner = owner;
+    nav_wanted = 1;
+    return 1;
+}
+fn h_fetch(info as i64) as i64 {
+    if (cast(i64, fetch_fn) == 0) { return 0; }
+    return call(fetch_fn, owner, info);
+}
+let is *dom.Node as focused with mut = cast(*dom.Node, 0);
+let is *dom.Node as focus_asked with mut = cast(*dom.Node, 0);
+let is *u8 as focus_owner with mut = cast(*u8, 0);
+fn h_state(op as i64, node as i64) as i64 {
+    if (op == 0) { return cast(i64, focused); }
+    if (focused != null) { focused.flags = focused.flags & (~dom.FLAG_FOCUS); }
+    focused = cast(*dom.Node, node);
+    // A script gave it the focus: the browser opens what typing needs when the page can show it.
+    focus_asked = focused;
+    focus_owner = owner;
+    if (focused != null) { focused.flags = focused.flags | dom.FLAG_FOCUS; }
+    dirty = 1;
+    return 0;
+}
+fn _table() as void {
+    if (table_ready == 1) { return; }
+    table[1] = cast(i64, fn_ptr(h_query));
+    table[2] = cast(i64, fn_ptr(h_query_all));
+    table[3] = cast(i64, fn_ptr(h_set_html));
+    table[4] = cast(i64, fn_ptr(h_set_text));
+    table[5] = cast(i64, fn_ptr(h_get_text));
+    table[6] = cast(i64, fn_ptr(h_get_attr));
+    table[7] = cast(i64, fn_ptr(h_set_attr));
+    table[8] = cast(i64, fn_ptr(h_create));
+    table[9] = cast(i64, fn_ptr(h_append));
+    table[10] = cast(i64, fn_ptr(h_tag));
+    table[11] = cast(i64, fn_ptr(h_root));
+    table[12] = cast(i64, fn_ptr(h_parent));
+    table[13] = cast(i64, fn_ptr(h_remove));
+    table[14] = cast(i64, fn_ptr(h_link));
+    table[15] = cast(i64, fn_ptr(h_kind));
+    table[16] = cast(i64, fn_ptr(h_text_node));
+    table[17] = cast(i64, fn_ptr(h_insert));
+    table[18] = cast(i64, fn_ptr(h_del_attr));
+    table[19] = cast(i64, fn_ptr(h_get_html));
+    table[20] = cast(i64, fn_ptr(h_clone));
+    table[21] = cast(i64, fn_ptr(h_ns));
+    table[22] = cast(i64, fn_ptr(h_create_ns));
+    table[23] = cast(i64, fn_ptr(h_set_data));
+    table[24] = cast(i64, fn_ptr(h_computed));
+    table[31] = cast(i64, fn_ptr(h_fetch));
+    table[25] = cast(i64, fn_ptr(h_url));
+    table[26] = cast(i64, fn_ptr(h_viewport));
+    table[27] = cast(i64, fn_ptr(h_rect));
+    table[28] = cast(i64, fn_ptr(h_fragment));
+    table[29] = cast(i64, fn_ptr(h_comment));
+    table[30] = cast(i64, fn_ptr(h_state));
+    table[32] = cast(i64, fn_ptr(h_eval));
+    table[33] = cast(i64, fn_ptr(h_cookie));
+    table[34] = cast(i64, fn_ptr(h_nav));
+    table[35] = cast(i64, fn_ptr(h_frame));
+    table[36] = cast(i64, fn_ptr(h_attr));
+    table[37] = cast(i64, fn_ptr(h_submit));
+    table_ready = 1;
+}
+
+// ── Files ──
+fn _read_all(path as *u8, out_n as *i64) as *u8 {
+    let is i64 as fd = syscall(2, path, 0, 0);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as sz = syscall(8, fd, 0, 2);
+    syscall(8, fd, 0, 0);
+    let is *u8 as b = cast(*u8, syscall(9, 0, sz + 1, 3, 34, -1, 0));
+    let is i64 as got with mut = 0;
+    while (got < sz) {
+        let is i64 as r = syscall(0, fd, cast(i64, b) + got, sz - got);
+        if (r <= 0) { break; }
+        got = got + r;
+    }
+    syscall(3, fd);
+    *out_n = got;
+    return b;
+}
+fn _write_all(fd as i64, p as *u8, n as i64) as void {
+    let is i64 as off with mut = 0;
+    while (off < n) {
+        let is i64 as r = syscall(1, fd, cast(i64, p) + off, n - off);
+        if (r <= 0) { return; }
+        off = off + r;
+    }
+}
+fn _cat(to as *u8, at as i64, s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as a with mut = at;
+    while (cast(i64, s[i]) != 0) { to[a] = s[i]; a = a + 1; i = i + 1; }
+    to[a] = cast(u8, 0);
+    return a;
+}
+fn _itoa(to as *u8, at as i64, v as i64) as i64 {
+    let is [24]u8 as b;
+    let is i64 as p with mut = 23;
+    let is i64 as x with mut = v;
+    b[p] = cast(u8, 0);
+    if (x == 0) { p = p - 1; b[p] = cast(u8, 48); }
+    while (x > 0) { p = p - 1; b[p] = cast(u8, 48 + x % 10); x = x / 10; }
+    return _cat(to, at, cast(*u8, cast(i64, &b) + p));
+}
+// The sources sit next to the build: <checkout>/build/browser and <checkout>/build/motor.
+fn _checkout(to as *u8) as i64 {
+    let is i64 as n = syscall(89, "/proc/self/exe", to, 3000);
+    if (n <= 0) { return 0; }
+    let is i64 as i with mut = n;
+    let is i64 as slashes with mut = 0;
+    while (i > 0 && slashes < 2) { i = i - 1; if (cast(i64, to[i]) == 47) { slashes = slashes + 1; } }
+    to[i] = cast(u8, 0);
+    return i;
+}
+// <checkout>/build/motor/cache, made if it has to be.
+fn _cache_dir(to as *u8) as i64 {
+    let is i64 as n = _checkout(to);
+    if (n == 0) { return 0; }
+    let is i64 as a = _cat(to, n, "/build/motor/cache");
+    syscall(83, to, 448);
+    return a;
+}
+fn _us(label as *u8, v as i64) as void {
+    let is [64]u8 as b;
+    let is i64 as a with mut = _cat(cast(*u8, &b), 0, label);
+    a = _itoa(cast(*u8, &b), a, v / 1000);
+    a = _cat(cast(*u8, &b), a, ".");
+    let is i64 as frac = (v % 1000) / 100;
+    a = _itoa(cast(*u8, &b), a, frac);
+    a = _cat(cast(*u8, &b), a, " ms");
+    syscall(1, 2, &b, a);
+}
+
+// The compiler, in this process: a clean copy of its image for each use, the files it needs
+// from what is packed into this program, and all its memory given back after.
+fn _compile(bundle as *u8, text as *u8, n as i64, opt as *u8, out as *u8, link_to as *u8) as i32 {
+    let is i64 as csl_n with mut = 0;
+    let is *u8 as bytes = pack.find(bundle, "caustic.csl", &csl_n);
+    if (cast(i64, bytes) == 0) { io.write_str(2, "js: no compiler in the pack\n"); return 1; }
+    let is image.Image as im with mut;
+    if (image.open(bytes, csl_n, &im) == 0) { io.write_str(2, "js: compiler image not loaded\n"); return 1; }
+    let is *u8 as add = image.resolve(&im, "motor_add_file");
+    let is *u8 as run = image.resolve(&im, "motor_compile");
+    let is *u8 as done = image.resolve(&im, "motor_done");
+    if (cast(i64, add) == 0 || cast(i64, run) == 0 || cast(i64, done) == 0) { io.write_str(2, "js: compiler entry not found\n"); image.close(&im); return 1; }
+    if (env.getenv("CAUSTIC_JS_LOUD") != null) {
+        let is *u8 as loud = image.resolve(&im, "motor_loud");
+        if (cast(i64, loud) != 0) { call(loud); }
+    }
+    pack.each_std(bundle, add);
+    call(add, cast(i64, "/motor/page.cst"), cast(i64, text), n);
+    let is [11]*u8 as av;
+    av[0] = "caustic"; av[1] = "-q"; av[2] = opt; av[3] = "--target=caustic-x86_64";
+    av[4] = "--shared"; av[5] = "--mode=pure"; av[6] = "/motor/page.cst"; av[7] = "-o"; av[8] = out;
+    // For an eval: an object, whose runtime is the page's, already loaded.
+    if (cast(i64, link_to) != 0) {
+        av[4] = "-c";
+        let is *u8 as lk = image.resolve(&im, "motor_link_to");
+        if (cast(i64, lk) != 0) { call(lk, cast(i64, link_to)); }
+    }
+    av[9] = cast(*u8, 0);
+    av[10] = cast(*u8, 0);
+    let is [4096]u8 as obj;
+    let is i64 as ol with mut = 0;
+    while (out[ol] != 0 && ol < 4090) { obj[ol] = out[ol]; ol = ol + 1; }
+    obj[ol] = 46; obj[ol + 1] = 111; obj[ol + 2] = 0;
+    let is *u8 as op = image.resolve(&im, "motor_obj_path");
+    if (cast(i64, op) != 0) { call(op, cast(i64, &obj)); }
+    let is i64 as rc = call(run, 9, cast(i64, &av));
+    call(done);
+    syscall(87, cast(i64, &obj));
+    image.close(&im);
+    return cast(i32, rc);
+}
+
+// The pages' images, for an eval to be linked to the one that asked for it.
+struct LoadedPage { im as image.Image; path as [640]u8; room as [2]i64; }
+let is [64]LoadedPage as loaded with mut;
+let is i64 as loaded_n with mut = 0;
+// A page's image, from its file. Its bytes stay: the export table is read from them.
+fn _page_load(path as *u8) as *LoadedPage {
+    let is i64 as fd = syscall(2, path, 0, 0);
+    if (fd < 0) { return cast(*LoadedPage, 0); }
+    let is i64 as size = syscall(8, fd, 0, 2);
+    syscall(8, fd, 0, 0);
+    let is *u8 as f = cast(*u8, syscall(9, 0, size + 1, 3, 34, -1, 0));
+    let is i64 as got with mut = 0;
+    while (got < size) {
+        let is i64 as r = syscall(0, fd, cast(i64, f) + got, size - got);
+        if (r <= 0) { break; }
+        got = got + r;
+    }
+    syscall(3, fd);
+    let is *LoadedPage as lp = &loaded[loaded_n % 64];
+    if (got < size || image.open_in(f, size, &lp.im, cast(*i64, &lp.room)) == 0) { return cast(*LoadedPage, 0); }
+    let is i64 as i with mut = 0;
+    while (path[i] != 0) { lp.path[i] = path[i]; i = i + 1; }
+    lp.path[i] = 0;
+    loaded_n = loaded_n + 1;
+    return lp;
+}
+fn _page_of(addr as i64) as *LoadedPage {
+    let is *LoadedPage as best with mut = cast(*LoadedPage, 0);
+    let is i64 as i with mut = 0;
+    let is i64 as n with mut = loaded_n;
+    if (n > 64) { n = 64; }
+    while (i < n) {
+        let is *LoadedPage as lp = &loaded[i];
+        if (lp.im.base <= addr && (cast(i64, best) == 0 || lp.im.base > best.im.base)) { best = lp; }
+        i = i + 1;
+    }
+    return best;
+}
+struct EvalDone { page as i64; hash as i64; strs as i64; roots as i64; names as i64; top as i64; }
+let is [1024]EvalDone as evals with mut;
+let is i64 as evals_n with mut = 0;
+let is [512]u8 as eval_error with mut;
+fn _eval_error(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0 && i < 511) { eval_error[i] = s[i]; i = i + 1; }
+    eval_error[i] = 0;
+}
+// On the stack h_eval made for it. info: text, length, an address in the asking page; then, on
+// the way out, the module's four functions, or the error text; and 1 if it has not run before.
+fn _eval_work(info as *i64) as i64 {
+    let is *u8 as source = cast(*u8, info[0]);
+    let is i64 as n = info[1];
+    let is *LoadedPage as lp = _page_of(info[2]);
+    if (cast(i64, lp) == 0) { return 0; }
+    let is *u8 as bundle = embed.start();
+    let is i64 as rn with mut = 0;
+    let is *u8 as rt = pack.find(bundle, "rt.cst", &rn);
+    let is i64 as h with mut = 7809847782465536322;
+    let is i64 as i with mut = 0;
+    while (i < n) { h = (h ^ cast(i64, source[i])) * 1099511628211; i = i + 1; }
+    let is [18]i64 as st with mut;
+    if (syscall(4, "/proc/self/exe", &st) == 0) { h = (h ^ st[11]) * 1099511628211; h = (h ^ st[12]) * 1099511628211; }
+    h = h + jsc.trace_calls;
+    i = 0;
+    while (i < evals_n) {
+        let is *EvalDone as ed = &evals[i];
+        if (ed.page == lp.im.base && ed.hash == h) {
+            info[3] = ed.strs; info[4] = ed.roots; info[5] = ed.names; info[6] = ed.top; info[7] = 0;
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (evals_n >= 1024) { return 0; }
+    let is [512]u8 as cache;
+    if (_cache_dir(cast(*u8, &cache)) == 0) { return 0; }
+    let is [640]u8 as obj;
+    let is i64 as a with mut = _cat(cast(*u8, &obj), 0, cast(*u8, &cache));
+    a = _cat(cast(*u8, &obj), a, "/e");
+    let is i64 as bit with mut = 0;
+    while (bit < 16) {
+        let is i64 as nib = (h >> (bit * 4)) & 15;
+        if (nib < 10) { obj[a] = cast(u8, 48 + nib); } else { obj[a] = cast(u8, 87 + nib); }
+        a = a + 1;
+        bit = bit + 1;
+    }
+    _cat(cast(*u8, &obj), a, ".o");
+    if (syscall(21, &obj, 4) != 0) {
+        let is i64 as gn with mut = 0;
+        let is *u8 as gtext = jsc.translate_eval(source, n, &gn);
+        if (cast(i64, gtext) == 0) {
+            _eval_error(jsc.last_error());
+            info[3] = cast(i64, &eval_error);
+            jsc.release();
+            return 0;
+        }
+        // A very big script is rarely hot all over, and the wait for it is the first thing seen.
+        let is *u8 as eval_opt with mut = "-O1";
+        if (n > 262144) { eval_opt = "-O0"; }
+        let is [700]u8 as tmp;
+        let is i64 as ta with mut = _cat(cast(*u8, &tmp), 0, cast(*u8, &obj));
+        ta = _cat(cast(*u8, &tmp), ta, ".building-");
+        ta = _itoa(cast(*u8, &tmp), ta, syscall(39));
+        let is *u8 as text = cast(*u8, syscall(9, 0, rn + gn + 1, 3, 34, -1, 0));
+        i = 0;
+        while (i < rn) { text[i] = rt[i]; i = i + 1; }
+        i = 0;
+        while (i < gn) { text[rn + i] = gtext[i]; i = i + 1; }
+        jsc.release();
+        let is i32 as rc = _compile(bundle, text, rn + gn, eval_opt, cast(*u8, &tmp), cast(*u8, &lp.path));
+        syscall(11, text, rn + gn + 1);
+        if (rc != 0) { io.write_str(2, "js: eval: the compiler refused the text\n"); return 0; }
+        // The target names what it writes this way, even an object.
+        _cat(cast(*u8, &tmp), ta, ".cse");
+        syscall(82, &tmp, &obj);
+    }
+    let is i64 as fd = syscall(2, &obj, 0, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as size = syscall(8, fd, 0, 2);
+    syscall(8, fd, 0, 0);
+    let is *u8 as f = cast(*u8, syscall(9, 0, size + 1, 3, 34, -1, 0));
+    let is i64 as got with mut = 0;
+    while (got < size) {
+        let is i64 as r = syscall(0, fd, cast(i64, f) + got, size - got);
+        if (r <= 0) { break; }
+        got = got + r;
+    }
+    syscall(3, fd);
+    let is image.Linked as l with mut;
+    let is i64 as ok = image.link_object(f, size, &lp.im, cast(*i64, &lp.room), &l);
+    if (ok == 0) { io.write_str(2, "js: eval: could not link\n"); syscall(11, f, size + 1); return 0; }
+    let is *EvalDone as ed = &evals[evals_n];
+    ed.page = lp.im.base; ed.hash = h;
+    ed.strs = cast(i64, image.linked_sym(&l, "js_strs"));
+    ed.roots = cast(i64, image.linked_sym(&l, "js_gc_roots"));
+    ed.names = cast(i64, image.linked_sym(&l, "js_names"));
+    ed.top = cast(i64, image.linked_sym(&l, "js_top"));
+    syscall(11, f, size + 1);
+    if (ed.strs == 0 || ed.roots == 0 || ed.names == 0 || ed.top == 0) { return 0; }
+    evals_n = evals_n + 1;
+    info[3] = ed.strs; info[4] = ed.roots; info[5] = ed.names; info[6] = ed.top; info[7] = 1;
+    return 1;
+}
+fn _stack_call(f as *u8, arg as i64, top as i64) as i64 with naked {
+    asm("push rbp\nmov rbp, rsp\nmov rsp, rdx\nmov rax, rdi\nmov rdi, rsi\ncall rax\nmov rsp, rbp\npop rbp\nret\n");
+}
+// A script may call eval from a generator's small stack, and the compiler recurses deeply: all
+// of this runs on a stack of its own, with a stack limit that does not get in its way.
+fn h_eval(info as *i64) as i64 {
+    let is i64 as size = 67108864;
+    let is i64 as st = syscall(9, 0, size, 3, 34 + 16384, -1, 0);
+    if (st <= 0) { return 0; }
+    let is [64]i64 as tls;
+    let is i64 as z with mut = 0;
+    while (z < 64) { tls[z] = 0; z = z + 1; }
+    let is i64 as old_fs with mut = 0;
+    syscall(158, 4099, &old_fs);
+    syscall(158, 4098, &tls);
+    let is i64 as r = _stack_call(cast(*u8, fn_ptr(_eval_work)), cast(i64, info), st + size - 64);
+    syscall(158, 4098, old_fs);
+    syscall(11, st, size);
+    return r;
+}
+
+// Runs the page's script text. The function to call for events, or 0.
+fn run(d as *dom.Document, source as *u8, n as i64) as i64 {
+    _table();
+    cur_doc = d;
+    let is i64 as t0 = _now_us();
+    let is *u8 as bundle = embed.start();
+    let is i64 as rn with mut = 0;
+    let is *u8 as rt = pack.find(bundle, "rt.cst", &rn);
+    let is i64 as pn with mut = 0;
+    let is *u8 as prelude = pack.find(bundle, "prelude.js", &pn);
+    if (cast(i64, rt) == 0 || cast(i64, prelude) == 0) { io.write_str(2, "js: the runtime is not in this program\n"); return 0; }
+
+    let is *u8 as all = cast(*u8, syscall(9, 0, pn + n + 1, 3, 34, -1, 0));
+    let is i64 as i with mut = 0;
+    while (i < pn) { all[i] = prelude[i]; i = i + 1; }
+    i = 0;
+    while (i < n) { all[pn + i] = source[i]; i = i + 1; }
+    let is *u8 as optv = env.getenv("CAUSTIC_JS_OPT");
+    let is *u8 as opt with mut = "-O1";
+    if (optv != null && optv[0] != 0) { opt = optv; }
+    // The same page's image is the same image: kept by what went into it, and the translation
+    // is not needed at all once it exists. The program's own time says which translator it was.
+    let is i64 as h with mut = -3750763034362895579;
+    i = 0;
+    while (i < rn) { h = (h ^ cast(i64, rt[i])) * 1099511628211; i = i + 1; }
+    i = 0;
+    while (i < pn + n) { h = (h ^ cast(i64, all[i])) * 1099511628211; i = i + 1; }
+    i = 0;
+    while (opt[i] != 0) { h = (h ^ cast(i64, opt[i])) * 1099511628211; i = i + 1; }
+    let is [18]i64 as st with mut;
+    if (syscall(4, "/proc/self/exe", &st) == 0) { h = (h ^ st[11]) * 1099511628211; h = (h ^ st[12]) * 1099511628211; }
+    jsc.trace_calls = cast(i64, env.getenv("CAUSTIC_JS_TRACE") != null);
+    h = h + jsc.trace_calls;
+    let is i64 as t1 with mut = _now_us();
+    let is [512]u8 as cache;
+    let is i64 as cn = _cache_dir(cast(*u8, &cache));
+    if (cn == 0) { jsc.release(); return 0; }
+    let is [640]u8 as lib;
+    let is i64 as a with mut = _cat(cast(*u8, &lib), 0, cast(*u8, &cache));
+    a = _cat(cast(*u8, &lib), a, "/");
+    let is i64 as bit with mut = 0;
+    while (bit < 16) {
+        let is i64 as nib = (h >> (bit * 4)) & 15;
+        if (nib < 10) { lib[a] = cast(u8, 48 + nib); } else { lib[a] = cast(u8, 87 + nib); }
+        a = a + 1;
+        bit = bit + 1;
+    }
+    _cat(cast(*u8, &lib), a, ".csl");
+    let is i64 as have = syscall(21, &lib, 4);
+    if (have != 0) {
+        let is i64 as gn with mut = 0;
+        let is *u8 as gtext = jsc.translate(all, pn + n, &gn);
+        if (cast(i64, gtext) == 0) {
+            io.write_str(2, "js: not run: ");
+            io.write_str(2, jsc.last_error());
+            io.write_str(2, "\n");
+            jsc.release();
+            return 0;
+        }
+        t1 = _now_us();
+        runs = runs + 1;
+        let is [700]u8 as tmp;
+        let is i64 as ta with mut = _cat(cast(*u8, &tmp), 0, cast(*u8, &lib));
+        ta = _cat(cast(*u8, &tmp), ta, ".building-");
+        ta = _itoa(cast(*u8, &tmp), ta, syscall(39));
+        let is *u8 as text = cast(*u8, syscall(9, 0, rn + gn + 1, 3, 34, -1, 0));
+        i = 0;
+        while (i < rn) { text[i] = rt[i]; i = i + 1; }
+        i = 0;
+        while (i < gn) { text[rn + i] = gtext[i]; i = i + 1; }
+        jsc.release();
+        let is i32 as rc = _compile(bundle, text, rn + gn, opt, cast(*u8, &tmp), cast(*u8, 0));
+        syscall(11, text, rn + gn + 1);
+        if (rc != 0) { io.write_str(2, "js: the compiler refused the generated text\n"); return 0; }
+        syscall(82, &tmp, &lib);
+    }
+    let is i64 as t2 = _now_us();
+
+    // Images are not closed: a tab may still be running one.
+    let is *LoadedPage as lp = _page_load(cast(*u8, &lib));
+    if (cast(i64, lp) == 0) { io.write_str(2, "js: could not load the image\n"); return 0; }
+    let is i64 as entry = cast(i64, image.resolve(&lp.im, "js_main"));
+    let is i64 as disp = cast(i64, image.resolve(&lp.im, "js_dispatch"));
+    last_next = cast(i64, image.resolve(&lp.im, "js_next_timer"));
+    last_tick = cast(i64, image.resolve(&lp.im, "js_tick"));
+    last_done = cast(i64, image.resolve(&lp.im, "js_fetch_done"));
+    last_msg = cast(i64, image.resolve(&lp.im, "js_message"));
+    last_script = cast(i64, image.resolve(&lp.im, "js_run_script"));
+    if (entry == 0) { return 0; }
+    let is i64 as t3 = _now_us();
+    dirty = 1;
+    call(cast(*u8, entry), cast(i64, &table));
+    let is i64 as t4 = _now_us();
+    _us("js: translate ", t1 - t0);
+    _us(", compile ", t2 - t1);
+    _us(", load ", t3 - t2);
+    _us(", run ", t4 - t3);
+    syscall(1, 2, "\n", 1);
+    return disp;
+}
+
+// A kind of event at a node, for that page's scripts. 1 when a listener ran, 2 more when
+// the default was stopped.
+fn fire(d as *dom.Document, disp as i64, node as *dom.Node, type_s as *u8, tn as i64, info as *i64) as i64 {
+    if (disp == 0) { return 0; }
+    cur_doc = d;
+    return call(cast(*u8, disp), cast(i64, node), cast(i64, type_s), tn, cast(i64, info));
+}
+fn deliver(d as *dom.Document, done as i64, id as i64, status as i64, data as *u8, n as i64, ctype as *u8) as void {
+    if (done == 0) { return; }
+    cur_doc = d;
+    call(cast(*u8, done), id, status, cast(i64, data), n, cast(i64, ctype));
+}
+
+// When its next timer is due, in ms, or -1.
+fn next_timer(f as i64) as i64 {
+    if (f == 0) { return -1; }
+    return call(cast(*u8, f));
+}
+fn tick(d as *dom.Document, f as i64) as void {
+    if (f == 0) { return; }
+    cur_doc = d;
+    call(cast(*u8, f));
+}

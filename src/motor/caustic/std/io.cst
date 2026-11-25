@@ -1,0 +1,1592 @@
+use "os.cst" as os;
+// Comptime-gated backend imports: only the target's submodule is loaded.
+// Linux builds save the cost of parsing+semantic-walking the Windows
+// backend; vice-versa for Windows. The `if (os.current() == OS_X)` dispatch
+// inside this file folds to a literal at semantic time, and the semantic
+// dead-branch eliminator skips visiting the wrong-target's `*_io.X` calls,
+// so references to a backend that wasn't imported never get type-checked.
+if (__target_is_linux + __compat_mode)   use "io/linux.cst"   as linux_io;
+if (__target_is_windows + __compat_mode) use "io/windows.cst" as windows_io;
+if (__target_is_caustic + __compat_mode) use "os/causticos.cst" as caustic_io;
+if (__target_is_wasm + __compat_mode)    use "io/wasm.cst"    as wasm_io;
+// Linux-only raw bindings for directory ops not yet abstracted. Used only
+// inside `if (os.current() == os.OS_LINUX)` branches — gated to skip the load
+// entirely on Windows builds via the semantic dead-branch eliminator.
+if (__target_is_linux + __compat_mode) use "os/linux.cst" as linux;
+if (__target_is_windows + __compat_mode) use "os/windows.cst" as win;
+use "string.cst" as string;
+use "mem.cst" only bins, core as mem;
+
+// Standard fd values (mirror Linux convention; the Windows backend
+// (io/windows.cst) maps these internally to GetStdHandle results).
+let is i64 as STDIN  with imut = 0;
+let is i64 as STDOUT with imut = 1;
+let is i64 as STDERR with imut = 2;
+
+// === Internal OS dispatchers ===
+// All OS-touching primitives go through these — every `if (__target_is_X)`
+// pair gets dead-stripped at IR gen so neither target ships the other's code.
+
+// ── For the browser: the compiler running inside its process ──
+// Files it asks for may be in memory, an exit goes back to the caller instead of ending
+// the process, and what it would print is not printed.
+struct _VFile { path as *u8; data as *u8; size as i64; pos as i64; }
+let is i64 as _VFD_BASE with imut = 1099511627776;
+let is [512]_VFile as _vfiles with mut;
+let is i64 as _nvfiles with mut = 0;
+let is *u8 as motor_exit with mut = cast(*u8, 0);
+let is i64 as motor_mute with mut = 0;
+fn _vfs_same(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i64, a[i] == b[i]);
+}
+fn _vfs_find(path as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < _nvfiles) {
+        if (_vfs_same(_vfiles[i].path, path) == 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn vfs_add(path as *u8, data as *u8, size as i64) as void {
+    if (_nvfiles >= 512) { return; }
+    _vfiles[_nvfiles].path = path;
+    _vfiles[_nvfiles].data = data;
+    _vfiles[_nvfiles].size = size;
+    _vfiles[_nvfiles].pos = 0;
+    _nvfiles = _nvfiles + 1;
+}
+
+fn _write_fd(fd as i64, buf as *u8, n as i64) as i64 {
+    if (motor_mute == 1 && (fd == 1 || fd == 2)) { return n; }
+    if (os.current() == os.OS_LINUX)   { return linux_io.write(fd, buf, n); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.write(fd, buf, n); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.write(fd, buf, n); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.write(fd, buf, n); }
+    return 0 - 1;
+}
+
+// Write exactly n bytes. A single write() may transfer less than asked (a pipe
+// with a small buffer, a large file write interrupted by a signal); the raw
+// calls above return the count transferred, and every caller used to drop it on
+// the floor and report success. This loops until the whole buffer is out,
+// retrying only on EINTR (returned as exactly -4, the Linux errno); any other
+// non-positive return ends the attempt, because retrying a real error just
+// spins. Returns the number of bytes written, or -1 on failure.
+//
+// Buffered writers in this file record a failure in `write_failed`; stderr
+// diagnostics keep using the raw call, since losing a diagnosis is better than
+// dying while trying to report it.
+let is i32 as write_failed with mut = 0;
+
+fn write_all_fd(fd as i64, buf as *u8, n as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as w = _write_fd(fd, cast(*u8, cast(i64, buf) + done), n - done);
+        if (w == 0 - 4) { continue; }   // EINTR: the write never started
+        if (w <= 0) { return 0 - 1; }
+        done = done + w;
+    }
+    return done;
+}
+
+fn _read_fd(fd as i64, buf as *u8, n as i64) as i64 {
+    if (fd >= _VFD_BASE) {
+        let is *_VFile as vf = &_vfiles[fd - _VFD_BASE];
+        let is i64 as left = vf.size - vf.pos;
+        let is i64 as take with mut = n;
+        if (take > left) { take = left; }
+        let is i64 as q with mut = 0;
+        while (q < take) { buf[q] = vf.data[vf.pos + q]; q = q + 1; }
+        vf.pos = vf.pos + take;
+        return take;
+    }
+    if (os.current() == os.OS_LINUX)   { return linux_io.read(fd, buf, n); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.read(fd, buf, n); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.read(fd, buf, n); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.read(fd, buf, n); }
+    return 0 - 1;
+}
+
+fn _open_read(path as *u8) as i64 {
+    if (_nvfiles > 0) {
+        let is i64 as vi = _vfs_find(path);
+        if (vi >= 0) { _vfiles[vi].pos = 0; return _VFD_BASE + vi; }
+    }
+    if (os.current() == os.OS_LINUX)   { return linux_io.open_read(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.open_read(path); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.open_read(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.open_read(path); }
+    return 0 - 1;
+}
+
+fn _open_write(path as *u8) as i64 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.open_write(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.open_write(path); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.open_write(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.open_write(path); }
+    return 0 - 1;
+}
+
+fn _close_fd(fd as i64) as i32 {
+    if (fd >= _VFD_BASE) { return 0; }
+    if (os.current() == os.OS_LINUX)   { return linux_io.close(fd); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.close(fd); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.close(fd); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.close(fd); }
+    return cast(i32, 0 - 1);
+}
+
+fn _open_append(path as *u8) as i64 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.open_append(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.open_append(path); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.open_append(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.open_append(path); }
+    return 0 - 1;
+}
+
+fn _lseek(fd as i64, offset as i64, whence as i32) as i64 {
+    if (fd >= _VFD_BASE) {
+        let is *_VFile as vf = &_vfiles[fd - _VFD_BASE];
+        if (whence == 2) { vf.pos = vf.size + offset; } else if (whence == 0) { vf.pos = offset; } else { vf.pos = vf.pos + offset; }
+        return vf.pos;
+    }
+    if (os.current() == os.OS_LINUX)   { return linux_io.lseek(fd, offset, whence); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.lseek(fd, offset, whence); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.lseek(fd, offset, whence); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.lseek(fd, offset, whence); }
+    return 0 - 1;
+}
+
+// Terminate the process with the given exit code (0–255 on POSIX,
+// truncated to u32 on Windows). Does not return.
+fn exit(code as i32) as void {
+    if (cast(i64, motor_exit) != 0) { call(motor_exit, cast(i64, code)); }
+    if (os.current() == os.OS_LINUX)   { linux_io.exit(code); }
+    if (os.current() == os.OS_WINDOWS) { windows_io.exit(code); }
+    if (os.current() == os.OS_CAUSTIC) { caustic_io.exit(code); }
+    if (os.current() == os.OS_WASM)    { wasm_io.exit(code); }
+}
+
+let is i32 as _SEEK_SET with imut = 0;
+let is i32 as _SEEK_END with imut = 2;
+
+fn unlink(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.unlink(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.unlink(path); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.unlink(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.unlink(path); }
+    return cast(i32, 0 - 1);
+}
+
+fn rename(src as *u8, dst as *u8) as i32 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.rename(src, dst); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.rename(src, dst); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.rename(src, dst); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.rename(src, dst); }
+    return cast(i32, 0 - 1);
+}
+
+// Write a whole file so that a reader never sees a partial one.
+//
+// _open_write truncates, so the plain open/write/close sequence leaves the file
+// at zero length for as long as the write takes, and leaves it truncated
+// forever if the process dies partway. Two processes writing the same path
+// interleave into a file that is neither of theirs. Both matter for anything a
+// CONCURRENT reader consumes — a build cache written by parallel jobs is the
+// case this exists for, where the result is one process's valid-looking header
+// over another's body, which passes every check the reader makes.
+//
+// So: write the whole thing to "<path>.<pid>.tmp", then rename over the target.
+// rename(2) is atomic and replaces; MoveFileExA is given
+// MOVEFILE_REPLACE_EXISTING for the same effect. A reader sees either the
+// complete old file or the complete new one. The pid in the name is what keeps
+// two processes from colliding on the temporary as well.
+//
+// Returns 0 on success, -1 on failure — leaving the previous file untouched.
+fn write_file_atomic(path as *u8, buf as *u8, len as i64) as i32 {
+    let is i64 as plen = strlen(path);
+    let is i64 as tcap = plen + 32;                  // ".<20 digits>.tmp" and room to spare
+    let is *u8 as tmp = mem.core.mmap_anon(tcap);
+    if (cast(i64, tmp) == 0 || cast(i64, tmp) == 0 - 1) { return cast(i32, 0 - 1); }
+    mem.core.memcpy(tmp, path, plen);
+
+    let is i64 as w with mut = plen;
+    tmp[w] = cast(u8, 46); w = w + 1;                // '.'
+    let is i64 as p with mut = os.pid();
+    if (p < 0) { p = 0 - p; }
+    let is i64 as dstart = w;
+    if (p == 0) { tmp[w] = cast(u8, 48); w = w + 1; }
+    while (p > 0) { tmp[w] = cast(u8, 48 + p % 10); p = p / 10; w = w + 1; }
+    let is i64 as a with mut = dstart;               // digits came out reversed
+    let is i64 as b with mut = w - 1;
+    while (a < b) {
+        let is u8 as t = tmp[a]; tmp[a] = tmp[b]; tmp[b] = t;
+        a = a + 1; b = b - 1;
+    }
+    tmp[w] = cast(u8, 46);  w = w + 1;               // ".tmp"
+    tmp[w] = cast(u8, 116); w = w + 1;
+    tmp[w] = cast(u8, 109); w = w + 1;
+    tmp[w] = cast(u8, 112); w = w + 1;
+    tmp[w] = cast(u8, 0);
+
+    let is i64 as fd = _open_write(tmp);
+    if (fd < 0) { mem.core.munmap(tmp, tcap); return cast(i32, 0 - 1); }
+
+    let is i64 as done with mut = 0;
+    while (done < len) {
+        let is i64 as n = _write_fd(fd, cast(*u8, cast(i64, buf) + done), len - done);
+        if (n <= 0) {
+            _close_fd(fd);
+            unlink(tmp);
+            mem.core.munmap(tmp, tcap);
+            return cast(i32, 0 - 1);
+        }
+        done = done + n;
+    }
+    _close_fd(fd);
+
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        mem.core.munmap(tmp, tcap);
+        return cast(i32, 0 - 1);
+    }
+    mem.core.munmap(tmp, tcap);
+    return 0;
+}
+
+fn mkdir(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.mkdir(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.mkdir(path); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.mkdir(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.mkdir(path); }
+    return cast(i32, 0 - 1);
+}
+
+fn exists(path as *u8) as i32 {
+    if (_nvfiles > 0 && _vfs_find(path) >= 0) { return 1; }
+    if (os.current() == os.OS_LINUX)   { return linux_io.exists(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.exists(path); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.exists(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.exists(path); }
+    return 0;
+}
+
+// Resolves the running executable's absolute path into `buf`. Returns the
+// number of bytes written (no trailing NUL), or 0 on failure.
+fn get_self_path(buf as *u8, size as i64) as i64 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.get_self_path(buf, size); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.get_self_path(buf, size); }
+    if (os.current() == os.OS_CAUSTIC) { return caustic_io.get_self_path(buf, size); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.get_self_path(buf, size); }
+    return 0;
+}
+
+// Registers the running program's own path (argv[0]). Needed only on CausticOS,
+// where the kernel does not track process paths — get_self_path there returns
+// whatever was registered here. On Linux/Windows self-path comes from the OS
+// (/proc/self/exe, GetModuleFileNameA), so this is a no-op. Callers can invoke
+// it unconditionally at startup with argv[0].
+fn set_self_path(p as *u8) as void {
+    if (os.current() == os.OS_CAUSTIC) { caustic_io.set_self_path(p); }
+}
+
+// Marks `path` as executable. POSIX → chmod 0755; Windows → no-op
+// (executability is determined by the .exe extension).
+fn make_executable(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.make_executable(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.make_executable(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.make_executable(path); }
+    return 0;
+}
+
+// Last-modification time of `path` as an opaque i64 value. Values are
+// only meaningful when compared against other `mtime()` results from
+// the same OS. Returns 0 if the file does not exist. Linux returns
+// `st_mtim.tv_sec`; Windows returns the FILETIME 64-bit tick count.
+fn mtime(path as *u8) as i64 {
+    if (os.current() == os.OS_LINUX)   { return linux_io.mtime(path); }
+    if (os.current() == os.OS_WINDOWS) { return windows_io.mtime(path); }
+    if (os.current() == os.OS_WASM)    { return wasm_io.mtime(path); }
+    return 0;
+}
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn _free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
+fn _ensure() as *mem.Bins {
+    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
+    return &_bins;
+}
+
+// --- Buffered Reader ---
+
+struct Reader {
+    fd as i64;
+    buf as *u8;
+    cap as i64;
+    len as i64;
+    pos as i64;
+}
+
+fn Reader(fd as i64, buf as *u8, cap as i64) as Reader {
+    let is Reader as r;
+    r.fd = fd;
+    r.buf = buf;
+    r.cap = cap;
+    r.len = 0;
+    r.pos = 0;
+    return r;
+}
+
+// Refills buffer if empty. Returns byte (0-255) or -1 (EOF/Error)
+fn read(r as *Reader) as i32 {
+    // Cache buf pointer locally
+    let is *u8 as buf = r.buf;
+    let is i64 as cap = r.cap;
+    let is i64 as fd = r.fd;
+    
+    if (r.pos >= r.len) {
+        r.pos = 0;
+        let is i64 as n = _read_fd(fd, buf, cap);
+        r.len = n;
+        
+        if (n <= 0) {
+            return cast(i32, 0 - 1); // EOF or Error
+        }
+    }
+
+    let is i64 as p = r.pos;
+    let is u8 as b = buf[p];
+    r.pos = p + 1;
+    
+    return cast(i32, b);
+}
+
+// Reads a line efficiently using the internal buffer
+fn readline(r as *Reader) as string.String {
+    // Initial guess for line length
+    let is i64 as cap with mut = 64;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = _alloc(cap);
+    if (cast(i64, ptr) == 0) {
+        let is string.String as empty;
+        empty.ptr = cast(*u8, 0);
+        empty.len = 0;
+        empty.cap = 0;
+        return empty;
+    }
+
+    while (1 == 1) {
+        let is i32 as b = read(r);
+
+        if (b == (0 - 1)) {
+            break;
+        }
+
+        if (b == 10) { // \n
+            break;
+        }
+
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        ptr[len] = cast(u8, b);
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0); // Null terminator
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+
+    return s;
+}
+
+fn peek(r as *Reader) as i32 {
+    if (r.pos >= r.len) {
+        r.pos = 0;
+        let is i64 as n = _read_fd(r.fd, r.buf, r.cap);
+        r.len = n;
+        if (n <= 0) {
+            return cast(i32, 0 - 1);
+        }
+    }
+    return cast(i32, r.buf[r.pos]);
+}
+
+fn skip(r as *Reader, count as i64) as void {
+    let is i64 as remaining with mut = count;
+    while (remaining > 0) {
+        let is i32 as b = read(r);
+        if (b == (0 - 1)) { return; }
+        remaining = remaining - 1;
+    }
+}
+
+fn read_until(r as *Reader, delim as u8) as string.String {
+    let is i64 as cap with mut = 64;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = _alloc(cap);
+    if (cast(i64, ptr) == 0) {
+        let is string.String as empty;
+        empty.ptr = cast(*u8, 0);
+        empty.len = 0;
+        empty.cap = 0;
+        return empty;
+    }
+
+    while (1 == 1) {
+        let is i32 as b = read(r);
+        if (b == (0 - 1)) { break; }
+        if (cast(u8, b) == delim) { break; }
+
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        ptr[len] = cast(u8, b);
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0);
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+    return s;
+}
+
+fn read_all(r as *Reader) as string.String {
+    let is i64 as cap with mut = 1024;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = _alloc(cap);
+    if (cast(i64, ptr) == 0) {
+        let is string.String as empty;
+        empty.ptr = cast(*u8, 0);
+        empty.len = 0;
+        empty.cap = 0;
+        return empty;
+    }
+
+    while (1 == 1) {
+        let is i32 as b = read(r);
+        if (b == (0 - 1)) { break; }
+
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        ptr[len] = cast(u8, b);
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0);
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+    return s;
+}
+
+// --- Buffered Writer ---
+
+struct Writer {
+    fd as i64;
+    buf as *u8;
+    cap as i64;
+    len as i64;
+}
+
+fn Writer(fd as i64, buf as *u8, cap as i64) as Writer {
+    let is Writer as w;
+    w.fd = fd;
+    w.buf = buf;
+    w.cap = cap;
+    w.len = 0;
+    return w;
+}
+
+fn flush(w as *Writer) as void {
+    if (w.len > 0) {
+        if (write_all_fd(w.fd, w.buf, w.len) < 0) { write_failed = 1; }
+        w.len = 0;
+    }
+}
+
+fn put(w as *Writer, b as u8) as void {
+    if (w.len >= w.cap) {
+        flush(w);
+    }
+    let is i64 as l = w.len;
+    w.buf[l] = b;
+    w.len = l + 1;
+}
+
+fn write(w as *Writer, s as string.String) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as slen = cast(i64, s.len);
+
+    // Optimization: if string is larger than buffer, flush and write directly
+    if (slen > w.cap) {
+        flush(w);
+        if (write_all_fd(w.fd, s.ptr, slen) < 0) { write_failed = 1; }
+        return;
+    }
+
+    while (i < slen) {
+        put(w, s.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn writer_bytes(w as *Writer, ptr as *u8, len as i64) as void {
+    if (len > w.cap) {
+        flush(w);
+        if (write_all_fd(w.fd, ptr, len) < 0) { write_failed = 1; }
+        return;
+    }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        put(w, ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn writeln(w as *Writer, s as string.String) as void {
+    write(w, s);
+    put(w, cast(u8, 10));
+}
+
+fn write_i64(w as *Writer, n as i64) as void {
+    if (n == 0) { put(w, 48); return; }
+
+    if (n == (0 - 9223372036854775807 - 1)) {
+        writer_bytes(w, "-9223372036854775808", 20);
+        return;
+    }
+
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i32 as start with mut = pos + 1;
+    while (start < 24) {
+        put(w, buf[start]);
+        start = start + 1;
+    }
+}
+
+// --- Low-level helpers ---
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn write_str(fd as i64, s as *u8) as void {
+    _write_fd(fd, s, strlen(s));
+}
+
+fn write_int(fd as i64, n as i64) as void {
+    if (n == 0) { _write_fd(fd, "0", 1); return; }
+
+    // Special case INT64_MIN
+    if (n == (0 - 9223372036854775807 - 1)) {
+        _write_fd(fd, "-9223372036854775808", 20);
+        return;
+    }
+
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i64 as start = cast(i64, pos) + 1;
+    _write_fd(fd, cast(*u8, cast(i64, &buf) + start), 24 - start);
+}
+
+// --- Generic IO ---
+
+fn write_bytes(fd as i64, ptr as *u8, len as i64) as i64 {
+    return _write_fd(fd, ptr, len);
+}
+
+fn write_string(fd as i64, s as string.String) as i64 {
+    return _write_fd(fd, s.ptr, cast(i64, s.len));
+}
+
+fn read_exact(fd as i64, buf as *u8, count as i64) as i64 {
+    let is i64 as total with mut = 0;
+    while (total < count) {
+        let is i64 as addr = cast(i64, buf) + total;
+        let is i64 as n = _read_fd(fd, cast(*u8, addr), count - total);
+        if (n <= 0) {
+            break;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+// --- Formatted Output Helpers ---
+
+fn print_hex(n as i64) as void {
+    let is *u8 as hex = "0123456789abcdef";
+    let is [18]u8 as buf;
+
+    buf[0] = 48;  // '0'
+    buf[1] = 120; // 'x'
+
+    let is i64 as val with mut = n;
+    let is i32 as i with mut = 15;
+
+    while (i >= 0) {
+        buf[2 + i] = hex[val & 15];
+        val = val >> 4;
+        i = i - 1;
+    }
+
+    _write_fd(STDOUT, &buf, 18);
+}
+
+fn print_bool(b as i32) as void {
+    if (b != 0) {
+        _write_fd(STDOUT, "true", 4);
+    } else {
+        _write_fd(STDOUT, "false", 5);
+    }
+}
+
+fn print_ptr(ptr as *u8) as void {
+    print_hex(cast(i64, ptr));
+}
+
+// --- Formatted Output (printf) ---
+//
+// printf / sprintf / fdprintf / writer_printf share one formatter (_vformat)
+// that follows C's printf: flags `- + 0 space #`, width and precision (also
+// `*`), length modifiers, and the conversions d i u x X o c s p f F e E g G,
+// plus Caustic's %S (a *string.String). Floats print the exact binary value
+// rounded to nearest, ties to even, so the text matches glibc byte for byte.
+//
+// Every variadic argument travels as a 64-bit slot: %d, %u, %x and %o print
+// the whole slot whatever the length modifier (l, ll, z, j, t, L are accepted
+// and change nothing), while h and hh narrow to 16 and 8 bits as in C. A float
+// argument (f32 or f64) arrives as f64.
+
+struct VaList {
+    gp_offset as i32;
+    fp_offset as i32;
+    overflow_arg_area as *u8;
+    reg_save_area as *u8;
+}
+
+fn print_uint(n as u64) as void {
+    if (n == 0) { _write_fd(STDOUT, "0", 1); return; }
+    let is [20]u8 as buf;
+    let is u64 as val with mut = n;
+    let is i32 as pos with mut = 19;
+    while (val > 0) {
+        buf[pos] = cast(u8, cast(i64, val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    let is i64 as start = cast(i64, pos) + 1;
+    _write_fd(STDOUT, cast(*u8, cast(i64, &buf) + start), 20 - start);
+}
+
+fn _pad(count as i64, ch as u8) as void {
+    let is u8 as c = ch;
+    let is i64 as k with mut = 0;
+    while (k < count) { _write_fd(STDOUT, &c, 1); k = k + 1; }
+}
+
+// The next 64-bit variadic slot.
+fn _va_next(va as *VaList) as i64 {
+    let is i32 as gp_limit with mut = 48;
+    if (__target_is_aarch64 == 1) { gp_limit = 64; }
+    let is *i64 as p with mut = cast(*i64, 0);
+    if (va.gp_offset < gp_limit) {
+        p = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
+        va.gp_offset = va.gp_offset + 8;
+    } else {
+        p = cast(*i64, va.overflow_arg_area);
+        va.overflow_arg_area = va.overflow_arg_area + 8;
+    }
+    return *p;
+}
+
+// Formatter output goes to a Writer. A negative fd marks a fixed buffer
+// (sprintf): bytes past `cap` are dropped instead of flushed.
+fn _fo(o as *Writer, c as u8) as void {
+    if (o.fd < 0) {
+        if (o.len < o.cap) {
+            let is i64 as l = o.len;
+            o.buf[l] = c;
+            o.len = l + 1;
+        }
+        return;
+    }
+    put(o, c);
+}
+
+fn _fo_rep(o as *Writer, c as u8, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { _fo(o, c); k = k + 1; }
+}
+
+fn _fo_mem(o as *Writer, p as *u8, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { _fo(o, p[k]); k = k + 1; }
+}
+
+struct _FSpec {
+    left as i32;
+    plus as i32;
+    space as i32;
+    zero as i32;
+    alt as i32;
+    width as i64;
+    prec as i64;     // -1 = not given
+}
+
+// One field: [spaces] prefix [zeros] body [spaces], `width` wide.
+fn _fo_field(o as *Writer, sp as *_FSpec, pre as *u8, plen as i64, zeros as i64, body as *u8, blen as i64) as void {
+    let is i64 as pad = sp.width - (plen + zeros + blen);
+    if (sp.left == 0 && pad > 0) { _fo_rep(o, 32, pad); }
+    _fo_mem(o, pre, plen);
+    _fo_rep(o, 48, zeros);
+    _fo_mem(o, body, blen);
+    if (sp.left == 1 && pad > 0) { _fo_rep(o, 32, pad); }
+}
+
+fn _fmt_int(o as *Writer, sp as *_FSpec, v as i64, conv as u8, lenmod as i32) as void {
+    let is i32 as signed with mut = 0;
+    if (conv == 100 || conv == 105) { signed = 1; }   // d i
+    let is i64 as x with mut = v;
+    // h / hh narrow, as C does with the promoted argument.
+    if (lenmod == 1) {
+        if (signed == 1) { x = cast(i64, cast(i16, x & 0xFFFF)); } else { x = x & 0xFFFF; }
+    } else if (lenmod == 2) {
+        if (signed == 1) { x = cast(i64, cast(i8, x & 0xFF)); } else { x = x & 0xFF; }
+    }
+    let is i32 as neg with mut = 0;
+    let is u64 as u with mut = cast(u64, x);
+    if (signed == 1 && x < 0) { neg = 1; u = cast(u64, 0 - x); }
+
+    let is u64 as base with mut = 10;
+    if (conv == 120 || conv == 88 || conv == 112) { base = 16; }
+    if (conv == 111) { base = 8; }
+    let is *u8 as dchars with mut = "0123456789abcdef";
+    if (conv == 88) { dchars = "0123456789ABCDEF"; }
+
+    let is [24]u8 as db;
+    let is i64 as dpos with mut = 24;
+    let is u64 as t with mut = u;
+    while (t != 0) {
+        dpos = dpos - 1;
+        db[dpos] = dchars[cast(i64, t % base)];
+        t = t / base;
+    }
+    let is i64 as prec with mut = sp.prec;
+    if (prec < 0) { prec = 1; }
+    let is i64 as nd = 24 - dpos;
+    let is i64 as zeros with mut = 0;
+    if (prec > nd) { zeros = prec - nd; }
+    // %#o: the first digit printed is a 0.
+    if (conv == 111 && sp.alt == 1 && zeros == 0) {
+        if (nd == 0 || db[dpos] != 48) { zeros = 1; }
+    }
+
+    let is [2]u8 as pre;
+    let is i64 as plen with mut = 0;
+    if (signed == 1) {
+        if (neg == 1) { pre[0] = 45; plen = 1; }
+        else if (sp.plus == 1) { pre[0] = 43; plen = 1; }
+        else if (sp.space == 1) { pre[0] = 32; plen = 1; }
+    }
+    if ((conv == 120 || conv == 88) && sp.alt == 1 && u != 0) {
+        pre[0] = 48; pre[1] = conv; plen = 2;
+    }
+    if (conv == 112) {
+        if (u == 0) {
+            _fo_field(o, sp, "", 0, 0, "(nil)", 5);
+            return;
+        }
+        pre[0] = 48; pre[1] = 120; plen = 2;
+    }
+    if (sp.zero == 1 && sp.left == 0 && sp.prec < 0) {
+        let is i64 as fill = sp.width - (plen + zeros + nd);
+        if (fill > 0) { zeros = zeros + fill; }
+    }
+    _fo_field(o, sp, cast(*u8, &pre), plen, zeros, cast(*u8, cast(i64, &db) + dpos), nd);
+}
+
+// Exact decimal digits of a finite, nonzero double's magnitude: the value is
+// 0.d0 d1 ... d(n-1) x 10^dp. Returns n (no trailing zeros); dp via *dpp.
+// Works with a big integer in base 10^9 limbs: m * 2^e when e >= 0, and
+// m * 5^-e (= m * 2^e * 10^-e) when e < 0, so every digit is exact.
+fn _fdigits(bits as i64, dg as *u8, dpp as *i32) as i32 {
+    let is i64 as bexp = (bits >> 52) & 0x7FF;
+    let is i64 as m with mut = bits & 0xFFFFFFFFFFFFF;
+    let is i64 as e with mut = 0;
+    if (bexp == 0) { e = 0 - 1074; } else { m = m | 0x10000000000000; e = bexp - 1075; }
+    while ((m & 1) == 0) { m = m >> 1; e = e + 1; }
+
+    let is [100]i64 as L;
+    let is i32 as nl with mut = 0;
+    let is i64 as mm with mut = m;
+    while (mm != 0) { L[nl] = mm % 1000000000; mm = mm / 1000000000; nl = nl + 1; }
+
+    let is i64 as left with mut = e;
+    let is i64 as mul with mut = 0;
+    if (e < 0) { left = 0 - e; }
+    while (left > 0) {
+        if (e > 0) {
+            let is i64 as k with mut = left;
+            if (k > 29) { k = 29; }
+            mul = 1 << k;
+            left = left - k;
+        } else {
+            if (left >= 13) { mul = 1220703125; left = left - 13; }
+            else {
+                mul = 1;
+                while (left > 0) { mul = mul * 5; left = left - 1; }
+            }
+        }
+        let is i64 as carry with mut = 0;
+        let is i32 as j with mut = 0;
+        while (j < nl) {
+            let is i64 as tv = L[j] * mul + carry;
+            L[j] = tv % 1000000000;
+            carry = tv / 1000000000;
+            j = j + 1;
+        }
+        while (carry != 0) { L[nl] = carry % 1000000000; carry = carry / 1000000000; nl = nl + 1; }
+    }
+
+    // Limbs to digits, most significant first.
+    let is i32 as n with mut = 0;
+    let is [9]u8 as tmp;
+    let is i32 as li with mut = nl - 1;
+    while (li >= 0) {
+        let is i64 as v with mut = L[li];
+        let is i32 as q with mut = 0;
+        while (q < 9) { tmp[8 - q] = cast(u8, v % 10); v = v / 10; q = q + 1; }
+        let is i32 as s with mut = 0;
+        if (li == nl - 1) { while (s < 8 && tmp[s] == 0) { s = s + 1; } }
+        while (s < 9) { dg[n] = tmp[s]; n = n + 1; s = s + 1; }
+        li = li - 1;
+    }
+    let is i32 as dp with mut = n;
+    if (e < 0) { dp = n + cast(i32, e); }
+    while (n > 0 && dg[n - 1] == 0) { n = n - 1; }
+    *dpp = dp;
+    return n;
+}
+
+// Keep the first `keep` digits, rounding to nearest with ties to even (the
+// digits are exact, so a tie is a 5 with nothing after it).
+fn _fround(dg as *u8, np as *i32, dpp as *i32, keep as i32) as void {
+    let is i32 as n with mut = *np;
+    if (keep >= n) { return; }
+    if (keep < 0) { *np = 0; return; }
+    let is u8 as r = dg[keep];
+    let is i32 as up with mut = 0;
+    if (r > 5) { up = 1; }
+    else if (r == 5) {
+        if (keep + 1 < n) { up = 1; }
+        else if (keep > 0 && (dg[keep - 1] & 1) == 1) { up = 1; }
+    }
+    n = keep;
+    if (up == 1) {
+        let is i32 as idx with mut = keep - 1;
+        while (idx >= 0 && dg[idx] == 9) { idx = idx - 1; }
+        if (idx < 0) {
+            dg[0] = 1;
+            *np = 1;
+            *dpp = *dpp + 1;
+            return;
+        }
+        dg[idx] = dg[idx] + 1;
+        n = idx + 1;
+    }
+    while (n > 0 && dg[n - 1] == 0) { n = n - 1; }
+    *np = n;
+}
+
+fn _fdig(dg as *u8, n as i32, k as i64) as u8 {
+    if (k < 0 || k >= cast(i64, n)) { return 48; }
+    return dg[k] + 48;
+}
+
+fn _fmt_float(o as *Writer, sp as *_FSpec, bits as i64, conv as u8) as void {
+    let is i32 as upper with mut = 0;
+    let is u8 as lc with mut = conv;
+    if (conv == 70 || conv == 69 || conv == 71) { upper = 1; lc = conv + 32; }
+
+    let is [1]u8 as pre;
+    let is i64 as plen with mut = 0;
+    if (bits < 0) { pre[0] = 45; plen = 1; }
+    else if (sp.plus == 1) { pre[0] = 43; plen = 1; }
+    else if (sp.space == 1) { pre[0] = 32; plen = 1; }
+
+    if (((bits >> 52) & 0x7FF) == 0x7FF) {
+        let is *u8 as word with mut = "inf";
+        if ((bits & 0xFFFFFFFFFFFFF) != 0) { word = "nan"; }
+        if (upper == 1) {
+            word = "INF";
+            if ((bits & 0xFFFFFFFFFFFFF) != 0) { word = "NAN"; }
+        }
+        _fo_field(o, sp, cast(*u8, &pre), plen, 0, word, 3);
+        return;
+    }
+
+    let is i64 as prec with mut = sp.prec;
+    if (prec < 0) { prec = 6; }
+    if (prec > 800) { prec = 800; }
+
+    let is [800]u8 as dg;
+    let is i32 as n with mut = 0;
+    let is i32 as dp with mut = 0;
+    if ((bits & 0x7FFFFFFFFFFFFFFF) != 0) { n = _fdigits(bits, cast(*u8, &dg), &dp); }
+
+    let is i32 as estyle with mut = 0;
+    let is i64 as fprec with mut = prec;
+    if (lc == 102) {
+        _fround(cast(*u8, &dg), &n, &dp, dp + cast(i32, prec));
+    } else if (lc == 101) {
+        estyle = 1;
+        _fround(cast(*u8, &dg), &n, &dp, cast(i32, prec) + 1);
+    } else {
+        let is i64 as P with mut = prec;
+        if (P == 0) { P = 1; }
+        let is i64 as X0 = cast(i64, dp) - 1;
+        _fround(cast(*u8, &dg), &n, &dp, cast(i32, P));
+        let is i64 as X with mut = 0;
+        if (n > 0) { X = cast(i64, dp) - 1; }
+        if (X < P && X >= 0 - 4) { fprec = P - 1 - X; }
+        else if (n > 0 && X0 == P - 1 && X == P) {
+            // glibc picks the style before rounding: 999999.5 under %#g is
+            // fixed-point with no fraction digits, then carries to 1e+06 and
+            // prints "1.e+06". Match it.
+            estyle = 1; fprec = 0;
+        }
+        else { estyle = 1; fprec = P - 1; }
+        if (sp.alt == 0) {
+            let is i64 as have with mut = 0;
+            if (estyle == 1) { have = cast(i64, n) - 1; }
+            else { have = cast(i64, n) - cast(i64, dp); }
+            if (have < 0) { have = 0; }
+            if (fprec > have) { fprec = have; }
+        }
+    }
+
+    let is [1200]u8 as body;
+    let is i64 as bl with mut = 0;
+    if (estyle == 0) {
+        if (dp <= 0) { body[bl] = 48; bl = bl + 1; }
+        else {
+            let is i64 as k with mut = 0;
+            while (k < cast(i64, dp)) { body[bl] = _fdig(cast(*u8, &dg), n, k); bl = bl + 1; k = k + 1; }
+        }
+        if (fprec > 0 || sp.alt == 1) { body[bl] = 46; bl = bl + 1; }
+        let is i64 as j with mut = 0;
+        while (j < fprec) { body[bl] = _fdig(cast(*u8, &dg), n, cast(i64, dp) + j); bl = bl + 1; j = j + 1; }
+    } else {
+        body[bl] = _fdig(cast(*u8, &dg), n, 0); bl = bl + 1;
+        if (fprec > 0 || sp.alt == 1) { body[bl] = 46; bl = bl + 1; }
+        let is i64 as j with mut = 1;
+        while (j <= fprec) { body[bl] = _fdig(cast(*u8, &dg), n, j); bl = bl + 1; j = j + 1; }
+        if (upper == 1) { body[bl] = 69; } else { body[bl] = 101; }
+        bl = bl + 1;
+        let is i64 as X with mut = 0;
+        if (n > 0) { X = cast(i64, dp) - 1; }
+        if (X < 0) { body[bl] = 45; X = 0 - X; } else { body[bl] = 43; }
+        bl = bl + 1;
+        if (X >= 100) { body[bl] = cast(u8, 48 + X / 100); bl = bl + 1; }
+        body[bl] = cast(u8, 48 + (X / 10) % 10); bl = bl + 1;
+        body[bl] = cast(u8, 48 + X % 10); bl = bl + 1;
+    }
+
+    let is i64 as zeros with mut = 0;
+    if (sp.zero == 1 && sp.left == 0) {
+        let is i64 as fill = sp.width - (plen + bl);
+        if (fill > 0) { zeros = fill; }
+    }
+    _fo_field(o, sp, cast(*u8, &pre), plen, zeros, cast(*u8, &body), bl);
+}
+
+fn _vformat(o as *Writer, fmt as *u8, va as *VaList) as void {
+    let is i64 as i with mut = 0;
+    while (fmt[i] != 0) {
+        if (fmt[i] != 37) {
+            _fo(o, fmt[i]);
+            i = i + 1;
+            continue;
+        }
+        i = i + 1;   // '%'
+        if (fmt[i] == 0) { break; }
+        if (fmt[i] == 37) { _fo(o, 37); i = i + 1; continue; }
+
+        let is _FSpec as sp;
+        sp.left = 0; sp.plus = 0; sp.space = 0; sp.zero = 0; sp.alt = 0;
+        sp.width = 0; sp.prec = 0 - 1;
+        let is i32 as more with mut = 1;
+        while (more == 1) {
+            let is u8 as f = fmt[i];
+            if (f == 45) { sp.left = 1; }
+            else if (f == 43) { sp.plus = 1; }
+            else if (f == 32) { sp.space = 1; }
+            else if (f == 48) { sp.zero = 1; }
+            else if (f == 35) { sp.alt = 1; }
+            else { more = 0; }
+            if (more == 1) { i = i + 1; }
+        }
+        if (fmt[i] == 42) {
+            let is i64 as wv = cast(i64, cast(i32, _va_next(va) & 0xFFFFFFFF));
+            if (wv < 0) { sp.left = 1; sp.width = 0 - wv; } else { sp.width = wv; }
+            i = i + 1;
+        } else {
+            while (fmt[i] >= 48 && fmt[i] <= 57) {
+                sp.width = sp.width * 10 + (cast(i64, fmt[i]) - 48);
+                i = i + 1;
+            }
+        }
+        if (fmt[i] == 46) {
+            i = i + 1;
+            sp.prec = 0;
+            if (fmt[i] == 42) {
+                let is i64 as pv = cast(i64, cast(i32, _va_next(va) & 0xFFFFFFFF));
+                if (pv < 0) { sp.prec = 0 - 1; } else { sp.prec = pv; }
+                i = i + 1;
+            } else {
+                while (fmt[i] >= 48 && fmt[i] <= 57) {
+                    sp.prec = sp.prec * 10 + (cast(i64, fmt[i]) - 48);
+                    i = i + 1;
+                }
+            }
+        }
+        // Length modifiers: 1 = h, 2 = hh; the 64-bit ones change nothing.
+        let is i32 as lenmod with mut = 0;
+        let is i32 as lmore with mut = 1;
+        while (lmore == 1) {
+            let is u8 as c = fmt[i];
+            if (c == 104) {
+                if (lenmod == 1) { lenmod = 2; } else { lenmod = 1; }
+                i = i + 1;
+            } else if (c == 108 || c == 76 || c == 113 || c == 106 || c == 122 || c == 116) {
+                i = i + 1;
+            } else { lmore = 0; }
+        }
+        let is u8 as cv = fmt[i];
+        if (cv == 0) { break; }
+        i = i + 1;
+
+        if (cv == 100 || cv == 105 || cv == 117 || cv == 120 || cv == 88 || cv == 111 || cv == 112) {
+            _fmt_int(o, &sp, _va_next(va), cv, lenmod);
+        } else if (cv == 102 || cv == 70 || cv == 101 || cv == 69 || cv == 103 || cv == 71) {
+            _fmt_float(o, &sp, _va_next(va), cv);
+        } else if (cv == 99) {
+            let is u8 as ch = cast(u8, _va_next(va) & 0xFF);
+            _fo_field(o, &sp, "", 0, 0, &ch, 1);
+        } else if (cv == 115) {
+            let is *u8 as s with mut = cast(*u8, _va_next(va));
+            if (cast(i64, s) == 0) {
+                s = "(null)";
+                if (sp.prec >= 0 && sp.prec < 6) { s = ""; }
+            }
+            let is i64 as sl with mut = 0;
+            while (s[sl] != 0 && (sp.prec < 0 || sl < sp.prec)) { sl = sl + 1; }
+            _fo_field(o, &sp, "", 0, 0, s, sl);
+        } else if (cv == 83) {
+            let is *string.String as sp_s = cast(*string.String, _va_next(va));
+            let is i64 as sl with mut = cast(i64, sp_s.len);
+            if (sp.prec >= 0 && sl > sp.prec) { sl = sp.prec; }
+            _fo_field(o, &sp, "", 0, 0, sp_s.ptr, sl);
+        } else {
+            // Unknown conversion: print it as written, consume nothing.
+            _fo(o, 37);
+            _fo(o, cv);
+        }
+    }
+}
+
+// Formatted output to stdout. One write per call.
+fn printf(fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    let is [512]u8 as ob;
+    let is Writer as w with mut = Writer(STDOUT, cast(*u8, &ob), 512);
+    _vformat(&w, fmt, &va);
+    flush(&w);
+}
+
+// Formatted output to a file descriptor (STDERR, a file).
+fn fdprintf(fd as i64, fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    let is [512]u8 as ob;
+    let is Writer as w with mut = Writer(fd, cast(*u8, &ob), 512);
+    _vformat(&w, fmt, &va);
+    flush(&w);
+}
+
+// Formatted output appended to a buffered Writer; nothing is written until the
+// Writer flushes.
+fn writer_printf(w as *Writer, fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    _vformat(w, fmt, &va);
+}
+
+// Formats into buf (NUL-terminated, at most cap-1 bytes kept). Returns the
+// number of bytes stored, not counting the NUL.
+fn sprintf(buf as *u8, cap as i64, fmt as *u8, ...) as i64 {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    if (cap <= 0) { return 0; }
+    let is Writer as w with mut = Writer(0 - 1, buf, cap - 1);
+    _vformat(&w, fmt, &va);
+    buf[w.len] = 0;
+    return w.len;
+}
+
+struct File {
+    fd as i64;
+}
+
+fn print(s as string.String) as void {
+    if (s.len > 0) {
+        _write_fd(STDOUT, s.ptr, cast(i64, s.len));
+    }
+}
+
+fn println(s as string.String) as void {
+    print(s);
+    _write_fd(STDOUT, "\n", 1);
+}
+
+fn eprint(s as string.String) as void {
+    if (s.len > 0) {
+        _write_fd(STDERR, s.ptr, cast(i64, s.len));
+    }
+}
+
+fn eprintln(s as string.String) as void {
+    eprint(s);
+    _write_fd(STDERR, "\n", 1);
+}
+
+fn eprint_str(s as *u8) as void {
+    _write_fd(STDERR, s, strlen(s));
+}
+
+fn print_int(n as i64) as void {
+    let is [21]u8 as buf;
+    let is i32 as pos with mut = 20;
+    let is i64 as val with mut = n;
+    let is i32 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    if (val == 0) { buf[pos] = 48; pos = pos - 1; }
+    else { while (val > 0) { buf[pos] = cast(u8, 48 + cast(i32, val % 10)); val = val / 10; pos = pos - 1; } }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i32 as start = pos + 1;
+    _write_fd(STDOUT, cast(*u8, cast(i64, &buf) + cast(i64, start)), 21 - cast(i64, start));
+}
+
+// Legacy read_line (slow, unbuffered) - kept for compatibility
+// or could be rewritten to use a stack buffer
+fn read_line() as string.String {
+    // Implementation using small stack buffer for basic buffering
+    let is i64 as cap with mut = 128;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = _alloc(cap);
+
+    while (1 == 1) {
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        let is i64 as addr = cast(i64, ptr) + len;
+        let is i64 as n = _read_fd(STDIN, cast(*u8, addr), 1);
+
+        if (n <= 0) {
+            break;
+        }
+
+        if (ptr[len] == 10) { // \n
+            break;
+        }
+
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0);
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+
+    return s;
+}
+
+fn read_file(path as string.String) as string.String {
+    return read_file_in(_ensure(), path.ptr);
+}
+
+fn write_file(path as string.String, content as string.String) as i64 {
+    let is i64 as fd = _open_write(path.ptr);
+    if (fd < 0) { return fd; }
+    let is i64 as res = _write_fd(fd, content.ptr, cast(i64, content.len));
+    _close_fd(fd);
+    return res;
+}
+
+fn append_file(path as string.String, content as string.String) as i64 {
+    let is i64 as fd = _open_append(path.ptr);
+    if (fd < 0) { return fd; }
+    let is i64 as res = _write_fd(fd, content.ptr, cast(i64, content.len));
+    _close_fd(fd);
+    return res;
+}
+
+fn file_exists(path as string.String) as i32 {
+    let is i64 as fd = _open_read(path.ptr);
+    if (fd >= 0) {
+        _close_fd(fd);
+        return cast(i32, 1);
+    }
+    return cast(i32, 0);
+}
+
+fn file_size(path as *u8) as i64 {
+    let is i64 as fd = _open_read(path);
+    if (fd < 0) {
+        return cast(i64, 0 - 1);
+    }
+    let is i64 as size = _lseek(fd, 0, _SEEK_END);
+    _close_fd(fd);
+    return size;
+}
+
+fn open_file(path as string.String) as File {
+    let is i64 as fd = _open_read(path.ptr);
+    let is File as f;
+    f.fd = fd;
+    return f;
+}
+
+fn close_file(file as File) as void {
+    _close_fd(file.fd);
+}
+
+fn copy_file(src as string.String, dst as string.String) as i64 {
+    let is i64 as in_fd = _open_read(src.ptr);
+    if (in_fd < 0) { return in_fd; }
+
+    let is i64 as out_fd = _open_write(dst.ptr);
+    if (out_fd < 0) {
+        _close_fd(in_fd);
+        return out_fd;
+    }
+
+    let is [4096]u8 as buf;
+    let is i64 as total with mut = 0;
+
+    while (1 == 1) {
+        let is i64 as n = _read_fd(in_fd, &buf, 4096);
+        if (n <= 0) { break; }
+        let is i64 as w = _write_fd(out_fd, &buf, n);
+        if (w != n) {
+            _close_fd(in_fd);
+            _close_fd(out_fd);
+            return cast(i64, 0 - 1);
+        }
+        total = total + n;
+    }
+
+    _close_fd(in_fd);
+    _close_fd(out_fd);
+    return total;
+}
+
+fn read_file_in(h as *mem.Bins, path as *u8) as string.String {
+    let is i64 as fd = _open_read(path);
+    let is string.String as s;
+
+    if (fd < 0) {
+        s.ptr = cast(*u8, 0);
+        s.len = 0;
+        s.cap = 0;
+        return s;
+    }
+
+    let is i64 as size = _lseek(fd, 0, _SEEK_END);
+    _lseek(fd, 0, _SEEK_SET);
+
+    if (size > 2147483647 || size <= 0) {
+        _close_fd(fd);
+        s.ptr = cast(*u8, 0);
+        s.len = 0;
+        s.cap = 0;
+        return s;
+    }
+
+    s.len = cast(i32, size);
+    s.cap = cast(i32, size);
+    s.ptr = cast(*u8, mem.bins.bins_alloc(h, size + 1));
+    read_exact(fd, s.ptr, size);
+    s.ptr[size] = cast(u8, 0);
+
+    _close_fd(fd);
+    return s;
+}
+
+// --- Directory Operations ---
+
+// dirent64 field offsets (packed linux_dirent64):
+//   d_ino:    offset 0,  size 8 (i64)
+//   d_off:    offset 8,  size 8 (i64)
+//   d_reclen: offset 16, size 2 (u16)
+//   d_type:   offset 18, size 1 (u8)
+//   d_name:   offset 19, variable length (null-terminated)
+
+// File type constants (d_type)
+let is u8 as DT_UNKNOWN with imut = 0;
+let is u8 as DT_FIFO    with imut = 1;
+let is u8 as DT_CHR     with imut = 2;
+let is u8 as DT_DIR     with imut = 4;
+let is u8 as DT_BLK     with imut = 6;
+let is u8 as DT_REG     with imut = 8;
+let is u8 as DT_LNK     with imut = 10;
+let is u8 as DT_SOCK    with imut = 12;
+
+struct DirEntry {
+    name_ptr as *u8;
+    name_len as i64;
+    file_type as i64;
+}
+
+// Build the Win32 search pattern "<path>\\*" (or "<path>*" if the path already
+// ends with a separator). Caller frees the result.
+fn _win_dir_pattern(path as *u8) as *u8 {
+    let is i64 as plen = strlen(path);
+    let is *u8 as pat = _alloc(plen + 3);
+    let is i64 as i with mut = 0;
+    while (i < plen) { pat[i] = path[i]; i = i + 1; }
+    if (plen > 0 && (path[plen - 1] == 92 || path[plen - 1] == 47)) {
+        pat[plen] = 42;       // '*'
+        pat[plen + 1] = 0;
+    } else {
+        pat[plen] = 92;       // '\\'
+        pat[plen + 1] = 42;   // '*'
+        pat[plen + 2] = 0;
+    }
+    return pat;
+}
+
+// List directory entries.
+// Fills entries array. Names are copied to heap (caller must free name_ptr).
+// Skips "." and ".." automatically.
+// Returns number of entries found, or -1 on error.
+// Windows backend not yet implemented (FindFirstFileA/FindNextFileA path);
+// returns -1 there until the Windows directory enumerator lands.
+fn list_dir(path as *u8, entries as *DirEntry, max_entries as i32) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
+        if (fd < 0) { return cast(i32, 0 - 1); }
+        let is [4096]u8 as buf;
+        let is i32 as count with mut = 0;
+        while (1 == 1) {
+            let is i64 as nread = linux.getdents64(fd, &buf, 4096);
+            if (nread <= 0) { break; }
+            let is i64 as pos with mut = 0;
+            while (pos < nread) {
+                let is *u8 as entry_ptr = cast(*u8, cast(i64, &buf) + pos);
+                let is *u8 as reclen_ptr = cast(*u8, cast(i64, entry_ptr) + 16);
+                let is i64 as reclen = cast(i64, reclen_ptr[0]) + cast(i64, reclen_ptr[1]) * 256;
+                let is u8 as dtype = entry_ptr[18];
+                let is *u8 as name = cast(*u8, cast(i64, entry_ptr) + 19);
+                let is i64 as skip with mut = 0;
+                if (name[0] == 46 && name[1] == 0) { skip = 1; }
+                if (name[0] == 46 && name[1] == 46 && name[2] == 0) { skip = 1; }
+                if (skip == 0 && count < max_entries) {
+                    let is i32 as nlen with mut = 0;
+                    while (name[nlen] != 0) { nlen = nlen + 1; }
+                    let is *u8 as name_copy = _alloc(cast(i64, nlen) + 1);
+                    mem.core.memcpy(name_copy, name, cast(i64, nlen));
+                    name_copy[nlen] = 0;
+                    entries[count].name_ptr = name_copy;
+                    entries[count].name_len = cast(i64, nlen);
+                    entries[count].file_type = cast(i64, dtype);
+                    count = count + 1;
+                }
+                pos = pos + reclen;
+            }
+        }
+        _close_fd(fd);
+        return count;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        let is *u8 as pat = _win_dir_pattern(path);
+        let is [320]u8 as fdata;
+        let is i64 as h = win.FindFirstFileA(pat, &fdata);
+        _free(pat);
+        if (h == cast(i64, 0 - 1)) { return cast(i32, 0 - 1); }
+        let is i32 as count with mut = 0;
+        while (1 == 1) {
+            let is *u32 as attrs_p = cast(*u32, &fdata);
+            let is u32 as attrs = *attrs_p;
+            let is *u8 as name = cast(*u8, cast(i64, &fdata) + 44);   // cFileName
+            let is i64 as skip with mut = 0;
+            if (name[0] == 46 && name[1] == 0) { skip = 1; }
+            if (name[0] == 46 && name[1] == 46 && name[2] == 0) { skip = 1; }
+            if (skip == 0 && count < max_entries) {
+                let is i32 as nlen with mut = 0;
+                while (name[nlen] != 0) { nlen = nlen + 1; }
+                let is *u8 as name_copy = _alloc(cast(i64, nlen) + 1);
+                mem.core.memcpy(name_copy, name, cast(i64, nlen));
+                name_copy[nlen] = 0;
+                entries[count].name_ptr = name_copy;
+                entries[count].name_len = cast(i64, nlen);
+                if ((attrs & win.FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    entries[count].file_type = cast(i64, DT_DIR);
+                } else {
+                    entries[count].file_type = cast(i64, DT_REG);
+                }
+                count = count + 1;
+            }
+            if (win.FindNextFileA(h, &fdata) == 0) { break; }
+        }
+        win.FindClose(h);
+        return count;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Count entries in a directory (excluding . and ..)
+fn count_dir_entries(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        let is [4096]u8 as buf;
+        let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
+        if (fd < 0) { return cast(i32, 0 - 1); }
+        let is i32 as count with mut = 0;
+        while (1 == 1) {
+            let is i64 as nread = linux.getdents64(fd, &buf, 4096);
+            if (nread <= 0) { break; }
+            let is i64 as pos with mut = 0;
+            while (pos < nread) {
+                let is *u8 as entry_ptr = cast(*u8, cast(i64, &buf) + pos);
+                let is *u8 as reclen_ptr = cast(*u8, cast(i64, entry_ptr) + 16);
+                let is i64 as reclen = cast(i64, reclen_ptr[0]) + cast(i64, reclen_ptr[1]) * 256;
+                let is *u8 as name = cast(*u8, cast(i64, entry_ptr) + 19);
+                let is i64 as skip with mut = 0;
+                if (name[0] == 46 && name[1] == 0) { skip = 1; }
+                if (name[0] == 46 && name[1] == 46 && name[2] == 0) { skip = 1; }
+                if (skip == 0) { count = count + 1; }
+                pos = pos + reclen;
+            }
+        }
+        _close_fd(fd);
+        return count;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        let is *u8 as pat = _win_dir_pattern(path);
+        let is [320]u8 as fdata;
+        let is i64 as h = win.FindFirstFileA(pat, &fdata);
+        _free(pat);
+        if (h == cast(i64, 0 - 1)) { return cast(i32, 0 - 1); }
+        let is i32 as count with mut = 0;
+        while (1 == 1) {
+            let is *u8 as name = cast(*u8, cast(i64, &fdata) + 44);
+            let is i64 as skip with mut = 0;
+            if (name[0] == 46 && name[1] == 0) { skip = 1; }
+            if (name[0] == 46 && name[1] == 46 && name[2] == 0) { skip = 1; }
+            if (skip == 0) { count = count + 1; }
+            if (win.FindNextFileA(h, &fdata) == 0) { break; }
+        }
+        win.FindClose(h);
+        return count;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Check if path is a directory.
+fn is_dir(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
+        if (fd < 0) { return 0; }
+        _close_fd(fd);
+        return 1;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        let is u32 as a = win.GetFileAttributesA(path);
+        if (a == win.INVALID_FILE_ATTRIBUTES) { return 0; }
+        if ((a & win.FILE_ATTRIBUTE_DIRECTORY) != 0) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// Get current working directory.
+fn get_cwd(buf as *u8, size as i64) as i64 {
+    if (os.current() == os.OS_LINUX) { return linux.getcwd(buf, size); }
+    if (os.current() == os.OS_WINDOWS) {
+        let is u32 as n = win.GetCurrentDirectoryA(cast(u32, size), buf);
+        if (n == 0) { return 0 - 1; }
+        return cast(i64, n);
+    }
+    return 0 - 1;
+}

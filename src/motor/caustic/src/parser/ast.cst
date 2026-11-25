@@ -1,0 +1,590 @@
+use "../../std/mem.cst" as mem;
+use "../../std/mem/bins.cst" as bins;
+use "../ir/opt_mem.cst" as om;
+
+fn ast_alloc(size as i64) as *u8 { return om.opt_alloc(size); }
+
+// Transient node arena: function-body AST nodes are dead once their IR has been
+// generated (codegen works from the IR; at -O1 the IR is kept resident so the
+// body AST is never re-read), so a BUMP allocator freed WHOLESALE by
+// destroy_transient_nodes() after IR-gen is the right tool — exact 8-aligned
+// size per node, no bins slab-class rounding (~100B/node saved). It is a CHAIN of
+// mmap'd chunks grown ON DEMAND (8MB each) instead of one giant fixed
+// reservation: "allocate only what we use" — virtual size tracks the nodes
+// actually allocated (matters on a strict reserve/commit OS like CausticOS; on
+// Linux mmap is lazy either way). Types (new_type) and everything outside a
+// function body (globals, decls, params) stay in opt_bins and survive — codegen
+// still needs them. Destroy is skipped on PE builds (they walk the body AST for
+// .cstlocals). Chunk header: [next:8][top:8][cap:8][committed:8][data...].
+//
+// A chunk's 8MB is RESERVED, and committed _NC_STEP at a time as the bump
+// pointer reaches it (committed counts from the chunk base). On CausticOS a
+// commit is real RAM — there is no demand paging — so a chunk committed whole
+// meant a 388-byte file needed 8MB free for its syntax tree alone; on a 64MB
+// machine that failed, and the failure was a header written through the -1 a
+// failed mmap returns. On Linux and Windows reserve is the same lazy mapping as
+// before and commit is a no-op. Running out is mem.core.oom: said, and exit 1.
+let is *u8 as _nc_head with mut = cast(*u8, 0);   // first chunk (for freeing)
+let is *u8 as _nc_cur  with mut = cast(*u8, 0);   // current chunk (for alloc)
+let is i32 as _node_t_active with mut = 0;
+let is i64 as _NC_CHUNK with imut = 8388608;      // 8MB per chunk
+let is i64 as _NC_HDR   with imut = 32;
+let is i64 as _NC_STEP  with imut = 65536;       // commit granularity
+
+// Streaming build: each function goes from syntax tree to IR before the next is read.
+let is i32 as stream_active with mut = 0;
+
+fn node_transient_begin() as void { _node_t_active = 1; }
+fn node_transient_end() as void { _node_t_active = 0; }
+
+fn _nc_new(min as i64) as *u8 {
+    let is i64 as cap with mut = _NC_CHUNK;
+    if (cap < min) { cap = min; }
+    let is i64 as total = cap + _NC_HDR;
+    let is *u8 as c = mem.core.reserve_anon(total);
+    if (cast(i64, c) == 0 || cast(i64, c) == 0 - 1) { mem.core.oom("the syntax tree", total); }
+    let is i64 as first = _nc_round(_NC_HDR + min, total);
+    if (mem.core.commit_anon(c, first) != cast(i32, 0)) { mem.core.oom("the syntax tree", first); }
+    *cast(*i64, c) = 0;                            // next
+    *cast(*i64, cast(i64, c) + 8) = 0;            // top
+    *cast(*i64, cast(i64, c) + 16) = cap;         // cap
+    *cast(*i64, cast(i64, c) + 24) = first;       // committed
+    return c;
+}
+
+// `end` rounded up to the commit step, never past the chunk's `total`.
+fn _nc_round(end as i64, total as i64) as i64 {
+    let is i64 as r with mut = (end + (_NC_STEP - 1)) & (0 - _NC_STEP);
+    if (r > total) { r = total; }
+    return r;
+}
+
+// Back the chunk through `end` (bytes from its base) before handing it out.
+fn _nc_commit_to(c as *u8, end as i64) as void {
+    let is i64 as committed = *cast(*i64, cast(i64, c) + 24);
+    if (end <= committed) { return; }
+    let is i64 as total = *cast(*i64, cast(i64, c) + 16) + _NC_HDR;
+    let is i64 as newc = _nc_round(end, total);
+    if (mem.core.commit_anon(cast(*u8, cast(i64, c) + committed), newc - committed) != cast(i32, 0)) {
+        mem.core.oom("the syntax tree", newc - committed);
+    }
+    *cast(*i64, cast(i64, c) + 24) = newc;
+}
+
+// Back to empty, keeping the first chunk: nodes of the next function land on the same
+// pages. A streaming build calls this once per function, so the syntax tree of the
+// largest function is all that is ever resident.
+fn reset_transient_nodes() as void {
+    if (cast(i64, _nc_head) == 0) { return; }
+    let is *u8 as c with mut = cast(*u8, *cast(*i64, _nc_head));
+    while (cast(i64, c) != 0) {
+        let is *u8 as nxt = cast(*u8, *cast(*i64, c));
+        let is i64 as cap = *cast(*i64, cast(i64, c) + 16);
+        mem.core.munmap(c, cap + _NC_HDR);
+        c = nxt;
+    }
+    *cast(*i64, _nc_head) = 0;
+    *cast(*i64, cast(i64, _nc_head) + 8) = 0;
+    _nc_cur = _nc_head;
+}
+
+fn destroy_transient_nodes() as void {
+    let is *u8 as c with mut = _nc_head;
+    while (cast(i64, c) != 0) {
+        let is *u8 as nxt = cast(*u8, *cast(*i64, c));
+        let is i64 as cap = *cast(*i64, cast(i64, c) + 16);
+        mem.core.munmap(c, cap + _NC_HDR);
+        c = nxt;
+    }
+    _nc_head = cast(*u8, 0);
+    _nc_cur = cast(*u8, 0);
+    _node_t_active = 0;
+}
+
+// === Node kinds ===
+let is i32 as NK_NUM       with imut = 0;
+let is i32 as NK_IDENT     with imut = 1;
+let is i32 as NK_STRING    with imut = 2;
+let is i32 as NK_ADD       with imut = 3;
+let is i32 as NK_SUB       with imut = 4;
+let is i32 as NK_MUL       with imut = 5;
+let is i32 as NK_DIV       with imut = 6;
+let is i32 as NK_MOD       with imut = 7;
+let is i32 as NK_EQ        with imut = 8;
+let is i32 as NK_NE        with imut = 9;
+let is i32 as NK_LT        with imut = 10;
+let is i32 as NK_LE        with imut = 11;
+let is i32 as NK_GT        with imut = 12;
+let is i32 as NK_GE        with imut = 13;
+let is i32 as NK_ASSIGN    with imut = 14;
+let is i32 as NK_EXPR_STMT with imut = 15;
+let is i32 as NK_RETURN    with imut = 16;
+let is i32 as NK_FN        with imut = 17;
+let is i32 as NK_FNCALL    with imut = 18;
+let is i32 as NK_BLOCK     with imut = 19;
+let is i32 as NK_LET       with imut = 20;
+let is i32 as NK_IF        with imut = 21;
+let is i32 as NK_ASM       with imut = 22;
+let is i32 as NK_WHILE     with imut = 23;
+let is i32 as NK_CAST      with imut = 24;
+let is i32 as NK_ADDR      with imut = 25;
+let is i32 as NK_DEREF     with imut = 26;
+let is i32 as NK_INDEX     with imut = 27;
+let is i32 as NK_SYSCALL   with imut = 28;
+let is i32 as NK_MEMBER    with imut = 29;
+let is i32 as NK_LAND      with imut = 30;
+let is i32 as NK_LOR       with imut = 31;
+let is i32 as NK_BREAK     with imut = 32;
+let is i32 as NK_CONTINUE  with imut = 33;
+let is i32 as NK_SHL       with imut = 34;
+let is i32 as NK_SHR       with imut = 35;
+let is i32 as NK_BAND      with imut = 36;
+let is i32 as NK_BOR       with imut = 37;
+let is i32 as NK_SIZEOF    with imut = 38;
+let is i32 as NK_USE       with imut = 39;
+let is i32 as NK_FOR       with imut = 40;
+let is i32 as NK_DO_WHILE  with imut = 41;
+let is i32 as NK_BXOR      with imut = 42;
+let is i32 as NK_BNOT      with imut = 43;
+let is i32 as NK_LNOT      with imut = 44;
+let is i32 as NK_NEG       with imut = 45;
+let is i32 as NK_ENUM_LIT  with imut = 46;
+let is i32 as NK_MATCH     with imut = 47;
+let is i32 as NK_DEFER     with imut = 48;
+let is i32 as NK_FN_PTR    with imut = 49;
+let is i32 as NK_VA_START  with imut = 50;
+let is i32 as NK_TYPE_ALIAS with imut = 51;
+let is i32 as NK_CALL_INDIRECT with imut = 52;
+let is i32 as NK_STRUCT_LIT with imut = 53;
+let is i32 as NK_STRUCT_FIELD with imut = 54;
+let is i32 as NK_SQRT      with imut = 55;
+// __builtin_mulhi_u64(a, b) — the high 64 bits of an unsigned 64x64
+// product. One instruction on x86 (mul), and without it every bignum,
+// Poly1305, GHASH and X25519 has to be written in 32-bit limbs.
+let is i32 as NK_MULHI     with imut = 57;
+let is i32 as NK_ATOMIC    with imut = 56;  // atomic builtin; sub-kind in node.val
+
+// === Atomic sub-kinds (stored in NK_ATOMIC node.val) ===
+let is i32 as ATOMIC_LOAD  with imut = 0;  // atomic_load(ptr) -> *ptr
+let is i32 as ATOMIC_STORE with imut = 1;  // atomic_store(ptr, v) -> void
+let is i32 as ATOMIC_ADD   with imut = 2;  // atomic_add(ptr, v) -> old
+let is i32 as ATOMIC_XCHG  with imut = 3;  // atomic_xchg(ptr, v) -> old
+let is i32 as ATOMIC_CAS   with imut = 4;  // atomic_cas(ptr, expected, desired) -> old
+let is i32 as ATOMIC_FENCE with imut = 5;  // fence() -> void
+
+// === Var flags ===
+let is i32 as VF_NONE with imut = 0;
+let is i32 as VF_MUT  with imut = 1;
+let is i32 as VF_IMUT with imut = 2;
+
+// === Type kinds ===
+let is i32 as TY_VOID   with imut = 0;
+let is i32 as TY_I8     with imut = 1;
+let is i32 as TY_I16    with imut = 2;
+let is i32 as TY_I32    with imut = 3;
+let is i32 as TY_I64    with imut = 4;
+let is i32 as TY_U8     with imut = 5;
+let is i32 as TY_U16    with imut = 6;
+let is i32 as TY_U32    with imut = 7;
+let is i32 as TY_U64    with imut = 8;
+let is i32 as TY_F32    with imut = 9;
+let is i32 as TY_F64    with imut = 10;
+let is i32 as TY_BOOL   with imut = 11;
+let is i32 as TY_CHAR   with imut = 12;
+let is i32 as TY_STRING with imut = 13;
+let is i32 as TY_PTR    with imut = 14;
+let is i32 as TY_ARRAY  with imut = 15;
+let is i32 as TY_STRUCT with imut = 16;
+let is i32 as TY_ENUM   with imut = 17;
+let is i32 as TY_FN     with imut = 18;
+
+// An array whose length was written as the name of a constant rather than as a
+// literal — `[MAX]u8`. The parser has no symbol table, so it parks the length
+// here and stashes the constant's name in name_ptr/name_len, which an array
+// otherwise does not use. semantic/types.cst resolve_type_ref folds it.
+//
+// The marker has to be a value no real length can hold, because the failure it
+// exists to prevent is a length of ZERO passing for a real one: a zero-sized
+// array declares a zero-sized slot, and every write through it lands on
+// whatever the allocator put next.
+let is i32 as ARRAY_LEN_PENDING with imut = cast(i32, 0 - 1);
+
+// === Type struct ===
+struct Type {
+    kind as i32;
+    base as *Type;
+    array_len as i32;
+    name_ptr as *u8;
+    name_len as i32;
+    size as i32;
+    // semantic: struct/enum fields (linked list of *Node, cast from *u8)
+    fields as *u8;
+    field_count as i32;
+    variant_count as i32;
+    // generic info on Type
+    gen_params as *u8;
+    gen_param_count as i32;
+    gen_args as *u8;
+    gen_arg_count as i32;
+    payload_offset as i32;
+    max_payload as i32;
+    base_name_ptr as *u8;
+    base_name_len as i32;
+    // The module prefix this type was resolved out of, when it was named
+    // through one (`sub.Coisa`). A type keeps its SOURCE spelling, which only
+    // resolves in a scope where that alias is bound — so a value whose type
+    // came through a re-exporting hub could not find its own methods unless
+    // the consumer also imported the module underneath. This is the owner, in
+    // the form method symbols are actually declared under. Set by
+    // resolve_type_ref and carried along by the alias copy, which is what makes
+    // it survive a re-export.
+    owner_prefix_ptr as *u8;
+    owner_prefix_len as i32;
+}
+
+// Side-struct for rare declaration-only Node fields. Only NK_FN / NK_USE / impl
+// / sectioned-decl nodes ever set these; the ~184K function-body expr/stmt nodes
+// leave Node.extra null and so carry 8B instead of these 32B. Lazily allocated
+// (node_ensure_extra) in opt_bins, where the decl nodes that own it also live.
+struct Node_Extra {
+    impl_ptr as *u8;          // extern/impl method DLL or type name
+    impl_len as i16;
+    only_names as *u8;        // `use ... only a, b`
+    only_count as i16;
+    section_ptr as *u8;       // `with section(".name")`
+    section_len as i16;
+    is_imut as i8;            // `with imut` function
+    is_ginst as i8;           // NK_FN that is a generic instance clone
+    is_noinline as i8;        // `with noinline` function: every call stays a call
+    is_naked as i8;           // `with naked` function: no prologue/epilogue, asm-only body
+    lazy_tok as i32;          // token of a body not parsed yet (0 = parsed)
+    walked as i8;             // semantic analysis has seen this function
+    ir_func as *u8;           // its IR, already generated (streaming build)
+}
+
+// === Node struct ===
+struct Node {
+    // Low-cardinality fields are narrowed (i32->i16/i8) to shrink the node: at
+    // ~249K live nodes in the self-host build, every byte trimmed is ~0.25MB off
+    // the AST. Storage only — reads widen back to i32 and the AST cache
+    // (cache_read/write) serializes by VALUE (write_i32) so the format is
+    // unchanged. Fields that can legitimately hold large values
+    // (name_len: string-literal bytes; tok_idx; var_offset; stack_size; val)
+    // stay i32/i64.
+    kind as i32;
+    next as *Node;
+    ty as *Type;
+    tok_idx as i32;
+    // binary / unary
+    lhs as *Node;
+    rhs as *Node;
+    val as i64;
+    fval as f64;
+    // expression / statement
+    expr as *Node;
+    init_expr as *Node;
+    // name (zero-copy from source)
+    name_ptr as *u8;
+    name_len as i32;
+    member_ptr as *u8;
+    member_len as i16;
+    return_type as *Type;
+    flags as i8;              // VF_NONE/MUT/IMUT (0-2)
+    // function
+    body as *Node;
+    params as *Node;
+    is_variadic as i8;
+    is_extern as i8;
+    // call
+    args as *Node;
+    // generics (packed arrays)
+    generic_params as *u8;
+    generic_param_count as i16;
+    generic_args as *u8;
+    generic_arg_count as i16;
+    // block
+    stmts as *Node;
+    // control flow (shared: if/while/for/do_while/match)
+    cond as *Node;
+    then_b as *Node;
+    else_b as *Node;
+    for_init as *Node;
+    for_step as *Node;
+    // match
+    match_type as *Type;
+    cases as *Node;
+    // enum literal
+    discriminant as i16;
+    payload_args as *Node;
+    // semantic phase
+    var_offset as i32;
+    stack_size as i32;
+    is_global as i8;
+    is_string_const as i8;
+    asm_name_ptr as *u8;
+    asm_name_len as i16;
+    // Rare declaration-only fields (impl/extern name, `use only`, `with section`,
+    // `with imut`, generic-instance flag) moved to a lazily-allocated side-struct
+    // so body nodes don't carry 32B of dead fields. Use the ast.nx_* getters
+    // (null-safe, default 0) and node_ensure_extra() before a set.
+    extra as *Node_Extra;
+}
+
+// === Bitcast helper: f64 <-> i64 via stack buffer ===
+
+// An NK_IDENT's is_string_const when it names a `with imut` float literal: val
+// holds the bits, and a read of it is that constant, not a load.
+let is i8 as IDENT_FLOAT_CONST with imut = 2;
+// An `extern let` and the NK_IDENTs naming it: defined in another object, so an
+// access takes its address first (a 64-bit `mov r64, [rip+g]` on an undefined g
+// is the assembler's GOT load).
+let is i8 as IDENT_EXTERN_VAR with imut = 3;
+
+fn f64_to_i64(val as f64) as i64 {
+    let is [8]u8 as buf;
+    let is *f64 as fp = cast(*f64, &buf);
+    *fp = val;
+    let is *i64 as ip = cast(*i64, &buf);
+    return *ip;
+}
+
+fn i64_to_f64(bits as i64) as f64 { return *cast(*f64, &bits); }
+
+fn round_f32(value as f64) as f64 { return cast(f64, cast(f32, value)); }
+
+fn f32_bits(value as f64) as i64 {
+    let is f32 as narrowed = cast(f32, value);
+    return cast(i64, *cast(*u32, &narrowed));
+}
+
+// Round the integer significand directly, not through f64: the latter
+// loses the sticky bit at large binary32 halfway boundaries during bootstrap.
+fn integer_to_f32(value as i64, signed as i32) as f64 {
+    let is u64 as magnitude with mut = cast(u64, value);
+    let is i64 as sign with mut = 0;
+    if (signed == 1 && value < 0) { sign = 0x80000000; magnitude = cast(u64, 0 - value); }
+    if (magnitude == cast(u64, 0)) { return 0.0; }
+    let is u64 as probe with mut = magnitude;
+    let is i32 as exponent with mut = 0;
+    while (probe > cast(u64, 1)) { probe = probe >> 1; exponent = exponent + 1; }
+    let is u64 as significand with mut = magnitude;
+    if (exponent <= 23) { significand = magnitude << (23 - exponent); }
+    else {
+        let is i32 as shift = exponent - 23;
+        significand = magnitude >> shift;
+        let is u64 as remainder = magnitude & ((cast(u64, 1) << shift) - cast(u64, 1));
+        let is u64 as halfway = cast(u64, 1) << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (significand & cast(u64, 1)) != cast(u64, 0))) {
+            significand = significand + cast(u64, 1);
+        }
+        if (significand == (cast(u64, 1) << 24)) { significand = significand >> 1; exponent = exponent + 1; }
+    }
+    let is i64 as bits = sign | (cast(i64, exponent + 127) << 23) | cast(i64, significand & cast(u64, 0x7fffff));
+    return cast(f64, *cast(*f32, &bits));
+}
+
+fn integer_to_f64(value as i64, signed as i32) as f64 {
+    if (signed == 1 || value >= 0) { return cast(f64, value); }
+    let is i64 as half = cast(i64, (cast(u64, value) >> 1) | (cast(u64, value) & cast(u64, 1)));
+    return cast(f64, half) * 2.0;
+}
+
+// === Singleton types ===
+let is *Type as type_void   with mut;
+let is *Type as type_i8     with mut;
+let is *Type as type_i16    with mut;
+let is *Type as type_i32    with mut;
+let is *Type as type_i64    with mut;
+let is *Type as type_u8     with mut;
+let is *Type as type_u16    with mut;
+let is *Type as type_u32    with mut;
+let is *Type as type_u64    with mut;
+let is *Type as type_f32    with mut;
+let is *Type as type_f64    with mut;
+let is *Type as type_bool   with mut;
+let is *Type as type_char   with mut;
+let is *Type as type_string with mut;
+
+// === Constructors ===
+
+fn memzero(p as *u8, n as i64) as void {
+    let is i64 as words = n / 8;
+    let is *i64 as wp = cast(*i64, p);
+    let is i64 as i with mut = 0;
+    while (i < words) {
+        let is *i64 as dst = cast(*i64, cast(i64, wp) + i * 8);
+        *dst = 0;
+        i = i + 1;
+    }
+    i = words * 8;
+    while (i < n) {
+        p[i] = cast(u8, 0);
+        i = i + 1;
+    }
+}
+
+fn new_type(kind as i32) as *Type {
+    let is *Type as t = cast(*Type, om.perm_alloc(sizeof(Type)));
+    memzero(cast(*u8, t), sizeof(Type));
+    t.kind = kind;
+    return t;
+}
+
+// Raw Node allocation (uninitialized): from the transient bump arena while
+// `_node_t_active` is set (function-body parsing AND generic-instance cloning —
+// both are body nodes freed wholesale after IR-gen), else from opt_bins. Callers
+// that overwrite the whole node (clone via memcpy) use this directly; new_node
+// zeroes + sets kind on top.
+fn node_alloc_raw() as *Node {
+    if (_node_t_active == 1) {
+        let is i64 as need = (sizeof(Node) + 7) & (0 - 8);   // 8-aligned
+        if (cast(i64, _nc_cur) != 0) {
+            let is i64 as top = *cast(*i64, cast(i64, _nc_cur) + 8);
+            let is i64 as cap = *cast(*i64, cast(i64, _nc_cur) + 16);
+            if (top + need <= cap) {
+                _nc_commit_to(_nc_cur, _NC_HDR + top + need);
+                let is *u8 as p = cast(*u8, cast(i64, _nc_cur) + _NC_HDR + top);
+                *cast(*i64, cast(i64, _nc_cur) + 8) = top + need;
+                return cast(*Node, p);
+            }
+        }
+        // current chunk full (or none yet): grow by one chunk
+        let is *u8 as c = _nc_new(need);
+        if (cast(i64, _nc_head) == 0) { _nc_head = c; }
+        else { *cast(*i64, _nc_cur) = cast(i64, c); }         // prev.next = c
+        _nc_cur = c;
+        *cast(*i64, cast(i64, c) + 8) = need;                 // top = need
+        return cast(*Node, cast(i64, c) + _NC_HDR);
+    }
+    return cast(*Node, om.perm_alloc(sizeof(Node)));
+}
+
+fn new_node(kind as i32) as *Node {
+    let is *Node as n = node_alloc_raw();
+    memzero(cast(*u8, n), sizeof(Node));
+    n.kind = kind;
+    return n;
+}
+
+// --- Node_Extra accessors ---
+// Lazily allocate the side-struct (in opt_bins; decl nodes that own it survive
+// through codegen). Setters do `node_ensure_extra(n).field = v`; getters are
+// null-safe and return the zero default body nodes would have had inline.
+fn node_ensure_extra(n as *Node) as *Node_Extra {
+    if (cast(i64, n.extra) == 0) {
+        let is *Node_Extra as e = cast(*Node_Extra, om.perm_alloc(sizeof(Node_Extra)));
+        memzero(cast(*u8, e), sizeof(Node_Extra));
+        n.extra = e;
+    }
+    return n.extra;
+}
+fn nx_lazy_tok(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return n.extra.lazy_tok; }
+fn nx_walked(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.walked); }
+fn nx_ir_func(n as *Node) as *u8 { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.ir_func; }
+fn nx_impl_ptr(n as *Node) as *u8    { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.impl_ptr; }
+fn nx_impl_len(n as *Node) as i32    { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.impl_len); }
+fn nx_only_names(n as *Node) as *u8  { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.only_names; }
+fn nx_only_count(n as *Node) as i32  { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.only_count); }
+fn nx_section_ptr(n as *Node) as *u8 { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.section_ptr; }
+fn nx_section_len(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.section_len); }
+fn nx_is_imut(n as *Node) as i32     { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.is_imut); }
+fn nx_is_ginst(n as *Node) as i32    { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.is_ginst); }
+fn nx_is_noinline(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.is_noinline); }
+fn nx_is_naked(n as *Node) as i32    { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.is_naked); }
+
+fn make_type_sized(kind as i32, size as i32) as *Type {
+    let is *Type as t = new_type(kind);
+    t.size = size;
+    return t;
+}
+
+fn types_init() as void {
+    type_void   = make_type_sized(TY_VOID, 0);
+    type_i8     = make_type_sized(TY_I8, 1);
+    type_i16    = make_type_sized(TY_I16, 2);
+    type_i32    = make_type_sized(TY_I32, 4);
+    type_i64    = make_type_sized(TY_I64, 8);
+    type_u8     = make_type_sized(TY_U8, 1);
+    type_u16    = make_type_sized(TY_U16, 2);
+    type_u32    = make_type_sized(TY_U32, 4);
+    type_u64    = make_type_sized(TY_U64, 8);
+    type_f32    = make_type_sized(TY_F32, 4);
+    type_f64    = make_type_sized(TY_F64, 8);
+    type_bool   = make_type_sized(TY_BOOL, 1);
+    type_char   = make_type_sized(TY_CHAR, 1);
+    type_string = make_type_sized(TY_STRING, 8);
+}
+
+// Map a Type to the canonical primitive singleton when its kind is a
+// primitive (0..13). The type system compares primitives by pointer
+// identity (e.g. `rt != type_void`), so a fresh copy — such as one rebuilt
+// by the AST cache deserializer — must be folded back to the singleton or
+// those comparisons spuriously fail. Non-primitive types are returned as-is.
+fn canon_type(t as *Type) as *Type {
+    if (cast(i64, t) == 0) { return t; }
+    let is i32 as k = t.kind;
+    if (k == TY_VOID)   { return type_void; }
+    if (k == TY_I8)     { return type_i8; }
+    if (k == TY_I16)    { return type_i16; }
+    if (k == TY_I32)    { return type_i32; }
+    if (k == TY_I64)    { return type_i64; }
+    if (k == TY_U8)     { return type_u8; }
+    if (k == TY_U16)    { return type_u16; }
+    if (k == TY_U32)    { return type_u32; }
+    if (k == TY_U64)    { return type_u64; }
+    if (k == TY_F32)    { return type_f32; }
+    if (k == TY_F64)    { return type_f64; }
+    if (k == TY_BOOL)   { return type_bool; }
+    if (k == TY_CHAR)   { return type_char; }
+    if (k == TY_STRING) { return type_string; }
+    return t;
+}
+
+// === Generic param helpers ===
+// generic_params: packed array of {*u8 ptr, i32 len} = 12 bytes each
+// generic_args: packed array of *Type = 8 bytes each
+
+fn gp_alloc(count as i32) as *u8 {
+    return ast_alloc(cast(i64, count) * 12);
+}
+
+fn gp_set(buf as *u8, idx as i32, ptr as *u8, len as i32) as void {
+    let is i64 as off = cast(i64, idx) * 12;
+    let is *i64 as p = cast(*i64, cast(i64, buf) + off);
+    *p = cast(i64, ptr);
+    let is *i32 as l = cast(*i32, cast(i64, buf) + off + 8);
+    *l = len;
+}
+
+fn gp_ptr(buf as *u8, idx as i32) as *u8 {
+    let is i64 as off = cast(i64, idx) * 12;
+    let is *i64 as p = cast(*i64, cast(i64, buf) + off);
+    return cast(*u8, *p);
+}
+
+fn gp_len(buf as *u8, idx as i32) as i32 {
+    let is i64 as off = cast(i64, idx) * 12 + 8;
+    let is *i32 as l = cast(*i32, cast(i64, buf) + off);
+    return *l;
+}
+
+fn ga_alloc(count as i32) as *u8 {
+    return ast_alloc(cast(i64, count) * 8);
+}
+
+fn ga_set(buf as *u8, idx as i32, t as *Type) as void {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + cast(i64, idx) * 8);
+    *p = cast(i64, t);
+}
+
+fn ga_get(buf as *u8, idx as i32) as *Type {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + cast(i64, idx) * 8);
+    return cast(*Type, *p);
+}
+
+fn clone_node(n as *Node) as *Node {
+    let is *Node as c = cast(*Node, om.perm_alloc(sizeof(Node)));
+    mem.memcpy(cast(*u8, c), cast(*u8, n), sizeof(Node));
+    c.next = cast(*Node, 0);
+    return c;
+}

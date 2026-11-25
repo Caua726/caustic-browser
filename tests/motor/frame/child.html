@@ -1,0 +1,7 @@
+<!DOCTYPE html><html><head><title>child</title><style>body{margin:0;background:#cfe}</style></head><body><p id="t">child</p>
+<script>
+addEventListener('message',function(e){
+  if(e.data&&e.data.echo!==undefined)e.source.postMessage({back:e.data.echo,from:e.origin},e.origin);
+});
+parent.postMessage({hello:1,top:top===parent,self:window===self,par:parent!==window,len:window.length,fe:window.frameElement,org:location.origin,ua:navigator.userAgent.indexOf('Mozilla/5.0')===0},'*');
+</script></body></html>

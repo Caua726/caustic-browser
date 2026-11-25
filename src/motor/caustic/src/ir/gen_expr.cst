@@ -1,0 +1,1379 @@
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../semantic/scope.cst" as sc;
+use "../semantic/defs.cst" as sd;
+use "defs.cst" as d;
+use "gen.cst" as g;
+use "../codegen/target.cst" as tgt;
+use "../nest.cst" as nest;
+
+fn emit_deferred_calls() as void {
+    let is i32 as i with mut = g.defer_count - 1;
+    while (i >= 0) {
+        let is *ast.Node as nd = cast(*ast.Node, g.get_defer(i));
+        gen_expr(nd);
+        i = i - 1;
+    }
+}
+
+// Emit defers added since `target` (in reverse, LIFO). Used by control-flow
+// constructs to run defers at the end of a block scope before popping them.
+fn emit_deferred_calls_to(target as i32) as void {
+    let is i32 as i with mut = g.defer_count - 1;
+    while (i >= target) {
+        let is *ast.Node as nd = cast(*ast.Node, g.get_defer(i));
+        gen_expr(nd);
+        i = i - 1;
+    }
+}
+
+fn gen_addr(node as *ast.Node) as i32 {
+    let is i32 as k = node.kind;
+    let is i32 as line = g.tok_line(node.tok_idx);
+
+    if (k == ast.NK_IDENT) {
+        let is i32 as dest = g.new_vreg();
+        if (node.is_global == 1) {
+            let is *d.IRInst as i = d.new_inst(d.IR_ADDR_GLOBAL);
+            i.dest = d.op_vreg(dest);
+            if (node.asm_name_len > 0) {
+                i.global_name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+                i.global_name_len = node.asm_name_len;
+            } else {
+                i.global_name_ptr = d.str_dup(node.name_ptr, node.name_len);
+                i.global_name_len = cast(i16, node.name_len);
+            }
+            i.is_extern_global = node.is_extern;
+            if (node.is_string_const == ast.IDENT_EXTERN_VAR) { i.is_extern_global = cast(i8, 2); }
+            i.line = line;
+            g.emit(i);
+        } else {
+            let is *d.IRInst as i = d.new_inst(d.IR_ADDR);
+            i.dest = d.op_vreg(dest);
+            i.src1 = d.op_imm(cast(i64, node.var_offset));
+            i.line = line;
+            g.emit(i);
+        }
+        return dest;
+    }
+
+    if (k == ast.NK_DEREF) {
+        return gen_expr(node.expr);
+    }
+
+    if (k == ast.NK_INDEX) {
+        let is *ast.Type as lty = node.lhs.ty;
+        let is i32 as base with mut;
+        if (lty.kind == ast.TY_PTR) {
+            base = gen_expr(node.lhs);
+        } else {
+            base = gen_addr(node.lhs);
+        }
+        let is i32 as index = gen_expr(node.rhs);
+        let is *ast.Type as ety = node.ty;
+        let is i32 as sz = ety.size;
+        let is i32 as off_reg with mut;
+        if (sz == 1) { off_reg = index; }
+        else if (sz == 2) { off_reg = g.emit_binary(d.IR_SHL, index, g.emit_imm(1, line), line); }
+        else if (sz == 4) { off_reg = g.emit_binary(d.IR_SHL, index, g.emit_imm(2, line), line); }
+        else if (sz == 8) { off_reg = g.emit_binary(d.IR_SHL, index, g.emit_imm(3, line), line); }
+        else { off_reg = g.emit_binary(d.IR_MUL, index, g.emit_imm(cast(i64, sz), line), line); }
+        return g.emit_binary(d.IR_ADD, base, off_reg, line);
+    }
+
+    if (k == ast.NK_MEMBER) {
+        let is *ast.Type as lty = node.lhs.ty;
+        let is i32 as base with mut;
+        if (lty.kind == ast.TY_PTR) {
+            base = gen_expr(node.lhs);
+        } else {
+            base = gen_addr(node.lhs);
+        }
+        if (node.var_offset == 0) { return base; }
+        let is i32 as off_reg = g.emit_imm(cast(i64, node.var_offset), line);
+        return g.emit_binary(d.IR_ADD, base, off_reg, line);
+    }
+
+    if (k == ast.NK_FNCALL || k == ast.NK_CALL_INDIRECT) {
+        // A call result is an rvalue with no home of its own, so `f().field`
+        // and `f()[i]` had nothing to take the address of and landed here.
+        // Give it one.
+        //
+        // A return larger than 8 bytes already travels through a slot the
+        // caller allocated, and gen_fncall hands back that slot's address —
+        // nothing more to do. A smaller one arrives in a register, so it gets
+        // spilled to a fresh slot. Either way the storage lives in the current
+        // frame, which outlives every use of the expression it came from.
+        let is i32 as val = gen_expr(node);
+        let is *ast.Type as rty = node.ty;
+        if (rty.size > 8) { return val; }
+
+        g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + rty.size;
+        if (g.ctx_func.alloc_stack_size % 16 != 0) {
+            g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + 16 - (g.ctx_func.alloc_stack_size % 16);
+        }
+        let is i32 as offset = g.ctx_func.alloc_stack_size;
+        let is i32 as slot = g.new_vreg();
+        let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+        ga.dest = d.op_vreg(slot);
+        ga.src1 = d.op_imm(cast(i64, offset));
+        ga.line = line;
+        g.emit(ga);
+
+        let is *d.IRInst as st = d.new_inst(d.IR_STORE);
+        st.dest = d.op_vreg(slot);
+        st.src1 = d.op_vreg(val);
+        st.cast_to = cast(*u8, rty);
+        st.line = line;
+        g.emit(st);
+        return slot;
+    }
+
+    io.write_str(io.STDERR, "ir: gen_addr: unsupported node kind\n");
+    io.exit(1);
+    return 0;
+}
+
+// === Extracted helpers for gen_expr ===
+
+fn emit_load_from_addr(addr as i32, ty_ptr as *u8, line as i32) as i32 {
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    if (ty.size > 8) { return addr; }
+    let is i32 as dest = g.new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_LOAD);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_vreg(addr);
+    i.cast_to = ty_ptr;
+    i.line = line;
+    g.emit(i);
+    return dest;
+}
+
+fn gen_cmp(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i32 {
+    // Const-fold for comparisons on integer literals — same family as the
+    // arithmetic folds above. Required for `if (os.current == os.OS_LINUX)`
+    // and similar parse-time-decidable conditions to feed the dead-branch
+    // elim in gen_stmt's NK_IF handler.
+    //
+    // Integer literals only: a float literal carries its value in fval and
+    // leaves val at zero, so comparing two of them here would compare 0 with
+    // 0 and answer every ordering question wrong.
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM
+        && g.is_float_kind(node.lhs.ty.kind) == 0
+        && g.is_float_kind(node.rhs.ty.kind) == 0) {
+        let is i64 as a = node.lhs.val;
+        let is i64 as b = node.rhs.val;
+        let is i64 as r with mut = 0;
+        if (op == d.IR_EQ) { if (a == b) { r = 1; } }
+        else if (op == d.IR_NE) { if (a != b) { r = 1; } }
+        else if (op == d.IR_LT) { if (a <  b) { r = 1; } }
+        else if (op == d.IR_LE) { if (a <= b) { r = 1; } }
+        else if (op == d.IR_GT) { if (a >  b) { r = 1; } }
+        else if (op == d.IR_GE) { if (a >= b) { r = 1; } }
+        return g.emit_imm(r, line);
+    }
+    let is i32 as lhs = gen_expr(node.lhs);
+    let is i32 as rhs = gen_expr(node.rhs);
+    let is i32 as r = g.emit_binary(op, lhs, rhs, line);
+    if (need_cast == 1) {
+        g.ctx_tail.cast_to = cast(*u8, node.lhs.ty);
+    }
+    return r;
+}
+
+// === x >= A && x <= B as one unsigned compare ===
+//
+// For an integer variable x of n bits and integer constants A <= B of its
+// type, x lies in [A, B] exactly when x - A, wrapped to n bits, is at most
+// B - A read as an unsigned n-bit number: below A the difference wraps to a
+// huge one. One subtraction and one compare in x's own width (so a widened
+// loop keeps its narrow lanes) instead of two compares and a branch. x > A
+// and x < B count as x >= A + 1 and x <= B - 1; the bounds come in either
+// order.
+
+// The bound a compare `x op N` puts on x: 1 lower (*v = the least x), 2 upper
+// (*v = the greatest), 0 none.
+fn _rf_bound(c as *ast.Node, v as *i64) as i32 {
+    let is i32 as k = c.kind;
+    if (k != ast.NK_GE && k != ast.NK_GT && k != ast.NK_LE && k != ast.NK_LT) { return 0; }
+    if (cast(i64, c.lhs) == 0 || cast(i64, c.rhs) == 0) { return 0; }
+    if (c.lhs.kind != ast.NK_IDENT || c.rhs.kind != ast.NK_NUM) { return 0; }
+    if (cast(i64, c.rhs.ty) == 0 || g.is_float_kind(c.rhs.ty.kind) == 1) { return 0; }
+    let is i64 as n = c.rhs.val;
+    if (n < 0 - 2147483647 || n > 2147483647) { return 0; }
+    if (k == ast.NK_GE) { *v = n; return 1; }
+    if (k == ast.NK_GT) { *v = n + 1; return 1; }
+    if (k == ast.NK_LE) { *v = n; return 2; }
+    *v = n - 1;
+    return 2;
+}
+
+fn _range_fold(node as *ast.Node, line as i32) as i32 {
+    let is *ast.Node as a = node.lhs;
+    let is *ast.Node as b = node.rhs;
+    if (cast(i64, a) == 0 || cast(i64, b) == 0) { return 0 - 1; }
+    let is i64 as va with mut = 0;
+    let is i64 as vb with mut = 0;
+    let is i32 as ka = _rf_bound(a, &va);
+    let is i32 as kb = _rf_bound(b, &vb);
+    if (ka == 0 || kb == 0 || ka == kb) { return 0 - 1; }
+    let is *ast.Node as x = a.lhs;
+    if (d.str_eq(x.name_ptr, x.name_len, b.lhs.name_ptr, b.lhs.name_len) == 0) { return 0 - 1; }
+    let is *ast.Type as t = x.ty;
+    if (cast(i64, t) == 0 || cast(i64, b.lhs.ty) != cast(i64, t)) { return 0 - 1; }
+    let is i32 as tk = t.kind;
+    // integers only (i8..i64, u8..u64, char)
+    if (!((tk >= 1 && tk <= 8) || tk == 12)) { return 0 - 1; }
+    let is i64 as lo with mut = va;
+    let is i64 as hi with mut = vb;
+    if (ka == 2) { lo = vb; hi = va; }
+    if (lo > hi) { return 0 - 1; }
+    // an unsigned x is never below 0
+    if ((tk >= 5 && tk <= 8) || tk == 12) { if (lo < 0) { return 0 - 1; } }
+    // the bounds must be values of x's type
+    let is i32 as sz = t.size;
+    let is *ast.Type as ut with mut = ast.type_u64;
+    if (sz == 1) { ut = ast.type_u8; } else if (sz == 2) { ut = ast.type_u16; } else if (sz == 4) { ut = ast.type_u32; }
+    else if (sz != 8) { return 0 - 1; }
+    if (sz < 8) {
+        let is i64 as bits = cast(i64, sz) * 8;
+        let is i64 as smin = 0 - (cast(i64, 1) << (bits - 1));
+        let is i64 as umax = (cast(i64, 1) << bits) - 1;
+        if (lo < smin || hi > umax) { return 0 - 1; }
+        if (tk >= 1 && tk <= 4 && hi >= (cast(i64, 1) << (bits - 1))) { return 0 - 1; }
+    }
+    let is i32 as xv = gen_expr(x);
+    let is i32 as xu with mut = xv;
+    if (cast(i64, ut) != cast(i64, t)) { xu = g.emit_cast_from(xv, cast(*u8, t), cast(*u8, ut), line); }
+    let is i32 as off = g.emit_imm(lo, line);
+    let is i32 as diff = g.emit_binary(d.IR_SUB, xu, off, line);
+    g.ctx_tail.cast_to = cast(*u8, ut);
+    let is i32 as span = g.emit_imm(hi - lo, line);
+    let is i32 as r = g.emit_binary(d.IR_LE, diff, span, line);
+    g.ctx_tail.cast_to = cast(*u8, ut);
+    return r;
+}
+
+fn gen_bitwise(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i32 {
+    let is i32 as lhs = gen_expr(node.lhs);
+    let is i32 as rhs = gen_expr(node.rhs);
+    let is i32 as r = g.emit_binary(op, lhs, rhs, line);
+    if (need_cast == 1) {
+        g.ctx_tail.cast_to = cast(*u8, node.ty);
+    }
+    return r;
+}
+
+// Any argument a float (one byte per argument)?
+fn _any_flt(is_flt as *u8, n as i32) as i32 {
+    let is i32 as j with mut = 0;
+    while (j < n) { if (is_flt[j] == cast(u8, 1)) { return 1; } j = j + 1; }
+    return 0;
+}
+
+// SET_ARGs of an x86_64 call with a float argument, System V places
+// (g.abi_codes): the stack ones last argument first (push order) after the
+// `sub rsp, 8` an odd count needs, then the registers. Returns the stack count.
+fn _emit_xmm_abi_args(arg_vregs as *u8, is_flt as *u8, n as i32, line as i32) as i32 {
+    let is *i32 as codes = cast(*i32, d.opt_alloc(cast(i64, n) * 4 + 8));
+    let is i32 as st = g.abi_codes(is_flt, n, codes);
+    if (st % 2 != 0) {
+        let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+        pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+        pa.asm_str_len = 10;
+        pa.line = line;
+        g.emit(pa);
+    }
+    let is i32 as j with mut = n - 1;
+    while (j >= 0) {
+        if (codes[j] >= 6 && codes[j] < 100) {
+            g.emit_set_arg_at(j, codes[j], *(cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4)), line);
+        }
+        j = j - 1;
+    }
+    j = 0;
+    while (j < n) {
+        if (codes[j] < 6 || codes[j] >= 100) {
+            g.emit_set_arg_at(j, codes[j], *(cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4)), line);
+        }
+        j = j + 1;
+    }
+    d.opt_free(cast(*u8, codes));
+    return st;
+}
+
+fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
+    let is i32 as arg_count with mut = 0;
+    let is *ast.Node as a with mut = node.args;
+    while (cast(i64, a) != 0) { arg_count = arg_count + 1; a = a.next; }
+
+    // SRET for large struct return
+    let is i32 as use_sret with mut = 0;
+    if (ty.size > 8) { use_sret = 1; }
+
+    let is i32 as sret_addr with mut = cast(i32, 0 - 1);
+    if (use_sret == 1) {
+        g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + ty.size;
+        if (g.ctx_func.alloc_stack_size % 16 != 0) {
+            g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + 16 - (g.ctx_func.alloc_stack_size % 16);
+        }
+        let is i32 as offset = g.ctx_func.alloc_stack_size;
+        sret_addr = g.new_vreg();
+        let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+        ga.dest = d.op_vreg(sret_addr);
+        ga.src1 = d.op_imm(cast(i64, offset));
+        ga.line = line;
+        g.emit(ga);
+        arg_count = arg_count + 1;
+    }
+
+    // Generate args. The three arrays are sized by the call's own argument
+    // count (including the hidden sret slot, which occupies index 0 when
+    // present). They used to be fixed at 64 entries while the loops below
+    // walked to arg_count, so a 65-argument call indexed past the end of all
+    // three: arg vregs went missing and the call passed whatever happened to
+    // be next on the stack.
+    let is i64 as av_bytes with mut = cast(i64, arg_count) * 4;
+    if (av_bytes < 8) { av_bytes = 8; }
+    let is *u8 as arg_vregs = d.opt_alloc(av_bytes);
+    let is *u8 as arg_is_flt = d.opt_alloc(cast(i64, arg_count) + 8);
+    let is *u8 as arg_types = d.opt_alloc(cast(i64, arg_count) * 8 + 8);
+    let is i32 as ai with mut = 0;
+    if (sret_addr != cast(i32, 0 - 1)) {
+        let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
+        *av = sret_addr;
+        let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, ai));
+        *af = 0;
+        let is *i64 as at = cast(*i64, cast(i64, arg_types) + cast(i64, ai) * 8);
+        *at = 0;
+        ai = ai + 1;
+    }
+    a = node.args;
+    while (cast(i64, a) != 0) {
+        let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
+        *av = gen_expr(a);
+        let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, ai));
+        if (g.is_float_kind(a.ty.kind) == 1) { *af = 1; }
+        else { *af = 0; }
+        let is *i64 as at = cast(*i64, cast(i64, arg_types) + cast(i64, ai) * 8);
+        *at = cast(i64, a.ty);
+        ai = ai + 1;
+        a = a.next;
+    }
+
+    let is i32 as stack_args with mut = 0;
+    let is i32 as padding with mut = 0;
+    let is i32 as j with mut = 0;
+    let is i32 as xmm_total with mut = 0;
+    let is i32 as a64 with mut = 0;
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) { a64 = 1; }
+    let is i32 as gpr_limit with mut = 6;
+    if (a64 == 1) { gpr_limit = 8; }
+    // WASM has no register/stack ABI: every argument is a positional operand.
+    // Force all args into the "register" path (huge limit) so none are spilled
+    // to the machine stack — this both keeps SET_ARG indices positional (which
+    // the wasm backend relies on) and suppresses the x86 `sub rsp,8` padding IR.
+    let is i32 as w_arch = tgt.target_get().arch;
+    if (w_arch == tgt.ARCH_WASM32 || w_arch == tgt.ARCH_WASM64) { gpr_limit = 1000000; }
+
+    if (node.is_extern == 1) {
+        // System V ABI: floats → xmm0-xmm7, ints → rdi/rsi/rdx/rcx/r8/r9
+        let is i32 as gpr_total with mut = 0;
+        j = 0;
+        while (j < arg_count) {
+            let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, j));
+            if (*af == 1) { xmm_total = xmm_total + 1; }
+            else { gpr_total = gpr_total + 1; }
+            j = j + 1;
+        }
+        let is i32 as stack_gpr with mut = 0;
+        let is i32 as stack_xmm with mut = 0;
+        if (gpr_total > gpr_limit) { stack_gpr = gpr_total - gpr_limit; }
+        if (xmm_total > 8) { stack_xmm = xmm_total - 8; }
+        stack_args = stack_gpr + stack_xmm;
+        if (stack_args % 2 != 0) { padding = 1; }
+        if (padding == 1 && a64 == 0) {
+            let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+            pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+            pa.asm_str_len = 10;
+            pa.line = line;
+            g.emit(pa);
+        }
+        // Classify each arg: on_stack or register
+        let is *u8 as arg_on_stk = d.opt_alloc(cast(i64, arg_count) + 8);
+        let is *i32 as arg_stack_slot = cast(*i32, d.opt_alloc(cast(i64, arg_count) * 4 + 8));
+        let is i32 as gi with mut = 0;
+        let is i32 as xi with mut = 0;
+        let is i32 as stack_slot with mut = 0;
+        j = 0;
+        while (j < arg_count) {
+            let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, j));
+            let is *u8 as osk = cast(*u8, cast(i64, arg_on_stk) + cast(i64, j));
+            let is *i32 as oss = cast(*i32, cast(i64, arg_stack_slot) + cast(i64, j) * 4);
+            if (*af == 1) {
+                if (xi < 8) { *osk = 0; }
+                else { *osk = 1; *oss = stack_slot; stack_slot = stack_slot + 1; }
+                xi = xi + 1;
+            } else {
+                if (gi < gpr_limit) { *osk = 0; }
+                else { *osk = 1; *oss = stack_slot; stack_slot = stack_slot + 1; }
+                gi = gi + 1;
+            }
+            j = j + 1;
+        }
+        // Push stack overflow args in reverse
+        j = arg_count - 1;
+        while (j >= 0) {
+            let is *u8 as osk = cast(*u8, cast(i64, arg_on_stk) + cast(i64, j));
+            if (*osk == 1) {
+                let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+                let is *i32 as oss = cast(*i32, cast(i64, arg_stack_slot) + cast(i64, j) * 4);
+                if (a64 == 1) { g.emit_set_arg(8 + *oss, *av, cast(*u8, 0), line); }
+                else { g.emit_set_arg(6, *av, cast(*u8, 0), line); }
+            }
+            j = j - 1;
+        }
+        // Set register args with separate GPR/XMM indices
+        gi = 0;
+        xi = 0;
+        j = 0;
+        while (j < arg_count) {
+            let is *u8 as osk = cast(*u8, cast(i64, arg_on_stk) + cast(i64, j));
+            let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, j));
+            if (*osk == 0) {
+                let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+                if (*af == 1) {
+                    let is *i64 as at = cast(*i64, cast(i64, arg_types) + cast(i64, j) * 8);
+                    g.emit_set_arg(xi, *av, cast(*u8, *at), line);
+                    xi = xi + 1;
+                } else {
+                    g.emit_set_arg(gi, *av, cast(*u8, 0), line);
+                    gi = gi + 1;
+                }
+            } else {
+                if (*af == 1) { xi = xi + 1; }
+                else { gi = gi + 1; }
+            }
+            j = j + 1;
+        }
+        d.opt_free(cast(*u8, arg_on_stk));
+        d.opt_free(cast(*u8, arg_stack_slot));
+    } else if (node.is_variadic == 0 && g.xmm_args_abi() == 1 && _any_flt(arg_is_flt, arg_count) == 1) {
+        // x86_64 with a float argument: System V places (g.abi_codes).
+        stack_args = _emit_xmm_abi_args(arg_vregs, arg_is_flt, arg_count, line);
+    } else {
+        // Internal Caustic ABI: all args in GPRs
+        if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
+        if (stack_args % 2 != 0) { padding = 1; }
+        if (padding == 1 && a64 == 0) {
+            let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+            pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+            pa.asm_str_len = 10;
+            pa.line = line;
+            g.emit(pa);
+        }
+        // Stack args in reverse
+        j = arg_count - 1;
+        while (j >= gpr_limit) {
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+            g.emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j - 1;
+        }
+        // Register args
+        j = 0;
+        while (j < arg_count && j < gpr_limit) {
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+            g.emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j + 1;
+        }
+    }
+
+    d.opt_free(arg_vregs);
+    d.opt_free(arg_is_flt);
+    d.opt_free(arg_types);
+
+    // Use asm_name if available (for mangled names)
+    let is *u8 as cname with mut = node.name_ptr;
+    let is i32 as clen with mut = node.name_len;
+    if (node.asm_name_len > 0) {
+        cname = node.asm_name_ptr;
+        clen = node.asm_name_len;
+    }
+    let is i32 as ret_reg with mut = 0;
+    if (ast.nx_impl_len(node) > 0 && node.is_extern == 1) {
+        // FFI call: targets a DLL function. Codegen will use MS x64 ABI
+        // and emit an indirect `call qword ptr [rip+__imp_X]`.
+        ret_reg = g.emit_ffi_call(cname, clen, ast.nx_impl_ptr(node), ast.nx_impl_len(node), node.is_variadic, cast(*u8, ty), xmm_total, arg_count, line);
+    } else {
+        ret_reg = g.emit_call(cname, clen, node.is_variadic, node.is_extern, cast(*u8, ty), xmm_total, line);
+    }
+
+    if (stack_args > 0) {
+        let is i32 as pad2 with mut = 0;
+        if (stack_args % 2 != 0) { pad2 = 1; }
+        let is i32 as cleanup_bytes = (stack_args + pad2) * 8;
+        // Restore the outgoing stack area using the selected ABI's stack name.
+        let is [32]u8 as cbuf;
+        let is i32 as cpos with mut = 9;
+        mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
+        if (a64 == 1) {
+            mem.memcpy(cast(*u8, &cbuf), "add sp, sp, ", 12);
+            cpos = 12;
+        }
+        let is i32 as cv with mut = cleanup_bytes;
+        let is [10]u8 as nbuf;
+        let is i32 as ni with mut = 0;
+        while (cv > 0) {
+            nbuf[ni] = cast(u8, (cv % 10) + 48);
+            cv = cv / 10;
+            ni = ni + 1;
+        }
+        let is i32 as nj with mut = ni - 1;
+        while (nj >= 0) {
+            cbuf[cpos] = nbuf[nj];
+            cpos = cpos + 1;
+            nj = nj - 1;
+        }
+        let is *d.IRInst as cl = d.new_inst(d.IR_ASM);
+        cl.asm_str_ptr = d.str_dup(cast(*u8, &cbuf), cpos);
+        cl.asm_str_len = cpos;
+        cl.line = line;
+        g.emit(cl);
+    }
+
+    if (sret_addr != cast(i32, 0 - 1)) { return sret_addr; }
+    return ret_reg;
+}
+
+fn gen_syscall(node as *ast.Node, line as i32) as i32 {
+    let is i32 as arg_count with mut = 0;
+    let is [56]u8 as arg_vregs;
+    let is *ast.Node as a with mut = node.args;
+    while (cast(i64, a) != 0) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, arg_count) * 4);
+        *av = gen_expr(a);
+        arg_count = arg_count + 1;
+        a = a.next;
+    }
+    let is i32 as si with mut = 0;
+    while (si < arg_count) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, si) * 4);
+        let is *d.IRInst as sa = d.new_inst(d.IR_SET_SYS_ARG);
+        sa.dest = d.op_imm(cast(i64, si));
+        sa.src1 = d.op_vreg(*av);
+        sa.line = line;
+        g.emit(sa);
+        si = si + 1;
+    }
+    let is i32 as dest = g.new_vreg();
+    let is *d.IRInst as sc = d.new_inst(d.IR_SYSCALL);
+    sc.dest = d.op_vreg(dest);
+    sc.line = line;
+    g.emit(sc);
+    return dest;
+}
+
+// Branch on a condition without materializing && and || as a 0 or 1 first:
+// jump to `fl` when it is false, and fall through when it is true.
+fn gen_cond_false(node as *ast.Node, fl as i32, line as i32) as void {
+    if (node.kind == ast.NK_LAND) {
+        let is i32 as rf = _range_fold(node, line);
+        if (rf >= 0) { _branch(d.IR_JZ, rf, fl, line); return; }
+        gen_cond_false(node.lhs, fl, line);
+        gen_cond_false(node.rhs, fl, line);
+        return;
+    }
+    if (node.kind == ast.NK_LOR) {
+        let is i32 as tl = g.new_label();
+        gen_cond_true(node.lhs, tl, line);
+        gen_cond_false(node.rhs, fl, line);
+        _branch_label(tl);
+        return;
+    }
+    _branch(d.IR_JZ, gen_expr(node), fl, line);
+}
+
+// The same, jumping to `tl` when it is true.
+fn gen_cond_true(node as *ast.Node, tl as i32, line as i32) as void {
+    if (node.kind == ast.NK_LOR) {
+        gen_cond_true(node.lhs, tl, line);
+        gen_cond_true(node.rhs, tl, line);
+        return;
+    }
+    if (node.kind == ast.NK_LAND) {
+        let is i32 as rf = _range_fold(node, line);
+        if (rf >= 0) { _branch(d.IR_JNZ, rf, tl, line); return; }
+        let is i32 as fl = g.new_label();
+        gen_cond_false(node.lhs, fl, line);
+        gen_cond_true(node.rhs, tl, line);
+        _branch_label(fl);
+        return;
+    }
+    _branch(d.IR_JNZ, gen_expr(node), tl, line);
+}
+
+// `*cast(*i64, &x)` of a local f64, or `*cast(*f64, &n)` of a local i64: the
+// program asks for the bits. The value needs no address and no trip to memory.
+fn _bits_of_local(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
+    if (d.ir_opt_level < 2 || g.xmm_args_abi() == 0) { return 0 - 1; }
+    let is *ast.Node as c = node.expr;
+    if (c.kind != ast.NK_CAST || c.expr.kind != ast.NK_ADDR) { return 0 - 1; }
+    let is *ast.Node as x = c.expr.expr;
+    if (x.kind != ast.NK_IDENT || x.is_global != 0 || cast(i64, x.ty) == 0) { return 0 - 1; }
+    let is i32 as tk = ty.kind;
+    let is i32 as xk = x.ty.kind;
+    let is i32 as t_int = cast(i32, tk == ast.TY_I64 || tk == ast.TY_U64);
+    let is i32 as x_int = cast(i32, xk == ast.TY_I64 || xk == ast.TY_U64);
+    let is i32 as fits = cast(i32, (tk == ast.TY_F64 && x_int == 1) || (t_int == 1 && xk == ast.TY_F64));
+    if (fits == 0) { return 0 - 1; }
+    let is i32 as v = gen_expr(x);
+    let is i32 as dest = g.new_vreg();
+    let is *d.IRInst as b = d.new_inst(d.IR_BITS);
+    b.dest = d.op_vreg(dest);
+    b.src1 = d.op_vreg(v);
+    b.cast_from = cast(*u8, x.ty);
+    b.cast_to = cast(*u8, ty);
+    b.line = line;
+    g.emit(b);
+    return dest;
+}
+
+fn _branch(op as i32, v as i32, lab as i32, line as i32) as void {
+    let is *d.IRInst as j = d.new_inst(op);
+    j.src1 = d.op_vreg(v); j.dest = d.op_label(lab); j.line = line;
+    g.emit(j);
+}
+
+fn _branch_label(lab as i32) as void {
+    let is *d.IRInst as l = d.new_inst(d.IR_LABEL);
+    l.dest = d.op_label(lab);
+    g.emit(l);
+}
+
+// Atomic builtins (seq_cst). cast_to carries the pointee type so codegen picks
+// 32 vs 64-bit. LOAD/ADD/XCHG/CAS return the OLD value in a fresh vreg;
+// STORE/FENCE return 0 (void — never consumed, guaranteed by semantic).
+fn gen_atomic(node as *ast.Node, line as i32) as i32 {
+    let is i32 as sub = cast(i32, node.val);
+    if (sub == ast.ATOMIC_FENCE) {
+        let is *d.IRInst as fi = d.new_inst(d.IR_FENCE);
+        fi.line = line; g.emit(fi);
+        return 0;
+    }
+    let is *ast.Node as p0 = node.args;
+    let is *u8 as pointee with mut = cast(*u8, 0);
+    if (cast(i64, p0) != 0 && cast(i64, p0.ty) != 0) { pointee = cast(*u8, p0.ty.base); }
+    let is i32 as ptr_reg = gen_expr(p0);
+
+    if (sub == ast.ATOMIC_LOAD) {
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as li = d.new_inst(d.IR_ATOMIC_LOAD);
+        li.dest = d.op_vreg(dest); li.src1 = d.op_vreg(ptr_reg);
+        li.cast_to = pointee; li.line = line; g.emit(li);
+        return dest;
+    }
+
+    let is *ast.Node as p1 = p0.next;
+    if (sub == ast.ATOMIC_STORE) {
+        let is i32 as val_reg = gen_expr(p1);
+        let is *d.IRInst as si = d.new_inst(d.IR_ATOMIC_STORE);
+        si.src1 = d.op_vreg(ptr_reg); si.src2 = d.op_vreg(val_reg);
+        si.cast_to = pointee; si.line = line; g.emit(si);
+        return 0;
+    }
+    if (sub == ast.ATOMIC_ADD || sub == ast.ATOMIC_XCHG) {
+        let is i32 as val_reg = gen_expr(p1);
+        let is i32 as dest = g.new_vreg();
+        let is i32 as opc with mut = d.IR_ATOMIC_ADD;
+        if (sub == ast.ATOMIC_XCHG) { opc = d.IR_ATOMIC_XCHG; }
+        let is *d.IRInst as ai = d.new_inst(opc);
+        ai.dest = d.op_vreg(dest); ai.src1 = d.op_vreg(ptr_reg); ai.src2 = d.op_vreg(val_reg);
+        ai.cast_to = pointee; ai.line = line; g.emit(ai);
+        return dest;
+    }
+    // ATOMIC_CAS: args = ptr, expected, desired. IR_CAS_EXPECTED loads expected
+    // into rax and must immediately precede IR_ATOMIC_CAS (kept adjacent here).
+    let is *ast.Node as p2 = p1.next;
+    let is i32 as exp_reg = gen_expr(p1);
+    let is i32 as des_reg = gen_expr(p2);
+    let is *d.IRInst as ce = d.new_inst(d.IR_CAS_EXPECTED);
+    ce.src1 = d.op_vreg(exp_reg); ce.line = line; g.emit(ce);
+    let is i32 as dest = g.new_vreg();
+    let is *d.IRInst as ci = d.new_inst(d.IR_ATOMIC_CAS);
+    ci.dest = d.op_vreg(dest); ci.src1 = d.op_vreg(ptr_reg); ci.src2 = d.op_vreg(des_reg);
+    ci.cast_to = pointee; ci.line = line; g.emit(ci);
+    return dest;
+}
+
+fn gen_enum_lit(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
+    let is i32 as disc = node.discriminant;
+    // Simple enum (no payload, small)
+    if (cast(i64, node.payload_args) == 0 && ty.size <= 4) {
+        return g.emit_imm(cast(i64, disc), line);
+    }
+    // Tagged union with no payload but needs full allocation
+    if (cast(i64, node.payload_args) == 0 && ty.size > 4) {
+        let is i32 as total_size = ty.size;
+        g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + total_size;
+        if (g.ctx_func.alloc_stack_size % 16 != 0) {
+            g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + 16 - (g.ctx_func.alloc_stack_size % 16);
+        }
+        let is i32 as offset = g.ctx_func.alloc_stack_size;
+        let is i32 as base_addr = g.new_vreg();
+        let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+        ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; g.emit(ga);
+        let is i32 as disc_reg = g.emit_imm(cast(i64, disc), line);
+        let is *d.IRInst as st = d.new_inst(d.IR_STORE);
+        st.dest = d.op_vreg(base_addr); st.src1 = d.op_vreg(disc_reg);
+        st.cast_to = cast(*u8, ast.type_i32); st.line = line; g.emit(st);
+        return base_addr;
+    }
+    // Tagged union with payload
+    let is i32 as total_size = ty.size;
+    g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + total_size;
+    if (g.ctx_func.alloc_stack_size % 16 != 0) {
+        g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + 16 - (g.ctx_func.alloc_stack_size % 16);
+    }
+    let is i32 as offset = g.ctx_func.alloc_stack_size;
+    let is i32 as base_addr = g.new_vreg();
+    let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+    ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; g.emit(ga);
+    // Store discriminant
+    let is i32 as disc_reg = g.emit_imm(cast(i64, disc), line);
+    let is *d.IRInst as st = d.new_inst(d.IR_STORE);
+    st.dest = d.op_vreg(base_addr); st.src1 = d.op_vreg(disc_reg);
+    st.cast_to = cast(*u8, ast.type_i32); st.line = line; g.emit(st);
+    // Store payload
+    let is i32 as payload_off = ty.payload_offset;
+    let is i32 as payload_addr with mut = base_addr;
+    if (payload_off > 0) {
+        let is i32 as ofreg = g.emit_imm(cast(i64, payload_off), line);
+        payload_addr = g.emit_binary(d.IR_ADD, base_addr, ofreg, line);
+    }
+    // Store each payload arg sequentially
+    let is *ast.Node as arg with mut = node.payload_args;
+    while (cast(i64, arg) != 0) {
+        let is i32 as val = gen_expr(arg);
+        let is *ast.Type as arg_ty = arg.ty;
+        if (arg_ty.size > 8) {
+            let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+            cp.dest = d.op_vreg(payload_addr); cp.src1 = d.op_vreg(val);
+            cp.src2 = d.op_imm(cast(i64, arg_ty.size)); cp.line = line; g.emit(cp);
+        } else {
+            let is *d.IRInst as sv = d.new_inst(d.IR_STORE);
+            sv.dest = d.op_vreg(payload_addr); sv.src1 = d.op_vreg(val);
+            sv.cast_to = cast(*u8, arg_ty); sv.line = line; g.emit(sv);
+        }
+        arg = arg.next;
+    }
+    return base_addr;
+}
+
+// === gen_expr ===
+
+fn gen_expr(node as *ast.Node) as i32 {
+    if (cast(i64, node) == 0) {
+        io.write_str(io.STDERR, "ir: null expression node\n");
+        io.exit(1);
+    }
+    if (nest.spent() == 1) { io.exit(1); }
+
+    let is i32 as k = node.kind;
+    let is i32 as line = g.tok_line(node.tok_idx);
+    let is *ast.Type as ty = node.ty;
+
+    // NK_ADDR
+    if (k == ast.NK_ADDR) { return gen_addr(node.expr); }
+
+    // NK_DEREF
+    if (k == ast.NK_DEREF) {
+        let is i32 as bits = _bits_of_local(node, ty, line);
+        if (bits >= 0) { return bits; }
+        let is i32 as addr = gen_expr(node.expr);
+        return emit_load_from_addr(addr, cast(*u8, ty), line);
+    }
+
+    // NK_INDEX
+    if (k == ast.NK_INDEX) {
+        let is i32 as addr = gen_addr(node);
+        return emit_load_from_addr(addr, cast(*u8, ty), line);
+    }
+
+    // NK_MEMBER
+    if (k == ast.NK_MEMBER) {
+        let is i32 as addr = gen_addr(node);
+        return emit_load_from_addr(addr, cast(*u8, ty), line);
+    }
+
+    // NK_ASSIGN
+    if (k == ast.NK_ASSIGN) {
+        // Fast path: `local = expr` (simple scalar). Emit `STORE [imm] = expr`
+        // directly so mem2reg can see a pure IMM-offset slot and promote it.
+        // Without this, the lhs goes through `IR_ADDR &[rbp-N]; STORE [vreg]`
+        // which makes find_promotable flag the slot as address-taken — that's
+        // what caused fannkuch's loop-carried scalars to stay on the stack.
+        if (node.lhs.kind == ast.NK_IDENT && node.lhs.is_global == 0
+            && ty.size <= 8) {
+            let is i32 as rhs_kind = node.rhs.kind;
+            if (rhs_kind == ast.NK_FNCALL || rhs_kind == ast.NK_SYSCALL) {
+                let is *d.IRInst as ctx_inst = d.new_inst(d.IR_SET_CTX);
+                ctx_inst.src1 = d.op_imm(0);
+                ctx_inst.line = line;
+                g.emit(ctx_inst);
+            }
+            let is i32 as rhs_val = gen_expr(node.rhs);
+            let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+            si.dest = d.op_imm(cast(i64, node.lhs.var_offset));
+            si.src1 = d.op_vreg(rhs_val);
+            si.cast_to = cast(*u8, ty);
+            si.line = line;
+            g.emit(si);
+            return rhs_val;
+        }
+        let is i32 as lhs_addr = gen_addr(node.lhs);
+        let is i32 as rhs_kind = node.rhs.kind;
+        if (rhs_kind == ast.NK_FNCALL || rhs_kind == ast.NK_SYSCALL) {
+            let is *d.IRInst as ctx_inst = d.new_inst(d.IR_SET_CTX);
+            // Only pass lhs_addr as context for struct return (size > 8)
+            // For scalar types, clear context to avoid corrupting r10
+            if (ty.size > 8) {
+                ctx_inst.src1 = d.op_vreg(lhs_addr);
+            } else {
+                ctx_inst.src1 = d.op_imm(0);
+            }
+            ctx_inst.line = line;
+            g.emit(ctx_inst);
+        }
+        let is i32 as rhs_val = gen_expr(node.rhs);
+        if (ty.size > 8) {
+            let is *d.IRInst as i = d.new_inst(d.IR_COPY);
+            i.dest = d.op_vreg(lhs_addr);
+            i.src1 = d.op_vreg(rhs_val);
+            i.src2 = d.op_imm(cast(i64, ty.size));
+            i.line = line;
+            g.emit(i);
+            return lhs_addr;
+        }
+        let is *d.IRInst as i = d.new_inst(d.IR_STORE);
+        i.dest = d.op_vreg(lhs_addr);
+        i.src1 = d.op_vreg(rhs_val);
+        i.cast_to = cast(*u8, ty);
+        i.line = line;
+        g.emit(i);
+        return rhs_val;
+    }
+
+    // NK_NUM
+    if (k == ast.NK_NUM) {
+        if (g.is_float_kind(node.ty.kind) == 1) {
+            let is f64 as value with mut = node.fval;
+            if (node.ty.kind == ast.TY_F32) { value = ast.round_f32(value); }
+            let is i32 as result = g.emit_imm(ast.f64_to_i64(value), line);
+            g.ctx_tail.cast_to = cast(*u8, node.ty);
+            return result;
+        }
+        return g.emit_imm(node.val, line);
+    }
+
+    // NK_STRING
+    if (k == ast.NK_STRING) {
+        let is i32 as sid = g.register_string(node.name_ptr, node.name_len);
+        let is i32 as dest = g.new_vreg();
+        // Build label name ".LCN"
+        let is [16]u8 as lbuf;
+        lbuf[0] = 46; // '.'
+        lbuf[1] = 76; // 'L'
+        lbuf[2] = 67; // 'C'
+        let is i32 as llen with mut = 3;
+        // Write integer id
+        let is i32 as tmp_id with mut = sid;
+        if (tmp_id == 0) {
+            lbuf[llen] = 48;
+            llen = llen + 1;
+        } else {
+            let is [10]u8 as dbuf;
+            let is i32 as di with mut = 0;
+            while (tmp_id > 0) {
+                dbuf[di] = cast(u8, (tmp_id % 10) + 48);
+                tmp_id = tmp_id / 10;
+                di = di + 1;
+            }
+            let is i32 as dj with mut = di - 1;
+            while (dj >= 0) {
+                lbuf[llen] = dbuf[dj];
+                llen = llen + 1;
+                dj = dj - 1;
+            }
+        }
+        let is *d.IRInst as i = d.new_inst(d.IR_ADDR_GLOBAL);
+        i.dest = d.op_vreg(dest);
+        i.global_name_ptr = d.str_dup(cast(*u8, &lbuf), llen);
+        i.global_name_len = cast(i16, llen);
+        i.line = line;
+        g.emit(i);
+        return dest;
+    }
+
+    // NK_SIZEOF
+    if (k == ast.NK_SIZEOF) {
+        return g.emit_imm(node.val, line);
+    }
+
+    // NK_IDENT
+    if (k == ast.NK_IDENT) {
+        // Const-prop: if this resolves to an imut global whose init expr
+        // folded to a literal in semantic, emit the literal directly. Skips
+        // the IR_ADDR_GLOBAL + IR_LOAD pair so dead-branch elim and other
+        // literal-driven folds upstream can see the actual constant value.
+        if (node.is_global == 1 && node.is_string_const == ast.IDENT_FLOAT_CONST) {
+            let is i32 as fc = g.emit_imm(node.val, line);
+            g.ctx_tail.cast_to = cast(*u8, ty);
+            return fc;
+        }
+        if (node.is_global == 1) {
+            let is *sd.Variable as cv = sc.lookup_var(node.name_ptr, node.name_len);
+            if (cast(i64, cv) != 0 && cv.has_folded_init == 1) {
+                return g.emit_imm(cv.folded_init_val, line);
+            }
+        }
+        let is i32 as reg = g.new_vreg();
+        if (node.is_global == 1) {
+            let is i32 as addr = g.new_vreg();
+            let is *d.IRInst as ai = d.new_inst(d.IR_ADDR_GLOBAL);
+            ai.dest = d.op_vreg(addr);
+            if (node.asm_name_len > 0) {
+                ai.global_name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+                ai.global_name_len = node.asm_name_len;
+            } else {
+                ai.global_name_ptr = d.str_dup(node.name_ptr, node.name_len);
+                ai.global_name_len = cast(i16, node.name_len);
+            }
+            ai.is_extern_global = node.is_extern;
+            if (node.is_string_const == ast.IDENT_EXTERN_VAR) { ai.is_extern_global = cast(i8, 2); }
+            ai.line = line;
+            g.emit(ai);
+            if (ty.size > 8) { return addr; }
+            if (node.is_string_const == 1) { return addr; }
+            let is *d.IRInst as li = d.new_inst(d.IR_LOAD);
+            li.dest = d.op_vreg(reg);
+            li.src1 = d.op_vreg(addr);
+            li.cast_to = cast(*u8, ty);
+            li.line = line;
+            g.emit(li);
+        } else {
+            if (ty.size > 8) {
+                let is *d.IRInst as i = d.new_inst(d.IR_ADDR);
+                i.dest = d.op_vreg(reg);
+                i.src1 = d.op_imm(cast(i64, node.var_offset));
+                i.line = line;
+                g.emit(i);
+                return reg;
+            }
+            let is *d.IRInst as i = d.new_inst(d.IR_LOAD);
+            i.dest = d.op_vreg(reg);
+            i.src1 = d.op_imm(cast(i64, node.var_offset));
+            i.cast_to = cast(*u8, ty);
+            i.line = line;
+            g.emit(i);
+        }
+        return reg;
+    }
+
+    // NK_CAST
+    if (k == ast.NK_CAST) {
+        let is i32 as src = gen_expr(node.expr);
+        return g.emit_cast_from(src, cast(*u8, node.expr.ty), cast(*u8, ty), line);
+    }
+
+    // NK_FN_PTR
+    if (k == ast.NK_FN_PTR) {
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as i = d.new_inst(d.IR_FN_ADDR);
+        i.dest = d.op_vreg(dest);
+        if (node.asm_name_len > 0) {
+            i.global_name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+            i.global_name_len = node.asm_name_len;
+        } else {
+            i.global_name_ptr = d.str_dup(node.name_ptr, node.name_len);
+            i.global_name_len = cast(i16, node.name_len);
+        }
+        i.line = line;
+        g.emit(i);
+        return dest;
+    }
+
+    // Binary ops: ADD, SUB, MUL, DIV, MOD
+    if (k == ast.NK_ADD) {
+        // Constant fold. A float literal keeps its value in fval and leaves
+        // val at zero, so folding one through the integer field silently
+        // yields 0 — hence the float guard, as on NK_DIV below.
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM && g.is_float_kind(ty.kind) == 0) {
+            return g.emit_imm(node.lhs.val + node.rhs.val, line);
+        }
+        let is i32 as lhs with mut = gen_expr(node.lhs);
+        let is i32 as rhs with mut = gen_expr(node.rhs);
+        // Pointer arithmetic: ptr + int
+        let is *ast.Type as lty = node.lhs.ty;
+        let is *ast.Type as rty = node.rhs.ty;
+        if (lty.kind == ast.TY_PTR) {
+            let is i32 as sz = lty.base.size;
+            if (sz > 1) {
+                let is i32 as sr = g.emit_imm(cast(i64, sz), line);
+                rhs = g.emit_binary(d.IR_MUL, rhs, sr, line);
+            }
+            return g.emit_binary(d.IR_ADD, lhs, rhs, line);
+        }
+        if (rty.kind == ast.TY_PTR) {
+            let is i32 as sz = rty.base.size;
+            if (sz > 1) {
+                let is i32 as sr = g.emit_imm(cast(i64, sz), line);
+                lhs = g.emit_binary(d.IR_MUL, lhs, sr, line);
+            }
+            return g.emit_binary(d.IR_ADD, lhs, rhs, line);
+        }
+        if (cast(i64, lty) != cast(i64, ty)) { lhs = g.emit_cast_from(lhs, cast(*u8, lty), cast(*u8, ty), line); }
+        if (cast(i64, rty) != cast(i64, ty)) { rhs = g.emit_cast_from(rhs, cast(*u8, rty), cast(*u8, ty), line); }
+        if (g.is_float_kind(ty.kind) == 1) {
+            let is i32 as value = g.emit_binary(d.IR_FADD, lhs, rhs, line);
+            g.ctx_tail.cast_to = cast(*u8, ty);
+            return value;
+        }
+        let is i32 as r_add = g.emit_binary(d.IR_ADD, lhs, rhs, line);
+        g.ctx_tail.cast_to = cast(*u8, ty);
+        return r_add;
+    }
+
+    if (k == ast.NK_SUB) {
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM && g.is_float_kind(ty.kind) == 0) {
+            return g.emit_imm(node.lhs.val - node.rhs.val, line);
+        }
+        let is i32 as lhs with mut = gen_expr(node.lhs);
+        let is i32 as rhs with mut = gen_expr(node.rhs);
+        let is *ast.Type as lty = node.lhs.ty;
+        let is *ast.Type as rty = node.rhs.ty;
+        // ptr - int
+        if (lty.kind == ast.TY_PTR && rty.kind != ast.TY_PTR) {
+            let is i32 as sz = lty.base.size;
+            if (sz > 1) {
+                let is i32 as sr = g.emit_imm(cast(i64, sz), line);
+                rhs = g.emit_binary(d.IR_MUL, rhs, sr, line);
+            }
+            return g.emit_binary(d.IR_SUB, lhs, rhs, line);
+        }
+        // ptr - ptr
+        if (lty.kind == ast.TY_PTR && rty.kind == ast.TY_PTR) {
+            let is i32 as diff = g.emit_binary(d.IR_SUB, lhs, rhs, line);
+            let is i32 as sz = lty.base.size;
+            if (sz > 1) {
+                let is i32 as sr = g.emit_imm(cast(i64, sz), line);
+                return g.emit_binary(d.IR_DIV, diff, sr, line);
+            }
+            return diff;
+        }
+        if (cast(i64, lty) != cast(i64, ty)) { lhs = g.emit_cast_from(lhs, cast(*u8, lty), cast(*u8, ty), line); }
+        if (cast(i64, rty) != cast(i64, ty)) { rhs = g.emit_cast_from(rhs, cast(*u8, rty), cast(*u8, ty), line); }
+        if (g.is_float_kind(ty.kind) == 1) {
+            let is i32 as value = g.emit_binary(d.IR_FSUB, lhs, rhs, line);
+            g.ctx_tail.cast_to = cast(*u8, ty);
+            return value;
+        }
+        let is i32 as r_sub = g.emit_binary(d.IR_SUB, lhs, rhs, line);
+        g.ctx_tail.cast_to = cast(*u8, ty);
+        return r_sub;
+    }
+
+    if (k == ast.NK_MUL) {
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM && g.is_float_kind(ty.kind) == 0) {
+            return g.emit_imm(node.lhs.val * node.rhs.val, line);
+        }
+        let is i32 as lhs with mut = gen_expr(node.lhs);
+        let is i32 as rhs with mut = gen_expr(node.rhs);
+        if (cast(i64, node.lhs.ty) != cast(i64, ty)) { lhs = g.emit_cast_from(lhs, cast(*u8, node.lhs.ty), cast(*u8, ty), line); }
+        if (cast(i64, node.rhs.ty) != cast(i64, ty)) { rhs = g.emit_cast_from(rhs, cast(*u8, node.rhs.ty), cast(*u8, ty), line); }
+        if (g.is_float_kind(ty.kind) == 1) {
+            let is i32 as value = g.emit_binary(d.IR_FMUL, lhs, rhs, line);
+            g.ctx_tail.cast_to = cast(*u8, ty);
+            return value;
+        }
+        let is i32 as r_mul = g.emit_binary(d.IR_MUL, lhs, rhs, line);
+        g.ctx_tail.cast_to = cast(*u8, ty);
+        return r_mul;
+    }
+
+    if (k == ast.NK_DIV) {
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM && g.is_float_kind(ty.kind) == 0) {
+            return g.emit_imm(node.lhs.val / node.rhs.val, line);
+        }
+        let is i32 as lhs with mut = gen_expr(node.lhs);
+        let is i32 as rhs with mut = gen_expr(node.rhs);
+        if (cast(i64, node.lhs.ty) != cast(i64, ty)) { lhs = g.emit_cast_from(lhs, cast(*u8, node.lhs.ty), cast(*u8, ty), line); }
+        if (cast(i64, node.rhs.ty) != cast(i64, ty)) { rhs = g.emit_cast_from(rhs, cast(*u8, node.rhs.ty), cast(*u8, ty), line); }
+        if (g.is_float_kind(ty.kind) == 1) {
+            let is i32 as value = g.emit_binary(d.IR_FDIV, lhs, rhs, line);
+            g.ctx_tail.cast_to = cast(*u8, ty);
+            return value;
+        }
+        let is i32 as dv = g.emit_binary(d.IR_DIV, lhs, rhs, line);
+        g.ctx_tail.cast_to = cast(*u8, ty);
+        return dv;
+    }
+
+    if (k == ast.NK_MOD) {
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM) {
+            return g.emit_imm(node.lhs.val % node.rhs.val, line);
+        }
+        let is i32 as lhs with mut = gen_expr(node.lhs);
+        let is i32 as rhs with mut = gen_expr(node.rhs);
+        if (cast(i64, node.lhs.ty) != cast(i64, ty)) { lhs = g.emit_cast_from(lhs, cast(*u8, node.lhs.ty), cast(*u8, ty), line); }
+        if (cast(i64, node.rhs.ty) != cast(i64, ty)) { rhs = g.emit_cast_from(rhs, cast(*u8, node.rhs.ty), cast(*u8, ty), line); }
+        let is i32 as md = g.emit_binary(d.IR_MOD, lhs, rhs, line);
+        g.ctx_tail.cast_to = cast(*u8, ty);
+        return md;
+    }
+
+    // Comparison ops — always carry operand type so codegen can dispatch
+    // f64/f32 compares to ucomisd + CF-based jumps.
+    if (k == ast.NK_EQ) { return gen_cmp(node, d.IR_EQ, line, 1); }
+    if (k == ast.NK_NE) { return gen_cmp(node, d.IR_NE, line, 1); }
+    if (k == ast.NK_LT) { return gen_cmp(node, d.IR_LT, line, 1); }
+    if (k == ast.NK_LE) { return gen_cmp(node, d.IR_LE, line, 1); }
+    if (k == ast.NK_GT) { return gen_cmp(node, d.IR_GT, line, 1); }
+    if (k == ast.NK_GE) { return gen_cmp(node, d.IR_GE, line, 1); }
+
+    // Bitwise ops — always pass type so codegen can truncate narrow results
+    if (k == ast.NK_SHL) { return gen_bitwise(node, d.IR_SHL, line, 1); }
+    if (k == ast.NK_SHR) { return gen_bitwise(node, d.IR_SHR, line, 1); }
+    if (k == ast.NK_BAND) { return gen_bitwise(node, d.IR_AND, line, 1); }
+    if (k == ast.NK_BOR) { return gen_bitwise(node, d.IR_OR, line, 1); }
+    if (k == ast.NK_BXOR) { return gen_bitwise(node, d.IR_XOR, line, 1); }
+
+    // Unary ops
+    if (k == ast.NK_BNOT) {
+        let is i32 as src = gen_expr(node.expr);
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as i = d.new_inst(d.IR_NOT);
+        i.dest = d.op_vreg(dest);
+        i.src1 = d.op_vreg(src);
+        i.line = line;
+        g.emit(i);
+        return dest;
+    }
+    if (k == ast.NK_LNOT) {
+        let is i32 as src = gen_expr(node.expr);
+        let is i32 as zero = g.emit_imm(0, line);
+        return g.emit_binary(d.IR_EQ, src, zero, line);
+    }
+    if (k == ast.NK_NEG) {
+        let is i32 as src = gen_expr(node.expr);
+        let is i32 as dest = g.new_vreg();
+        let is i32 as neg_op with mut = d.IR_NEG;
+        if (g.is_float_kind(ty.kind) == 1) { neg_op = d.IR_FNEG; }
+        let is *d.IRInst as i = d.new_inst(neg_op);
+        i.dest = d.op_vreg(dest);
+        i.src1 = d.op_vreg(src);
+        i.cast_to = cast(*u8, ty);
+        i.line = line;
+        g.emit(i);
+        return dest;
+    }
+
+    // Logical AND (multi-def dest — blocks const prop but is correct)
+    if (k == ast.NK_LAND) {
+        let is i32 as rf = _range_fold(node, line);
+        if (rf >= 0) { return rf; }
+        let is i32 as false_l = g.new_label();
+        let is i32 as end_l = g.new_label();
+        let is i32 as dest = g.new_vreg();
+        gen_cond_false(node.lhs, false_l, line);
+        gen_cond_false(node.rhs, false_l, line);
+        let is *d.IRInst as mt = d.new_inst(d.IR_IMM);
+        mt.dest = d.op_vreg(dest); mt.src1 = d.op_imm(1); g.emit(mt);
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(end_l); g.emit(jmp);
+        let is *d.IRInst as fl = d.new_inst(d.IR_LABEL);
+        fl.dest = d.op_label(false_l); g.emit(fl);
+        let is *d.IRInst as mf = d.new_inst(d.IR_IMM);
+        mf.dest = d.op_vreg(dest); mf.src1 = d.op_imm(0); g.emit(mf);
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(end_l); g.emit(el);
+        return dest;
+    }
+
+    // Logical OR (multi-def dest — blocks const prop but is correct)
+    if (k == ast.NK_LOR) {
+        let is i32 as true_l = g.new_label();
+        let is i32 as end_l = g.new_label();
+        let is i32 as dest = g.new_vreg();
+        gen_cond_true(node.lhs, true_l, line);
+        gen_cond_true(node.rhs, true_l, line);
+        let is *d.IRInst as mf = d.new_inst(d.IR_IMM);
+        mf.dest = d.op_vreg(dest); mf.src1 = d.op_imm(0); g.emit(mf);
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(end_l); g.emit(jmp);
+        let is *d.IRInst as tl = d.new_inst(d.IR_LABEL);
+        tl.dest = d.op_label(true_l); g.emit(tl);
+        let is *d.IRInst as mt = d.new_inst(d.IR_IMM);
+        mt.dest = d.op_vreg(dest); mt.src1 = d.op_imm(1); g.emit(mt);
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(end_l); g.emit(el);
+        return dest;
+    }
+
+    // NK_FNCALL
+    if (k == ast.NK_FNCALL) { return gen_fncall(node, ty, line); }
+
+    // NK_CALL_INDIRECT: call(fn_ptr, args...)
+    if (k == ast.NK_CALL_INDIRECT) {
+        let is i32 as fn_ptr_vreg = gen_expr(node.expr);
+        let is i32 as arg_count with mut = 0;
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { arg_count = arg_count + 1; a = a.next; }
+
+        let is i64 as av_bytes with mut = cast(i64, arg_count) * 4;
+        if (av_bytes < 8) { av_bytes = 8; }
+        let is *u8 as arg_vregs = d.opt_alloc(av_bytes);
+        let is *u8 as arg_is_flt_i = d.opt_alloc(cast(i64, arg_count) + 8);
+        let is i32 as ai with mut = 0;
+        a = node.args;
+        while (cast(i64, a) != 0) {
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
+            *av = gen_expr(a);
+            arg_is_flt_i[ai] = cast(u8, 0);
+            if (cast(i64, a.ty) != 0 && g.is_float_kind(a.ty.kind) == 1) { arg_is_flt_i[ai] = cast(u8, 1); }
+            ai = ai + 1;
+            a = a.next;
+        }
+
+        // Stack args in reverse (internal ABI: all GPR)
+        let is i32 as stack_args with mut = 0;
+        let is i32 as padding with mut = 0;
+        let is i32 as a64 with mut = 0;
+        if (tgt.target_get().arch == tgt.ARCH_AARCH64) { a64 = 1; }
+        let is i32 as gpr_limit with mut = 6;
+        if (a64 == 1) { gpr_limit = 8; }
+        let is i32 as xmm_abi_i with mut = 0;
+        if (g.xmm_args_abi() == 1 && _any_flt(arg_is_flt_i, arg_count) == 1) { xmm_abi_i = 1; }
+        if (xmm_abi_i == 1) {
+            stack_args = _emit_xmm_abi_args(arg_vregs, arg_is_flt_i, arg_count, line);
+            arg_count = 0;
+        }
+        if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
+        if (stack_args % 2 != 0) { padding = 1; }
+        if (padding == 1 && a64 == 0 && xmm_abi_i == 0) {
+            let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+            pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+            pa.asm_str_len = 10;
+            pa.line = line;
+            g.emit(pa);
+        }
+        let is i32 as j with mut = arg_count - 1;
+        while (j >= gpr_limit) {
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+            g.emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j - 1;
+        }
+        j = 0;
+        while (j < arg_count && j < gpr_limit) {
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+            g.emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j + 1;
+        }
+        d.opt_free(arg_vregs);
+        d.opt_free(arg_is_flt_i);
+
+        let is i32 as ret_reg = g.emit_call_indirect(fn_ptr_vreg, line);
+        // Attach return type for float handling in codegen
+        if (cast(i64, ty) != 0) { g.ctx_tail.cast_to = cast(*u8, ty); }
+
+        if (stack_args > 0) {
+            let is i32 as pad2 with mut = 0;
+            if (stack_args % 2 != 0) { pad2 = 1; }
+            let is i32 as cleanup_bytes = (stack_args + pad2) * 8;
+            let is [32]u8 as cbuf;
+            mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
+            let is i32 as cpos with mut = 9;
+            if (a64 == 1) {
+                mem.memcpy(cast(*u8, &cbuf), "add sp, sp, ", 12);
+                cpos = 12;
+            }
+            let is i32 as cv with mut = cleanup_bytes;
+            let is [10]u8 as nbuf;
+            let is i32 as ni with mut = 0;
+            while (cv > 0) {
+                nbuf[ni] = cast(u8, (cv % 10) + 48);
+                cv = cv / 10;
+                ni = ni + 1;
+            }
+            let is i32 as nj with mut = ni - 1;
+            while (nj >= 0) {
+                cbuf[cpos] = nbuf[nj];
+                cpos = cpos + 1;
+                nj = nj - 1;
+            }
+            let is *d.IRInst as cl = d.new_inst(d.IR_ASM);
+            cl.asm_str_ptr = d.str_dup(cast(*u8, &cbuf), cpos);
+            cl.asm_str_len = cpos;
+            cl.line = line;
+            g.emit(cl);
+        }
+
+        return ret_reg;
+    }
+
+    // NK_SYSCALL
+    if (k == ast.NK_SYSCALL) { return gen_syscall(node, line); }
+
+    // NK_ATOMIC — atomic builtins (seq_cst)
+    if (k == ast.NK_ATOMIC) { return gen_atomic(node, line); }
+
+    // NK_ENUM_LIT
+    if (k == ast.NK_ENUM_LIT) { return gen_enum_lit(node, ty, line); }
+
+    // NK_VA_START
+    if (k == ast.NK_VA_START) {
+        let is i32 as va_addr = gen_expr(node.expr);
+        let is *d.IRInst as vai = d.new_inst(d.IR_VA_START);
+        vai.src1 = d.op_vreg(va_addr);
+        vai.src2 = d.op_imm(cast(i64, g.ctx_func.num_args));
+        vai.line = line;
+        g.emit(vai);
+        return va_addr;
+    }
+
+    // NK_MULHI — `__builtin_mulhi_u64(a, b)` → IR_MULHI_U64 (one `mul` at
+    // codegen, whose high half lands in rdx).
+    if (k == ast.NK_MULHI) {
+        let is i32 as s1 = gen_expr(node.args);
+        let is i32 as s2 = gen_expr(node.args.next);
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as mi = d.new_inst(d.IR_MULHI_U64);
+        mi.dest = d.op_vreg(dest);
+        mi.src1 = d.op_vreg(s1);
+        mi.src2 = d.op_vreg(s2);
+        mi.line = line;
+        g.emit(mi);
+        return dest;
+    }
+
+    // NK_SQRT preserves operand precision in the typed float instruction.
+    if (k == ast.NK_SQRT) {
+        let is i32 as src = gen_expr(node.expr);
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as si = d.new_inst(d.IR_FSQRT);
+        si.dest = d.op_vreg(dest);
+        si.src1 = d.op_vreg(src);
+        si.cast_to = cast(*u8, ty);
+        si.line = line;
+        g.emit(si);
+        return dest;
+    }
+
+    io.write_str(io.STDERR, "ir: unsupported expression kind: ");
+    io.write_int(io.STDERR, cast(i64, k));
+    io.write_str(io.STDERR, "\n");
+    io.exit(1);
+    return 0;
+}
+
+// === gen_stmt ===

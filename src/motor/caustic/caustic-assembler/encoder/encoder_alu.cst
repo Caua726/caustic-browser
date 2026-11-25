@@ -1,0 +1,361 @@
+use "../core/asm_defs.cst" as def;
+use "../core/buf.cst" as buf;
+use "encoder_util.cst" as eu;
+
+// Integer ALU family: IDIV/DIV/NEG/NOT, IMUL (1-op / reg,imm / reg,reg / reg,mem),
+// ADD/SUB/AND/OR/XOR/CMP, TEST, SHL/SHR/SAR.
+// Returns the encoded size in bytes, or eu.ENC_SKIP if not handled here.
+fn encode_alu(b as *buf.ByteBuffer, inst as i32, op1 as *def.Operand, op2 as *def.Operand, resolve_label as i64, cur_off as i64) as i32 {
+    let is i64 as start = b.len;
+
+    // --- IDIV/DIV/NEG/NOT reg, and IMUL reg single-op ---
+    if ((inst == def.INST_IDIV || inst == def.INST_DIV || inst == def.INST_MUL || inst == def.INST_NEG || inst == def.INST_NOT) && op1.kind == def.OP_REG) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        buf.buf_emit8(b, eu.make_rex(w, 0, 0, eu.reg_ext(op1.reg_id)));
+        buf.buf_emit8(b, 247);
+        let is i32 as ext with mut = 7;
+        if (inst == def.INST_DIV) { ext = 6; }
+        if (inst == def.INST_MUL) { ext = 4; }
+        if (inst == def.INST_NEG) { ext = 3; }
+        if (inst == def.INST_NOT) { ext = 2; }
+        buf.buf_emit8(b, eu.make_modrm(3, ext, code));
+        return cast(i32, b.len - start);
+    }
+
+    // --- IMUL reg (single-op, F7 /5): rdx:rax = rax * reg signed ---
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_NONE) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        buf.buf_emit8(b, eu.make_rex(w, 0, 0, eu.reg_ext(op1.reg_id)));
+        buf.buf_emit8(b, 247);
+        buf.buf_emit8(b, eu.make_modrm(3, 5, code));
+        return cast(i32, b.len - start);
+    }
+
+    // --- IMUL reg, imm (three-op encoded as imul dest, dest, imm) ---
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_IMM) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op1.reg_id)));
+        if (op2.imm >= 0 - 128 && op2.imm <= 127) {
+            buf.buf_emit8(b, 107);                                       // 6B
+            buf.buf_emit8(b, eu.make_modrm(3, code, code));
+            buf.buf_emit8(b, cast(i32, op2.imm) & 255);
+        } else {
+            buf.buf_emit8(b, 105);                                       // 69
+            buf.buf_emit8(b, eu.make_modrm(3, code, code));
+            buf.buf_emit32_le(b, op2.imm);
+        }
+        return cast(i32, b.len - start);
+    }
+
+    // --- ADD/SUB/AND/OR/XOR/CMP reg, reg ---
+    if (inst == def.INST_ADD || inst == def.INST_SUB || inst == def.INST_AND || inst == def.INST_OR || inst == def.INST_XOR || inst == def.INST_CMP) {
+        let is i32 as opcode with mut = 0;
+        let is i32 as imm_ext with mut = 0;
+        if (inst == def.INST_ADD) { opcode = 1; imm_ext = 0; }
+        if (inst == def.INST_SUB) { opcode = 41; imm_ext = 5; }
+        if (inst == def.INST_AND) { opcode = 33; imm_ext = 4; }
+        if (inst == def.INST_OR)  { opcode = 9; imm_ext = 1; }
+        if (inst == def.INST_XOR) { opcode = 49; imm_ext = 6; }
+        if (inst == def.INST_CMP) { opcode = 57; imm_ext = 7; }
+
+        // reg, reg
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as dst_code = eu.reg_code(op1.reg_id);
+            let is i32 as src_code = eu.reg_code(op2.reg_id);
+            if (sz == 16) { buf.buf_emit8(b, 102); }
+            let is i32 as need_rex with mut = 0;
+            let is i32 as w with mut = 0;
+            if (sz == 64) { w = 1; need_rex = 1; }
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            // spl/bpl/sil/dil exist only with a REX prefix (without one the
+            // same codes name ah/ch/dh/bh).
+            if (sz == 8 && (eu.needs_rex_for_8bit(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op2.reg_id) == 1)) { need_rex = 1; }
+            if (need_rex == 1) {
+                buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op2.reg_id), 0, eu.reg_ext(op1.reg_id)));
+            }
+            if (sz == 8) { buf.buf_emit8(b, opcode - 1); }
+            else { buf.buf_emit8(b, opcode); }
+            buf.buf_emit8(b, eu.make_modrm(3, src_code, dst_code));
+            return cast(i32, b.len - start);
+        }
+
+        // reg, imm
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_IMM) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as code = eu.reg_code(op1.reg_id);
+            let is i32 as w with mut = 0;
+            if (sz == 64) { w = 1; }
+            if (sz == 16) { buf.buf_emit8(b, 102); }
+            if (w == 1 || eu.reg_ext(op1.reg_id) == 1 || (sz == 8 && eu.needs_rex_for_8bit(op1.reg_id) == 1)) {
+                buf.buf_emit8(b, eu.make_rex(w, 0, 0, eu.reg_ext(op1.reg_id)));
+            }
+            if (eu.imm_is8(op2.imm) == 1 && sz != 8) {
+                buf.buf_emit8(b, 131);
+                buf.buf_emit8(b, eu.make_modrm(3, imm_ext, code));
+                buf.buf_emit8(b, cast(i32, op2.imm));
+            } else {
+                if (sz == 8) {
+                    buf.buf_emit8(b, 128);
+                    buf.buf_emit8(b, eu.make_modrm(3, imm_ext, code));
+                    buf.buf_emit8(b, cast(i32, op2.imm));
+                } else {
+                    buf.buf_emit8(b, 129);
+                    buf.buf_emit8(b, eu.make_modrm(3, imm_ext, code));
+                    if (sz == 16) { buf.buf_emit16_le(b, cast(i32, op2.imm)); }
+                    else { buf.buf_emit32_le(b, op2.imm); }
+                }
+            }
+            return cast(i32, b.len - start);
+        }
+
+        // BYTE PTR [mem], imm8 — 80 /ext ib
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_IMM && op1.mem_size == 8
+            && op2.imm >= 0 - 128 && op2.imm <= 255) {
+            let is i32 as rex_x with mut = 0;
+            if (eu.has_sib(op1) == 1) { rex_x = eu.reg_ext(op1.mem_index); }
+            if (rex_x == 1 || eu.reg_ext(op1.mem_base) == 1) {
+                buf.buf_emit8(b, eu.make_rex(0, 0, rex_x, eu.reg_ext(op1.mem_base)));
+            }
+            buf.buf_emit8(b, 128);
+            if (eu.has_sib(op1) == 1) {
+                eu.emit_mem_modrm_sib(b, imm_ext, op1.mem_base, op1.mem_index, op1.mem_scale, op1.mem_disp);
+            } else {
+                eu.emit_mem_modrm(b, imm_ext, op1.mem_base, op1.mem_disp);
+            }
+            buf.buf_emit8(b, cast(i32, op2.imm) & 255);
+            return cast(i32, b.len - start);
+        }
+
+        // WORD/DWORD/QWORD PTR [mem], imm — [66] [REX] 83 /ext ib, or 81 /ext
+        // iw/id (the imm is sign-extended to the operand size). Codegen emits
+        // `add QWORD PTR [rbp-8], 1` for a counter that stays in memory.
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_IMM
+            && (op1.mem_size == 16 || op1.mem_size == 32 || op1.mem_size == 64)
+            && op2.imm >= 0 - 2147483648 && op2.imm <= 2147483647) {
+            let is i32 as w with mut = 0;
+            if (op1.mem_size == 64) { w = 1; }
+            if (op1.mem_size == 16) { buf.buf_emit8(b, 102); }
+            let is i32 as rex_x with mut = 0;
+            if (eu.has_sib(op1) == 1) { rex_x = eu.reg_ext(op1.mem_index); }
+            if (w == 1 || rex_x == 1 || eu.reg_ext(op1.mem_base) == 1) {
+                buf.buf_emit8(b, eu.make_rex(w, 0, rex_x, eu.reg_ext(op1.mem_base)));
+            }
+            let is i32 as short with mut = 0;
+            if (eu.imm_is8(op2.imm) == 1) { short = 1; }
+            if (short == 1) { buf.buf_emit8(b, 131); } else { buf.buf_emit8(b, 129); }
+            if (eu.has_sib(op1) == 1) {
+                eu.emit_mem_modrm_sib(b, imm_ext, op1.mem_base, op1.mem_index, op1.mem_scale, op1.mem_disp);
+            } else {
+                eu.emit_mem_modrm(b, imm_ext, op1.mem_base, op1.mem_disp);
+            }
+            if (short == 1) { buf.buf_emit8(b, cast(i32, op2.imm) & 255); }
+            else if (op1.mem_size == 16) { buf.buf_emit16_le(b, cast(i32, op2.imm)); }
+            else { buf.buf_emit32_le(b, op2.imm); }
+            return cast(i32, b.len - start);
+        }
+
+        // reg, [mem]
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as dst_code = eu.reg_code(op1.reg_id);
+            let is i32 as w with mut = 0;
+            if (sz == 64) { w = 1; }
+            if (sz == 16) { buf.buf_emit8(b, 102); }
+            let is i32 as rex_x with mut = 0;
+            if (eu.has_sib(op2) == 1) { rex_x = eu.reg_ext(op2.mem_index); }
+            buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op1.reg_id), rex_x, eu.reg_ext(op2.mem_base)));
+            // r8, m8 is the opcode below the r32, m32 one (02 vs 03, ... 3A vs 3B).
+            if (sz == 8) { buf.buf_emit8(b, opcode + 1); }
+            else { buf.buf_emit8(b, opcode + 2); }
+            if (eu.has_sib(op2) == 1) {
+                eu.emit_mem_modrm_sib(b, dst_code, op2.mem_base, op2.mem_index, op2.mem_scale, op2.mem_disp);
+            } else {
+                eu.emit_mem_modrm(b, dst_code, op2.mem_base, op2.mem_disp);
+            }
+            return cast(i32, b.len - start);
+        }
+    }
+
+    // --- TEST reg, reg ---
+    if (inst == def.INST_TEST && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as dst_code = eu.reg_code(op1.reg_id);
+        let is i32 as src_code = eu.reg_code(op2.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        if (sz == 16) { buf.buf_emit8(b, 102); }
+        let is i32 as need_rex with mut = 0;
+        if (w == 1) { need_rex = 1; }
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+        if (sz == 8 && (eu.needs_rex_for_8bit(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op2.reg_id) == 1)) { need_rex = 1; }
+        if (need_rex == 1) {
+            buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op2.reg_id), 0, eu.reg_ext(op1.reg_id)));
+        }
+        if (sz == 8) { buf.buf_emit8(b, 132); }
+        else { buf.buf_emit8(b, 133); }
+        buf.buf_emit8(b, eu.make_modrm(3, src_code, dst_code));
+        return cast(i32, b.len - start);
+    }
+
+    // --- TEST reg64, imm32 --- REX.W F7 /0 id (the imm is sign-extended)
+    if (inst == def.INST_TEST && op1.kind == def.OP_REG && op2.kind == def.OP_IMM
+        && eu.reg_size(op1.reg_id) == 64) {
+        buf.buf_emit8(b, eu.make_rex(1, 0, 0, eu.reg_ext(op1.reg_id)));
+        buf.buf_emit8(b, 247);
+        buf.buf_emit8(b, eu.make_modrm(3, 0, eu.reg_code(op1.reg_id)));
+        buf.buf_emit32_le(b, op2.imm);
+        return cast(i32, b.len - start);
+    }
+
+    // --- IMUL reg, reg ---
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 175);
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+
+    // --- IMUL reg, [mem] (REX 0F AF /r): codegen folds a load into a multiply ---
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        let is i32 as rex_x with mut = 0;
+        if (eu.has_sib(op2) == 1) { rex_x = eu.reg_ext(op2.mem_index); }
+        buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op1.reg_id), rex_x, eu.reg_ext(op2.mem_base)));
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 175);
+        if (eu.has_sib(op2) == 1) {
+            eu.emit_mem_modrm_sib(b, eu.reg_code(op1.reg_id), op2.mem_base, op2.mem_index, op2.mem_scale, op2.mem_disp);
+        } else {
+            eu.emit_mem_modrm(b, eu.reg_code(op1.reg_id), op2.mem_base, op2.mem_disp);
+        }
+        return cast(i32, b.len - start);
+    }
+
+    // --- CMOVcc reg, reg (0F 40+cc /r): dest = src if cc holds ---
+    if (def.is_cmov(inst) == 1 && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, def.cmov_opcode(inst));
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+
+    // --- SHL/SHR/SAR reg, cl ---
+    if ((inst == def.INST_SHL || inst == def.INST_SHR || inst == def.INST_SAR
+         || inst == def.INST_ROL || inst == def.INST_ROR) && op1.kind == def.OP_REG) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        let is i32 as w with mut = 0;
+        if (sz == 64) { w = 1; }
+        let is i32 as ext with mut = 4;
+        if (inst == def.INST_SHR) { ext = 5; }
+        if (inst == def.INST_SAR) { ext = 7; }
+        if (inst == def.INST_ROL) { ext = 0; }
+        if (inst == def.INST_ROR) { ext = 1; }
+
+        buf.buf_emit8(b, eu.make_rex(w, 0, 0, eu.reg_ext(op1.reg_id)));
+        if (op2.kind == def.OP_REG) {
+            // shift by CL
+            buf.buf_emit8(b, 211);
+            buf.buf_emit8(b, eu.make_modrm(3, ext, code));
+        } else if (op2.kind == def.OP_IMM) {
+            if (op2.imm == 1) {
+                buf.buf_emit8(b, 209);
+                buf.buf_emit8(b, eu.make_modrm(3, ext, code));
+            } else {
+                buf.buf_emit8(b, 193);
+                buf.buf_emit8(b, eu.make_modrm(3, ext, code));
+                buf.buf_emit8(b, cast(i32, op2.imm));
+            }
+        }
+        return cast(i32, b.len - start);
+    }
+
+    // --- Atomic RMW: XCHG / CMPXCHG / XADD (B0), MR form ---
+    // cmpxchg/xadd write reg(op2) into r/m(op1); xchg swaps. The memory-
+    // destination form is what the atomics codegen emits (preceded by a `lock`
+    // line for cmpxchg/xadd; xchg with memory locks implicitly). reg,reg and
+    // `xchg reg, [mem]` are also handled for hand-written .s. Operand size comes
+    // from the register source.
+    if (inst == def.INST_XCHG || inst == def.INST_CMPXCHG || inst == def.INST_XADD) {
+        let is *def.Operand as d with mut = op1;
+        let is *def.Operand as s with mut = op2;
+        // xchg is symmetric: normalise `xchg reg, [mem]` to `[mem], reg`.
+        if (inst == def.INST_XCHG && op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            d = op2;
+            s = op1;
+        }
+        if (s.kind == def.OP_REG) {
+            let is i32 as sz = eu.reg_size(s.reg_id);
+            let is i32 as src_code = eu.reg_code(s.reg_id);
+            let is i32 as w with mut = 0;
+            if (sz == 64) { w = 1; }
+
+            if (d.kind == def.OP_MEM) {
+                if (sz == 16) { buf.buf_emit8(b, 102); }
+                let is i32 as rex_x with mut = 0;
+                if (eu.has_sib(d) == 1) { rex_x = eu.reg_ext(d.mem_index); }
+                buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(s.reg_id), rex_x, eu.reg_ext(d.mem_base)));
+                if (inst == def.INST_XCHG) {
+                    if (sz == 8) { buf.buf_emit8(b, 134); } else { buf.buf_emit8(b, 135); }
+                } else if (inst == def.INST_CMPXCHG) {
+                    buf.buf_emit8(b, 15);
+                    if (sz == 8) { buf.buf_emit8(b, 176); } else { buf.buf_emit8(b, 177); }
+                } else {
+                    buf.buf_emit8(b, 15);
+                    if (sz == 8) { buf.buf_emit8(b, 192); } else { buf.buf_emit8(b, 193); }
+                }
+                if (eu.has_sib(d) == 1) {
+                    eu.emit_mem_modrm_sib(b, src_code, d.mem_base, d.mem_index, d.mem_scale, d.mem_disp);
+                } else {
+                    eu.emit_mem_modrm(b, src_code, d.mem_base, d.mem_disp);
+                }
+                return cast(i32, b.len - start);
+            }
+
+            if (d.kind == def.OP_REG) {
+                let is i32 as dst_code = eu.reg_code(d.reg_id);
+                if (sz == 16) { buf.buf_emit8(b, 102); }
+                let is i32 as need_rex with mut = 0;
+                if (w == 1) { need_rex = 1; }
+                if (eu.reg_ext(d.reg_id) == 1 || eu.reg_ext(s.reg_id) == 1) { need_rex = 1; }
+                if (sz == 8 && (eu.needs_rex_for_8bit(d.reg_id) == 1 || eu.needs_rex_for_8bit(s.reg_id) == 1)) { need_rex = 1; }
+                if (need_rex == 1) {
+                    buf.buf_emit8(b, eu.make_rex(w, eu.reg_ext(s.reg_id), 0, eu.reg_ext(d.reg_id)));
+                }
+                if (inst == def.INST_XCHG) {
+                    if (sz == 8) { buf.buf_emit8(b, 134); } else { buf.buf_emit8(b, 135); }
+                } else if (inst == def.INST_CMPXCHG) {
+                    buf.buf_emit8(b, 15);
+                    if (sz == 8) { buf.buf_emit8(b, 176); } else { buf.buf_emit8(b, 177); }
+                } else {
+                    buf.buf_emit8(b, 15);
+                    if (sz == 8) { buf.buf_emit8(b, 192); } else { buf.buf_emit8(b, 193); }
+                }
+                buf.buf_emit8(b, eu.make_modrm(3, src_code, dst_code));
+                return cast(i32, b.len - start);
+            }
+        }
+    }
+
+    return eu.ENC_SKIP;
+}

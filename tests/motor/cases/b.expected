@@ -1,0 +1,36 @@
+9 ç 231 ã 😀 8 3 128512 AÇÃO 😀 É áé ação é 9 8 ação 😀 é**
+2 55357 56832 true true true
+1 açao true çã ééé 1 a|é|b true true 1 2
+2
+a%20b%26%C3%A9 a b&é a%20b/%C3%A9?x=1 aGVsbG8= hello é 2
+a\n|b|:a
+|b|:1,2 false
+true false
+true false
+2
+named 2 anon 1 arrow meth fld Cn m Cn
+5 0 {}
+1 dflt true false
+4 true get:a,get:b,set:c,get:c,del
+function 20 1 true 1 q
+44 255 3 undefined false 44,255,0
+-56 1.100000023841858 255,0,2 4294967295 -25536 1 16 2,4 7 2 4
+x y /p/q h.com 1
+[object Array] [object Null] [object RegExp] Symbol(q) false
+RangeError m RangeError: m true 0 string
+ME: z true true
+function function
+in
+2
+3 strict
+0
+1
+2
+a
+é
+2 2
+ag 1
+ag 2
+fa p
+fa q
+{"value":1,"done":false} {"value":9,"done":true}

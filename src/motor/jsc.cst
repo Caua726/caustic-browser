@@ -1,0 +1,2595 @@
+// JavaScript to Caustic text: a parser, scope analysis and a generator, for a subset of
+// the language. Outside the subset it stops and says why, and the page has no script.
+// Generated code is flat: every subexpression is a temporary, in evaluation order.
+
+struct N {
+    k as i64; op as *u8; s as *u8; num as f64; flag as i64; st as i64; opt as i64; is_gen as i64; is_async as i64;
+    a as *N; b as *N; c as *N; d as *N; list as *N; next as *N;
+    scope as *Scope; fnc as *Func;
+}
+struct Var { name as *u8; func as *Func; sc as *Scope; owner as *Scope; in_loop as i64; captured as i64; slot as i64; cname as *u8; next as *Var; nextf as *Var; prop as i64; }
+struct Scope { parent as *Scope; func as *Func; vars as *Var; has_env as i64; nslots as i64; ename as *u8; }
+struct Func { parent as *Func; node as *N; root as *Scope; arrow as i64; has_try as i64; needs_argc as i64; this_var as *Var; args_var as *Var; self_var as *Var; vars as *Var; nextall as *Func; cname as *u8; uses_this as i64; strict as i64; }
+struct Buf { p as *u8; n as i64; cap as i64; }
+struct Chunk { next as *Chunk; size as i64; }
+
+// ── Memory, freed all at once ──
+let is *Chunk as chunks with mut = cast(*Chunk, 0);
+let is i64 as a_p with mut = 0;
+let is i64 as a_end with mut = 0;
+fn _map(n as i64) as i64 { return syscall(9, 0, n, 3, 34, -1, 0); }
+fn ja(sz as i64) as *u8 {
+    let is i64 as n = (sz + 15) & -16;
+    if (a_p + n > a_end) {
+        let is i64 as c with mut = 1048576;
+        if (n + 32 > c) { c = (n + 4127) & -4096; }
+        let is *Chunk as k = cast(*Chunk, _map(c));
+        k.next = chunks; k.size = c; chunks = k;
+        a_p = cast(i64, k) + 32; a_end = cast(i64, k) + c;
+    }
+    let is i64 as r = a_p;
+    a_p = a_p + n;
+    return cast(*u8, r);
+}
+fn ja_free() as void {
+    let is *Chunk as k with mut = chunks;
+    while (cast(i64, k) != 0) { let is *Chunk as x = k.next; syscall(11, k, k.size); k = x; }
+    chunks = cast(*Chunk, 0); a_p = 0; a_end = 0;
+}
+fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (cast(i64, s[n]) != 0) { n = n + 1; } return n; }
+fn seq(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (cast(i64, a[i]) == cast(i64, b[i])) { if (cast(i64, a[i]) == 0) { return 1; } i = i + 1; }
+    return 0;
+}
+fn dupn(s as *u8, n as i64) as *u8 {
+    let is *u8 as r = ja(n + 1);
+    let is i64 as i with mut = 0;
+    while (i < n) { r[i] = s[i]; i = i + 1; }
+    r[n] = cast(u8, 0);
+    return r;
+}
+
+// ── Errors ──
+let is [256]u8 as err_msg with mut;
+let is i64 as failed with mut = 0;
+let is i64 as src_len with mut = 0;
+let is i64 as pos with mut = 0;
+fn fail(a as *u8, b as *u8) as void {
+    if (failed == 1) { return; }
+    failed = 1;
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (cast(i64, a[i]) != 0 && n < 200) { err_msg[n] = a[i]; n = n + 1; i = i + 1; }
+    i = 0;
+    if (cast(i64, b) != 0) { while (cast(i64, b[i]) != 0 && n < 250) { err_msg[n] = b[i]; n = n + 1; i = i + 1; } }
+    err_msg[n] = cast(u8, 0);
+    // No token is left, or a loop waiting for one would never end.
+    pos = src_len;
+    tk = T_EOF;
+    tk_s = "";
+}
+
+// ── Lexer ──
+let is i64 as T_EOF with imut = 0;
+let is i64 as T_ID with imut = 1;
+let is i64 as T_NUM with imut = 2;
+let is i64 as T_STR with imut = 3;
+let is i64 as T_TPL with imut = 4;
+let is i64 as T_P with imut = 5;
+let is *u8 as src with mut = cast(*u8, 0);
+let is i64 as tk with mut = 0;
+let is *u8 as tk_s with mut = cast(*u8, 0);
+let is i64 as tk_sl with mut = 0;
+let is f64 as tk_num with mut = 0.0;
+let is i64 as tk_nl with mut = 0;
+let is i64 as tk_start with mut = 0;
+
+fn is_id0(c as i64) as i32 { if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 36 || c >= 128) { return 1; } return 0; }
+fn is_dig(c as i64) as i32 { if (c >= 48 && c <= 57) { return 1; } return 0; }
+fn at(i as i64) as i64 { if (i >= src_len) { return 0; } return cast(i64, src[i]); }
+fn hexv(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+fn put_utf8(b as *u8, n0 as i64, u as i64) as i64 {
+    let is i64 as n with mut = n0;
+    if (u < 128) { b[n] = cast(u8, u); return n + 1; }
+    if (u < 2048) { b[n] = cast(u8, 192 | (u >> 6)); b[n + 1] = cast(u8, 128 | (u & 63)); return n + 2; }
+    if (u < 65536) { b[n] = cast(u8, 224 | (u >> 12)); b[n + 1] = cast(u8, 128 | ((u >> 6) & 63)); b[n + 2] = cast(u8, 128 | (u & 63)); return n + 3; }
+    b[n] = cast(u8, 240 | (u >> 18)); b[n + 1] = cast(u8, 128 | ((u >> 12) & 63)); b[n + 2] = cast(u8, 128 | ((u >> 6) & 63)); b[n + 3] = cast(u8, 128 | (u & 63));
+    return n + 4;
+}
+// One escape after the backslash at pos; written to b.
+fn read_escape(b as *u8, n0 as i64) as i64 {
+    let is i64 as c = at(pos);
+    pos = pos + 1;
+    let is i64 as n with mut = n0;
+    if (c == 110) { b[n] = cast(u8, 10); return n + 1; }
+    if (c == 116) { b[n] = cast(u8, 9); return n + 1; }
+    if (c == 114) { b[n] = cast(u8, 13); return n + 1; }
+    if (c == 98) { b[n] = cast(u8, 8); return n + 1; }
+    if (c == 102) { b[n] = cast(u8, 12); return n + 1; }
+    if (c == 118) { b[n] = cast(u8, 11); return n + 1; }
+    if (c == 48 && is_dig(at(pos)) == 0) { b[n] = cast(u8, 0); return n + 1; }
+    if (c == 10) { return n; }
+    if (c == 120) {
+        let is i64 as u = hexv(at(pos)) * 16 + hexv(at(pos + 1));
+        pos = pos + 2;
+        return put_utf8(b, n, u);
+    }
+    if (c == 117) {
+        let is i64 as u with mut = 0;
+        if (at(pos) == 123) {
+            pos = pos + 1;
+            while (at(pos) != 125 && pos < src_len) { u = u * 16 + hexv(at(pos)); pos = pos + 1; }
+            pos = pos + 1;
+        } else {
+            let is i64 as i with mut = 0;
+            while (i < 4) { u = u * 16 + hexv(at(pos + i)); i = i + 1; }
+            pos = pos + 4;
+        }
+        return put_utf8(b, n, u);
+    }
+    b[n] = cast(u8, c);
+    return n + 1;
+}
+let is [40]*u8 as puncts with mut;
+let is i64 as puncts_ready with mut = 0;
+fn init_puncts() as void {
+    puncts[0] = ">>>="; puncts[1] = "..."; puncts[2] = "==="; puncts[3] = "!=="; puncts[4] = ">>>"; puncts[5] = "<<="; puncts[6] = ">>="; puncts[7] = "**=";
+    puncts[8] = "=>"; puncts[9] = "=="; puncts[10] = "!="; puncts[11] = "<="; puncts[12] = ">="; puncts[13] = "&&="; puncts[14] = "||="; puncts[15] = "??=";
+    puncts[16] = "&&"; puncts[17] = "||"; puncts[18] = "??"; puncts[19] = "**";
+    puncts[20] = "?."; puncts[21] = "++"; puncts[22] = "--"; puncts[23] = "+="; puncts[24] = "-="; puncts[25] = "*="; puncts[26] = "/="; puncts[27] = "%=";
+    puncts[28] = "&="; puncts[29] = "|="; puncts[30] = "^="; puncts[31] = "<<"; puncts[32] = ">>"; puncts[33] = cast(*u8, 0);
+    puncts_ready = 1;
+}
+fn next() as void {
+    tk_nl = 0;
+    while (pos < src_len) {
+        let is i64 as c = at(pos);
+        if (c == 10) { tk_nl = 1; pos = pos + 1; }
+        else if (c == 32 || c == 9 || c == 13) { pos = pos + 1; }
+        else if (c == 47 && at(pos + 1) == 47) { while (pos < src_len && at(pos) != 10) { pos = pos + 1; } }
+        else if (c == 47 && at(pos + 1) == 42) {
+            pos = pos + 2;
+            while (pos < src_len && !(at(pos) == 42 && at(pos + 1) == 47)) { if (at(pos) == 10) { tk_nl = 1; } pos = pos + 1; }
+            pos = pos + 2;
+        } else { break; }
+    }
+    tk_start = pos;
+    if (pos >= src_len) { tk = T_EOF; tk_s = ""; return; }
+    let is i64 as c = at(pos);
+    if (is_id0(c) == 1 || (c == 35 && is_id0(at(pos + 1)) == 1)) {
+        let is i64 as st = pos;
+        if (c == 35) { pos = pos + 1; }
+        while (is_id0(at(pos)) == 1 || is_dig(at(pos)) == 1) { pos = pos + 1; }
+        // A private name is a hidden key that no ordinary string can spell by accident.
+        if (c == 35) {
+            let is i64 as tn = pos - st - 1;
+            let is *u8 as b = dupn("#priv:", 6 + tn);
+            let is i64 as k with mut = 0;
+            while (k < 6) { b[k] = cast(u8, cast(i64, "#priv:"[k])); k = k + 1; }
+            k = 0;
+            while (k < tn) { b[6 + k] = cast(u8, at(st + 1 + k)); k = k + 1; }
+            b[6 + tn] = cast(u8, 0);
+            tk = T_ID; tk_s = b;
+            return;
+        }
+        tk = T_ID; tk_s = dupn(cast(*u8, cast(i64, src) + st), pos - st);
+        return;
+    }
+    if (is_dig(c) == 1 || (c == 46 && is_dig(at(pos + 1)) == 1)) {
+        tk = T_NUM; tk_s = "";
+        let is f64 as v with mut = 0.0;
+        if (c == 48 && (at(pos + 1) == 120 || at(pos + 1) == 88 || at(pos + 1) == 98 || at(pos + 1) == 66 || at(pos + 1) == 111 || at(pos + 1) == 79)) {
+            let is i64 as x = at(pos + 1) | 32;
+            let is f64 as base with mut = 16.0;
+            if (x == 98) { base = 2.0; }
+            if (x == 111) { base = 8.0; }
+            pos = pos + 2;
+            while (hexv(at(pos)) >= 0) { v = v * base + cast(f64, hexv(at(pos))); pos = pos + 1; }
+            tk_num = v;
+            return;
+        }
+        while (is_dig(at(pos)) == 1) { v = v * 10.0 + cast(f64, at(pos) - 48); pos = pos + 1; }
+        let is i64 as ex with mut = 0;
+        if (at(pos) == 46) {
+            pos = pos + 1;
+            while (is_dig(at(pos)) == 1) { v = v * 10.0 + cast(f64, at(pos) - 48); ex = ex - 1; pos = pos + 1; }
+        }
+        if ((at(pos) | 32) == 101) {
+            pos = pos + 1;
+            let is i64 as sg with mut = 1;
+            if (at(pos) == 45) { sg = -1; pos = pos + 1; } else if (at(pos) == 43) { pos = pos + 1; }
+            let is i64 as e2 with mut = 0;
+            while (is_dig(at(pos)) == 1) { e2 = e2 * 10 + at(pos) - 48; pos = pos + 1; }
+            ex = ex + sg * e2;
+        }
+        while (ex > 0) { v = v * 10.0; ex = ex - 1; }
+        let is f64 as dv with mut = 1.0;
+        while (ex < 0) { dv = dv * 10.0; ex = ex + 1; }
+        tk_num = v / dv;
+        if (at(pos) == 110) { fail("BigInt literal", cast(*u8, 0)); }
+        return;
+    }
+    if (c == 34 || c == 39) {
+        let is i64 as q = c;
+        pos = pos + 1;
+        let is i64 as st = pos;
+        while (pos < src_len && at(pos) != q) { if (at(pos) == 92) { pos = pos + 1; } pos = pos + 1; }
+        let is *u8 as b = ja(pos - st + 8);
+        let is i64 as n with mut = 0;
+        pos = st;
+        while (pos < src_len && at(pos) != q) {
+            if (at(pos) == 92) { pos = pos + 1; n = read_escape(b, n); }
+            else { b[n] = cast(u8, at(pos)); n = n + 1; pos = pos + 1; }
+        }
+        pos = pos + 1;
+        b[n] = cast(u8, 0);
+        tk = T_STR; tk_s = b; tk_sl = n;
+        return;
+    }
+    if (c == 96) { pos = pos + 1; tk = T_TPL; tk_s = "`"; return; }
+    if (puncts_ready == 0) { init_puncts(); }
+    let is i64 as i with mut = 0;
+    while (cast(i64, puncts[i]) != 0) {
+        let is *u8 as p = puncts[i];
+        let is i64 as j with mut = 0;
+        while (cast(i64, p[j]) != 0 && at(pos + j) == cast(i64, p[j])) { j = j + 1; }
+        if (cast(i64, p[j]) == 0 && !(i == 20 && is_dig(at(pos + 2)) == 1)) { pos = pos + j; tk = T_P; tk_s = p; return; }
+        i = i + 1;
+    }
+    tk = T_P;
+    tk_s = dupn(cast(*u8, cast(i64, src) + pos), 1);
+    pos = pos + 1;
+}
+fn is_p(s as *u8) as i32 { if (tk == T_P && seq(tk_s, s) == 1) { return 1; } return 0; }
+fn is_kw(s as *u8) as i32 { if (tk == T_ID && seq(tk_s, s) == 1) { return 1; } return 0; }
+fn eat(s as *u8) as i32 { if (is_p(s) == 1) { next(); return 1; } return 0; }
+fn eat_kw(s as *u8) as i32 { if (is_kw(s) == 1) { next(); return 1; } return 0; }
+fn expect(s as *u8) as void { if (eat(s) == 0) { fail("expected ", s); } }
+fn semi() as void {
+    if (eat(";") == 1) { return; }
+    if (is_p("}") == 1 || tk == T_EOF || tk_nl == 1) { return; }
+    fail("expected ; before ", tk_s);
+}
+
+// ── AST ──
+let is i64 as S_VAR with imut = 1;
+let is i64 as S_DECL with imut = 2;
+let is i64 as S_FN with imut = 3;
+let is i64 as S_CLASS with imut = 4;
+let is i64 as S_RET with imut = 5;
+let is i64 as S_IF with imut = 6;
+let is i64 as S_BLOCK with imut = 7;
+let is i64 as S_WHILE with imut = 8;
+let is i64 as S_DO with imut = 9;
+let is i64 as S_FOR with imut = 10;
+let is i64 as S_OF with imut = 11;
+let is i64 as S_BREAK with imut = 12;
+let is i64 as S_CONT with imut = 13;
+let is i64 as S_THROW with imut = 14;
+let is i64 as S_EMPTY with imut = 15;
+let is i64 as S_EXPR with imut = 16;
+let is i64 as S_SWITCH with imut = 17;
+let is i64 as S_CASE with imut = 18;
+let is i64 as S_TRY with imut = 19;
+let is i64 as S_LABEL with imut = 20;
+let is i64 as S_FORIN with imut = 21;
+let is i64 as E_NUM with imut = 30;
+let is i64 as E_STR with imut = 31;
+let is i64 as E_ID with imut = 32;
+let is i64 as E_THIS with imut = 33;
+let is i64 as E_NULL with imut = 34;
+let is i64 as E_TRUE with imut = 35;
+let is i64 as E_FALSE with imut = 36;
+let is i64 as E_TPL with imut = 37;
+let is i64 as E_BIN with imut = 38;
+let is i64 as E_LOG with imut = 39;
+let is i64 as E_COND with imut = 40;
+let is i64 as E_UN with imut = 41;
+let is i64 as E_UPD with imut = 42;
+let is i64 as E_ASSIGN with imut = 43;
+let is i64 as E_MEM with imut = 44;
+let is i64 as E_IDX with imut = 45;
+let is i64 as E_CALL with imut = 46;
+let is i64 as E_NEW with imut = 47;
+let is i64 as E_ARR with imut = 48;
+let is i64 as E_OBJ with imut = 49;
+let is i64 as E_PROP with imut = 50;
+let is i64 as E_FN with imut = 51;
+let is i64 as E_SEQ with imut = 52;
+let is i64 as E_CLASS with imut = 53;
+let is i64 as E_METHOD with imut = 54;
+let is i64 as E_SPREAD with imut = 55;
+let is i64 as E_REGEX with imut = 56;
+let is i64 as E_SUPER with imut = 57;
+let is i64 as E_CHAIN with imut = 58;
+let is i64 as E_HOLE with imut = 59;
+let is i64 as E_YIELD with imut = 60;
+let is i64 as E_AWAIT with imut = 61;
+
+fn nn(k as i64) as *N {
+    let is *N as n = cast(*N, ja(sizeof(N)));
+    n.k = k; n.op = cast(*u8, 0); n.s = cast(*u8, 0); n.num = 0.0; n.flag = 0; n.st = 0; n.opt = 0; n.is_gen = 0; n.is_async = 0;
+    n.a = cast(*N, 0); n.b = cast(*N, 0); n.c = cast(*N, 0); n.d = cast(*N, 0); n.list = cast(*N, 0); n.next = cast(*N, 0);
+    n.scope = cast(*Scope, 0); n.fnc = cast(*Func, 0);
+    return n;
+}
+fn push(parent as *N, tail as *N, x as *N) as *N {
+    if (cast(i64, tail) == 0) { parent.list = x; } else { tail.next = x; }
+    return x;
+}
+fn is_null(n as *N) as i32 { if (cast(i64, n) == 0) { return 1; } return 0; }
+fn NONE() as *u8 { return cast(*u8, 0); }
+
+// ── Parser ──
+let is i64 as no_in with mut = 0;
+let is i64 as in_gen with mut = 0;
+let is i64 as in_async with mut = 0;
+
+fn skip_template() as void {
+    while (pos < src_len) {
+        let is i64 as c = at(pos);
+        if (c == 96) { pos = pos + 1; return; }
+        if (c == 92) { pos = pos + 2; continue; }
+        if (c == 36 && at(pos + 1) == 123) {
+            pos = pos + 2;
+            let is i64 as depth with mut = 1;
+            while (pos < src_len && depth > 0) {
+                let is i64 as d = at(pos);
+                if (d == 123) { depth = depth + 1; pos = pos + 1; }
+                else if (d == 125) { depth = depth - 1; pos = pos + 1; }
+                else if (d == 96) { pos = pos + 1; skip_template(); }
+                else if (d == 34 || d == 39) {
+                    pos = pos + 1;
+                    while (pos < src_len && at(pos) != d) { if (at(pos) == 92) { pos = pos + 1; } pos = pos + 1; }
+                    pos = pos + 1;
+                } else { pos = pos + 1; }
+            }
+            continue;
+        }
+        pos = pos + 1;
+    }
+}
+struct Saved { pos as i64; tk as i64; s as *u8; sl as i64; num as f64; nl as i64; st as i64; }
+fn save(v as *Saved) as void { v.pos = pos; v.tk = tk; v.s = tk_s; v.sl = tk_sl; v.num = tk_num; v.nl = tk_nl; v.st = tk_start; }
+fn restore(v as *Saved) as void { pos = v.pos; tk = v.tk; tk_s = v.s; tk_sl = v.sl; tk_num = v.num; tk_nl = v.nl; tk_start = v.st; }
+// Arrow functions are only known at the =>, so a parenthesis is scanned ahead. A regex in
+// the parameter defaults could confuse this; none has been seen minified.
+fn looks_arrow() as i32 {
+    let is Saved as v with mut;
+    save(&v);
+    let is i64 as depth with mut = 0;
+    let is i32 as r with mut = 0;
+    while (tk != T_EOF) {
+        if (tk == T_TPL) { skip_template(); }
+        if (is_p("(") == 1 || is_p("[") == 1 || is_p("{") == 1) { depth = depth + 1; }
+        if (is_p(")") == 1 || is_p("]") == 1 || is_p("}") == 1) {
+            depth = depth - 1;
+            if (depth == 0) { next(); r = cast(i32, is_p("=>") == 1 && tk_nl == 0); break; }
+        }
+        next();
+    }
+    restore(&v);
+    return r;
+}
+fn peek_p(s as *u8) as i32 {
+    let is Saved as v with mut;
+    save(&v);
+    next();
+    let is i32 as r = is_p(s);
+    restore(&v);
+    return r;
+}
+fn peek_starts_fn() as i32 {
+    // After `async` on one line: function, or an arrow's parameters.
+    let is Saved as v with mut;
+    save(&v);
+    next();
+    let is i32 as r with mut = 0;
+    if (tk_nl == 0) {
+        if (is_kw("function") == 1) { r = 1; }
+        else if (is_p("(") == 1 && looks_arrow() == 1) { r = 1; }
+        else if (tk == T_ID && peek_p("=>") == 1) { r = 1; }
+    }
+    restore(&v);
+    return r;
+}
+fn parse_params(f as *N) as void {
+    let is *N as tail with mut = cast(*N, 0);
+    while (is_p(")") == 0 && tk != T_EOF) {
+        if (eat("...") == 1) { let is *N as sp0 = nn(E_SPREAD); sp0.a = binding(); tail = push(f, tail, sp0); break; }
+        let is i64 as sv = no_in;
+        no_in = 0;
+        tail = push(f, tail, assign());
+        no_in = sv;
+        if (eat(",") == 0) { break; }
+    }
+    expect(")");
+}
+fn binding() as *N {
+    if (is_p("{") == 1 || is_p("[") == 1) { return primary(); }
+    if (tk != T_ID) { fail("binding name ", tk_s); return nn(E_NULL); }
+    let is *N as id = nn(E_ID);
+    id.s = tk_s;
+    next();
+    return id;
+}
+fn parse_body(f as *N) as void {
+    let is i64 as sg = in_gen;
+    let is i64 as sa = in_async;
+    in_gen = f.is_gen;
+    in_async = f.is_async;
+    let is i64 as si = no_in;
+    no_in = 0;
+    let is *N as b = nn(S_BLOCK);
+    expect("{");
+    let is *N as tail with mut = cast(*N, 0);
+    while (is_p("}") == 0 && tk != T_EOF) { tail = push(b, tail, stmt()); }
+    expect("}");
+    f.a = b;
+    in_gen = sg;
+    in_async = sa;
+    no_in = si;
+}
+fn parse_function_rest(name as *u8, is_gen as i64, is_async as i64) as *N {
+    let is *N as f = nn(E_FN);
+    f.s = name;
+    f.is_gen = is_gen;
+    f.is_async = is_async;
+    let is i64 as sg = in_gen;
+    let is i64 as sa = in_async;
+    in_gen = is_gen;
+    in_async = is_async;
+    expect("(");
+    parse_params(f);
+    in_gen = sg;
+    in_async = sa;
+    parse_body(f);
+    return f;
+}
+// Fields are one hidden function each class calls on a new instance.
+fn this_assign(key as *u8, computed as *N, value as *N) as *N {
+    let is *N as t with mut = cast(*N, 0);
+    if (is_null(computed) == 0) { t = nn(E_IDX); t.a = nn(E_THIS); t.b = computed; }
+    else { t = nn(E_MEM); t.a = nn(E_THIS); t.s = key; }
+    let is *N as x = nn(E_ASSIGN);
+    x.op = "="; x.a = t; x.b = value;
+    if (is_null(value) == 1) { x.b = nn(E_ID); x.b.s = "undefined"; }
+    let is *N as st = nn(S_EXPR);
+    st.a = x;
+    return st;
+}
+fn hidden_fn() as *N {
+    let is *N as f = nn(E_FN);
+    f.a = nn(S_BLOCK);
+    return f;
+}
+fn parse_class() as *N {
+    let is *N as c = nn(E_CLASS);
+    if (tk == T_ID && is_kw("extends") == 0) { c.s = tk_s; next(); }
+    if (eat_kw("extends") == 1) { c.a = member_chain(primary(), 1); }
+    expect("{");
+    let is *N as tail with mut = cast(*N, 0);
+    let is *N as fields with mut = cast(*N, 0);
+    let is *N as ftail with mut = cast(*N, 0);
+    let is *N as sfields with mut = cast(*N, 0);
+    let is *N as stail with mut = cast(*N, 0);
+    while (is_p("}") == 0 && tk != T_EOF) {
+        if (eat(";") == 1) { continue; }
+        let is *N as m = nn(E_METHOD);
+        m.op = "method";
+        if (is_kw("static") == 1 && peek_p("(") == 0 && peek_p("=") == 0) {
+            next(); m.st = 1;
+            if (is_p("{") == 1) {
+                let is *N as blk = parse_block();
+                if (is_null(sfields) == 1) { sfields = hidden_fn(); }
+                if (is_null(stail) == 1) { sfields.a.list = blk; } else { stail.next = blk; }
+                stail = blk;
+                continue;
+            }
+        }
+        let is i64 as is_gen with mut = 0;
+        let is i64 as is_async with mut = 0;
+        if (is_kw("async") == 1 && peek_p("(") == 0 && peek_p("=") == 0 && peek_p(";") == 0) { next(); is_async = 1; }
+        if (eat("*") == 1) { is_gen = 1; }
+        if ((is_kw("get") == 1 || is_kw("set") == 1) && peek_p("(") == 0 && peek_p("=") == 0 && peek_p(";") == 0 && peek_p("}") == 0) {
+            m.op = tk_s; next();
+        }
+        if (eat("[") == 1) { m.b = assign(); expect("]"); }
+        else if (tk == T_ID || tk == T_STR) { m.s = tk_s; next(); }
+        else if (tk == T_NUM) { m.s = itos(cast(i64, tk_num)); next(); }
+        else { fail("class member ", tk_s); return c; }
+        if (is_p("(") == 1) {
+            m.a = parse_function_rest(cast(*u8, 0), is_gen, is_async);
+            tail = push(c, tail, m);
+        } else {
+            let is *N as v with mut = cast(*N, 0);
+            if (eat("=") == 1) { v = assign(); }
+            semi();
+            let is *N as st = this_assign(m.s, m.b, v);
+            if (m.st == 1) {
+                if (is_null(sfields) == 1) { sfields = hidden_fn(); }
+                if (is_null(stail) == 1) { sfields.a.list = st; } else { stail.next = st; }
+                stail = st;
+            } else {
+                if (is_null(fields) == 1) { fields = hidden_fn(); }
+                if (is_null(ftail) == 1) { fields.a.list = st; } else { ftail.next = st; }
+                ftail = st;
+            }
+        }
+    }
+    expect("}");
+    c.b = fields;
+    c.c = sfields;
+    return c;
+}
+fn parse_template() as *N {
+    let is *N as t = nn(E_TPL);
+    let is *N as tail with mut = cast(*N, 0);
+    while (1 == 1) {
+        let is i64 as st = pos;
+        while (pos < src_len && at(pos) != 96 && !(at(pos) == 36 && at(pos + 1) == 123)) {
+            if (at(pos) == 92) { pos = pos + 1; }
+            pos = pos + 1;
+        }
+        let is i64 as end = pos;
+        let is *u8 as b = ja(end - st + 8);
+        let is i64 as n with mut = 0;
+        pos = st;
+        while (pos < end) {
+            if (at(pos) == 92) { pos = pos + 1; n = read_escape(b, n); }
+            else { b[n] = cast(u8, at(pos)); n = n + 1; pos = pos + 1; }
+        }
+        b[n] = cast(u8, 0);
+        pos = end;
+        let is *N as q = nn(E_STR);
+        q.s = b; q.flag = n;
+        q.op = dupn(cast(*u8, cast(i64, src) + st), end - st);
+        tail = push(t, tail, q);
+        if (pos >= src_len) { fail("unterminated template", NONE()); return t; }
+        if (at(pos) == 96) { pos = pos + 1; next(); return t; }
+        pos = pos + 2;
+        next();
+        let is i64 as sv = no_in;
+        no_in = 0;
+        tail = push(t, tail, expr());
+        no_in = sv;
+        if (is_p("}") == 0) { fail("expected } in template", NONE()); return t; }
+    }
+    return t;
+}
+fn parse_args(c as *N) as void {
+    let is *N as tail with mut = cast(*N, 0);
+    let is i64 as save0 = no_in;
+    no_in = 0;
+    while (is_p(")") == 0 && tk != T_EOF) {
+        if (eat("...") == 1) { let is *N as sp0 = nn(E_SPREAD); sp0.a = assign(); tail = push(c, tail, sp0); }
+        else { tail = push(c, tail, assign()); }
+        if (eat(",") == 0) { break; }
+    }
+    no_in = save0;
+    expect(")");
+}
+fn read_regex() as *N {
+    pos = tk_start + 1;
+    let is i64 as st = pos;
+    let is i64 as cls with mut = 0;
+    while (pos < src_len) {
+        let is i64 as c = at(pos);
+        if (c == 92) { pos = pos + 2; continue; }
+        if (c == 91) { cls = 1; }
+        if (c == 93) { cls = 0; }
+        if (c == 47 && cls == 0) { break; }
+        if (c == 10) { fail("newline in a regular expression", NONE()); return nn(E_NULL); }
+        pos = pos + 1;
+    }
+    let is *N as r = nn(E_REGEX);
+    r.s = dupn(cast(*u8, cast(i64, src) + st), pos - st);
+    r.flag = pos - st;
+    pos = pos + 1;
+    let is i64 as fs = pos;
+    while (is_id0(at(pos)) == 1) { pos = pos + 1; }
+    r.op = dupn(cast(*u8, cast(i64, src) + fs), pos - fs);
+    next();
+    return r;
+}
+fn obj_key(p as *N) as void {
+    // The name of a property, to the node's s, or its computed key to b.
+    if (eat("[") == 1) { p.b = assign(); expect("]"); return; }
+    if (tk == T_ID) { p.s = tk_s; next(); return; }
+    if (tk == T_STR) { p.s = tk_s; p.flag = tk_sl; p.st = 1; next(); return; }
+    if (tk == T_NUM) {
+        let is f64 as d = tk_num;
+        if (cast(f64, cast(i64, d)) != d) { fail("fractional property key", NONE()); return; }
+        p.s = itos(cast(i64, d));
+        next();
+        return;
+    }
+    fail("property name ", tk_s);
+}
+fn primary() as *N {
+    if (tk == T_NUM) { let is *N as n = nn(E_NUM); n.num = tk_num; next(); return n; }
+    if (tk == T_STR) { let is *N as n = nn(E_STR); n.s = tk_s; n.flag = tk_sl; next(); return n; }
+    if (tk == T_TPL) { return parse_template(); }
+    if (eat("(") == 1) {
+        let is i64 as sv = no_in;
+        no_in = 0;
+        let is *N as x = expr();
+        no_in = sv;
+        expect(")");
+        return x;
+    }
+    if (eat("[") == 1) {
+        let is *N as a = nn(E_ARR);
+        let is *N as tail with mut = cast(*N, 0);
+        let is i64 as sv = no_in;
+        no_in = 0;
+        while (is_p("]") == 0 && tk != T_EOF) {
+            if (is_p(",") == 1) { next(); tail = push(a, tail, nn(E_HOLE)); continue; }
+            if (eat("...") == 1) { let is *N as sp0 = nn(E_SPREAD); sp0.a = assign(); tail = push(a, tail, sp0); }
+            else { tail = push(a, tail, assign()); }
+            if (eat(",") == 0) { break; }
+        }
+        no_in = sv;
+        expect("]");
+        return a;
+    }
+    if (eat("{") == 1) {
+        let is *N as o = nn(E_OBJ);
+        let is *N as tail with mut = cast(*N, 0);
+        let is i64 as sv = no_in;
+        no_in = 0;
+        while (is_p("}") == 0 && tk != T_EOF) {
+            let is *N as p = nn(E_PROP);
+            p.op = "init";
+            if (eat("...") == 1) { p.op = "spread"; p.a = assign(); tail = push(o, tail, p); if (eat(",") == 0) { break; } continue; }
+            let is i64 as is_gen with mut = 0;
+            let is i64 as is_async with mut = 0;
+            if (is_kw("async") == 1 && peek_p("(") == 0 && peek_p(":") == 0 && peek_p(",") == 0 && peek_p("}") == 0) { next(); is_async = 1; }
+            if (eat("*") == 1) { is_gen = 1; }
+            if ((is_kw("get") == 1 || is_kw("set") == 1) && peek_p("(") == 0 && peek_p(":") == 0 && peek_p(",") == 0 && peek_p("}") == 0 && peek_p("=") == 0) {
+                p.op = tk_s; next();
+            }
+            let is i64 as was_id = cast(i64, tk == T_ID);
+            obj_key(p);
+            if (eat(":") == 1) { p.a = assign(); }
+            else if (is_p("(") == 1) { p.a = parse_function_rest(cast(*u8, 0), is_gen, is_async); }
+            else if (was_id == 1) {
+                let is *N as v = nn(E_ID);
+                v.s = p.s;
+                p.a = v;
+                // A pattern's {a = 1}: an assignment that only makes sense there.
+                if (eat("=") == 1) { let is *N as x = nn(E_ASSIGN); x.op = "="; x.a = v; x.b = assign(); p.a = x; }
+            }
+            else { fail("property ", tk_s); return o; }
+            tail = push(o, tail, p);
+            if (eat(",") == 0) { break; }
+        }
+        no_in = sv;
+        expect("}");
+        return o;
+    }
+    if (tk == T_ID) {
+        if (is_kw("async") == 1 && peek_starts_fn() == 1) {
+            next();
+            if (eat_kw("function") == 1) { return func_expr(1); }
+            return arrow_fn(1);
+        }
+        if (eat_kw("function") == 1) { return func_expr(0); }
+        if (eat_kw("class") == 1) { return parse_class(); }
+        if (eat_kw("this") == 1) { return nn(E_THIS); }
+        if (eat_kw("null") == 1) { return nn(E_NULL); }
+        if (eat_kw("true") == 1) { return nn(E_TRUE); }
+        if (eat_kw("false") == 1) { return nn(E_FALSE); }
+        if (eat_kw("super") == 1) { return nn(E_SUPER); }
+        if (is_kw("import") == 1) {
+            next();
+            if (eat(".") == 1) { next(); return id_node("__import_meta"); }
+            return id_node("__import");
+        }
+        let is *N as id = nn(E_ID);
+        id.s = tk_s;
+        next();
+        return id;
+    }
+    if (is_p("/") == 1 || is_p("/=") == 1) { return read_regex(); }
+    fail("unexpected token ", tk_s);
+    return nn(E_NULL);
+}
+fn func_expr(is_async as i64) as *N {
+    let is i64 as is_gen = eat("*");
+    let is *u8 as name with mut = cast(*u8, 0);
+    if (tk == T_ID) { name = tk_s; next(); }
+    let is *N as f = parse_function_rest(name, is_gen, is_async);
+    f.st = 1;    // a name of its own, for its own body
+    return f;
+}
+fn arrow_fn(is_async as i64) as *N {
+    let is *N as f = nn(E_FN);
+    f.flag = 1;
+    f.is_async = is_async;
+    let is i64 as sa = in_async;
+    in_async = is_async;
+    if (eat("(") == 1) { parse_params(f); }
+    else { let is *N as p = nn(E_ID); p.s = tk_s; f.list = p; next(); }
+    if (eat("=>") == 0) { fail("expected =>", NONE()); }
+    if (is_p("{") == 1) { in_async = sa; parse_body(f); return f; }
+    let is *N as ret = nn(S_RET);
+    ret.a = assign();
+    let is *N as b = nn(S_BLOCK);
+    b.list = ret;
+    f.a = b;
+    in_async = sa;
+    return f;
+}
+fn id_node(name as *u8) as *N { let is *N as x = nn(E_ID); x.s = name; return x; }
+fn str_node(t as *u8) as *N {
+    let is *N as q = nn(E_STR);
+    q.s = t;
+    let is i64 as k with mut = 0;
+    while (cast(i64, t[k]) != 0) { k = k + 1; }
+    q.flag = k;
+    return q;
+}
+// tag`a${b}c`: tag(__tpl([cooked], [raw]), b)
+fn tagged(tag as *N) as *N {
+    let is *N as t = parse_template();
+    let is *N as cooked = nn(E_ARR);
+    let is *N as raws = nn(E_ARR);
+    let is *N as ctail with mut = cast(*N, 0);
+    let is *N as rtail with mut = cast(*N, 0);
+    let is *N as call_n = nn(E_CALL);
+    call_n.a = tag;
+    let is *N as first = nn(E_CALL);
+    first.a = id_node("__tpl");
+    let is *N as ftail with mut = push(first, cast(*N, 0), cooked);
+    push(first, ftail, raws);
+    let is *N as atail with mut = push(call_n, cast(*N, 0), first);
+    let is *N as x with mut = t.list;
+    let is i64 as odd with mut = 0;
+    while (is_null(x) == 0) {
+        let is *N as nx = x.next;
+        x.next = cast(*N, 0);
+        if (odd == 0) {
+            ctail = push(cooked, ctail, x);
+            rtail = push(raws, rtail, str_node(x.op));
+        } else { atail = push(call_n, atail, x); }
+        odd = 1 - odd;
+        x = nx;
+    }
+    return call_n;
+}
+fn member_chain(start as *N, allow_call as i64) as *N {
+    let is *N as x with mut = start;
+    let is i64 as chained with mut = 0;
+    while (failed == 0) {
+        if (tk == T_TPL) { x = tagged(x); continue; }
+        let is i64 as opt with mut = 0;
+        if (allow_call == 1 && is_p("?.") == 1) { next(); opt = 1; chained = 1; }
+        if (opt == 1 && tk == T_ID) {
+            let is *N as m = nn(E_MEM);
+            m.a = x; m.s = tk_s; m.opt = 1;
+            next();
+            x = m;
+        } else if (opt == 0 && eat(".") == 1) {
+            if (tk != T_ID) { fail("member name ", tk_s); return x; }
+            let is *N as m = nn(E_MEM);
+            m.a = x; m.s = tk_s;
+            next();
+            x = m;
+        } else if (eat("[") == 1) {
+            let is *N as m = nn(E_IDX);
+            m.a = x; m.opt = opt;
+            let is i64 as sv = no_in;
+            no_in = 0;
+            m.b = expr();
+            no_in = sv;
+            expect("]");
+            x = m;
+        } else if (tk == T_TPL) {
+            fail("tagged template", NONE());
+        } else if (allow_call == 1 && is_p("(") == 1) {
+            next();
+            let is *N as c = nn(E_CALL);
+            c.a = x; c.opt = opt;
+            parse_args(c);
+            x = c;
+        } else { break; }
+    }
+    if (chained == 1) { let is *N as w = nn(E_CHAIN); w.a = x; return w; }
+    return x;
+}
+fn parse_new() as *N {
+    if (eat(".") == 1) {
+        next();
+        let is *N as nt = nn(E_CALL);
+        nt.a = id_node("__newTarget");
+        push(nt, cast(*N, 0), nn(E_THIS));
+        return nt;
+    }
+    let is *N as cal with mut = cast(*N, 0);
+    if (eat_kw("new") == 1) { cal = parse_new(); }
+    else { cal = member_chain(primary(), 0); }
+    let is *N as n = nn(E_NEW);
+    n.a = cal;
+    if (eat("(") == 1) { parse_args(n); }
+    return n;
+}
+fn postfix() as *N {
+    let is *N as x with mut = cast(*N, 0);
+    if (eat_kw("new") == 1) { x = member_chain(parse_new(), 1); }
+    else { x = member_chain(primary(), 1); }
+    if ((is_p("++") == 1 || is_p("--") == 1) && tk_nl == 0) {
+        let is *N as u = nn(E_UPD);
+        u.op = tk_s; u.a = x;
+        next();
+        return u;
+    }
+    return x;
+}
+fn unary() as *N {
+    if (is_p("!") == 1 || is_p("-") == 1 || is_p("+") == 1 || is_p("~") == 1 || is_kw("typeof") == 1 || is_kw("void") == 1 || is_kw("delete") == 1) {
+        let is *N as u = nn(E_UN);
+        u.op = tk_s;
+        next();
+        u.a = unary();
+        return u;
+    }
+    if (is_p("++") == 1 || is_p("--") == 1) {
+        let is *N as u = nn(E_UPD);
+        u.op = tk_s; u.flag = 1;
+        next();
+        u.a = unary();
+        return u;
+    }
+    if (in_async == 1 && is_kw("await") == 1) {
+        next();
+        let is *N as w = nn(E_AWAIT);
+        w.a = unary();
+        return w;
+    }
+    return postfix();
+}
+fn prec() as i64 {
+    if (tk == T_ID) {
+        if (seq(tk_s, "instanceof") == 1) { return 7; }
+        if (no_in == 0 && seq(tk_s, "in") == 1) { return 7; }
+        return 0;
+    }
+    if (tk != T_P) { return 0; }
+    if (seq(tk_s, "??") == 1) { return 1; }
+    if (seq(tk_s, "||") == 1) { return 1; }
+    if (seq(tk_s, "&&") == 1) { return 2; }
+    if (seq(tk_s, "|") == 1) { return 3; }
+    if (seq(tk_s, "^") == 1) { return 4; }
+    if (seq(tk_s, "&") == 1) { return 5; }
+    if (seq(tk_s, "==") == 1 || seq(tk_s, "!=") == 1 || seq(tk_s, "===") == 1 || seq(tk_s, "!==") == 1) { return 6; }
+    if (seq(tk_s, "<") == 1 || seq(tk_s, ">") == 1 || seq(tk_s, "<=") == 1 || seq(tk_s, ">=") == 1) { return 7; }
+    if (seq(tk_s, "<<") == 1 || seq(tk_s, ">>") == 1 || seq(tk_s, ">>>") == 1) { return 8; }
+    if (seq(tk_s, "+") == 1 || seq(tk_s, "-") == 1) { return 9; }
+    if (seq(tk_s, "*") == 1 || seq(tk_s, "/") == 1 || seq(tk_s, "%") == 1) { return 10; }
+    if (seq(tk_s, "**") == 1) { return 11; }
+    return 0;
+}
+fn binary(min as i64) as *N {
+    let is *N as l with mut = unary();
+    while (failed == 0) {
+        let is i64 as p = prec();
+        if (p == 0 || p < min) { break; }
+        let is *u8 as op = tk_s;
+        next();
+        let is i64 as right_assoc = cast(i64, p == 11);
+        let is *N as r with mut = cast(*N, 0);
+        if (right_assoc == 1) { r = binary(p); } else { r = binary(p + 1); }
+        let is i64 as lg = cast(i64, seq(op, "&&") == 1 || seq(op, "||") == 1 || seq(op, "??") == 1);
+        let is *N as b with mut = nn(E_BIN);
+        if (lg == 1) { b = nn(E_LOG); }
+        b.op = op; b.a = l; b.b = r;
+        l = b;
+    }
+    return l;
+}
+fn is_assign_op() as i32 {
+    if (tk != T_P) { return 0; }
+    if (seq(tk_s, "=") == 1 || seq(tk_s, "+=") == 1 || seq(tk_s, "-=") == 1 || seq(tk_s, "*=") == 1 || seq(tk_s, "/=") == 1 ||
+        seq(tk_s, "%=") == 1 || seq(tk_s, "&=") == 1 || seq(tk_s, "|=") == 1 || seq(tk_s, "^=") == 1 || seq(tk_s, "<<=") == 1 ||
+        seq(tk_s, ">>=") == 1 || seq(tk_s, ">>>=") == 1 || seq(tk_s, "**=") == 1 || seq(tk_s, "&&=") == 1 || seq(tk_s, "||=") == 1 || seq(tk_s, "??=") == 1) { return 1; }
+    return 0;
+}
+fn assign() as *N {
+    if (in_gen == 1 && is_kw("yield") == 1) {
+        next();
+        let is *N as y = nn(E_YIELD);
+        if (eat("*") == 1) { y.flag = 1; y.a = assign(); return y; }
+        if (tk_nl == 0 && is_p(")") == 0 && is_p("]") == 0 && is_p("}") == 0 && is_p(",") == 0 && is_p(";") == 0 && is_p(":") == 0 && tk != T_EOF) {
+            y.a = assign();
+        }
+        return y;
+    }
+    if (tk == T_ID && peek_p("=>") == 1) { return arrow_fn(0); }
+    if (is_p("(") == 1 && looks_arrow() == 1) { return arrow_fn(0); }
+    let is *N as c = binary(1);
+    if (is_p("?") == 1) {
+        next();
+        let is *N as q = nn(E_COND);
+        q.a = c;
+        let is i64 as sv = no_in;
+        no_in = 0;
+        q.b = assign();
+        no_in = sv;
+        expect(":");
+        q.c = assign();
+        return q;
+    }
+    if (is_assign_op() == 1) {
+        let is *N as x = nn(E_ASSIGN);
+        x.op = tk_s; x.a = c;
+        if (c.k != E_ID && c.k != E_MEM && c.k != E_IDX && c.k != E_ARR && c.k != E_OBJ) { fail("bad assignment target", NONE()); return x; }
+        next();
+        x.b = assign();
+        return x;
+    }
+    return c;
+}
+fn expr() as *N {
+    let is *N as first = assign();
+    if (is_p(",") == 0) { return first; }
+    let is *N as s = nn(E_SEQ);
+    let is *N as tail with mut = push(s, cast(*N, 0), first);
+    while (eat(",") == 1) { tail = push(s, tail, assign()); }
+    return s;
+}
+fn parse_var(kind as i64) as *N {
+    let is *N as v = nn(S_VAR);
+    v.flag = kind;
+    let is *N as tail with mut = cast(*N, 0);
+    while (failed == 0) {
+        let is *N as d = nn(S_DECL);
+        d.b = binding();
+        if (eat("=") == 1) { d.a = assign(); }
+        tail = push(v, tail, d);
+        if (eat(",") == 0) { break; }
+    }
+    return v;
+}
+fn parse_block() as *N {
+    expect("{");
+    let is *N as b = nn(S_BLOCK);
+    let is *N as tail with mut = cast(*N, 0);
+    while (is_p("}") == 0 && tk != T_EOF) { tail = push(b, tail, stmt()); }
+    expect("}");
+    return b;
+}
+fn stmt() as *N {
+    if (is_p("{") == 1) { return parse_block(); }
+    if (eat(";") == 1) { return nn(S_EMPTY); }
+    if (tk == T_ID) {
+        if (is_kw("var") == 1 || is_kw("const") == 1 || (is_kw("let") == 1 && (peek_p("=") == 0 && peek_p(";") == 0 && peek_p(".") == 0))) {
+            let is i64 as kind = cast(i64, is_kw("var") == 0);
+            next();
+            let is *N as v = parse_var(kind);
+            semi();
+            return v;
+        }
+        if (is_kw("async") == 1 && peek_starts_fn() == 1) {
+            let is Saved as sv with mut;
+            save(&sv);
+            next();
+            if (eat_kw("function") == 1) {
+                let is i64 as g = eat("*");
+                let is *N as n = nn(S_FN);
+                n.s = tk_s;
+                next();
+                n.a = parse_function_rest(n.s, g, 1);
+                return n;
+            }
+            restore(&sv);
+        }
+        if (eat_kw("function") == 1) {
+            let is i64 as g = eat("*");
+            let is *N as n = nn(S_FN);
+            n.s = tk_s;
+            next();
+            n.a = parse_function_rest(n.s, g, 0);
+            return n;
+        }
+        if (eat_kw("class") == 1) {
+            let is *N as c = nn(S_CLASS);
+            c.s = tk_s;
+            c.a = parse_class();
+            return c;
+        }
+        if (eat_kw("return") == 1) {
+            let is *N as r = nn(S_RET);
+            if (is_p(";") == 0 && is_p("}") == 0 && tk != T_EOF && tk_nl == 0) { r.a = expr(); }
+            semi();
+            return r;
+        }
+        if (eat_kw("if") == 1) {
+            let is *N as n = nn(S_IF);
+            expect("(");
+            n.a = expr();
+            expect(")");
+            n.b = stmt();
+            if (eat_kw("else") == 1) { n.c = stmt(); }
+            return n;
+        }
+        if (eat_kw("while") == 1) {
+            let is *N as n = nn(S_WHILE);
+            expect("(");
+            n.a = expr();
+            expect(")");
+            n.b = stmt();
+            return n;
+        }
+        if (eat_kw("do") == 1) {
+            let is *N as n = nn(S_DO);
+            n.b = stmt();
+            if (eat_kw("while") == 0) { fail("expected while", NONE()); }
+            expect("(");
+            n.a = expr();
+            expect(")");
+            eat(";");
+            return n;
+        }
+        if (eat_kw("for") == 1) {
+            let is i64 as for_await with mut = 0;
+            if (is_kw("await") == 1) { next(); for_await = 1; }
+            expect("(");
+            let is *N as init with mut = cast(*N, 0);
+            if (is_p(";") == 0) {
+                no_in = 1;
+                if (is_kw("var") == 1 || is_kw("let") == 1 || is_kw("const") == 1) {
+                    let is i64 as kind = cast(i64, is_kw("var") == 0);
+                    next();
+                    init = parse_var(kind);
+                } else { init = expr(); }
+                no_in = 0;
+            }
+            if (is_kw("of") == 1 || is_kw("in") == 1) {
+                let is i64 as isof = is_kw("of");
+                next();
+                let is *N as n with mut = nn(S_OF);
+                if (isof == 0) { n = nn(S_FORIN); }
+                n.flag = for_await;
+                n.a = init;
+                if (isof == 1) { n.b = assign(); } else { n.b = expr(); }
+                expect(")");
+                n.c = stmt();
+                return n;
+            }
+            let is *N as n = nn(S_FOR);
+            n.a = init;
+            expect(";");
+            if (is_p(";") == 0) { n.b = expr(); }
+            expect(";");
+            if (is_p(")") == 0) { n.c = expr(); }
+            expect(")");
+            n.d = stmt();
+            return n;
+        }
+        if (eat_kw("break") == 1) {
+            let is *N as b = nn(S_BREAK);
+            if (tk == T_ID && tk_nl == 0) { b.s = tk_s; next(); }
+            semi();
+            return b;
+        }
+        if (eat_kw("continue") == 1) {
+            let is *N as b = nn(S_CONT);
+            if (tk == T_ID && tk_nl == 0) { b.s = tk_s; next(); }
+            semi();
+            return b;
+        }
+        if (eat_kw("throw") == 1) { let is *N as t = nn(S_THROW); t.a = expr(); semi(); return t; }
+        if (eat_kw("try") == 1) {
+            let is *N as t = nn(S_TRY);
+            t.a = parse_block();
+            if (eat_kw("catch") == 1) {
+                if (eat("(") == 1) { t.b = binding(); expect(")"); }
+                t.c = parse_block();
+            }
+            if (eat_kw("finally") == 1) { t.d = parse_block(); }
+            return t;
+        }
+        if (is_kw("export") == 1) {
+            next();
+            if (eat_kw("default") == 1) {
+                if (is_kw("function") == 1 || is_kw("class") == 1 || is_kw("async") == 1) { return stmt(); }
+                let is *N as ex0 = nn(S_EXPR);
+                ex0.a = assign();
+                semi();
+                return ex0;
+            }
+            if (is_p("{") == 1 || is_p("*") == 1) {
+                while (tk != T_EOF && is_p(";") == 0 && tk_nl == 0) { next(); }
+                while (tk != T_EOF && is_p(";") == 0 && is_p("}") == 0) { next(); }
+                next();
+                if (is_kw("from") == 1) { next(); next(); }
+                eat(";");
+                return nn(S_EMPTY);
+            }
+            return stmt();
+        }
+        if (is_kw("import") == 1 && peek_p("(") == 0 && peek_p(".") == 0) { fail("module syntax ", tk_s); return nn(S_EMPTY); }
+        if (eat_kw("switch") == 1) {
+            let is *N as n = nn(S_SWITCH);
+            expect("(");
+            n.a = expr();
+            expect(")");
+            expect("{");
+            let is *N as tail with mut = cast(*N, 0);
+            while (is_p("}") == 0 && tk != T_EOF) {
+                let is *N as c = nn(S_CASE);
+                if (eat_kw("default") == 0) {
+                    if (eat_kw("case") == 0) { fail("expected case", NONE()); return n; }
+                    c.a = expr();
+                }
+                expect(":");
+                let is *N as t2 with mut = cast(*N, 0);
+                while (is_kw("case") == 0 && is_kw("default") == 0 && is_p("}") == 0 && tk != T_EOF) { t2 = push(c, t2, stmt()); }
+                tail = push(n, tail, c);
+            }
+            expect("}");
+            return n;
+        }
+        if (peek_p(":") == 1) {
+            let is *N as l = nn(S_LABEL);
+            l.s = tk_s;
+            next();
+            next();
+            l.a = stmt();
+            return l;
+        }
+    }
+    let is *N as e = nn(S_EXPR);
+    e.a = expr();
+    semi();
+    return e;
+}
+
+// ── Scope analysis ──
+let is *Func as all_funcs with mut = cast(*Func, 0);
+let is i64 as class_depth with mut = 0;
+let is i64 as eval_mode with mut = 0;
+let is i64 as trace_calls with mut = 0;
+fn func_new(parent as *Func, node as *N, arrow as i64) as *Func {
+    let is *Func as f = cast(*Func, ja(sizeof(Func)));
+    f.parent = parent; f.node = node; f.arrow = arrow; f.has_try = 0; f.needs_argc = 0; f.root = cast(*Scope, 0);
+    f.this_var = cast(*Var, 0); f.args_var = cast(*Var, 0); f.self_var = cast(*Var, 0); f.vars = cast(*Var, 0); f.cname = cast(*u8, 0);
+    f.uses_this = 0;
+    f.strict = 0;
+    if (cast(i64, parent) != 0) { f.strict = parent.strict; }
+    if (class_depth > 0) { f.strict = 1; }
+    f.nextall = all_funcs; all_funcs = f;
+    return f;
+}
+fn scope_new(parent as *Scope, f as *Func) as *Scope {
+    let is *Scope as s = cast(*Scope, ja(sizeof(Scope)));
+    s.parent = parent; s.func = f; s.vars = cast(*Var, 0); s.has_env = 0; s.nslots = 0; s.ename = cast(*u8, 0);
+    return s;
+}
+fn var_new(name as *u8, sc as *Scope, in_loop as i64) as *Var {
+    let is *Var as v = cast(*Var, ja(sizeof(Var)));
+    let is *Func as f = sc.func;
+    v.name = name; v.func = f; v.sc = sc; v.owner = cast(*Scope, 0); v.in_loop = in_loop; v.captured = 0; v.slot = 0; v.cname = cast(*u8, 0);
+    v.prop = 0;
+    v.next = sc.vars; sc.vars = v;
+    v.nextf = f.vars; f.vars = v;
+    return v;
+}
+fn declare(sc as *Scope, name as *u8, in_loop as i64) as *Var {
+    let is *Var as x with mut = sc.vars;
+    while (cast(i64, x) != 0) { if (seq(x.name, name) == 1) { return x; } x = x.next; }
+    return var_new(name, sc, in_loop);
+}
+fn lookup(sc0 as *Scope, name as *u8) as *Var {
+    let is *Scope as sc with mut = sc0;
+    while (cast(i64, sc) != 0) {
+        let is *Var as x with mut = sc.vars;
+        while (cast(i64, x) != 0) {
+            if (seq(x.name, name) == 1) {
+                // A property of the global object is reached by name, like anything undeclared.
+                if (x.prop == 1) { return cast(*Var, 0); }
+                return x;
+            }
+            x = x.next;
+        }
+        sc = sc.parent;
+    }
+    return cast(*Var, 0);
+}
+fn pat_names(n as *N, sc as *Scope, lp as i64) as void {
+    if (is_null(n) == 1) { return; }
+    let is i64 as k = n.k;
+    if (k == E_ID) { declare(sc, n.s, lp); return; }
+    if (k == E_ASSIGN) { pat_names(n.a, sc, lp); return; }
+    if (k == E_SPREAD) { pat_names(n.a, sc, lp); return; }
+    if (k == E_PROP) { pat_names(n.a, sc, lp); return; }
+    if (k == E_ARR || k == E_OBJ) {
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) { pat_names(x, sc, lp); x = x.next; }
+    }
+}
+fn walk_kids(n as *N, fp as *u8, sc as *Scope, f as *Func, lp as i64) as void {
+    if (is_null(n.a) == 0) { call(fp, n.a, sc, f, lp); }
+    if (is_null(n.b) == 0) { call(fp, n.b, sc, f, lp); }
+    if (is_null(n.c) == 0) { call(fp, n.c, sc, f, lp); }
+    if (is_null(n.d) == 0) { call(fp, n.d, sc, f, lp); }
+    let is *N as x with mut = n.list;
+    while (is_null(x) == 0) { call(fp, x, sc, f, lp); x = x.next; }
+}
+fn hoist_vars(n as *N, sc as *Scope, f as *Func, lp as i64) as void {
+    if (n.k == E_FN || n.k == E_CLASS) { return; }
+    if (n.k == S_VAR && n.flag == 0) {
+        let is *N as d with mut = n.list;
+        while (is_null(d) == 0) { pat_names(d.b, sc, 0); d = d.next; }
+    }
+    walk_kids(n, fn_ptr(hoist_vars), sc, f, lp);
+}
+fn block_decls(first as *N, sc as *Scope, lp as i64) as void {
+    let is *N as st with mut = first;
+    while (is_null(st) == 0) {
+        if (st.k == S_VAR && st.flag == 1) {
+            let is *N as d with mut = st.list;
+            while (is_null(d) == 0) { pat_names(d.b, sc, lp); d = d.next; }
+        } else if (st.k == S_FN) { declare(sc, st.s, lp); }
+        else if (st.k == S_CLASS) { declare(sc, st.s, lp); }
+        st = st.next;
+    }
+}
+// "use strict" at the head of a list of statements.
+fn has_directive(st0 as *N) as i64 {
+    let is *N as st with mut = st0;
+    while (is_null(st) == 0 && st.k == S_EXPR && st.a.k == E_STR) {
+        if (seq(st.a.s, "use strict") == 1) { return 1; }
+        st = st.next;
+    }
+    return 0;
+}
+fn analyze_fn(n as *N, sc as *Scope, f as *Func) as void {
+    let is *Func as g = func_new(f, n, n.flag);
+    n.fnc = g;
+    if (has_directive(n.a.list) == 1) { g.strict = 1; }
+    let is *Scope as s = scope_new(sc, g);
+    g.root = s;
+    n.scope = s;
+    let is *N as p with mut = n.list;
+    while (is_null(p) == 0) {
+        pat_names(p, s, 0);
+        if (p.k == E_SPREAD) { g.needs_argc = 1; }
+        p = p.next;
+    }
+    let is i64 as np with mut = 0;
+    p = n.list;
+    while (is_null(p) == 0) { np = np + 1; p = p.next; }
+    if (np > 4) { g.needs_argc = 1; }
+    if (n.st == 1 && cast(i64, n.s) != 0 && cast(i64, lookup_here(s, n.s)) == 0) { g.self_var = declare(s, n.s, 0); }
+    p = n.list;
+    while (is_null(p) == 0) { analyze(p, s, g, 0); p = p.next; }
+    hoist_vars(n.a, s, g, 0);
+    block_decls(n.a.list, s, 0);
+    let is *N as st with mut = n.a.list;
+    while (is_null(st) == 0) { analyze(st, s, g, 0); st = st.next; }
+}
+fn lookup_here(s as *Scope, name as *u8) as *Var {
+    let is *Var as x with mut = s.vars;
+    while (cast(i64, x) != 0) { if (seq(x.name, name) == 1) { return x; } x = x.next; }
+    return cast(*Var, 0);
+}
+fn mark_use(sc as *Scope, f as *Func, name as *u8) as void {
+    let is *Var as v = lookup(sc, name);
+    if (cast(i64, v) != 0 && v.func != f) { v.captured = 1; }
+}
+fn analyze(n as *N, sc as *Scope, f as *Func, lp as i64) as void {
+    let is i64 as k = n.k;
+    if (k == E_FN) { analyze_fn(n, sc, f); return; }
+    if (k == S_FN) { analyze_fn(n.a, sc, f); return; }
+    if (k == S_CLASS) { analyze(n.a, sc, f, lp); return; }
+    if (k == E_CLASS) {
+        class_depth = class_depth + 1;
+        // The class's own name and parent, for its methods, in a scope of their own.
+        let is *Scope as cs = scope_new(sc, f);
+        n.scope = cs;
+        if (cast(i64, n.s) != 0) { declare(cs, n.s, lp); }
+        declare(cs, "%parent", lp);
+        declare(cs, "%fields", lp);
+        if (is_null(n.a) == 0) { analyze(n.a, cs, f, lp); }
+        if (is_null(n.b) == 0) { analyze_fn(n.b, cs, f); }
+        if (is_null(n.c) == 0) { analyze_fn(n.c, cs, f); }
+        let is *N as m with mut = n.list;
+        while (is_null(m) == 0) {
+            if (is_null(m.b) == 0) { analyze(m.b, cs, f, lp); }
+            analyze_fn(m.a, cs, f);
+            m = m.next;
+        }
+        class_depth = class_depth - 1;
+        return;
+    }
+    if (k == S_BLOCK) {
+        let is *Scope as b = scope_new(sc, f);
+        n.scope = b;
+        block_decls(n.list, b, lp);
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) { analyze(x, b, f, lp); x = x.next; }
+        return;
+    }
+    if (k == S_FOR || k == S_OF || k == S_FORIN || k == S_WHILE || k == S_DO) {
+        let is *Scope as b = scope_new(sc, f);
+        n.scope = b;
+        if ((k == S_FOR || k == S_OF || k == S_FORIN) && is_null(n.a) == 0 && n.a.k == S_VAR && n.a.flag == 1) {
+            let is *N as d with mut = n.a.list;
+            while (is_null(d) == 0) { pat_names(d.b, b, 1); d = d.next; }
+        }
+        walk_kids(n, fn_ptr(analyze), b, f, 1);
+        return;
+    }
+    if (k == S_TRY) {
+        f.has_try = 1;
+        analyze(n.a, sc, f, lp);
+        if (is_null(n.c) == 0) {
+            let is *Scope as cs = scope_new(sc, f);
+            n.scope = cs;
+            if (is_null(n.b) == 0) { pat_names(n.b, cs, lp); analyze(n.b, cs, f, lp); }
+            analyze(n.c, cs, f, lp);
+        }
+        if (is_null(n.d) == 0) { analyze(n.d, sc, f, lp); }
+        return;
+    }
+    if (k == E_ID) {
+        if (seq(n.s, "arguments") == 1) {
+            let is *Func as g with mut = f;
+            while (g.arrow == 1) { g = g.parent; }
+            // Each function has its own: one an outer function has does not count here.
+            let is *Scope as look with mut = sc;
+            let is i64 as mine with mut = 0;
+            while (cast(i64, look) != 0 && mine == 0) {
+                if (cast(i64, lookup_here(look, n.s)) != 0) { mine = 1; }
+                if (look == g.root) { break; }
+                look = look.parent;
+            }
+            if (mine == 0 && cast(i64, g.parent) != 0) {
+                g.needs_argc = 1;
+                g.args_var = declare(g.root, "arguments", 0);
+            }
+        }
+        mark_use(sc, f, n.s);
+        return;
+    }
+    if (k == E_THIS || k == E_SUPER) {
+        let is *Func as g with mut = f;
+        let is i64 as crossed with mut = 0;
+        while (g.arrow == 1) { g = g.parent; crossed = 1; }
+        g.uses_this = 1;
+        if (crossed == 1 && cast(i64, g.parent) != 0 && cast(i64, g.this_var) == 0) {
+            g.this_var = var_new("%this", g.root, 0);
+            g.this_var.captured = 1;
+        }
+        if (k == E_SUPER) { mark_use(sc, f, "%parent"); mark_use(sc, f, "%fields"); }
+        return;
+    }
+    if (k == E_MEM) { analyze(n.a, sc, f, lp); return; }
+    if (k == E_PROP) {
+        if (is_null(n.b) == 0) { analyze(n.b, sc, f, lp); }
+        analyze(n.a, sc, f, lp);
+        return;
+    }
+    walk_kids(n, fn_ptr(analyze), sc, f, lp);
+}
+fn name_vars() as void {
+    let is *Func as f with mut = all_funcs;
+    while (cast(i64, f) != 0) {
+        let is *Var as v with mut = f.vars;
+        while (cast(i64, v) != 0) {
+            // A try can jump back with registers as they were: what it can see lives in memory.
+            if (f.has_try == 1 && cast(i64, f.parent) != 0) { v.captured = 1; }
+            let is i64 as is_top = cast(i64, cast(i64, f.parent) == 0);
+            if (v.prop == 1) {
+                v.cname = "UNDEF";
+            } else if (v.captured == 1 && (is_top == 0 || v.in_loop == 1)) {
+                let is *Scope as o with mut = f.root;
+                if (v.in_loop == 1 || is_top == 1) { o = v.sc; }
+                o.has_env = 1;
+                o.nslots = o.nslots + 1;
+                v.owner = o;
+                v.slot = o.nslots;
+                v.cname = "slot";
+            } else if (is_top == 1) {
+                nvar = nvar + 1;
+                v.cname = fmt("g%", itos(nvar), "", "", "");
+                let is *Buf as saved = cur;
+                cur = &out_globals;
+                e1("let is i64 as % with mut = 10;\n", v.cname);
+                let is *Buf as was_cur = cur;
+                cur = &out_gc_roots;
+                e1("gc_range(cast(i64, &%), 8);\n", v.cname);
+                cur = was_cur;
+                cur = saved;
+            } else {
+                nvar = nvar + 1;
+                v.cname = fmt("v%", itos(nvar), "", "", "");
+            }
+            v = v.nextf;
+        }
+        f = f.nextall;
+    }
+}
+
+// ── Output ──
+fn buf_put(b as *Buf, s as *u8, n as i64) as void {
+    if (b.n + n > b.cap) {
+        let is i64 as nc with mut = b.cap * 2;
+        if (nc < b.n + n + 256) { nc = b.n + n + 256; }
+        let is *u8 as d = ja(nc);
+        let is i64 as i with mut = 0;
+        while (i < b.n) { d[i] = b.p[i]; i = i + 1; }
+        b.p = d; b.cap = nc;
+    }
+    let is i64 as j with mut = 0;
+    while (j < n) { b.p[b.n + j] = s[j]; j = j + 1; }
+    b.n = b.n + n;
+}
+let is Buf as out_funcs with mut;
+let is Buf as out_names with mut;
+let is Buf as out_gc_roots with mut;
+let is Buf as out_globals with mut;
+let is Buf as out_strs with mut;
+let is *Buf as cur with mut = cast(*Buf, 0);
+fn e4(fm as *u8, a as *u8, b as *u8, c as *u8, d as *u8) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as w with mut = 0;
+    while (cast(i64, fm[i]) != 0) {
+        if (cast(i64, fm[i]) == 37) {
+            let is *u8 as v with mut = a;
+            if (w == 1) { v = b; }
+            if (w == 2) { v = c; }
+            if (w == 3) { v = d; }
+            buf_put(cur, v, slen(v));
+            w = w + 1;
+        } else { buf_put(cur, cast(*u8, cast(i64, fm) + i), 1); }
+        i = i + 1;
+    }
+}
+fn e0(fm as *u8) as void { e4(fm, "", "", "", ""); }
+fn e1(fm as *u8, a as *u8) as void { e4(fm, a, "", "", ""); }
+fn e2(fm as *u8, a as *u8, b as *u8) as void { e4(fm, a, b, "", ""); }
+fn e3(fm as *u8, a as *u8, b as *u8, c as *u8) as void { e4(fm, a, b, c, ""); }
+fn fmt(fm as *u8, a as *u8, b as *u8, c as *u8, d as *u8) as *u8 {
+    let is Buf as t with mut;
+    t.p = cast(*u8, 0); t.n = 0; t.cap = 0;
+    let is *Buf as saved = cur;
+    cur = &t;
+    e4(fm, a, b, c, d);
+    cur = saved;
+    return dupn(t.p, t.n);
+}
+fn itos(v as i64) as *u8 {
+    let is [32]u8 as b;
+    let is i64 as p with mut = 31;
+    let is i64 as x with mut = v;
+    let is i64 as neg = cast(i64, v < 0);
+    if (neg == 1) { x = 0 - x; }
+    if (x == 0) { b[p] = cast(u8, 48); p = p - 1; }
+    while (x > 0) { b[p] = cast(u8, 48 + x % 10); x = x / 10; p = p - 1; }
+    if (neg == 1) { b[p] = cast(u8, 45); p = p - 1; }
+    return dupn(cast(*u8, cast(i64, &b) + p + 1), 31 - p);
+}
+
+// ── Generator ──
+let is i64 as ntmp with mut = 0;
+let is i64 as nvar with mut = 0;
+let is i64 as nfn with mut = 0;
+let is i64 as nic with mut = 0;
+let is i64 as nstr with mut = 0;
+let is i64 as next_loop_id with mut = 1;
+let is *Scope as g_scope with mut = cast(*Scope, 0);
+let is *Func as g_func with mut = cast(*Func, 0);
+
+let is i64 as L_LOOP with imut = 0;
+let is i64 as L_FOR with imut = 1;
+let is i64 as L_DO with imut = 2;
+let is i64 as L_SWITCH with imut = 3;
+let is i64 as L_BLOCK with imut = 4;
+let is i64 as MAX_DEPTH with imut = 512;
+let is [512]i64 as loop_kind with mut;
+let is [512]*N as loop_n with mut;
+let is [512]*u8 as loop_label with mut;
+let is [512]i64 as loop_id with mut;
+let is [512]i64 as loop_crossed with mut;
+let is [512]i64 as loop_tries with mut;
+let is [512]*Scope as loop_scope with mut;
+let is i64 as nloop with mut = 0;
+// Where the current function's own loops and tries begin; the rest are its enclosers'.
+let is i64 as loop_base with mut = 0;
+let is i64 as try_base with mut = 0;
+let is *u8 as pending_label with mut = cast(*u8, 0);
+
+let is [256]*u8 as try_frame with mut;
+let is [256]*N as try_fin with mut;
+let is i64 as ntry with mut = 0;
+
+fn tmp() as *u8 { ntmp = ntmp + 1; return fmt("t%", itos(ntmp), "", "", ""); }
+fn sp(x as *u8) as *u8 { let is *u8 as t = tmp(); e2("let is i64 as % = %;\n", t, x); return t; }
+fn ic() as *u8 { let is i64 as k = nic; nic = nic + 1; return fmt("cast(*i64, &ics[%])", itos(k * 4), "", "", ""); }
+fn hexch(v as i64) as i64 { if (v < 10) { return 48 + v; } return 87 + v; }
+
+// Every string once, in one blob of "length:bytes" the runtime splits at start: a few
+// thousand statements here would be most of what the compiler has to read.
+let is i64 as STR_BUCKETS with imut = 8192;
+let is [8192]i64 as str_bucket with mut;
+struct StrEnt { s as *u8; n as i64; idx as i64; next as *StrEnt; }
+fn strv_n(s as *u8, n as i64) as *u8 {
+    let is i64 as h with mut = 5381;
+    let is i64 as i with mut = 0;
+    while (i < n) { h = (h * 33 + cast(i64, s[i])) & 2147483647; i = i + 1; }
+    let is i64 as b = h & (STR_BUCKETS - 1);
+    let is *StrEnt as e with mut = cast(*StrEnt, str_bucket[b]);
+    while (cast(i64, e) != 0) {
+        if (e.n == n) {
+            let is i64 as j with mut = 0;
+            while (j < n && cast(i64, e.s[j]) == cast(i64, s[j])) { j = j + 1; }
+            if (j == n) { return fmt("strs[%]", itos(e.idx), "", "", ""); }
+        }
+        e = e.next;
+    }
+    let is *StrEnt as ne = cast(*StrEnt, ja(sizeof(StrEnt)));
+    ne.s = s; ne.n = n; ne.idx = nstr; ne.next = cast(*StrEnt, str_bucket[b]);
+    str_bucket[b] = cast(i64, ne);
+    let is i64 as k = nstr;
+    nstr = nstr + 1;
+    let is *Buf as saved = cur;
+    cur = &out_strs;
+    e1("%:", itos(n));
+    i = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c == 34) { e0("\\\""); }
+        else if (c == 92) { e0("\\\\"); }
+        else if (c >= 32 && c < 127) { buf_put(cur, cast(*u8, cast(i64, s) + i), 1); }
+        else {
+            let is [4]u8 as h2;
+            h2[0] = cast(u8, 92); h2[1] = cast(u8, 120);
+            h2[2] = cast(u8, hexch(c >> 4)); h2[3] = cast(u8, hexch(c & 15));
+            buf_put(cur, cast(*u8, &h2), 4);
+        }
+        i = i + 1;
+    }
+    cur = saved;
+    return fmt("strs[%]", itos(k), "", "", "");
+}
+fn strv(s as *u8) as *u8 { return strv_n(s, slen(s)); }
+fn num_operand(x as f64) as *u8 {
+    if (x >= -2147483648.0 && x <= 2147483647.0 && cast(f64, cast(i64, x)) == x && !(x == 0.0 && *cast(*i64, &x) != 0)) {
+        return fmt("box_i(%)", itos(cast(i64, x)), "", "", "");
+    }
+    let is i64 as bits = *cast(*i64, &x) + 562949953421312;
+    return itos(bits);
+}
+fn env_expr() as *u8 {
+    let is *Scope as s with mut = g_scope;
+    while (cast(i64, s) != 0 && s.func == g_func) {
+        if (s.has_env == 1) { return s.ename; }
+        s = s.parent;
+    }
+    return "env";
+}
+fn var_ref(v as *Var) as *u8 {
+    if (seq(v.cname, "slot") == 0) { return v.cname; }
+    let is *u8 as p with mut = env_expr();
+    let is *Scope as s with mut = g_scope;
+    while (cast(i64, s) != 0) {
+        if (s.has_env == 1) {
+            if (s == v.owner) { return fmt("%[%]", p, itos(v.slot), "", ""); }
+            p = fmt("cast(*i64, %[0])", p, "", "", "");
+        }
+        s = s.parent;
+    }
+    fail("internal: variable out of reach ", v.name);
+    return "UNDEF";
+}
+fn open_env(s as *Scope) as void {
+    if (s.has_env == 0) { return; }
+    ntmp = ntmp + 1;
+    s.ename = fmt("s%", itos(ntmp), "", "", "");
+    let is *Scope as saved = g_scope;
+    g_scope = s.parent;
+    let is *u8 as up with mut = "env";
+    if (cast(i64, s.parent) != 0 && s.parent.func == g_func) { up = env_expr(); }
+    g_scope = saved;
+    e3("let is *i64 as % with mut = rt_env(%, %);\n", s.ename, up, itos(s.nslots));
+}
+fn binfn(op as *u8) as *u8 {
+    if (seq(op, "+") == 1) { return "rt_add"; }
+    if (seq(op, "-") == 1) { return "rt_sub"; }
+    if (seq(op, "*") == 1) { return "rt_mul"; }
+    if (seq(op, "/") == 1) { return "rt_div"; }
+    if (seq(op, "%") == 1) { return "rt_mod"; }
+    if (seq(op, "&") == 1) { return "rt_band"; }
+    if (seq(op, "|") == 1) { return "rt_bor"; }
+    if (seq(op, "^") == 1) { return "rt_bxor"; }
+    if (seq(op, "<<") == 1) { return "rt_shl"; }
+    if (seq(op, ">>") == 1) { return "rt_shr"; }
+    if (seq(op, ">>>") == 1) { return "rt_ushr"; }
+    if (seq(op, "**") == 1) { return "rt_pow"; }
+    fail("operator ", op);
+    return "rt_add";
+}
+fn is_cmp(op as *u8) as i32 {
+    if (seq(op, "<") == 1 || seq(op, "<=") == 1 || seq(op, ">") == 1 || seq(op, ">=") == 1 || seq(op, "===") == 1 ||
+        seq(op, "!==") == 1 || seq(op, "==") == 1 || seq(op, "!=") == 1) { return 1; }
+    return 0;
+}
+fn cnd(n as *N) as *u8 {
+    if (n.k == E_BIN && is_cmp(n.op) == 1) {
+        let is *u8 as a = gx(n.a);
+        let is *u8 as b = gx(n.b);
+        let is *u8 as op = n.op;
+        if (seq(op, "<") == 1) { return fmt("rt_lt(%, %) == 1", a, b, "", ""); }
+        if (seq(op, "<=") == 1) { return fmt("rt_le(%, %) == 1", a, b, "", ""); }
+        if (seq(op, ">") == 1) { return fmt("rt_gt(%, %) == 1", a, b, "", ""); }
+        if (seq(op, ">=") == 1) { return fmt("rt_ge(%, %) == 1", a, b, "", ""); }
+        if (seq(op, "===") == 1) { return fmt("rt_seq(%, %) == 1", a, b, "", ""); }
+        if (seq(op, "!==") == 1) { return fmt("rt_seq(%, %) == 0", a, b, "", ""); }
+        if (seq(op, "==") == 1) { return fmt("rt_leq(%, %) == 1", a, b, "", ""); }
+        return fmt("rt_leq(%, %) == 0", a, b, "", "");
+    }
+    if (n.k == E_UN && seq(n.op, "!") == 1) { return fmt("!(%)", cnd(n.a), "", "", ""); }
+    return fmt("rt_truthy(%) == 1", gx(n), "", "", "");
+}
+fn has_spread(first as *N) as i32 {
+    let is *N as x with mut = first;
+    while (is_null(x) == 0) { if (x.k == E_SPREAD) { return 1; } x = x.next; }
+    return 0;
+}
+fn array_of(first as *N) as *u8 {
+    let is *u8 as r = tmp();
+    e1("let is i64 as % = arr_new(4);\n", r);
+    let is *N as x with mut = first;
+    while (is_null(x) == 0) {
+        if (x.k == E_SPREAD) { e2("rt_arr_spread(%, %);\n", r, gx(x.a)); }
+        else if (x.k == E_HOLE) { e1("arr_push(%, UNDEF);\n", r); }
+        else { let is *u8 as v = gx(x); e2("arr_push(%, %);\n", r, v); }
+        x = x.next;
+    }
+    return r;
+}
+// Arguments in order, then "a, b, UNDEF, UNDEF" for the call, with those past the fourth
+// and the count where the callee can find them. These are the last stores before a call.
+fn call_args(first as *N) as *u8 {
+    let is i64 as c with mut = 0;
+    let is *N as x with mut = first;
+    while (is_null(x) == 0) { c = c + 1; x = x.next; }
+    let is **u8 as ops = cast(**u8, ja((c + 1) * 8));
+    let is i64 as i with mut = 0;
+    x = first;
+    while (is_null(x) == 0) { ops[i] = gx(x); i = i + 1; x = x.next; }
+    i = 4;
+    while (i < c) { e2("rt_x[%] = %;\n", itos(i - 4), ops[i]); i = i + 1; }
+    e1("rt_argc = %;\n", itos(c));
+    let is *u8 as r with mut = "";
+    i = 0;
+    while (i < 4) {
+        if (i < c) { r = fmt("%, %", r, ops[i], "", ""); } else { r = fmt("%, UNDEF", r, "", "", ""); }
+        i = i + 1;
+    }
+    return r;
+}
+fn mem_get(n as *N, o as *u8, k as *u8) as *u8 {
+    let is *u8 as t = tmp();
+    if (n.k == E_IDX) { e3("let is i64 as % = rt_geti(%, %);\n", t, o, k); return t; }
+    let is *u8 as f with mut = "rt_get";
+    if (seq(n.s, "length") == 1) { f = "rt_length"; }
+    e4("let is i64 as % = %(%, ", t, f, o, "");
+    e2("%, %);\n", strv(n.s), ic());
+    return t;
+}
+fn mem_set(n as *N, o as *u8, k as *u8, v as *u8) as void {
+    if (n.k == E_IDX) { e3("rt_seti(%, %, %);\n", o, k, v); return; }
+    e4("rt_set(%, %, %, %);\n", o, strv(n.s), v, ic());
+}
+fn name_set(name as *u8, x as *u8) as void {
+    let is *Var as v = lookup(g_scope, name);
+    if (cast(i64, v) != 0) { e2("% = %;\n", var_ref(v), x); }
+    else { e2("rt_global_set(%, %);\n", strv(name), x); }
+}
+// A pattern takes a value apart, in a declaration or an assignment alike.
+fn gen_pat(n as *N, val as *u8) as void {
+    let is i64 as k = n.k;
+    if (k == E_ID) { name_set(n.s, val); return; }
+    if (k == E_MEM) { let is *u8 as o = gx(n.a); mem_set(n, o, "", val); return; }
+    if (k == E_IDX) { let is *u8 as o = gx(n.a); let is *u8 as kk = gx(n.b); mem_set(n, o, kk, val); return; }
+    if (k == E_ASSIGN) {
+        let is *u8 as t = tmp();
+        e2("let is i64 as % with mut = %;\n", t, val);
+        e1("if (% == UNDEF) {\n", t);
+        e2("% = %;\n", t, gx(n.b));
+        e0("}\n");
+        gen_pat(n.a, t);
+        return;
+    }
+    if (k == E_ARR) {
+        let is *u8 as a = sp(fmt("rt_iter_to_array(%)", val, "", "", ""));
+        let is i64 as i with mut = 0;
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) {
+            if (x.k == E_SPREAD) { gen_pat(x.a, sp(fmt("rt_arr_from(%, %)", a, itos(i), "", ""))); }
+            else if (x.k != E_HOLE) { gen_pat(x, sp(fmt("rt_geti(%, box_i(%))", a, itos(i), "", ""))); }
+            i = i + 1;
+            x = x.next;
+        }
+        return;
+    }
+    if (k == E_OBJ) {
+        e1("rt_need_obj(%);\n", val);
+        let is *u8 as seen with mut = "";
+        let is i64 as has_rest with mut = 0;
+        let is *N as y with mut = n.list;
+        while (is_null(y) == 0) { if (seq(y.op, "spread") == 1) { has_rest = 1; } y = y.next; }
+        if (has_rest == 1) { seen = sp("arr_new(4)"); }
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) {
+            if (seq(x.op, "spread") == 1) {
+                gen_pat(x.a, sp(fmt("rt_obj_rest(%, %)", val, seen, "", "")));
+            } else {
+                let is *u8 as key with mut = "";
+                if (is_null(x.b) == 0) { key = gx(x.b); } else { key = strv(x.s); }
+                if (has_rest == 1) { e2("arr_push(%, rt_key_value(%));\n", seen, key); }
+                gen_pat(x.a, sp(fmt("rt_geti(%, %)", val, key, "", "")));
+            }
+            x = x.next;
+        }
+        return;
+    }
+    fail("pattern", NONE());
+}
+fn gen_class(n as *N) as *u8 {
+    let is *Scope as saved = g_scope;
+    g_scope = n.scope;
+    open_env(n.scope);
+    let is *Var as pv = lookup_here(n.scope, "%parent");
+    let is *Var as fv = lookup_here(n.scope, "%fields");
+    let is *u8 as parent with mut = "UNDEF";
+    if (is_null(n.a) == 0) { parent = gx(n.a); }
+    e2("% = %;\n", var_ref(pv), parent);
+    if (is_null(n.b) == 0) { let is *u8 as ff = make_fn(n.b); e2("% = %;\n", var_ref(fv), ff); }
+    let is *N as ctor with mut = cast(*N, 0);
+    let is *N as m with mut = n.list;
+    while (is_null(m) == 0) {
+        if (cast(i64, m.s) != 0 && seq(m.s, "constructor") == 1 && m.st == 0) { ctor = m.a; }
+        m = m.next;
+    }
+    let is *u8 as f with mut = "";
+    if (is_null(ctor) == 0) { class_fields_var = fv; class_parent = n.a; f = sp(make_fn(ctor)); class_fields_var = cast(*Var, 0); }
+    else {
+        // No constructor: the parent's, with the same arguments, and then the fields.
+        f = sp(fmt("rt_default_ctor(%, %)", var_ref(pv), var_ref(fv), "", ""));
+    }
+    if (cast(i64, n.s) != 0) { e2("% = %;\n", var_ref(lookup_here(n.scope, n.s)), f); e3("rt_def_hidden(%, %, %);\n", f, strv("name"), strv(n.s)); }
+    let is *u8 as p = sp(fmt("rt_class_proto(%, %)", f, var_ref(pv), "", ""));
+    m = n.list;
+    while (is_null(m) == 0) {
+        if (!(cast(i64, m.s) != 0 && seq(m.s, "constructor") == 1 && m.st == 0)) {
+            let is *u8 as holder with mut = p;
+            if (m.st == 1) { holder = f; }
+            let is *u8 as key with mut = "";
+            if (is_null(m.b) == 0) { key = gx(m.b); } else { key = strv(m.s); }
+            if (cast(i64, m.s) != 0) { m.a.op = m.s; }
+            let is *u8 as mf = sp(make_fn(m.a));
+            if (seq(m.op, "get") == 1) { e3("rt_def_accessor(%, %, %, UNDEF, 0);\n", holder, key, mf); }
+            else if (seq(m.op, "set") == 1) { e3("rt_def_accessor(%, %, UNDEF, %, 0);\n", holder, key, mf); }
+            else { e3("rt_def_hidden(%, %, %);\n", holder, key, mf); }
+        }
+        m = m.next;
+    }
+    if (is_null(n.c) == 0) {
+        let is *u8 as sf = sp(make_fn(n.c));
+        e2("rt_argc = 0;\nrt_call(%, %, UNDEF, UNDEF, UNDEF, UNDEF);\n", sf, f);
+    }
+    g_scope = saved;
+    return f;
+}
+let is *Var as class_fields_var with mut = cast(*Var, 0);
+let is *N as class_parent with mut = cast(*N, 0);
+fn make_fn(n as *N) as *u8 {
+    let is *u8 as name = compile_func(n);
+    return fmt("fn_new(fn_ptr(%), %)", name, env_expr(), "", "");
+}
+fn this_expr() as *u8 {
+    let is *Func as g with mut = g_func;
+    while (g.arrow == 1) { g = g.parent; }
+    if (g == g_func) { return "this_v"; }
+    if (cast(i64, g.this_var) != 0) { return sp(var_ref(g.this_var)); }
+    return "G_global";
+}
+fn parent_of(sc as *Scope) as *u8 {
+    let is *Var as v = lookup(sc, "%parent");
+    if (cast(i64, v) == 0) { fail("super outside a class", NONE()); return "UNDEF"; }
+    return sp(var_ref(v));
+}
+// super.x: from the parent's prototype, whichever method kind asks. A static method's
+// super is not distinguished here, and would look on the prototype.
+fn super_base() as *u8 {
+    let is *u8 as p = parent_of(g_scope);
+    return sp(fmt("rt_super_base(%)", p, "", "", ""));
+}
+fn gen_call(n as *N) as *u8 {
+    let is *N as c = n.a;
+    let is *u8 as f with mut = "";
+    let is *u8 as th with mut = "UNDEF";
+    if (c.k == E_SUPER) {
+        // A parent constructor runs on this same object, then the fields.
+        let is *u8 as p = parent_of(g_scope);
+        let is *u8 as t = this_expr();
+        if (has_spread(n.list) == 1) { e3("rt_apply(%, %, %);\n", p, t, array_of(n.list)); }
+        else { let is *u8 as args = call_args(n.list); e3("rt_call(%, %%);\n", p, t, args); }
+        let is *Var as fv = lookup(g_scope, "%fields");
+        if (cast(i64, fv) != 0) { e2("rt_run_fields(%, %);\n", var_ref(fv), t); }
+        return t;
+    }
+    if (c.k == E_MEM && c.a.k == E_SUPER) {
+        th = this_expr();
+        let is *u8 as b = super_base();
+        f = mem_get(c, b, "");
+    } else if (c.k == E_MEM || c.k == E_IDX) {
+        th = gx(c.a);
+        if (c.opt == 1) { e1("if (rt_nullish(%) == 1) { break; }\n", th); }
+        let is *u8 as kk with mut = "";
+        if (c.k == E_IDX) { kk = gx(c.b); }
+        f = mem_get(c, th, kk);
+        if (trace_calls == 1 && c.k == E_IDX) { e1("rt_call_key = %;\nrt_call_name = \"[computed]\";\n", kk); }
+    } else {
+        f = gx(c);
+    }
+    if (n.opt == 1) { e1("if (rt_nullish(%) == 1) { break; }\n", f); }
+    if (has_spread(n.list) == 1) { return sp(fmt("rt_apply(%, %, %)", f, th, array_of(n.list), "")); }
+    let is *u8 as args = call_args(n.list);
+    // For finding out what a page wanted: which name it was calling, when that is not a function.
+    if (trace_calls == 1 && (c.k == E_MEM || c.k == E_ID)) { e1("rt_call_name = \"%\";\n", c.s); e1("rt_call_key = UNDEF;\n", ""); }
+    return sp(fmt("rt_call(%, %%)", f, th, args, ""));
+}
+fn gx(n as *N) as *u8 {
+    let is i64 as k = n.k;
+    if (k == E_NUM) { return num_operand(n.num); }
+    if (k == E_STR) {
+        if (n.flag > 0) { return strv_n(n.s, n.flag); }
+        return strv(n.s);
+    }
+    if (k == E_NULL) { return "NULLV"; }
+    if (k == E_TRUE) { return "TRUEV"; }
+    if (k == E_FALSE) { return "FALSEV"; }
+    if (k == E_HOLE) { return "UNDEF"; }
+    if (k == E_ID) {
+        if (seq(n.s, "undefined") == 1) { return "UNDEF"; }
+        let is *Var as v = lookup(g_scope, n.s);
+        if (cast(i64, v) != 0) { return sp(var_ref(v)); }
+        return sp(fmt("rt_global(%)", strv(n.s), "", "", ""));
+    }
+    if (k == E_THIS) { return this_expr(); }
+    if (k == E_REGEX) { return sp(fmt("rt_regex_new(%, %)", strv_n(n.s, n.flag), strv(n.op), "", "")); }
+    if (k == E_TPL) {
+        let is *N as x with mut = n.list;
+        let is *u8 as r with mut = gx(x);
+        x = x.next;
+        while (is_null(x) == 0) {
+            let is *u8 as v = gx(x);
+            r = sp(fmt("rt_add(%, to_str(%))", r, v, "", ""));
+            x = x.next;
+            r = sp(fmt("rt_add(%, %)", r, gx(x), "", ""));
+            x = x.next;
+        }
+        return r;
+    }
+    if (k == E_BIN) {
+        if (is_cmp(n.op) == 1) { return sp(fmt("box_b(cast(i32, %))", cnd(n), "", "", "")); }
+        let is *u8 as a = gx(n.a);
+        let is *u8 as b = gx(n.b);
+        if (seq(n.op, "in") == 1) { return sp(fmt("rt_in(%, %)", a, b, "", "")); }
+        if (seq(n.op, "instanceof") == 1) { return sp(fmt("rt_instanceof(%, %)", a, b, "", "")); }
+        return sp(fmt("%(%, %)", binfn(n.op), a, b, ""));
+    }
+    if (k == E_LOG) {
+        let is *u8 as r = tmp();
+        e2("let is i64 as % with mut = %;\n", r, gx(n.a));
+        if (seq(n.op, "&&") == 1) { e1("if (rt_truthy(%) == 1) {\n", r); }
+        else if (seq(n.op, "||") == 1) { e1("if (rt_truthy(%) == 0) {\n", r); }
+        else { e1("if (rt_nullish(%) == 1) {\n", r); }
+        e2("% = %;\n", r, gx(n.b));
+        e0("}\n");
+        return r;
+    }
+    if (k == E_COND) {
+        let is *u8 as r = tmp();
+        e1("let is i64 as % with mut = UNDEF;\n", r);
+        e1("if (%) {\n", cnd(n.a));
+        e2("% = %;\n", r, gx(n.b));
+        e0("} else {\n");
+        e2("% = %;\n", r, gx(n.c));
+        e0("}\n");
+        return r;
+    }
+    if (k == E_UN) {
+        let is *u8 as o = n.op;
+        if (seq(o, "!") == 1) { return sp(fmt("box_b(cast(i32, %))", cnd(n), "", "", "")); }
+        if (seq(o, "delete") == 1) {
+            let is *N as t = n.a;
+            if (t.k == E_MEM) { let is *u8 as b = gx(t.a); return sp(fmt("rt_delete(%, %)", b, strv(t.s), "", "")); }
+            if (t.k == E_IDX) { let is *u8 as b = gx(t.a); let is *u8 as kk = gx(t.b); return sp(fmt("rt_delete(%, %)", b, kk, "", "")); }
+            gx(t);
+            return "TRUEV";
+        }
+        if (seq(o, "typeof") == 1 && n.a.k == E_ID && cast(i64, lookup(g_scope, n.a.s)) == 0) {
+            if (seq(n.a.s, "undefined") == 1) { return strv("undefined"); }
+            return sp(fmt("rt_typeof(rt_global_or_undef(%))", strv(n.a.s), "", "", ""));
+        }
+        let is *u8 as v = gx(n.a);
+        if (seq(o, "-") == 1) { return sp(fmt("rt_neg(%)", v, "", "", "")); }
+        if (seq(o, "+") == 1) { return sp(fmt("rt_pos(%)", v, "", "", "")); }
+        if (seq(o, "~") == 1) { return sp(fmt("rt_bnot(%)", v, "", "", "")); }
+        if (seq(o, "typeof") == 1) { return sp(fmt("rt_typeof(%)", v, "", "", "")); }
+        return "UNDEF";
+    }
+    if (k == E_UPD) {
+        let is *u8 as one with mut = "box_i(1)";
+        if (seq(n.op, "--") == 1) { one = "box_i(-1)"; }
+        let is *N as t = n.a;
+        if (t.k == E_ID) {
+            let is *Var as v = lookup(g_scope, t.s);
+            let is *u8 as cv with mut = "";
+            if (cast(i64, v) != 0) { cv = var_ref(v); } else { cv = fmt("rt_global(%)", strv(t.s), "", "", ""); }
+            let is *u8 as old = sp(fmt("rt_pos(%)", cv, "", "", ""));
+            let is *u8 as nv = sp(fmt("rt_add(%, %)", old, one, "", ""));
+            name_set(t.s, nv);
+            if (n.flag == 1) { return nv; }
+            return old;
+        }
+        let is *u8 as o = gx(t.a);
+        let is *u8 as kk with mut = "";
+        if (t.k == E_IDX) { kk = gx(t.b); }
+        let is *u8 as old = sp(fmt("rt_pos(%)", mem_get(t, o, kk), "", "", ""));
+        let is *u8 as nv = sp(fmt("rt_add(%, %)", old, one, "", ""));
+        mem_set(t, o, kk, nv);
+        if (n.flag == 1) { return nv; }
+        return old;
+    }
+    if (k == E_ASSIGN) {
+        let is *N as t = n.a;
+        let is i64 as plain = cast(i64, seq(n.op, "=") == 1);
+        let is *u8 as bop = dupn(n.op, slen(n.op) - 1);
+        let is i64 as lg = cast(i64, seq(bop, "&&") == 1 || seq(bop, "||") == 1 || seq(bop, "??") == 1);
+        if (t.k == E_ARR || t.k == E_OBJ) {
+            let is *u8 as x = gx(n.b);
+            gen_pat(t, x);
+            return x;
+        }
+        if (t.k == E_ID) {
+            let is *Var as v = lookup(g_scope, t.s);
+            if (plain == 1) { let is *u8 as x = gx(n.b); name_set(t.s, x); return x; }
+            let is *u8 as cv with mut = "";
+            if (cast(i64, v) != 0) { cv = sp(var_ref(v)); } else { cv = sp(fmt("rt_global(%)", strv(t.s), "", "", "")); }
+            if (lg == 1) {
+                let is *u8 as r = tmp();
+                e2("let is i64 as % with mut = %;\n", r, cv);
+                if (seq(bop, "&&") == 1) { e1("if (rt_truthy(%) == 1) {\n", r); }
+                else if (seq(bop, "||") == 1) { e1("if (rt_truthy(%) == 0) {\n", r); }
+                else { e1("if (rt_nullish(%) == 1) {\n", r); }
+                e2("% = %;\n", r, gx(n.b));
+                name_set(t.s, r);
+                e0("}\n");
+                return r;
+            }
+            let is *u8 as r = gx(n.b);
+            let is *u8 as x = sp(fmt("%(%, %)", binfn(bop), cv, r, ""));
+            name_set(t.s, x);
+            return x;
+        }
+        let is *u8 as o with mut = "";
+        if (t.a.k == E_SUPER) { o = this_expr(); } else { o = gx(t.a); }
+        let is *u8 as kk with mut = "";
+        if (t.k == E_IDX) { kk = gx(t.b); }
+        if (plain == 1) { let is *u8 as x = gx(n.b); mem_set(t, o, kk, x); return x; }
+        let is *u8 as c = mem_get(t, o, kk);
+        if (lg == 1) {
+            let is *u8 as r = tmp();
+            e2("let is i64 as % with mut = %;\n", r, c);
+            if (seq(bop, "&&") == 1) { e1("if (rt_truthy(%) == 1) {\n", r); }
+            else if (seq(bop, "||") == 1) { e1("if (rt_truthy(%) == 0) {\n", r); }
+            else { e1("if (rt_nullish(%) == 1) {\n", r); }
+            e2("% = %;\n", r, gx(n.b));
+            mem_set(t, o, kk, r);
+            e0("}\n");
+            return r;
+        }
+        let is *u8 as r = gx(n.b);
+        let is *u8 as x = sp(fmt("%(%, %)", binfn(bop), c, r, ""));
+        mem_set(t, o, kk, x);
+        return x;
+    }
+    if (k == E_MEM) {
+        if (n.a.k == E_SUPER) { let is *u8 as b = super_base(); return mem_get(n, b, ""); }
+        let is *u8 as o = gx(n.a);
+        if (n.opt == 1) { e1("if (rt_nullish(%) == 1) { break; }\n", o); }
+        return mem_get(n, o, "");
+    }
+    if (k == E_IDX) {
+        if (n.a.k == E_SUPER) { let is *u8 as b = super_base(); let is *u8 as kk = gx(n.b); return mem_get(n, b, kk); }
+        let is *u8 as o = gx(n.a);
+        if (n.opt == 1) { e1("if (rt_nullish(%) == 1) { break; }\n", o); }
+        let is *u8 as kk = gx(n.b);
+        return mem_get(n, o, kk);
+    }
+    if (k == E_CHAIN) {
+        // A nullish link leaves the whole chain, by breaking out of this.
+        let is *u8 as r = tmp();
+        e1("let is i64 as % with mut = UNDEF;\nwhile (1 == 1) {\n", r);
+        e2("% = %;\n", r, gx(n.a));
+        e0("break;\n}\n");
+        return r;
+    }
+    if (k == E_CALL) { return gen_call(n); }
+    if (k == E_NEW) {
+        let is *u8 as f = gx(n.a);
+        if (has_spread(n.list) == 1) { return sp(fmt("rt_new_apply(%, %)", f, array_of(n.list), "", "")); }
+        let is *u8 as args = call_args(n.list);
+        return sp(fmt("rt_new(%%)", f, args, "", ""));
+    }
+    if (k == E_ARR) { return array_of(n.list); }
+    if (k == E_OBJ) {
+        let is *u8 as r = tmp();
+        e1("let is i64 as % = obj_new();\n", r);
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) {
+            if (seq(x.op, "spread") == 1) { e2("rt_obj_spread(%, %);\n", r, gx(x.a)); }
+            else if (seq(x.op, "get") == 1 || seq(x.op, "set") == 1) {
+                let is *u8 as key with mut = "";
+                if (is_null(x.b) == 0) { key = gx(x.b); } else { key = strv(x.s); }
+                let is *u8 as mf = sp(make_fn(x.a));
+                if (seq(x.op, "get") == 1) { e3("rt_def_accessor(%, %, %, UNDEF, 1);\n", r, key, mf); }
+                else { e3("rt_def_accessor(%, %, UNDEF, %, 1);\n", r, key, mf); }
+            }
+            else if (is_null(x.b) == 0) {
+                let is *u8 as key = gx(x.b);
+                let is *u8 as v = gx(x.a);
+                e3("rt_seti(%, %, %);\n", r, key, v);
+            }
+            else if (seq(x.s, "__proto__") == 1) { let is *u8 as v = gx(x.a); e2("rt_set_proto(%, %);\n", r, v); }
+            else {
+                if (x.a.k == E_FN && x.st != 1) { x.a.op = x.s; }
+                let is *u8 as v = gx(x.a);
+                if (x.st == 1) { e4("rt_set(%, %, %, %);\n", r, strv_n(x.s, x.flag), v, ic()); }
+                else { e4("rt_set(%, %, %, %);\n", r, strv(x.s), v, ic()); }
+            }
+            x = x.next;
+        }
+        return r;
+    }
+    if (k == E_FN) { return sp(make_fn(n)); }
+    if (k == E_CLASS) { return gen_class(n); }
+    if (k == E_SEQ) {
+        let is *u8 as r with mut = "UNDEF";
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) { r = gx(x); x = x.next; }
+        return r;
+    }
+    if (k == E_AWAIT) { return sp(fmt("rt_yield(%)", gx(n.a), "", "", "")); }
+    if (k == E_YIELD) {
+        if (n.flag == 1) { return sp(fmt("rt_yield_all(%)", gx(n.a), "", "", "")); }
+        let is *u8 as v with mut = "UNDEF";
+        if (is_null(n.a) == 0) { v = gx(n.a); }
+        if (cast(i64, g_func.node) != 0 && g_func.node.is_async == 1) { return sp(fmt("rt_yield(rt_agen_wrap(%))", v, "", "", "")); }
+        return sp(fmt("rt_yield(%)", v, "", "", ""));
+    }
+    if (k == E_SPREAD) { fail("spread here", NONE()); return "UNDEF"; }
+    fail("expression kind", NONE());
+    return "UNDEF";
+}
+fn hoist_fns(first as *N) as void {
+    let is *N as st with mut = first;
+    while (is_null(st) == 0) {
+        if (st.k == S_FN) {
+            let is *u8 as x = make_fn(st.a);
+            name_set(st.s, x);
+        }
+        st = st.next;
+    }
+}
+fn loop_push(kind as i64, n as *N, sc as *Scope) as void {
+    if (nloop >= MAX_DEPTH) { fail("loops nested too deep", NONE()); return; }
+    loop_kind[nloop] = kind;
+    loop_n[nloop] = n;
+    loop_label[nloop] = pending_label;
+    pending_label = cast(*u8, 0);
+    loop_id[nloop] = next_loop_id;
+    next_loop_id = next_loop_id + 1;
+    loop_crossed[nloop] = 0;
+    loop_tries[nloop] = ntry;
+    loop_scope[nloop] = sc;
+    nloop = nloop + 1;
+}
+// What a jump leaves: try frames inside the target, and their finally blocks.
+fn unwind_tries(to as i64) as void {
+    let is i64 as saved = ntry;
+    while (ntry > to) {
+        let is i64 as i = ntry - 1;
+        ntry = i;
+        e1("ex.leave(&%);\n", try_frame[i]);
+        if (is_null(try_fin[i]) == 0) { gs(try_fin[i]); }
+    }
+    ntry = saved;
+}
+fn loop_continue_code(i as i64) as void {
+    let is i64 as lk = loop_kind[i];
+    let is *Scope as sc = loop_scope[i];
+    if (lk == L_FOR) {
+        if (cast(i64, sc) != 0 && sc.has_env == 1) { e3("% = rt_env_copy(%, %);\n", sc.ename, sc.ename, itos(sc.nslots)); }
+        if (is_null(loop_n[i]) == 0) { gx(loop_n[i]); }
+    }
+    if (lk == L_DO) { e1("if (!(%)) { break; }\n", cnd(loop_n[i])); }
+    e0("continue;\n");
+}
+fn gen_jump(n as *N, is_cont as i64) as void {
+    let is i64 as t with mut = nloop - 1;
+    while (t >= loop_base) {
+        let is i64 as lk = loop_kind[t];
+        if (cast(i64, n.s) != 0) {
+            if (cast(i64, loop_label[t]) != 0 && seq(loop_label[t], n.s) == 1) { break; }
+        } else if (is_cont == 1) {
+            if (lk != L_SWITCH && lk != L_BLOCK) { break; }
+        } else if (lk != L_BLOCK) { break; }
+        t = t - 1;
+    }
+    if (t < loop_base) { fail("jump without a target", n.s); return; }
+    unwind_tries(loop_tries[t]);
+    if (t == nloop - 1) {
+        if (is_cont == 1) { loop_continue_code(t); } else { e0("break;\n"); }
+        return;
+    }
+    let is i64 as i with mut = nloop - 1;
+    while (i > t) { loop_crossed[i] = 1; i = i - 1; }
+    e2("rt_jump = %;\nrt_jump_cont = %;\nbreak;\n", itos(loop_id[t]), itos(is_cont));
+}
+// After a loop a jump went through: stop here, or keep leaving.
+fn after_loop(i as i64) as void {
+    if (loop_crossed[i] == 0 || i == loop_base) { return; }
+    let is i64 as up = i - 1;
+    e0("if (rt_jump != 0) {\n");
+    e1("if (rt_jump == %) {\nlet is i64 as jc = rt_jump_cont;\nrt_jump = 0;\n", itos(loop_id[up]));
+    if (loop_kind[up] != L_SWITCH && loop_kind[up] != L_BLOCK) {
+        e0("if (jc == 1) {\n");
+        let is i64 as saved = nloop;
+        nloop = i;
+        loop_continue_code(up);
+        nloop = saved;
+        e0("}\n");
+    }
+    e0("break;\n}\nbreak;\n}\n");
+}
+fn gen_try(n as *N) as void {
+    if (ntry >= 250) { fail("try nested too deep", NONE()); return; }
+    let is *u8 as fo with mut = "";
+    let is *u8 as co with mut = "";
+    if (is_null(n.d) == 0) {
+        fo = tmp(); co = tmp();
+        e4("let is ex.Frame as %;\nlet is i64 as % = ex.begin(&%);\nif (% == 0) {\n", fo, co, fo, co);
+        e1("ex.enter(&%);\n", fo);
+        try_frame[ntry] = fo;
+        try_fin[ntry] = n.d;
+        ntry = ntry + 1;
+    }
+    if (is_null(n.c) == 0) {
+        let is *u8 as fi = tmp();
+        let is *u8 as ci = tmp();
+        e4("let is ex.Frame as %;\nlet is i64 as % = ex.begin(&%);\nif (% == 0) {\n", fi, ci, fi, ci);
+        e1("ex.enter(&%);\n", fi);
+        try_frame[ntry] = fi;
+        try_fin[ntry] = cast(*N, 0);
+        ntry = ntry + 1;
+        gs(n.a);
+        ntry = ntry - 1;
+        e1("ex.leave(&%);\n} else {\n", fi);
+        let is *Scope as saved = g_scope;
+        g_scope = n.scope;
+        open_env(n.scope);
+        if (is_null(n.b) == 0) { gen_pat(n.b, ci); }
+        gs(n.c);
+        g_scope = saved;
+        e0("}\n");
+    } else {
+        gs(n.a);
+    }
+    if (is_null(n.d) == 0) {
+        ntry = ntry - 1;
+        e1("ex.leave(&%);\n", fo);
+        gs(n.d);
+        e0("} else {\n");
+        gs(n.d);
+        e1("ex.throw(%);\n}\n", co);
+    }
+}
+fn gs(n as *N) as void {
+    if (failed == 1) { return; }
+    let is i64 as k = n.k;
+    if (k == S_EXPR) {
+        let is *u8 as x = gx(n.a);
+        return;
+    }
+    if (k == S_VAR) {
+        let is *N as d with mut = n.list;
+        while (is_null(d) == 0) {
+            if (is_null(d.a) == 0 && d.a.k == E_FN && d.b.k == E_ID) { d.a.op = d.b.s; }
+            if (is_null(d.a) == 0) { let is *u8 as x = gx(d.a); gen_pat(d.b, x); }
+            else if (n.flag == 1 && d.b.k == E_ID) { name_set(d.b.s, "UNDEF"); }
+            d = d.next;
+        }
+        return;
+    }
+    if (k == S_FN || k == S_EMPTY) { return; }
+    if (k == S_CLASS) {
+        let is *u8 as x = gen_class(n.a);
+        name_set(n.s, x);
+        return;
+    }
+    if (k == S_RET) {
+        let is *u8 as x with mut = "UNDEF";
+        if (is_null(n.a) == 0) { x = sp(gx(n.a)); }
+        unwind_tries(try_base);
+        e1("return %;\n", x);
+        return;
+    }
+    if (k == S_IF) {
+        e1("if (%) {\n", cnd(n.a));
+        gs(n.b);
+        if (is_null(n.c) == 0) { e0("} else {\n"); gs(n.c); }
+        e0("}\n");
+        return;
+    }
+    if (k == S_BLOCK) {
+        let is *Scope as old = g_scope;
+        if (cast(i64, n.scope) != 0) { g_scope = n.scope; open_env(n.scope); }
+        hoist_fns(n.list);
+        let is *N as x with mut = n.list;
+        while (is_null(x) == 0) { gs(x); x = x.next; }
+        g_scope = old;
+        return;
+    }
+    if (k == S_LABEL) {
+        let is i64 as b = n.a.k;
+        if (b == S_WHILE || b == S_FOR || b == S_DO || b == S_OF || b == S_FORIN) {
+            pending_label = n.s;
+            gs(n.a);
+            return;
+        }
+        // A labeled statement that is not a loop: something to break out of.
+        pending_label = n.s;
+        loop_push(L_BLOCK, cast(*N, 0), cast(*Scope, 0));
+        e0("while (1 == 1) {\n");
+        gs(n.a);
+        e0("break;\n}\n");
+        nloop = nloop - 1;
+        after_loop(nloop);
+        return;
+    }
+    if (k == S_WHILE || k == S_FOR || k == S_DO) {
+        let is *Scope as old = g_scope;
+        g_scope = n.scope;
+        let is *u8 as lbl = pending_label;
+        pending_label = cast(*u8, 0);
+        open_env(n.scope);
+        if (k == S_FOR && is_null(n.a) == 0) { if (n.a.k == S_VAR) { gs(n.a); } else { gx(n.a); } }
+        pending_label = lbl;
+        e0("while (1 == 1) {\n");
+        if (k == S_WHILE) { e1("if (!(%)) { break; }\n", cnd(n.a)); }
+        if (k == S_FOR && is_null(n.b) == 0) { e1("if (!(%)) { break; }\n", cnd(n.b)); }
+        if (k == S_FOR) { loop_push(L_FOR, n.c, n.scope); gs(n.d); }
+        else if (k == S_DO) { loop_push(L_DO, n.a, n.scope); gs(n.b); }
+        else { loop_push(L_LOOP, cast(*N, 0), n.scope); gs(n.b); }
+        nloop = nloop - 1;
+        if (k == S_FOR) {
+            if (n.scope.has_env == 1) { e3("% = rt_env_copy(%, %);\n", n.scope.ename, n.scope.ename, itos(n.scope.nslots)); }
+            if (is_null(n.c) == 0) { gx(n.c); }
+        }
+        if (k == S_DO) { e1("if (!(%)) { break; }\n", cnd(n.a)); }
+        e0("}\n");
+        after_loop(nloop);
+        g_scope = old;
+        return;
+    }
+    if (k == S_OF || k == S_FORIN) {
+        let is *Scope as old = g_scope;
+        g_scope = n.scope;
+        let is *u8 as lbl = pending_label;
+        pending_label = cast(*u8, 0);
+        let is *u8 as subject = gx(n.b);
+        let is *u8 as it = tmp();
+        if (k == S_OF && n.flag == 1) { e2("let is i64 as % = rt_aiter(%);\n", it, subject); }
+        else if (k == S_OF) { e2("let is i64 as % = rt_iter(%);\n", it, subject); }
+        else { e2("let is i64 as % = rt_iter(rt_forin_keys(%));\n", it, subject); }
+        pending_label = lbl;
+        e0("while (1 == 1) {\n");
+        let is *u8 as v = tmp();
+        if (k == S_OF && n.flag == 1) { e2("let is i64 as % = rt_anext(%);\n", v, it); }
+        else { e2("let is i64 as % = rt_iter_next(%);\n", v, it); }
+        e1("if (% == 0) { break; }\n", v);
+        loop_push(L_LOOP, cast(*N, 0), n.scope);
+        open_env(n.scope);
+        if (n.a.k == S_VAR) { gen_pat(n.a.list.b, v); } else { gen_pat(n.a, v); }
+        gs(n.c);
+        nloop = nloop - 1;
+        e0("}\n");
+        after_loop(nloop);
+        g_scope = old;
+        return;
+    }
+    if (k == S_BREAK) { gen_jump(n, 0); return; }
+    if (k == S_CONT) { gen_jump(n, 1); return; }
+    if (k == S_THROW) { e1("ex.throw(%);\n", gx(n.a)); return; }
+    if (k == S_TRY) { gen_try(n); return; }
+    if (k == S_SWITCH) {
+        let is *u8 as lbl = pending_label;
+        pending_label = cast(*u8, 0);
+        let is *u8 as dv = sp(gx(n.a));
+        let is *u8 as hit = tmp();
+        e1("let is i64 as % with mut = 0;\n", hit);
+        // let and const in a switch belong to the whole of it.
+        let is *Scope as old = g_scope;
+        let is *Scope as sw = scope_new(g_scope, g_func);
+        let is *N as cc with mut = n.list;
+        pending_label = lbl;
+        e0("while (1 == 1) {\n");
+        loop_push(L_SWITCH, cast(*N, 0), cast(*Scope, 0));
+        let is i64 as i with mut = 1;
+        let is i64 as dflt with mut = 0;
+        let is *N as c with mut = n.list;
+        while (is_null(c) == 0) {
+            if (is_null(c.a) == 1) { dflt = i; }
+            else {
+                e1("if (% == 0) {\n", hit);
+                let is *u8 as tv = gx(c.a);
+                e4("if (rt_seq(%, %) == 1) { % = %; }\n}\n", dv, tv, hit, itos(i));
+            }
+            i = i + 1;
+            c = c.next;
+        }
+        if (dflt != 0) { e3("if (% == 0) { % = %; }\n", hit, hit, itos(dflt)); }
+        i = 1;
+        c = n.list;
+        while (is_null(c) == 0) {
+            e3("if (% != 0 && % <= %) {\n", hit, hit, itos(i));
+            hoist_fns(c.list);
+            let is *N as b with mut = c.list;
+            while (is_null(b) == 0) { gs(b); b = b.next; }
+            e0("}\n");
+            i = i + 1;
+            c = c.next;
+        }
+        nloop = nloop - 1;
+        e0("break;\n}\n");
+        after_loop(nloop);
+        g_scope = old;
+        return;
+    }
+    fail("statement kind", NONE());
+}
+fn compile_func(n as *N) as *u8 {
+    let is *Func as f = n.fnc;
+    nfn = nfn + 1;
+    f.cname = fmt("js%", itos(nfn), "", "", "");
+    let is *u8 as fname with mut = f.cname;
+    if (n.is_gen == 1 || n.is_async == 1) { fname = fmt("%b", f.cname, "", "", ""); }
+    let is Buf as body with mut;
+    body.p = cast(*u8, 0); body.n = 0; body.cap = 0;
+    let is *Buf as sb = cur;
+    let is *Func as sf = g_func;
+    let is *Scope as ss = g_scope;
+    let is i64 as snl = nloop;
+    let is i64 as snt = ntry;
+    let is *u8 as spl = pending_label;
+    let is *Var as scf = class_fields_var;
+    let is *N as scp = class_parent;
+    let is i64 as is_ctor = cast(i64, cast(i64, class_fields_var) != 0);
+    let is i64 as ctor_base = cast(i64, is_ctor == 1 && is_null(class_parent) == 1);
+    class_fields_var = cast(*Var, 0);
+    let is i64 as slb = loop_base;
+    let is i64 as stb = try_base;
+    loop_base = nloop;
+    try_base = ntry;
+    cur = &body; g_func = f; g_scope = n.scope; pending_label = cast(*u8, 0);
+    // Outside strict code a call without a receiver has the global object for this.
+    if (f.uses_this == 1 && f.strict == 0 && f.arrow == 0) {
+        e1("fn %(env as *i64, this_in as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64) as i64 {\nlet is i64 as this_v with mut = this_in;\nif (this_v == UNDEF || this_v == NULLV) { this_v = G_global; }\n", fname);
+    } else {
+        e1("fn %(env as *i64, this_v as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64) as i64 {\n", fname);
+    }
+    if (f.needs_argc == 1) { e0("let is i64 as argc = rt_argc;\n"); }
+    if (cast(i64, f.self_var) != 0) { e0("let is i64 as self_v = rt_callee;\n"); }
+    let is i64 as np with mut = 0;
+    let is *N as p with mut = n.list;
+    while (is_null(p) == 0) {
+        if (np >= 4 && p.k != E_SPREAD) { e2("let is i64 as x% = rt_xget(%, argc);\n", itos(np), itos(np - 4)); }
+        np = np + 1;
+        p = p.next;
+    }
+    open_env(n.scope);
+    let is *Var as v with mut = f.vars;
+    while (cast(i64, v) != 0) {
+        if (seq(v.cname, "slot") == 0) { e1("let is i64 as % with mut = UNDEF;\n", v.cname); }
+        v = v.nextf;
+    }
+    if (cast(i64, f.this_var) != 0) { e1("% = this_v;\n", var_ref(f.this_var)); }
+    if (cast(i64, f.self_var) != 0) { e1("% = self_v;\n", var_ref(f.self_var)); }
+    if (cast(i64, f.args_var) != 0) { e1("% = rt_arguments(argc, p0, p1, p2, p3);\n", var_ref(f.args_var)); }
+    let is i64 as pi with mut = 0;
+    p = n.list;
+    while (is_null(p) == 0) {
+        if (p.k == E_SPREAD) {
+            gen_pat(p.a, sp(fmt("rt_rest(%, argc, p0, p1, p2, p3)", itos(pi), "", "", "")));
+        } else {
+            let is *u8 as src0 with mut = fmt("p%", itos(pi), "", "", "");
+            if (pi >= 4) { src0 = fmt("x%", itos(pi), "", "", ""); }
+            gen_pat(p, src0);
+        }
+        pi = pi + 1;
+        p = p.next;
+    }
+    if (ctor_base == 1) {
+        let is *Var as fv = lookup(g_scope, "%fields");
+        if (cast(i64, fv) != 0) { e2("rt_run_fields(%, %);\n", var_ref(fv), "this_v"); }
+    }
+    hoist_fns(n.a.list);
+    let is *N as st with mut = n.a.list;
+    while (is_null(st) == 0) { gs(st); st = st.next; }
+    e0("return UNDEF;\n}\n");
+    if (n.is_gen == 1 || n.is_async == 1) {
+        // The body runs on a stack of its own, from a wrapper that only collects its arguments.
+        e4("fn %(env as *i64, this_v as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64) as i64 {\nreturn rt_coroutine(fn_ptr(%), env, this_v, p0, p1, p2, p3, %);\n}\n", f.cname, fname, itos(n.is_async * (1 + n.is_gen)), "");
+    }
+    let is *Buf as outer = &out_funcs;
+    cur = outer;
+    buf_put(cur, body.p, body.n);
+    // Its name when it has one, or the one the place it was written gives it.
+    let is *u8 as shown with mut = n.s;
+    if (cast(i64, shown) == 0) { shown = n.op; }
+    let is i64 as plen with mut = 0;
+    let is *N as pw with mut = n.list;
+    while (is_null(pw) == 0 && pw.k != E_SPREAD && pw.k != E_ASSIGN) { plen = plen + 1; pw = pw.next; }
+    if (cast(i64, shown) != 0 || plen > 0) {
+        let is *u8 as nv with mut = "0";
+        if (cast(i64, shown) != 0) { nv = strv(shown); }
+        cur = &out_names;
+        e3("rt_nm(fn_ptr(%), %, %);\n", f.cname, nv, itos(plen));
+        cur = outer;
+    }
+    loop_base = slb; try_base = stb;
+    cur = sb; g_func = sf; g_scope = ss; nloop = snl; ntry = snt; pending_label = spl;
+    class_fields_var = scf; class_parent = scp;
+    return f.cname;
+}
+
+// Caustic text for a program, or null with last_error() saying why. The text lasts until
+// release().
+let is Buf as result with mut;
+fn reset() as void {
+    failed = 0; ntmp = 0; nvar = 0; nfn = 0; nic = 0; nstr = 0; nloop = 0; loop_base = 0; try_base = 0; no_in = 0; ntry = 0; in_gen = 0; in_async = 0;
+    next_loop_id = 1; pending_label = cast(*u8, 0); class_fields_var = cast(*Var, 0); class_parent = cast(*N, 0);
+    all_funcs = cast(*Func, 0);
+    let is i64 as i with mut = 0;
+    while (i < STR_BUCKETS) { str_bucket[i] = 0; i = i + 1; }
+    out_funcs.p = cast(*u8, 0); out_funcs.n = 0; out_funcs.cap = 0;
+    out_names.p = cast(*u8, 0); out_names.n = 0; out_names.cap = 0;
+    out_gc_roots.p = cast(*u8, 0); out_gc_roots.n = 0; out_gc_roots.cap = 0;
+    out_globals.p = cast(*u8, 0); out_globals.n = 0; out_globals.cap = 0;
+    out_strs.p = cast(*u8, 0); out_strs.n = 0; out_strs.cap = 0;
+    result.p = cast(*u8, 0); result.n = 0; result.cap = 0;
+    err_msg[0] = cast(u8, 0);
+}
+fn has_text(s as *u8, n as i64, w as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as q with mut = 0;
+        while (w[q] != 0 && i + q < n && s[i + q] == w[q]) { q = q + 1; }
+        if (w[q] == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn is_private(name as *u8) as i64 { return cast(i64, name[0] == 95 && name[1] == 95); }
+// A script for eval: its value is left in rt_ev_value, and it throws what it throws.
+fn translate_eval(source as *u8, n as i64, out_n as *i64) as *u8 {
+    eval_mode = 1;
+    let is *u8 as r = translate(source, n, out_n);
+    eval_mode = 0;
+    return r;
+}
+fn translate(source as *u8, n as i64, out_n as *i64) as *u8 {
+    reset();
+    src = source; src_len = n; pos = 0;
+    next();
+    let is *N as prog = nn(S_BLOCK);
+    let is *N as tail with mut = cast(*N, 0);
+    while (tk != T_EOF && failed == 0) { tail = push(prog, tail, stmt()); }
+    if (failed == 1) { return cast(*u8, 0); }
+    let is *Func as top = func_new(cast(*Func, 0), prog, 0);
+    let is *Scope as sc = scope_new(cast(*Scope, 0), top);
+    top.root = sc;
+    if (eval_mode == 1) { top.strict = has_directive(prog.list); }
+    hoist_vars(prog, sc, top, 0);
+    // var and function at the top of a script are properties of the global object, which every
+    // script and every eval sees. The prelude's own, named __, stay out of the page's sight.
+    let is *Var as tv with mut = sc.vars;
+    while (cast(i64, tv) != 0) { if (is_private(tv.name) == 0) { tv.prop = 1; } tv = tv.next; }
+    block_decls(prog.list, sc, 0);
+    // Scripts compiled apart see each other's let and const only as properties of the global
+    // object: no other script can reach a variable of this file by name.
+    if (eval_mode == 1 || has_text(source, n, "__runScriptSlot(") == 1) {
+        tv = sc.vars;
+        while (cast(i64, tv) != 0) { if (is_private(tv.name) == 0) { tv.prop = 1; } tv = tv.next; }
+    }
+    let is *N as st with mut = prog.list;
+    while (is_null(st) == 0) {
+        if (st.k == S_FN && is_private(st.s) == 0) { lookup_here(sc, st.s).prop = 1; }
+        st = st.next;
+    }
+    st = prog.list;
+    while (is_null(st) == 0) {
+        if (st.k == S_EXPR && st.a.k == E_ID && seq(st.a.s, "__script__") == 1) { top.strict = has_directive(st.next); }
+        analyze(st, sc, top, 0);
+        st = st.next;
+    }
+    if (failed == 1) { return cast(*u8, 0); }
+    name_vars();
+    let is Buf as body with mut;
+    body.p = cast(*u8, 0); body.n = 0; body.cap = 0;
+    cur = &body; g_func = top; g_scope = sc;
+    e0("fn js_top() as void {\nlet is *i64 as env = cast(*i64, 0);\nlet is i64 as this_v = G_global;\n");
+    tv = sc.vars;
+    while (cast(i64, tv) != 0) {
+        if (tv.prop == 1) { e1("rt_global_decl(%);\n", strv(tv.name)); }
+        tv = tv.next;
+    }
+    hoist_fns(prog.list);
+    st = prog.list;
+    // Each script of a page stands alone: one that throws does not stop the next.
+    let is *u8 as open_f with mut = cast(*u8, 0);
+    let is *u8 as open_c with mut = cast(*u8, 0);
+    while (is_null(st) == 0) {
+        if (st.k == S_EXPR && st.a.k == E_ID && seq(st.a.s, "__script__") == 1) {
+            if (cast(i64, open_f) != 0) { e2("ex.leave(&%);\n} else {\nreport_uncaught(%);\n}\n", open_f, open_c); }
+            open_f = tmp();
+            open_c = tmp();
+            e4("let is ex.Frame as %;\nlet is i64 as % = ex.begin(&%);\nif (% == 0) {\n", open_f, open_c, open_f, open_c);
+            e1("ex.enter(&%);\n", open_f);
+        } else if (eval_mode == 1 && st.k == S_EXPR && is_null(st.next) == 1) {
+            let is *u8 as last = gx(st.a);
+            e1("rt_ev_value = %;\n", last);
+        } else { gs(st); }
+        st = st.next;
+    }
+    if (cast(i64, open_f) != 0) { e2("ex.leave(&%);\n} else {\nreport_uncaught(%);\n}\n", open_f, open_c); }
+    e0("}\n");
+    if (failed == 1) { return cast(*u8, 0); }
+    cur = &result;
+    let is i64 as ni with mut = nic * 4;
+    if (ni == 0) { ni = 4; }
+    let is i64 as ns with mut = nstr;
+    if (ns == 0) { ns = 1; }
+    e2("let is [%]i64 as ics with mut;\nlet is [%]i64 as strs with mut;\n", itos(ni), itos(ns));
+    buf_put(cur, out_globals.p, out_globals.n);
+    buf_put(cur, out_funcs.p, out_funcs.n);
+    buf_put(cur, body.p, body.n);
+    e2("fn js_gc_roots() as void {\ngc_range(cast(i64, &ics), % * 8);\ngc_range(cast(i64, &strs), % * 8);\n", itos(ni), itos(ns));
+    buf_put(cur, out_gc_roots.p, out_gc_roots.n);
+    e0("}\n");
+    e0("fn js_names() as void {\n");
+    buf_put(cur, out_names.p, out_names.n);
+    e0("}\n");
+    e1("fn js_strs() as void {\nrt_strs_init(cast(*i64, &strs), %, \"", itos(nstr));
+    buf_put(cur, out_strs.p, out_strs.n);
+    e0("\");\n}\n");
+    *out_n = result.n;
+    return result.p;
+}
+fn last_error() as *u8 { return cast(*u8, &err_msg); }
+fn release() as void { ja_free(); }

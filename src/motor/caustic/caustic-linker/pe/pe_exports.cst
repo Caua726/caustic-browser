@@ -1,0 +1,142 @@
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../../src/ir/opt_mem.cst" as om;
+
+// ============================================================
+
+// ====================================================================
+// PE export directory (--shared → .dll). Appended to .rdata, like the
+// debug directory; DataDirectory[0] points at it. Lets a DLL export its
+// defined functions so another PE can import them (GetProcAddress).
+// ====================================================================
+// The export directory names the library itself. It was a fixed
+// "caustic.dll" regardless of what the file was actually called, so a
+// libcaustic.dll described itself as something else — harmless for a loader
+// that resolves by filename, wrong for anything reading the image.
+let is *u8 as g_pe_dll_name with mut = "caustic.dll";
+let is i64 as g_pe_dll_name_len with mut = 11;
+
+// Basename of the output path, kept for the export directory.
+fn pe_set_dll_name(path as *u8) as void {
+    let is i64 as n = reader.strlen(path);
+    let is i64 as start with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (path[i] == 47) { start = i + 1; }   // '/'
+        i = i + 1;
+    }
+    g_pe_dll_name = cast(*u8, cast(i64, path) + start);
+    g_pe_dll_name_len = n - start;
+}
+
+fn _pe_name_lt(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    let is i32 as n with mut = alen;
+    if (blen < n) { n = blen; }
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { if (a[i] < b[i]) { return 1; } return 0; }
+        i = i + 1;
+    }
+    if (alen < blen) { return 1; }
+    return 0;
+}
+
+fn _pe_patch_add(buf as *reader.ByteBuffer, off as i64, delta as i64) as void {
+    let is *u8 as d = buf.data;
+    let is i64 as v with mut = cast(i64, d[off]) + (cast(i64, d[off+1]) << 8) + (cast(i64, d[off+2]) << 16) + (cast(i64, d[off+3]) << 24);
+    v = v + delta;
+    d[off] = cast(u8, v & 255);
+    d[off+1] = cast(u8, (v >> 8) & 255);
+    d[off+2] = cast(u8, (v >> 16) & 255);
+    d[off+3] = cast(u8, (v >> 24) & 255);
+}
+
+// Appends IMAGE_EXPORT_DIRECTORY + AddressOf{Functions,Names,NameOrdinals} +
+// strings to rodata_buf. AddressOfFunctions holds final RVAs; the directory
+// pointer fields and AddressOfNames entries are rodata-relative and fixed by
+// _pe_patch_export_dir once rodata_rva is known.
+fn build_pe_export_dir(ls as *linker.LinkerState, rodata_buf as *reader.ByteBuffer,
+                       out_dir_off as *i64, out_n as *i32, out_names_off as *i64,
+                       stub_size as i64) as void {
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is *i32 as idx = cast(*i32, om.opt_alloc(cast(i64, gsyms.count) * 4 + 4));
+    let is i32 as n with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.name_len > 0 && g.section == 1) { idx[n] = gi; n = n + 1; }
+        gi = gi + 1;
+    }
+    // selection sort by name — AddressOfNames must be sorted for GetProcAddress
+    let is i32 as a with mut = 0;
+    while (a < n) {
+        let is i32 as mn with mut = a;
+        let is i32 as b with mut = a + 1;
+        while (b < n) {
+            let is *linker.GlobalSym as gb = linker.gsym_get(gsyms, idx[b]);
+            let is *linker.GlobalSym as gm = linker.gsym_get(gsyms, idx[mn]);
+            if (_pe_name_lt(gb.name, gb.name_len, gm.name, gm.name_len) == 1) { mn = b; }
+            b = b + 1;
+        }
+        let is i32 as t = idx[a]; idx[a] = idx[mn]; idx[mn] = t;
+        a = a + 1;
+    }
+    *out_n = n;
+    while ((cast(i64, rodata_buf.len) & 3) != 0) { reader.buf_emit8(rodata_buf, 0); }
+    let is i64 as dir_off = cast(i64, rodata_buf.len);
+    *out_dir_off = dir_off;
+    let is i64 as funcs_off = dir_off + 40;
+    let is i64 as names_off = funcs_off + cast(i64, n) * 4;
+    let is i64 as ords_off  = names_off + cast(i64, n) * 4;
+    let is i64 as strs_off  = ords_off + cast(i64, n) * 2;
+    *out_names_off = names_off;
+
+    reader.buf_emit32_le(rodata_buf, 0);              // Characteristics
+    reader.buf_emit32_le(rodata_buf, 0);              // TimeDateStamp
+    reader.buf_emit32_le(rodata_buf, 0);              // Major/Minor Version
+    reader.buf_emit32_le(rodata_buf, strs_off);       // Name (→ dll name string)
+    reader.buf_emit32_le(rodata_buf, 1);              // Base (ordinal)
+    reader.buf_emit32_le(rodata_buf, cast(i64, n));   // NumberOfFunctions
+    reader.buf_emit32_le(rodata_buf, cast(i64, n));   // NumberOfNames
+    reader.buf_emit32_le(rodata_buf, funcs_off);      // AddressOfFunctions
+    reader.buf_emit32_le(rodata_buf, names_off);      // AddressOfNames
+    reader.buf_emit32_le(rodata_buf, ords_off);       // AddressOfNameOrdinals
+
+    let is i32 as k with mut = 0;
+    while (k < n) {                                   // AddressOfFunctions: absolute RVAs
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx[k]);
+        // +stub_size: the PE writer prepends the entry stub to .text, shifting
+        // every function by STUB_SIZE past the assign_addresses vaddr.
+        reader.buf_emit32_le(rodata_buf, g.vaddr - ls.base_addr + stub_size);
+        k = k + 1;
+    }
+    let is i64 as cur with mut = strs_off + g_pe_dll_name_len + 1;
+    k = 0;
+    while (k < n) {                                   // AddressOfNames: rodata-rel string offsets
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx[k]);
+        reader.buf_emit32_le(rodata_buf, cur);
+        cur = cur + cast(i64, g.name_len) + 1;
+        k = k + 1;
+    }
+    k = 0;
+    while (k < n) { reader.buf_emit16_le(rodata_buf, k); k = k + 1; }   // ordinals = index
+    reader.buf_append(rodata_buf, g_pe_dll_name, g_pe_dll_name_len);        // strings
+    reader.buf_emit8(rodata_buf, 0);
+    k = 0;
+    while (k < n) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx[k]);
+        reader.buf_append(rodata_buf, g.name, cast(i64, g.name_len));
+        reader.buf_emit8(rodata_buf, 0);
+        k = k + 1;
+    }
+}
+
+fn _pe_patch_export_dir(rodata_buf as *reader.ByteBuffer, dir_off as i64, names_off as i64, n as i32, rodata_rva as i64) as void {
+    _pe_patch_add(rodata_buf, dir_off + 12, rodata_rva);   // Name
+    _pe_patch_add(rodata_buf, dir_off + 28, rodata_rva);   // AddressOfFunctions
+    _pe_patch_add(rodata_buf, dir_off + 32, rodata_rva);   // AddressOfNames
+    _pe_patch_add(rodata_buf, dir_off + 36, rodata_rva);   // AddressOfNameOrdinals
+    let is i32 as k with mut = 0;
+    while (k < n) { _pe_patch_add(rodata_buf, names_off + cast(i64, k) * 4, rodata_rva); k = k + 1; }
+}
+

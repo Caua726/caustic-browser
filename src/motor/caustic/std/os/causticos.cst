@@ -1,0 +1,992 @@
+// =======================================================
+// std/os/causticos.cst — CausticOS raw kernel bindings
+//
+// CausticOS (os.OS_CAUSTIC) is its own operating system, NOT Linux. It has its
+// own kernel syscall ABI. The instruction convention is standard x86_64:
+//   rax = number; args rdi, rsi, rdx, r10, r8, r9; return in rax.
+//   preserves rbx, rbp, r12-r15, rsp; clobbers rax, rcx, r11 + arg regs.
+// A negative return is an errno; an unknown number returns E_NOSYS WITHOUT
+// killing the thread. The `syscall(...)` builtin emits the call directly (rax =
+// first arg, the rest in the arg registers) — no inline-asm wrapper, so the
+// prologue-clobbers-rdi/rsi gotcha never applies.
+//
+// Syscall table (mirrors causticos kernel/abi.cst — keep in sync):
+//   0 KERN_INFO(buf,size)        -> bytes; size==0 -> probe ceiling
+//   1 TIME_NOW_NS()              -> monotonic ns since boot
+//   2 TIME_SLEEP_NS(ns)          -> 0; ns<0 -> E_INVAL
+//   3 PROC_EXIT(code)            -> never returns
+//   4 PROC_GETPID()              -> pid
+//   5 PROC_YIELD()               -> 0
+//   6 IO_WRITE_SERIAL(buf,len)   -> bytes (COM1 console; no fd)
+//   7 MMAP(hint,len,prot)        -> vaddr | errno   (prot: R=1 W=2 X=4)
+//   8 MUNMAP(addr,len)           -> 0 | errno
+//   9 OPEN(path,len,flags)       -> fd | errno
+//  10 READ(fd,buf,n)             -> bytes | errno
+//  11 WRITE(fd,buf,n)            -> bytes | errno    (real VFS fd only)
+//  12 CLOSE(fd)                  -> 0 | errno
+//  13 LSEEK(fd,off,whence)       -> off | errno
+//  14 SPAWN(img,len,fdacts,nact) -> pid | errno
+//  15 WAIT(pid,status_ptr)       -> exit_code | errno
+// =======================================================
+
+let is i64 as SYS_KERN_INFO       with imut = 0;
+let is i64 as SYS_TIME_NOW_NS     with imut = 1;
+let is i64 as SYS_TIME_SLEEP_NS   with imut = 2;
+let is i64 as SYS_PROC_EXIT       with imut = 3;
+let is i64 as SYS_PROC_GETPID     with imut = 4;
+let is i64 as SYS_PROC_YIELD      with imut = 5;
+let is i64 as SYS_IO_WRITE_SERIAL with imut = 6;
+let is i64 as SYS_MMAP            with imut = 7;
+let is i64 as SYS_MUNMAP          with imut = 8;
+let is i64 as SYS_OPEN            with imut = 9;
+let is i64 as SYS_READ            with imut = 10;
+let is i64 as SYS_WRITE           with imut = 11;
+let is i64 as SYS_CLOSE           with imut = 12;
+let is i64 as SYS_LSEEK           with imut = 13;
+let is i64 as SYS_SPAWN           with imut = 14;
+let is i64 as SYS_WAIT            with imut = 15;
+let is i64 as SYS_UNLINK          with imut = 16;
+let is i64 as SYS_MKDIR           with imut = 17;
+let is i64 as SYS_RMDIR           with imut = 18;
+let is i64 as SYS_RENAME          with imut = 19;
+let is i64 as SYS_STAT            with imut = 20;
+let is i64 as SYS_READDIR         with imut = 21;
+let is i64 as SYS_DEV_OPEN        with imut = 22;
+let is i64 as SYS_PRESENT         with imut = 23;
+let is i64 as SYS_CHANNEL_CREATE  with imut = 24;
+let is i64 as SYS_SURFACE_INFO    with imut = 25;
+let is i64 as SYS_DEV_COUNT       with imut = 26;
+let is i64 as SYS_COMMIT          with imut = 27;
+let is i64 as SYS_DECOMMIT        with imut = 28;
+let is i64 as SYS_SEG_CREATE      with imut = 29;
+let is i64 as SYS_SEG_CLONE       with imut = 30;
+let is i64 as SYS_SEG_COPY        with imut = 31;
+let is i64 as SYS_FD_SEND         with imut = 32;
+let is i64 as SYS_FD_RECV         with imut = 33;
+let is i64 as SYS_POLL            with imut = 34;
+let is i64 as SYS_PROC_KILL       with imut = 35;
+let is i64 as SYS_PROC_LIST       with imut = 36;
+let is i64 as SYS_MEM_INFO        with imut = 37;
+let is i64 as SYS_STATFS          with imut = 38;
+let is i64 as STATFS_VOLATILE     with imut = 1;
+let is i64 as SYS_CPU_STAT        with imut = 39;
+let is i64 as SYS_TIME_WALL       with imut = 40;
+let is i64 as SYS_POWEROFF        with imut = 41;
+let is i64 as SYS_REBOOT          with imut = 42;
+let is i64 as SYS_POWER_PENDING   with imut = 43;
+let is i64 as SYS_POWER_REQUEST   with imut = 55;
+let is i64 as SYS_POWER_CANCEL    with imut = 56;
+let is i64 as POWER_OFF           with imut = 1;
+let is i64 as POWER_REBOOT        with imut = 2;
+let is i64 as SYS_STATX           with imut = 44;
+let is i64 as SYS_EVENT_SUBSCRIBE with imut = 45;
+let is i64 as SYS_THREAD_SPAWN    with imut = 46;
+let is i64 as SYS_THREAD_EXIT     with imut = 47;
+let is i64 as SYS_QUERY_DEVS      with imut = 48;
+let is i64 as SYS_DEV_INFO        with imut = 49;
+let is i64 as SYS_NET_INFO        with imut = 50;
+let is i64 as SYS_GET_RANDOM      with imut = 51;
+let is i64 as SYS_RANDOM_QUALITY  with imut = 52;
+let is i64 as SYS_AUDIO_INFO      with imut = 53;
+let is i64 as SYS_COUNT           with imut = 65;
+
+// Errno values the kernel returns (negative in rax).
+let is i64 as E_OK    with imut = 0;
+let is i64 as E_INVAL with imut = 0 - 1;
+let is i64 as E_NOSYS with imut = 0 - 2;
+let is i64 as E_FAULT with imut = 0 - 3;
+let is i64 as E_BADF  with imut = 0 - 4;
+let is i64 as E_NOMEM with imut = 0 - 5;
+let is i64 as E_RANGE with imut = 0 - 6;
+let is i64 as E_PERM  with imut = 0 - 7;
+let is i64 as E_AGAIN with imut = 0 - 8;
+let is i64 as E_NOENT with imut = 0 - 9;
+let is i64 as E_EXIST with imut = 0 - 10;
+let is i64 as E_ISDIR with imut = 0 - 11;
+let is i64 as E_NOTDIR with imut = 0 - 12;
+let is i64 as E_MFILE with imut = 0 - 13;
+let is i64 as E_NOSPC with imut = 0 - 14;
+let is i64 as E_IO    with imut = 0 - 15;
+let is i64 as E_PIPE  with imut = 0 - 16;
+// Writing to, removing, or renaming a file some live process was loaded from.
+// The kernel is executing that program's text out of pages it built from those
+// bytes, so they cannot move underneath it. Linux calls this ETXTBSY.
+let is i64 as E_TXTBSY with imut = 0 - 17;
+// (-18 is the kernel's own E_INTR: a call cut short because the caller is being
+// terminated. No program ever sees it.)
+// spawn was given a file this system does not run: not a CSE image (a Linux
+// ELF, a text file), one for another architecture, or one whose tables do not
+// hold together. The file exists; E_NOENT means it does not.
+let is i64 as E_NOEXEC with imut = 0 - 19;
+// spawn was given more arguments than ARGV_MAX bytes of them.
+let is i64 as E_2BIG with imut = 0 - 20;
+// rmdir was asked for a directory that still has entries in it.
+let is i64 as E_NOTEMPTY with imut = 0 - 21;
+
+// How much argument vector spawn takes: for every argument its bytes, plus 9
+// (its NUL and its pointer on the child's stack). The kernel's abi.ARGV_MAX.
+let is i64 as ARGV_MAX with imut = 262144;
+
+// An errno in words, for the end of a message a person reads:
+// "cannot open /x: no such file or directory".
+fn err_text(e as i64) as *u8 {
+    if (e == E_INVAL)  { return cast(*u8, "invalid argument"); }
+    if (e == E_NOSYS)  { return cast(*u8, "not something this kernel does"); }
+    if (e == E_FAULT)  { return cast(*u8, "bad address"); }
+    if (e == E_BADF)   { return cast(*u8, "not an open file descriptor"); }
+    if (e == E_NOMEM)  { return cast(*u8, "out of memory"); }
+    if (e == E_RANGE)  { return cast(*u8, "too large"); }
+    if (e == E_PERM)   { return cast(*u8, "not permitted"); }
+    if (e == E_AGAIN)  { return cast(*u8, "not ready yet; try again"); }
+    if (e == E_NOENT)  { return cast(*u8, "no such file or directory"); }
+    if (e == E_EXIST)  { return cast(*u8, "already exists"); }
+    if (e == E_ISDIR)  { return cast(*u8, "is a directory"); }
+    if (e == E_NOTDIR) { return cast(*u8, "not a directory"); }
+    if (e == E_MFILE)  { return cast(*u8, "too many open"); }
+    if (e == E_NOSPC)  { return cast(*u8, "no space left on the volume"); }
+    if (e == E_IO)     { return cast(*u8, "input/output error"); }
+    if (e == E_PIPE)   { return cast(*u8, "the other end is closed"); }
+    if (e == E_TXTBSY) { return cast(*u8, "a running program was loaded from it"); }
+    if (e == E_NOEXEC) { return cast(*u8, "not a program CausticOS runs"); }
+    if (e == E_2BIG)   { return cast(*u8, "argument list too long"); }
+    if (e == E_NOTEMPTY) { return cast(*u8, "the directory is not empty"); }
+    return cast(*u8, "unknown error");
+}
+
+// mmap / reserve / commit prot bits. Read is implied by the page being
+// present, WRITE adds PTE_WRITE, and the absence of EXEC means NX. WRITE
+// together with EXEC is E_INVAL — no mapping is both writable and executable
+// (W^X); a program that needs both maps the range twice.
+let is i64 as PROT_READ  with imut = 1;
+let is i64 as PROT_WRITE with imut = 2;
+let is i64 as PROT_EXEC  with imut = 4;
+
+// open flags (same bit values the VFS uses).
+let is i64 as O_RDONLY with imut = 0x0000;
+let is i64 as O_WRONLY with imut = 0x0001;
+let is i64 as O_RDWR   with imut = 0x0002;
+let is i64 as O_CREAT  with imut = 0x0040;
+let is i64 as O_TRUNC  with imut = 0x0200;
+let is i64 as O_APPEND with imut = 0x0400;
+
+// lseek whence.
+let is i64 as SEEK_SET with imut = 0;
+let is i64 as SEEK_CUR with imut = 1;
+let is i64 as SEEK_END with imut = 2;
+
+// dev_open device classes, fd-backed mmap flag, surface pixel format.
+let is i64 as DEV_FB               with imut = 0;
+let is i64 as DEV_KEYBOARD         with imut = 1;
+// DEV_MOUSE reads drain fixed 4-byte records, whole records only:
+// [dx i8, dy i8, buttons u8, wheel i8]. dx/dy signed raw PS/2 deltas (dy
+// positive = UP — screen inversion is the caller's policy), buttons a state
+// mask (bit0 L, bit1 R, bit2 M), wheel signed detents. Deltas beyond +-127
+// arrive split across consecutive records.
+let is i64 as DEV_MOUSE            with imut = 2;
+// DEV_TABLET (virtio-input) reads drain fixed 8-byte records, whole records
+// only: [x u16 LE, y u16 LE, buttons u8, wheel i8, 0, 0]. x/y are ABSOLUTE
+// positions normalized to 0..32767 (0,0 = top-left); scale onto the screen
+// as value*width/32768. Position is state, not deltas — a hypervisor pointer
+// tracks the host cursor with no grab.
+let is i64 as DEV_TABLET           with imut = 3;
+// DEV_NET is a raw ETHERNET FRAME device. One read returns exactly one frame
+// and its length (14..1518, FCS already stripped); one write transmits exactly
+// one. A read whose buffer is smaller than the pending frame returns E_RANGE
+// and the frame is DROPPED — ask net_info() for frame_max and offer at least
+// that much, and it never happens.
+//
+// Frames, not connections: ARP, IPv4, TCP, DHCP and DNS are userspace. Records
+// rather than a stream because the frame boundary is a fact of the hardware —
+// the PHY builds and strips the framing, so what arrives already is a record.
+let is i64 as DEV_NET              with imut = 4;
+// DEV_AUDIO_OUT / DEV_AUDIO_IN are a RING OF PCM plus a control page, mapped
+// with mmap_fd(). audio_info() reports the geometry the kernel opened the
+// stream with — the rate and the format are reported, never requested.
+//
+// The stream runs from acquire to close. There is no start, no stop, no
+// drain and no volume: silence is what you get by not feeding it, finishing
+// is polling until hw_ptr reaches your app_ptr, and gain is your business.
+//
+// One fd has ONE mode, fixed by its first data operation: mmap first and you
+// publish app_ptr yourself, write() first and the kernel advances it for you.
+// The other one is E_INVAL from then on, because two writers on app_ptr is a
+// race with no lock a program could take.
+//
+// poll() is how an mmap-mode program waits for the next period: WRITABLE on
+// playback means a period of room, READABLE on capture means a period of
+// samples.
+let is i64 as DEV_AUDIO_OUT        with imut = 5;
+let is i64 as DEV_AUDIO_IN         with imut = 6;
+let is i64 as MMAP_FD              with imut = 0x10;
+let is i64 as MMAP_RESERVE         with imut = 0x20;   // reserve-only (back no pages)
+let is i64 as SURFACE_FMT_XRGB8888 with imut = 0;
+
+// ---- keys: what a spawner hands a child, by what each one is for ----
+//
+// A spawn's fdacts are {label, src_fd} pairs; the kernel gives each key an fd
+// of its own choosing and key() finds it by label (SYS_KEY). This is the one
+// place labels are named: one number per purpose, so a program can never take
+// one daemon's channel for another's (it once did: the compositor adopted
+// netd's channel thinking it was soundd's, when keys were found at agreed fd
+// numbers — bugs.md N122). The kernel knows none of these; they are ours.
+//
+// KEY_KIND_MASK is the part of a label that says what the key is for; key()
+// matches on it, so bits above it are free to describe the key.
+let is i64 as SYS_KEY         with imut = 60;
+let is i64 as KEY_KIND_MASK   with imut = 0xFFFFFFFF;
+let is i64 as KEY_STDIN       with imut = 1;    // read, write, ... name these three 0,
+let is i64 as KEY_STDOUT      with imut = 2;    // 1 and 2 (the label minus one;
+let is i64 as KEY_STDERR      with imut = 3;    // _fd below)
+let is i64 as KEY_DIR         with imut = 4;    // a directory key: where it started (prog.dir)
+let is i64 as KEY_TTY         with imut = 5;    // the terminal's control channel (ttyproto),
+                                                // with a stdout that is the terminal
+let is i64 as KEY_WM          with imut = 6;    // a window's channel to the window manager
+let is i64 as KEY_CTL         with imut = 7;    // a terminal's job: its channel back to the terminal
+let is i64 as KEY_INPUT       with imut = 8;    // input events, compositor → WM
+let is i64 as KEY_SCENE       with imut = 9;    // scene updates, WM → compositor
+let is i64 as KEY_NET         with imut = 10;   // netd's gate
+let is i64 as KEY_SOUND       with imut = 11;   // soundd's gate
+let is i64 as KEY_HW          with imut = 12;   // authority over hardware (hw_*): the kernel
+                                                // gives /init this label, and it goes down from there
+
+// Above the kind: what the key is. KEY_TERMINAL on a stdout or stderr label
+// says a terminal reads it — the shell sets it when it hands the terminal's
+// own channel there. A key says what it is; there is no second key handed
+// only to be found (bugs.md N123).
+let is i64 as KEY_TERMINAL    with imut = 0x100000000;
+
+// key: the fd of the key labelled `label`, or E_NOENT when the spawner gave
+// none (or it was closed).
+fn key(label as i64) as i64 { return syscall(SYS_KEY, label, KEY_KIND_MASK, 0); }
+
+// is_terminal: 1 when stdin, stdout or stderr (fd 0, 1 or 2) is a terminal,
+// as its key's label says; 0 otherwise. Any other fd is 0: only a spawner
+// knows what a key is, and it says so in the label of the stdio it hands.
+fn is_terminal(fd as i64) as i64 {
+    if (fd < 0 || fd > 2) { return 0; }
+    let is [1]i64 as full;
+    full[0] = 0;
+    if (syscall(SYS_KEY, KEY_STDIN + fd, KEY_KIND_MASK, cast(i64, &full[0])) < 0) { return 0; }
+    if ((full[0] & KEY_TERMINAL) != 0) { return 1; }
+    return 0;
+}
+
+// ---- directory keys: a directory held by what it is, not by its name ----
+//
+// dir_open makes one for the directory an absolute path[0..n) names. It
+// follows the directory when a rename moves it and resolves nothing once the
+// directory is removed (E_NOENT). openat opens a name under one as the open_*
+// calls do (flags O_*); dir_resolve writes into out (cap bytes) the absolute
+// path name[0..n) has under one now — n 0 is the directory itself — and
+// returns its length. E_NOTDIR when dir_fd is not a directory key.
+let is i64 as SYS_DIR_OPEN    with imut = 61;
+let is i64 as SYS_OPENAT      with imut = 62;
+let is i64 as SYS_DIR_RESOLVE with imut = 63;
+fn dir_open(path as *u8, n as i64) as i64 { return syscall(SYS_DIR_OPEN, path, n); }
+fn openat(dir_fd as i64, path as *u8, flags as i64) as i64 {
+    return syscall(SYS_OPENAT, dir_fd, path, _slen(path), flags);
+}
+fn dir_resolve(dir_fd as i64, name as *u8, n as i64, out as *u8, cap as i64) as i64 {
+    return syscall(SYS_DIR_RESOLVE, dir_fd, name, n, out, cap);
+}
+
+// ---- hardware keys: who may take a device ----
+//
+// dev_open answers E_PERM unless this program holds a hardware key covering
+// the class (bugs.md N127). The kernel makes one, covering every class, for
+// /init (KEY_HW); every other is part of one, narrowed with hw_narrow and
+// handed to a child as its KEY_HW. hw_for(mask) is that, from this program's
+// own key: a key for a child, or E_PERM when the classes are not all mine to
+// give (E_NOENT when I hold none). Asking what devices there are — dev_count,
+// query_devs, dev_info — needs no key.
+let is i64 as SYS_HW_NARROW   with imut = 64;
+let is i64 as HW_SCREEN       with imut = 1;     // 1 << DEV_FB
+let is i64 as HW_KEYBOARD     with imut = 2;     // 1 << DEV_KEYBOARD
+let is i64 as HW_MOUSE        with imut = 4;     // 1 << DEV_MOUSE
+let is i64 as HW_TABLET       with imut = 8;     // 1 << DEV_TABLET
+let is i64 as HW_NET          with imut = 16;    // 1 << DEV_NET
+let is i64 as HW_AUDIO_OUT    with imut = 32;    // 1 << DEV_AUDIO_OUT
+let is i64 as HW_AUDIO_IN     with imut = 64;    // 1 << DEV_AUDIO_IN
+let is i64 as HW_AUDIO        with imut = 96;    // both converters
+fn hw_narrow(hw_fd as i64, mask as i64) as i64 { return syscall(SYS_HW_NARROW, hw_fd, mask); }
+fn hw_for(mask as i64) as i64 {
+    let is i64 as k = key(KEY_HW);
+    if (k < 0) { return E_NOENT; }
+    return hw_narrow(k, mask);
+}
+
+// SYS_POLL readiness bits. Each entry is 3 x i64 {fd, want, got}: `want` is
+// the bits the caller cares about; the kernel writes `got` = observed state
+// masked to (want | POLL_CLOSED | POLL_ERROR). A poll takes as many entries
+// as the caller's fd table has slots (64, more once it has grown). On a
+// channel, WRITABLE guarantees at least POLL_WRITE_UNIT bytes go through
+// without blocking or splitting — size protocol messages accordingly.
+let is i64 as POLL_READABLE    with imut = 1;
+let is i64 as POLL_WRITABLE    with imut = 2;
+let is i64 as POLL_CLOSED      with imut = 4;
+let is i64 as POLL_ERROR       with imut = 8;
+let is i64 as POLL_WRITE_UNIT  with imut = 64;
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// ---- io facade backend (called by std/io.cst's OS_CAUSTIC dispatch) ----
+
+// 0, 1 and 2 are stdin, stdout and stderr in every call here that takes an fd
+// (read, write, close, lseek, chan_info, poll): the std reads each as the key
+// labelled KEY_STDIN/STDOUT/STDERR, wherever the kernel put it. The kernel
+// never hands out 0..2 itself, so a real descriptor is never shadowed. It is
+// what portable code needs — the compiler writes to 1 and 2 on every OS — and
+// what lets a program find its stdio without knowing its number. Looked up
+// once: _stdio holds fd + 1 once found, -1 when there is no such key, 0 before.
+let is [3]i64 as _stdio with mut;
+
+fn _fd(fd as i64) as i64 {
+    if (fd < 0 || fd > 2) { return fd; }
+    let is i64 as c = _stdio[fd];
+    if (c > 0) { return c - 1; }
+    if (c < 0) { return 0 - 1; }
+    let is i64 as k = key(KEY_STDIN + fd);
+    if (k < 0) { _stdio[fd] = 0 - 1; return 0 - 1; }
+    _stdio[fd] = k + 1;
+    return k;
+}
+
+// write(fd, buf, n): SYS_WRITE to the fd — a VFS file or a console-channel
+// endpoint the shell handed down (1 = stdout). If the fd doesn't exist (a
+// standalone program writing to stdout with none), fall back to the serial
+// console so output still appears. So: under the shell, write(1) reaches the
+// terminal via the console channel; run bare, it reaches serial.
+fn write(fd as i64, buf as *u8, n as i64) as i64 {
+    let is i64 as r = syscall(11, _fd(fd), buf, n);
+    if (r == E_BADF) { return syscall(6, buf, n); }
+    return r;
+}
+fn read(fd as i64, buf as *u8, n as i64) as i64 { return syscall(10, _fd(fd), buf, n); }
+// A relative path opens under the directory this program was started in, as
+// it is now: its key KEY_DIR, through SYS_OPENAT. With no such key a relative
+// path opens nothing, as before there were keys. An empty path names nothing
+// (E_NOENT, as POSIX has it) — it is what a name under a start directory that
+// was removed comes out as (prog.abspath).
+fn _open(path as *u8, flags as i64) as i64 {
+    let is i64 as n = _slen(path);
+    if (n == 0) { return E_NOENT; }
+    if (path[0] != cast(u8, 47)) {
+        let is i64 as dk = key(KEY_DIR);
+        if (dk >= 0) { return syscall(SYS_OPENAT, dk, path, n, flags); }
+    }
+    return syscall(9, path, n, flags);
+}
+fn open_read(path as *u8) as i64   { return _open(path, O_RDONLY); }
+fn open_write(path as *u8) as i64  { return _open(path, O_WRONLY | O_CREAT | O_TRUNC); }
+fn open_append(path as *u8) as i64 { return _open(path, O_WRONLY | O_CREAT | O_APPEND); }
+fn close(fd as i64) as i32 {
+    let is i64 as real = _fd(fd);
+    if (fd >= 0 && fd <= 2) { _stdio[fd] = 0 - 1; }
+    return cast(i32, syscall(12, real));
+}
+fn lseek(fd as i64, offset as i64, whence as i32) as i64 { return syscall(13, _fd(fd), offset, cast(i64, whence)); }
+
+// ---- self-path (stdlib discovery for the self-hosting compiler) ----
+// CausticOS does NOT track a process's path. A spawn names the image it starts
+// — a path or an fd — but the kernel keeps no record of it on the child, and
+// argv is data, not authority, so nothing resolves it afterwards either. A
+// program's "own path" is therefore purely the argv[0] its spawner chose; there
+// is no /proc/self/exe and (by design) no syscall for it. The program
+// registers argv[0] via set_self_path at startup; get_self_path hands it back.
+// Unregistered → 0, and the caller falls back to a built-in default (e.g. the
+// compiler's stdlib dir). g_self_path is BSS-zeroed (null) until set.
+let is *u8 as g_self_path with mut;
+
+fn set_self_path(p as *u8) as void { g_self_path = p; }
+
+fn get_self_path(buf as *u8, size as i64) as i64 {
+    let is *u8 as src = g_self_path;
+    if (cast(i64, src) == 0) { return 0; }
+    if (size <= 0) { return 0; }
+    let is i64 as i with mut = 0;
+    let is i64 as lim = size - 1;
+    while (src[i] != 0 && i < lim) {
+        buf[i] = src[i];
+        i = i + 1;
+    }
+    buf[i] = 0;   // NUL-terminate (length returned excludes it)
+    return i;
+}
+
+// PROC_EXIT(code) — terminates the process; never returns.
+fn exit(code as i32) as void { syscall(3, cast(i64, code)); }
+
+// ---- direct kernel services (for code that targets CausticOS specifically) ----
+fn getpid() as i64 { return syscall(4); }
+fn yield_cpu() as i64 { return syscall(5); }
+fn sleep_ns(ns as i64) as i64 { return syscall(2, ns); }
+fn time_ns() as i64 { return syscall(1); }
+fn kern_info(buf as *u8, size as i64) as i64 { return syscall(0, buf, size); }
+fn write_serial(buf as *u8, len as i64) as i64 { return syscall(6, buf, len); }
+
+// memory: anonymous mappings (no fd/offset in v0).
+fn mmap(hint as i64, len as i64, prot as i64) as i64 { return syscall(7, hint, len, prot); }
+fn munmap(addr as i64, len as i64) as i64 { return syscall(8, addr, len); }
+
+// Strict reserve/commit (Phase E). reserve claims a VA window backing no pages
+// (touching it faults until commit); commit backs a range with zero frames;
+// decommit drops the frames but keeps the reservation; munmap releases it.
+// commit/reserve return E_NOMEM (honest, at the call site) rather than faulting.
+fn reserve(hint as i64, len as i64, prot as i64) as i64 { return syscall(7, hint, len, prot | MMAP_RESERVE); }
+fn commit(addr as i64, len as i64, prot as i64) as i64 { return syscall(27, addr, len, prot); }
+fn decommit(addr as i64, len as i64) as i64 { return syscall(28, addr, len); }
+
+// process: spawn a child from a NAMED image — a path, or an fd you hold.
+//
+// It used to take the image as bytes, which meant every caller wrote the same
+// six lines: open, lseek to size, mmap, read, spawn, munmap. That cost a full
+// eager-committed copy in the parent, a second staging copy in the kernel, and
+// a third into the child — and shared nothing, since bytes are not an object.
+// Naming the source instead lets the kernel's image cache map one set of frames
+// into every process running the same program.
+//
+//   fdacts: array of {label, src_fd} (16 B each), n_acts <= 16 — the ONLY way
+//           the child gets keys (its fd table starts empty): the object at
+//           src_fd, as the key labelled KEY_* (see key() above), at an fd the
+//           kernel picks. A src_fd of 0..2 is this program's own stdio, as
+//           everywhere in the std. Pass 0/0 for none.
+//   argv:   array of {str_ptr, str_len} (16 B each), at most ARGV_MAX bytes of
+//           them (each argument's length + 9), else E_2BIG — copied onto the
+//           child's System V stack as argc/argv. argv is data, not authority:
+//           the kernel never resolves it. Pass 0/0 for no args.
+//
+// SYS_SPAWN takes a single *SpawnParams; we marshal the 72-byte struct on the
+// stack and pass its pointer. The plain forms grant no budget (0 = unlimited);
+// the _budget forms cap the child's committed_bytes, confining a reserve-bomb
+// to the child.
+let is i64 as SPAWN_SRC_PATH with imut = 0;
+let is i64 as SPAWN_SRC_FD   with imut = 1;
+
+fn _spawn(kind as i64, fd as i64, path as *u8, path_len as i64,
+          fdacts as *u8, n_acts as i64, argv as *u8, argc as i64,
+          budget as i64) as i64 {
+    // The keys, with a src_fd of 0..2 read as this program's stdio. Copied:
+    // the caller's array is the caller's. More than 16 is the kernel's to
+    // refuse, so those are passed as they are.
+    let is [32]i64 as acts;
+    let is *i64 as src = cast(*i64, fdacts);
+    let is *u8 as use_acts with mut = fdacts;
+    if (n_acts > 0 && n_acts <= 16 && cast(i64, fdacts) != 0) {
+        let is i64 as i with mut = 0;
+        while (i < n_acts) {
+            acts[i * 2] = src[i * 2];
+            acts[i * 2 + 1] = _fd(src[i * 2 + 1]);
+            i = i + 1;
+        }
+        use_acts = cast(*u8, &acts[0]);
+    }
+    let is [9]i64 as sp;
+    sp[0] = kind;
+    sp[1] = fd;
+    sp[2] = cast(i64, path);
+    sp[3] = path_len;
+    sp[4] = cast(i64, use_acts);
+    sp[5] = n_acts;
+    sp[6] = cast(i64, argv);
+    sp[7] = argc;
+    sp[8] = budget;
+    return syscall(14, cast(i64, &sp[0]));
+}
+
+// Spawn the program at `path`. The kernel opens it — the same resolution any
+// open() does, and the same one the loader already performs for /lib.
+fn spawn_path_budget(path as *u8, fdacts as *u8, n_acts as i64,
+                     argv as *u8, argc as i64, budget as i64) as i64 {
+    return _spawn(SPAWN_SRC_PATH, 0, path, _slen(path), fdacts, n_acts, argv, argc, budget);
+}
+fn spawn_path(path as *u8, fdacts as *u8, n_acts as i64, argv as *u8, argc as i64) as i64 {
+    return spawn_path_budget(path, fdacts, n_acts, argv, argc, 0);
+}
+
+// Spawn from an fd you already hold — a file you opened, or a segment carrying
+// an image that never came from the filesystem (the memfd analogue). The fd is
+// borrowed: it is still yours, and you still close it.
+fn spawn_fd_budget(img_fd as i64, fdacts as *u8, n_acts as i64,
+                   argv as *u8, argc as i64, budget as i64) as i64 {
+    return _spawn(SPAWN_SRC_FD, img_fd, cast(*u8, 0), 0, fdacts, n_acts, argv, argc, budget);
+}
+fn spawn_fd(img_fd as i64, fdacts as *u8, n_acts as i64, argv as *u8, argc as i64) as i64 {
+    return spawn_fd_budget(img_fd, fdacts, n_acts, argv, argc, 0);
+}
+// wait: wait for child `pid` (pid <= 0: any) to exit, reap it, and return its
+// exit code (also at status_ptr when it is not 0). It waits until the child is
+// gone, however long that takes: a kill interrupts it with E_INTR, and a pid
+// that is not your child is E_NOENT. E_AGAIN never means "it exited" (bugs.md
+// N125).
+//
+// WAIT_HAS_TIMEOUT is bit 62 of the pid: it says the third argument is the
+// timeout. A kernel from before this argument reads it as a plain pid and waits
+// its old five seconds; a caller that never set it gets the same, which is why
+// the bit exists (see the comment in kernel/abi.cst).
+let is i64 as WAIT_HAS_TIMEOUT with imut = 0x4000000000000000;
+fn wait(pid as i64, status_ptr as *i64) as i64 {
+    return syscall(15, pid | WAIT_HAS_TIMEOUT, status_ptr, 0 - 1);
+}
+// wait_ns: the same with an explicit window, in ns. 0 answers now (E_AGAIN while
+// the child is still running), a positive number waits that long, a negative one
+// waits it out.
+fn wait_ns(pid as i64, status_ptr as *i64, timeout_ns as i64) as i64 {
+    return syscall(15, pid | WAIT_HAS_TIMEOUT, status_ptr, timeout_ns);
+}
+// Forced termination of a DESCENDANT, and of everything it started (the spawn
+// tree is the kill authority — no ambient pid namespace; E_NOENT for anything
+// outside yours). It exits 137 with its fd table drained (peers see EOF/CLOSED
+// at once); its parent's wait() collects it as usual.
+fn kill(pid as i64) as i64 { return syscall(35, pid); }
+// The exit codes the kernel gives a child it ended: killed (by kill(), Ctrl+C)
+// or crashed (a CPU exception in ring 3).
+let is i64 as EXIT_KILLED         with imut = 137;
+let is i64 as EXIT_FAULT          with imut = 139;
+// Why a process ended, when its code cannot say it. A program states one on the
+// way out, the collector reads it from wait_info's ninth word, and the shell
+// names it in words instead of asking the reader to translate a number that
+// imitates a signal (bugs.md N133).
+let is i64 as END_REASON_NONE          with imut = 0;
+let is i64 as END_REASON_OUTPUT_CLOSED with imut = 1;   // whoever read its output is gone
+let is i64 as SYS_PROC_EXIT_REASON with imut = 59;
+// exit_reason: PROC_EXIT, and why.
+fn exit_reason(code as i32, reason as i64) as void { syscall(SYS_PROC_EXIT_REASON, cast(i64, code), reason); }
+// wait_info: wait(), and how the child ended — out needs WAIT_INFO_WORDS i64:
+// [exit code, crashed (1/0), vector, error_code, rip, addr (cr2 for a page
+// fault, else 0), name[16] (argv[0], NUL-terminated), why it ended
+// (END_REASON_*; 0 when it just exited)]. vector..addr are 0 unless it crashed.
+// The fault is gone once the child is collected, so whoever has to say "it
+// crashed" collects it with this. It waits until the child is gone; wait_info_ns
+// takes the same window as wait_ns.
+let is i64 as SYS_PROC_WAIT_INFO  with imut = 57;
+let is i64 as WAIT_INFO_WORDS     with imut = 9;
+fn wait_info(pid as i64, out as *i64) as i64 {
+    return syscall(SYS_PROC_WAIT_INFO, pid | WAIT_HAS_TIMEOUT, cast(i64, out), 0 - 1);
+}
+fn wait_info_ns(pid as i64, out as *i64, timeout_ns as i64) as i64 {
+    return syscall(SYS_PROC_WAIT_INFO, pid | WAIT_HAS_TIMEOUT, cast(i64, out), timeout_ns);
+}
+
+// --- introspection (read-only snapshots for ps/top/free/df) ---
+// proc_list: fill `entries` with up to `max` ProcInfo records
+// (PROC_INFO_WORDS i64 each: pid, ppid, state (1 alive, 2 exiting, 3 zombie),
+// exit_code, thread_count, resident bytes, name[16] = argv[0] in words 6-7,
+// cumulative cpu ns, threads running or ready to run — 0 = all waiting).
+// Returns the TOTAL count, the kernel's row (pid 0) included — greater than
+// `max` means the snapshot was truncated: ask again with room for it. max 0
+// only counts. The kernel sets no limit of its own.
+// mem_info: [total_pages, free_pages, page_size, committed_total].
+// statfs: [total_bytes, free_bytes, block_size, flags] for the mounted fs —
+// out needs 4 i64. STATFS_VOLATILE in flags: what is written there is gone at
+// power off (a live root), which whoever is at the keyboard has to be told.
+let is i64 as PROC_INFO_WORDS     with imut = 10;
+fn proc_list(entries as *i64, max as i64) as i64 { return syscall(36, cast(i64, entries), max); }
+fn mem_info(out as *i64) as i64 { return syscall(37, cast(i64, out)); }
+fn statfs(out as *i64) as i64 { return syscall(38, cast(i64, out)); }
+// [ncpu, busy_ns per cpu ..., now_ns]. The busy figures are CUMULATIVE: two
+// samples and the clock between them give a real utilisation ratio. Needs 18
+// i64 of room.
+fn cpu_stat(out as *i64) as i64 { return syscall(39, cast(i64, out)); }
+fn time_wall(out as *i64) as i64 { return syscall(40, cast(i64, out)); }      // [year,month,day,hour,min,sec,weekday] from the RTC
+fn poweroff() as i64 { return syscall(41); }                                  // ACPI S5 soft-off — does not return
+fn reboot() as i64 { return syscall(42); }                                    // machine reset — does not return
+fn power_pending() as i64 { return syscall(43); }                             // what is asked of the power: 0, POWER_OFF, POWER_REBOOT
+// Ask for the power to go off or the machine to restart the way the power
+// button does: whoever holds an EVENT_POWER queue (a desktop) closes its
+// windows first. With none (or asked a second time) the machine goes down at
+// once and this does not return.
+fn power_request(kind as i64) as i64 { return syscall(55, kind); }
+// The desktop calling a pending request off (a window would not close).
+fn power_cancel() as i64 { return syscall(56); }
+
+// VFS metadata (kernel syscalls 16-21) — forward path + length. `stat`/`readdir`
+// fill a caller-provided VfsStat / VfsDirEntry buffer (layout from kernel/vfs.cst).
+fn unlink(path as *u8) as i32 { return cast(i32, syscall(16, path, _slen(path))); }
+fn mkdir(path as *u8) as i32  { return cast(i32, syscall(17, path, _slen(path))); }
+fn rmdir(path as *u8) as i32  { return cast(i32, syscall(18, path, _slen(path))); }
+fn rename(src as *u8, dst as *u8) as i32 { return cast(i32, syscall(19, src, _slen(src), dst, _slen(dst))); }
+fn stat(path as *u8, out as *u8) as i32 { return cast(i32, syscall(20, path, _slen(path), out)); }
+fn exists(path as *u8) as i32 {
+    let is [4]i64 as st;   // VfsStat is 32 bytes; only the success/fail of stat matters here
+    if (syscall(20, path, _slen(path), cast(*u8, &st)) == 0) { return 1; }
+    return 0;
+}
+fn readdir(fd as i64, out as *u8) as i64 { return syscall(21, fd, out); }
+// statx — stat plus the FAT32 write-time. Fills 5 x i64 = 40 bytes:
+//   [0] size  [1] first_cluster  [2] attr  [3] is_dir  [4] mtime (epoch s)
+// mtime 0 means the kernel has no stamp for that entry, not "epoch".
+fn statx(path as *u8, out as *u8) as i32 { return cast(i32, syscall(44, path, _slen(path), out)); }
+
+// --- display / surface (dev_open DEV_FB → a surface fd) ---
+fn dev_open(class as i64, index as i64, flags as i64) as i64 { return syscall(22, class, index, flags); }
+fn present(fd as i64, x as i64, y as i64, w as i64, h as i64) as i64 { return syscall(23, fd, x, y, w, h); }
+// dev_count(class) — how many devices of this class exist (a device manager
+// asks this, then dev_opens each index 0..count-1).
+fn dev_count(class as i64) as i64 { return syscall(26, class); }
+fn surface_info(fd as i64, out as *u8) as i64 { return syscall(25, fd, out); }
+// fd-backed mmap of a surface's backbuffer: hint=0, len ignored, fd in r10.
+fn mmap_fd(prot as i64, fd as i64) as i64 { return syscall(7, cast(i64, 0), cast(i64, 0), prot | MMAP_FD, fd); }
+
+// Segments (KOBJ_SEGMENT): shareable RAM behind an fd. seg_create mints one;
+// attach it with mmap_fd(prot, fd) (same path as a surface); share it by
+// passing the fd at spawn (fdacts). seg_clone makes a second independent fd
+// over the same frames. Detach = close(fd).
+fn seg_create(npages as i64, flags as i64) as i64 { return syscall(29, npages, flags); }
+fn seg_clone(fd as i64) as i64 { return syscall(30, fd); }
+// Random-access copy of a segment's bytes without mapping it (no cursor — a
+// pointed access). seg_read copies seg→buf, seg_write copies buf→seg.
+fn seg_read(fd as i64, off as i64, buf as *u8, len as i64) as i64 { return syscall(31, fd, off, cast(i64, buf), len, cast(i64, 0)); }
+fn seg_write(fd as i64, off as i64, buf as *u8, len as i64) as i64 { return syscall(31, fd, off, cast(i64, buf), len, cast(i64, 1)); }
+
+// --- IPC: channel_create writes [fd_a, fd_b] (2 x i64) to `out`. read/write/close
+//     on either endpoint use the existing read()/write()/close() (any fd kind). ---
+fn channel_create(out as *i64) as i64 { return syscall(24, out); }
+// channel_create_growing — the same pair, with rings that start small and grow
+// with what the channel carries, up to the same 8 KiB a direction: for the
+// many that carry little (a job's output, a pipe). A ring the kernel had no
+// memory to grow holds less, and chan_info/POLL_WRITABLE say so; two sides that
+// write to each other without reading first want channel_create. CHAN_GROWING
+// is bit 62 of `out`, which no pointer has (the kernel's abi.cst).
+let is i64 as CHAN_GROWING with imut = 0x4000000000000000;
+fn channel_create_growing(out as *i64) as i64 { return syscall(24, cast(i64, out) | CHAN_GROWING); }
+// Out-of-band fd (KObject reference) passing over a channel. fd_send hands a
+// local fd to the channel's peer; fd_recv installs a delivered reference at a
+// fresh fd. E_AGAIN = slot busy / nothing pending. The SCM_RIGHTS analogue.
+fn fd_send(chan_fd as i64, fd as i64) as i64 { return syscall(32, chan_fd, fd); }
+fn fd_recv(chan_fd as i64) as i64 { return syscall(33, chan_fd); }
+
+// --- lifecycle events: the signal replacement. Subscribe to your OWN children
+//     (pid must be the caller's — the spawn tree is the authority, there is no
+//     ambient namespace) and get back a readable, pollable fd. Reads yield whole
+//     {pid, kind, code} records of EVENT_REC_BYTES each; a 0-byte read means
+//     "nothing queued now", NOT end-of-stream, so multiplex it with poll().
+//     mask 0 = EVENT_EXIT. EVENT_POWER only when named: holding such a queue
+//     makes this process the one the kernel lets shut the machine down
+//     gracefully (subscribe, poll, and on a record run the shutdown). ---
+let is i64 as EVENT_REC_BYTES with imut = 24;   // 3 x i64 per record
+let is i64 as EVENT_EXIT      with imut = 1;    // kind: a child exited; code = its exit code
+let is i64 as EVENT_POWER     with imut = 2;    // kind: the power was asked to go; pid 0, code = POWER_OFF | POWER_REBOOT
+fn event_subscribe(pid as i64, mask as i64) as i64 { return syscall(45, pid, mask); }
+
+// --- threads over one address space. thread_spawn starts a ring-3 thread in
+//     the CALLER's aspace at `entry`, with `arg` in rdi, running on `stack_top`
+//     (the caller made that stack — the kernel supplies mechanism, the stack
+//     is policy) with `block` as its thread block, its fs base. thread_start
+//     below makes both and is what to call. thread_exit ends the calling
+//     thread only; exit() still ends the whole process. A worker that blocks
+//     or computes lives here without stalling the parent's poll loop. ---
+fn thread_spawn(entry as i64, arg as i64, stack_top as i64, block as i64) as i64 {
+    return syscall(46, entry, arg, stack_top, block);
+}
+fn thread_exit(code as i64) as void { syscall(47, code); }
+
+// The thread block (kernel/abi.cst THREAD_BLOCK_*): what belongs to one thread,
+// at its fs base, 64 bytes. The loader writes the first thread's; thread_start
+// writes the others'.
+//   [0]  lowest committed byte of the thread's stack — a dynamic-stack
+//        program's prologue probes read it (fs:[0]) and lower it as they grow
+//        the stack;
+//   [8]  the block's own address;
+//   [16] the bottom of the stack's reservation, which growth cannot pass.
+let is i64 as THREAD_BLOCK_SIZE with imut = 64;
+let is i64 as TB_STACK_LOW      with imut = 0;
+let is i64 as TB_SELF           with imut = 8;
+let is i64 as TB_STACK_FLOOR    with imut = 16;
+
+// What a thread started by thread_run runs first: its entry function with its
+// argument — the two thread_run left at the top of the new stack, `at` — and
+// then the end of the thread, with what the entry returned as the code. So an
+// entry function may end with thread_exit or simply return.
+fn _thread_main(at as *i64) as void {
+    let is i64 as code = call(at[0], at[1]);
+    thread_exit(code);
+    return;
+}
+
+// A thread's stack and block, as thread_start made them.
+struct ThreadStack {
+    base as i64;     // the reservation: [base, base + size)
+    size as i64;
+    block as i64;    // its thread block, at the top
+    tid as i64;
+}
+
+// thread_block_init — lay a thread block at the top of the stack
+// [base, base + size), whose committed part starts at `low`, and return the
+// block's address: what thread_run starts a thread under. thread_start does
+// this for the stack it makes; a caller that keeps stacks of its own does it
+// each time it starts a thread on one.
+fn thread_block_init(base as i64, size as i64, low as i64) as i64 {
+    let is *i64 as tb = cast(*i64, base + size - THREAD_BLOCK_SIZE);
+    let is i64 as w with mut = 0;
+    while (w < THREAD_BLOCK_SIZE / 8) { tb[w] = 0; w = w + 1; }
+    tb[TB_STACK_LOW / 8] = low;
+    tb[TB_SELF / 8] = cast(i64, tb);
+    tb[TB_STACK_FLOOR / 8] = base;
+    return cast(i64, tb);
+}
+
+// thread_run — start entry(arg) on the stack below `block`, through
+// _thread_main: the entry and its argument go in the top 16 bytes of the
+// stack, and the thread is entered 8 below them, rsp 8 off 16-byte alignment
+// as after a call. The tid, or the errno.
+fn thread_run(entry as i64, arg as i64, block as i64) as i64 {
+    let is *i64 as at = cast(*i64, block - 16);
+    at[0] = entry;
+    at[1] = arg;
+    return thread_spawn(cast(i64, fn_ptr(_thread_main)), cast(i64, at), block - 24, block);
+}
+
+// thread_start — run entry(arg) on a new thread with a stack of its own:
+// `reserve_bytes` of address space, the top `commit_bytes` of them committed
+// (both rounded up to pages, the commit to at least one), the thread block in
+// the top 64 bytes and the stack below it. In a dynamic-stack program the
+// thread's probes commit more as it goes deeper, up to the reservation; in
+// one with a static stack the commit is all it gets, so make it the whole
+// reservation. 0 and `t` filled in, or the errno with nothing left reserved.
+fn thread_start(t as *ThreadStack, entry as i64, arg as i64, reserve_bytes as i64, commit_bytes as i64) as i64 {
+    let is i64 as size = ((reserve_bytes + 4095) / 4096) * 4096;
+    let is i64 as c with mut = ((commit_bytes + 4095) / 4096) * 4096;
+    if (c < 4096) { c = 4096; }
+    if (size < c) { return E_INVAL; }
+    let is i64 as rw = PROT_READ | PROT_WRITE;
+    let is i64 as base = reserve(0, size, rw);
+    if (base < 0) { return base; }
+    let is i64 as rc = commit(base + size - c, c, rw);
+    if (rc != 0) { munmap(base, size); return rc; }
+    let is i64 as tb = thread_block_init(base, size, base + size - c);
+    let is i64 as tid = thread_run(entry, arg, tb);
+    if (tid < 0) { munmap(base, size); return tid; }
+    t.base = base;
+    t.size = size;
+    t.block = tb;
+    t.tid = tid;
+    return 0;
+}
+
+// Give a thread's stack and block back — once the thread has ended, which
+// is the caller's to know (a channel it closed, a flag it set last).
+fn thread_stack_free(t as *ThreadStack) as void {
+    if (t.base != 0) { munmap(t.base, t.size); }
+    t.base = 0; t.size = 0; t.block = 0;
+    return;
+}
+
+// --- device enumeration: the read-all counterpart of dev_count. Writes
+//     {class, index} pairs (2 x i64) for every registered instance, up to
+//     `max` pairs, and returns the TOTAL — a return above `max` means the
+//     snapshot was truncated. ---
+fn query_devs(out as *i64, max as i64) as i64 { return syscall(48, cast(i64, out), max); }
+
+// --- identity of ONE instance the caller already located. Fills DevInfo,
+//     DEV_INFO_WORDS i64:
+//       [0] class  [1] index  [2] vendor  [3] product  [4..7] name (32 B, NUL-padded)
+//     vendor/product are the bus's own ids, 0 when the bus has no such notion
+//     (PS/2, platform, the boot framebuffer) — PCI vendor 0 is not valid, so 0
+//     is unambiguous. E_NOENT when there is no index-th instance of the class:
+//     the index is honest, never an alias of 0. ---
+let is i64 as DEV_INFO_WORDS with imut = 8;
+fn dev_info(class as i64, index as i64, out as *i64) as i64 {
+    return syscall(49, class, index, cast(i64, out));
+}
+
+// --- network port state: MAC, MTU, link and counters for a DEV_NET fd ---
+// Takes the fd, not a (class, index) pair: this is live device state and you
+// have to hold the key to read it. Fills NET_INFO_WORDS words:
+//   [0] mtu          [1] frame_max — the smallest buffer a read is safe with
+//   [2] link_up      [3] speed_mbps (0 = unknown)
+//   [4] mac          — six bytes in the low 48 bits, mac[i] at 8*i
+//   [5] flags        — broadcast, promiscuous, or receive-mode unknown
+//   [6] rx_packets   [7] rx_dropped   [8] rx_toobig
+//   [9] tx_packets   [10] tx_errors   [11] reserved
+//   [12..15] driver name, 32 bytes NUL-padded ("e1000", "vnet")
+// The name lives here because dev_info reports the HARDWARE NODE's name,
+// which is "pci" for every card on the bus. Separate from dev_info because
+// that one is bus identity, stable and safe to cache; these change under you.
+let is i64 as NET_INFO_WORDS     with imut = 16;
+let is i64 as NET_FLAG_BROADCAST with imut = 1;
+let is i64 as NET_FLAG_PROMISC   with imut = 2;
+// A device without receive-filter control cannot promise filtered reception.
+let is i64 as NET_FLAG_PROMISC_UNKNOWN with imut = 4;
+
+fn net_info(fd as i64, out as *i64) as i64 {
+    return syscall(50, fd, cast(i64, out));
+}
+
+// --- unpredictable bytes ---
+// A kernel service rather than something each program invents from the clock:
+// the kernel is where the on-die TRNG and interrupt timing are. Fills up to
+// RANDOM_MAX_BYTES per call and returns the count; loop for more.
+//
+// random_quality() says what you are getting. RANDOM_HW is an on-die
+// generator and key-grade. RANDOM_JITTER is an interrupt-timing pool —
+// genuine entropy, but weak and slow to collect: fine for sequence numbers
+// and DNS query IDs, NOT for keys. Code that needs key-grade material must
+// check rather than assume.
+let is i64 as RANDOM_JITTER    with imut = 1;
+let is i64 as RANDOM_HW        with imut = 2;
+let is i64 as RANDOM_MAX_BYTES with imut = 4096;
+
+fn get_random(buf as *u8, n as i64) as i64 { return syscall(51, cast(i64, buf), n); }
+fn random_quality() as i64 { return syscall(52); }
+
+// One unpredictable 64-bit word. The shape most callers actually want.
+fn random_u64() as i64 {
+    let is [8]u8 as b;
+    if (get_random(cast(*u8, &b[0]), 8) != 8) { return 0; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 8) { v = v | (cast(i64, b[i]) << (8 * i)); i = i + 1; }
+    return v;
+}
+
+// --- audio stream geometry, and where it has got to ---
+// Takes the fd, like net_info, and for the same reason. Fills
+// AUDIO_INFO_WORDS words:
+//   [0] rate_hz       [1] channels      [2] format (AUDIO_FMT_*)
+//   [3] frame_bytes   [4] period_frames [5] period_count
+//   [6] buffer_frames [7] data_offset — also the control page's size
+//   [8] direction (AUDIO_DIR_*)         [9] map_bytes
+//   [10] flags (AUDIO_FLAG_*)
+//   [11] hw_ptr       [12] app_ptr      [13] xruns
+//   [14..15] reserved [16..19] driver name, 32 bytes NUL-padded ("vsnd")
+//
+// The cursors are here so a program in WRITE mode can finish properly: it has
+// no mapping, so this is the only place it can see that the hardware has
+// caught up with everything it wrote. Poll until info[11] >= info[12] and the
+// last sample has left the converter; close before that and it has not.
+let is i64 as AUDIO_INFO_WORDS with imut = 20;
+let is i64 as AUDIO_FMT_S16_LE with imut = 0;
+let is i64 as AUDIO_DIR_OUT    with imut = 0;
+let is i64 as AUDIO_DIR_IN     with imut = 1;
+let is i64 as AUDIO_FLAG_MODE_MMAP   with imut = 1;
+let is i64 as AUDIO_FLAG_MODE_STREAM with imut = 2;
+let is i64 as AUDIO_FLAG_ACTIVE      with imut = 4;
+
+fn audio_info(fd as i64, out as *i64) as i64 {
+    return syscall(53, fd, cast(i64, out));
+}
+
+
+// SYS_CHAN_INFO — how much this channel endpoint will take right now.
+// Fills 4 words: [capacity, readable, writable, peer_closed]. `writable` is
+// the number a server needs to decide whether a message fits: POLL_WRITABLE
+// only promises POLL_WRITE_UNIT, and a daemon that writes more than fits
+// blocks on one client while every other one waits.
+let is i64 as CHAN_INFO_WORDS with imut = 4;
+
+let is i64 as SYS_CHAN_INFO       with imut = 54;
+
+fn chan_info(fd as i64, out as *i64) as i64 { return syscall(SYS_CHAN_INFO, _fd(fd), out); }
+
+// SYS_WATCH — an fd that polls READABLE once `path` changes: a file opened
+// for writing closed, the name created, removed or renamed (either side). A
+// directory's watch also hears every entry directly inside it. The path is
+// absolute and need not exist yet; names compare normalised and without
+// regard to case. Poll it with the rest of your fds; watch_changes() takes
+// the count since the last call (0 when none) without blocking.
+let is i64 as SYS_WATCH           with imut = 58;
+
+fn watch(path as *u8) as i64 { return syscall(SYS_WATCH, path, _slen(path)); }
+
+fn watch_changes(fd as i64) as i64 {
+    let is [1]i64 as n;
+    n[0] = 0;
+    if (syscall(10, fd, cast(*u8, &n[0]), 8) != 8) { return 0; }
+    return n[0];
+}
+// --- the control page, which is shared memory and therefore ABI ---
+// Every field is an i64 with EXACTLY ONE writer, which is the whole of the
+// synchronisation design. The facts at 0x000 are written once at acquire; the
+// kernel owns the line at 0x080; the program owns the line at 0x100. Three
+// cache lines so the two cursors do not bounce each other.
+//
+// hw_ptr and app_ptr are MONOTONIC 64-BIT FRAME COUNTS, not ring indices: at
+// 48 kHz a 63-bit count lasts six million years, so there is no wraparound
+// case and no full-versus-empty ambiguity. Frames available = hw_ptr -
+// app_ptr; room = buffer_frames - (app_ptr - hw_ptr); the byte offset of a
+// frame is data_offset + (ptr % buffer_frames) * frame_bytes.
+//
+// Read them through audio_ctl_get and publish through audio_ctl_publish:
+// those derive a fresh pointer per access, which is what keeps the compiler
+// from caching a word that another party is writing.
+let is i64 as AUDIO_CTL_BYTES   with imut = 4096;
+let is i64 as AUDIO_CTL_MAGIC   with imut = 0x43415544;   // "CAUD"
+let is i64 as AUDIO_CTL_VERSION with imut = 1;
+
+let is i64 as AUDIO_W_MAGIC         with imut = 0;
+let is i64 as AUDIO_W_VERSION       with imut = 1;
+let is i64 as AUDIO_W_RATE          with imut = 2;
+let is i64 as AUDIO_W_CHANNELS      with imut = 3;
+let is i64 as AUDIO_W_FORMAT        with imut = 4;
+let is i64 as AUDIO_W_FRAME_BYTES   with imut = 5;
+let is i64 as AUDIO_W_PERIOD_FRAMES with imut = 6;
+let is i64 as AUDIO_W_PERIOD_COUNT  with imut = 7;
+let is i64 as AUDIO_W_BUFFER_FRAMES with imut = 8;
+let is i64 as AUDIO_W_DATA_OFFSET   with imut = 9;
+let is i64 as AUDIO_W_DIRECTION     with imut = 10;
+let is i64 as AUDIO_W_HW_PTR        with imut = 16;
+let is i64 as AUDIO_W_XRUNS         with imut = 17;
+let is i64 as AUDIO_W_IRQ_SEQ       with imut = 18;
+let is i64 as AUDIO_W_RUNNING       with imut = 19;
+let is i64 as AUDIO_W_APP_PTR       with imut = 32;
+let is i64 as AUDIO_W_APP_FLAGS     with imut = 33;
+let is i64 as AUDIO_APP_DRAINING    with imut = 1;
+
+// One word of the control page, read fresh. Never hoist these into a local
+// and reuse it across a wait — the other side is writing.
+fn audio_ctl_get(base as i64, word as i64) as i64 {
+    let is *i64 as p = cast(*i64, base + word * 8);
+    return p[0];
+}
+
+// Publish a word the PROGRAM owns (app_ptr, app_flags). The fence is what
+// orders the samples you just stored ahead of the pointer that advertises
+// them: without it the compiler is free to move the store, and the hardware
+// would read frames you had not written yet.
+fn audio_ctl_publish(base as i64, word as i64, v as i64) as void {
+    // Per-architecture spelling of the same barrier. `mfence` is x86-only, and
+    // emitting it unconditionally made this module unassemblable for AArch64 —
+    // the branch not taken is dead-stripped before codegen, so only one reaches
+    // the assembler.
+    if (__target_is_aarch64 == 1) { asm("dmb ish\n"); }
+    else { asm("mfence\n"); }
+    let is *i64 as p = cast(*i64, base + word * 8);
+    p[0] = v;
+    return;
+}
+
+// Unpack one byte of the MAC from word [4] of net_info's output.
+fn net_mac_byte(packed as i64, i as i64) as i64 {
+    return (packed >> (8 * i)) & 0xFF;
+}
+
+// --- wait-many readiness: block until any watched fd is ready, the deadline
+//     passes, or (timeout 0) after one non-blocking sweep. `entries` is an
+//     array of n records, 3 x i64 each: {fd, want, got}. Returns how many
+//     entries have got != 0 (0 = timeout). timeout_ns < 0 waits forever. A
+//     bad fd marks its own entry POLL_ERROR and counts as ready — one dead
+//     fd never wedges the loop. 0..2 are stdio, as everywhere here: such an
+//     entry is polled on its key and handed back as the caller wrote it (the
+//     first 8 of them; there are three names). ---
+fn poll(entries as *i64, n as i64, timeout_ns as i64) as i64 {
+    let is [8]i64 as at;                           // which entries named 0..2,
+    let is [8]i64 as was;                          // and which name
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as fd = entries[i * 3];
+        if (fd >= 0 && fd <= 2 && k < 8) {
+            at[k] = i; was[k] = fd; k = k + 1;
+            entries[i * 3] = _fd(fd);
+        }
+        i = i + 1;
+    }
+    let is i64 as r = syscall(34, cast(i64, entries), n, timeout_ns);
+    while (k > 0) { k = k - 1; entries[at[k] * 3] = was[k]; }
+    return r;
+}

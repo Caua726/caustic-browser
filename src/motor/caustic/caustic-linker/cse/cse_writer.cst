@@ -1,0 +1,1277 @@
+// =======================================================
+// cse_writer.cst — Caustic Standard Executable (CSE) output
+//
+// Emitted for --target=caustic-x86_64 (object_format == 3). Three modes,
+// selected by tgt.g_target.cse_mode:
+//   0 = pure   : 32-byte CST_ header + flat image, runs on CausticOS only
+//   1 = compat : APE-style polyglot (PE + shell + CST)        [Phase 4]
+//   2 = bundle : polyglot w/ standalone PE + ELF + CST bodies [Phase 4]
+//
+// write_cse() is the entry point; it runs relocation + dispatches by mode.
+//
+// PURE layout: a CST_ v3 image — header + segment table + tightly packed
+// segment bytes, no page padding. The loader walks the segment table and, per
+// entry, copies file_size bytes to vaddr, zero-fills to mem_size (bss), and
+// applies perms. vaddrs come straight from assign_addresses() and are baked
+// into the relocations by apply_relocations(), so the loader needs no fix-up.
+//
+// Header (48 bytes = 0x30). Earlier revisions were 32 bytes (v1/v2); the
+// segment table moved with it, so anything parsing this MUST branch on the
+// version at 0x04 rather than assume an offset:
+//   0x00 4  magic "CST_"        (43 53 54 5f)
+//   0x04 2  version = 3         (u16 LE)
+//   0x06 1  arch                (1 = x86_64)
+//   0x07 1  flags               (bit0 = dynamic stack growth, bit1 = opens its own window)
+//   0x08 8  entry_point         (u64 LE, absolute vaddr = ls.entry_vaddr)
+//   0x10 8  base_addr           (u64 LE)
+//   0x18 4  seg_count           (u32 LE)
+//   0x1C 4  app_version_off     (u32 LE, file offset of a NUL-term string; 0 = none)
+//   0x20 8  import_off          (u64 LE, import table offset; 0 = none)
+//   0x28 4  import_count        (u32 LE)
+//   0x2C 4  stack_size          (u32 LE, declared user-stack bytes)
+//
+// Segment table: seg_count * 24 bytes, from 0x30:
+//   +0x00 8 vaddr   +0x08 4 file_off (rel to image, 0 if bss)
+//   +0x0C 4 file_size   +0x10 4 mem_size   +0x14 4 perms (1=R 2=W 4=X)
+// Then: packed segment data. file_off is relative to the image start, so the
+// same bytes work standalone (pure) and embedded (the combiner records the
+// image's base in the CST* mini-header; the loader adds it).
+// =======================================================
+
+use "../../std/io.cst" as io;
+use "../readers/elf_reader.cst" as reader;
+use "../elf/elf_writer.cst" as elfw;
+use "../core/linker.cst" as linker;
+use "../core/relocate.cst" as reloc;
+use "../../src/codegen/target.cst" as tgt;
+use "../../src/codegen/dynsyms.cst" as dyns;
+use "../../src/ir/opt_mem.cst" as om;
+
+// === .csl kernel32 imports (compat Windows path) =====================
+// The compat .csl's Windows io path calls kernel32 via `call [__imp_X]`. For
+// our loader (not the Windows loader) those slots must exist + be filled. We
+// place an __imp_ slot table just past the segments, register __imp_<sym> ->
+// slot so apply_relocations resolves the calls, and record a kernel32 import
+// table in the CSL_ image. On Windows the loader (a real PE) writes its own
+// kernel32 addresses (fn_ptr(os.windows.X)) into the slots — no PEB walk.
+
+// vaddr just past every real segment — base of the __imp_ slot table.
+fn _csl_imp_base(ls as *linker.LinkerState) as i64 {
+    let is i64 as e with mut = ls.text_vaddr + ls.text_size;
+    if (ls.rodata_vaddr + ls.rodata_size > e) { e = ls.rodata_vaddr + ls.rodata_size; }
+    if (ls.data_vaddr + ls.data_size > e) { e = ls.data_vaddr + ls.data_size; }
+    if (ls.bss_vaddr + ls.bss_total > e) { e = ls.bss_vaddr + ls.bss_total; }
+    return (e + 7) & (0 - 8);
+}
+
+// Register each __imp_<sym> as a global at its slot vaddr (mirror of the PE
+// register_imp_gsyms) so `call [rip+__imp_X]` relocations resolve to the slot.
+fn register_csl_imp_gsyms(ls as *linker.LinkerState, imp_base as i64) as void {
+    let is *i64 as lsp = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as lsl = cast(*i32, ls.cstimport_sym_lens);
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as i with mut = 0;
+    while (i < ls.cstimport_count) {
+        let is i32 as sl = lsl[i];
+        let is *u8 as full = om.opt_alloc(cast(i64, sl) + 7);
+        full[0] = 95; full[1] = 95; full[2] = 105; full[3] = 109; full[4] = 112; full[5] = 95;  // "__imp_"
+        let is *u8 as sn = cast(*u8, lsp[i]);
+        let is i32 as k with mut = 0;
+        while (k < sl) { full[6 + k] = sn[k]; k = k + 1; }
+        full[6 + sl] = cast(u8, 0);
+        let is i32 as full_len = sl + 6;
+        let is i64 as vaddr = imp_base + cast(i64, i) * 8;
+        let is i32 as existing = linker.gsym_find(gsyms, full, full_len);
+        if (existing >= 0) {
+            let is *linker.GlobalSym as g = linker.gsym_get(gsyms, existing);
+            g.vaddr = vaddr; g.section = reader.SECIDX_DATA; g.defined = 1;
+        } else {
+            linker.gsym_add(gsyms, full, full_len, reader.SECIDX_DATA, vaddr, 0, 1);
+        }
+        i = i + 1;
+    }
+}
+
+// Must mirror CSE_MAX_SEGS in causticos/kernel/sys/cse.cst — the loader rejects
+// any image declaring more (rc=-11). Emitting past it produced a .cse that built
+// clean and failed at load, so the writer enforces the same ceiling and says so.
+let is i32 as CSE_MAX_SEGS with imut = 16;
+
+// The container's version is major.minor in two bytes, not one u16: an image
+// and the container that indexes it are both CST_ v3, told apart by the minor.
+// minor 0 = a plain image, minor 1 = an index over N of them.
+let is i32 as CSE_CONTAINER_MAJOR with imut = 3;
+let is i32 as CSE_CONTAINER_MINOR with imut = 1;
+let is i32 as CSE_FAT_HDR with imut = 16;
+
+// The manifest byte at 0x07 of every CSE header — the container's and the inner
+// image's, same bits in both, so a reader that looks at either sees the same
+// thing. A desktop reads it (`image_flags` in userspace/wm/client.cst) to decide
+// what a program is:
+//   bit0  the program's worst case is undecidable statically, so its stack grows
+//         on demand (set by codegen, not by a flag)
+//   bit1  --window   it opens its own window; a desktop starts it as is
+//   bit2  --service  the system starts it, with the channels or configuration it
+//                    needs; a desktop does not offer it as an app
+//   bit3  --fixture  a development fixture, not an application
+fn cse_manifest_flags() as i32 {
+    let is i32 as f with mut = 0;
+    if (tgt.cse_stack_dynamic_get() == 1) { f = f | 1; }
+    if (tgt.cse_window_get() == 1) { f = f | 2; }
+    if (tgt.cse_service_get() == 1) { f = f | 4; }
+    if (tgt.cse_fixture_get() == 1) { f = f | 8; }
+    return f;
+}
+let is i32 as CSE_FAT_MAX with imut = 8;
+
+
+// Write a finished output buffer to disk. Mirrors elf_writer's helper so
+// cse_writer stays independent of the (large) elf_writer module.
+fn cse_write_buf_to_file(out as *reader.ByteBuffer, output_path as *u8) as i32 {
+    let is i64 as fd = io._open_write(output_path);
+    if (fd < 0) {
+        io._write_fd(io.STDERR, "caustic-ld: cannot create ", 26);
+        io._write_fd(io.STDERR, output_path, cast(i64, reader.strlen(output_path)));
+        io._write_fd(io.STDERR, "\n", 1);
+        return 1;
+    }
+    // Same rule as the ELF writer: the whole image or an error. A truncated
+    // CST_ image used to be reported as a successful link.
+    let is i64 as w = io.write_all_fd(fd, out.data, out.len);
+    if (w != out.len) {
+        io._write_fd(io.STDERR, "caustic-ld: short write: ", 25);
+        io._write_fd(io.STDERR, output_path, cast(i64, reader.strlen(output_path)));
+        io._write_fd(io.STDERR, "\n", 1);
+        io._close_fd(fd);
+        return 1;
+    }
+    io._close_fd(fd);
+    return 0;
+}
+
+// Emit a CST_ v3 image into `out` (which must start at the image's own offset
+// 0). The layout is documented in full at the top of this file — 48-byte
+// header, segment table at 0x30, then packed segment bytes.
+//
+// The name says v2 for historical reasons; it emits v3.
+//
+// === .cse import table (dynamic CST_ v3) =============================
+// A dynamic .cse imports stdlib symbols from a .csl instead of bundling them
+// (built with -lcaustic, which externalizes _std_* → undefined globals). We
+// record each unresolved relocation so the CausticOS loader can patch it after
+// resolving the symbol from the .csl — no loader embedded in the program.
+//
+// Import table (at header.import_off, present iff version==3 && import_count>0):
+//   u32 import_count
+//   csl_name           (NUL-terminated, e.g. "libcaustic.csl")
+//   import_count * {
+//     u32 rtype          (R_X86_64_*: 2=PC32, 4=PLT32, 1=64 …)
+//     u64 site_vaddr     (absolute vaddr of the 4/8-byte field to patch)
+//     sym_name           (NUL-terminated)
+//   }
+// Loader: load the .csl; for each entry resolve sym_name → S; patch site_vaddr
+// (PC32/PLT32: *(i32*)site = S - (site+4) + addend; 64: *(i64*)site = S+addend).
+
+// If this reloc targets an undefined global (a .csl import), return its name
+// (and length via out_len); else 0.
+fn _cse_import_name(ls as *linker.LinkerState, obj as *reader.ObjFile, rel as *reader.ObjReloc, out_len as *i32) as *u8 {
+    let is *reader.ObjSym as sym = reader.sym_get(obj, rel.sym_idx);
+    if (sym.name_len <= 0) { return cast(*u8, 0); }
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as gi = linker.gsym_find(gsyms, sym.name, sym.name_len);
+    if (gi < 0) { return cast(*u8, 0); }
+    let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+    if (g.defined == 1) { return cast(*u8, 0); }
+    *out_len = sym.name_len;
+    return sym.name;
+}
+
+fn cse_count_imports(ls as *linker.LinkerState) as i32 {
+    let is i32 as cnt with mut = 0;
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as obj = linker.get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+            let is i32 as nl with mut = 0;
+            if (cast(i64, _cse_import_name(ls, obj, rel, &nl)) != 0) { cnt = cnt + 1; }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+    return cnt;
+}
+
+// Which library exports this symbol, as an index into the table emitted below.
+// -1 when no registered library claims it, which the caller reports rather than
+// writing an entry the loader could only fail on.
+fn _cse_import_lib(nm as *u8, nl as i32) as i64 {
+    return dyns.dynsyms_lookup(nm, cast(i64, nl));
+}
+
+// Import table, minor 2 (see the version byte in the header):
+//
+//   u32 import_count
+//   u32 lib_count
+//   u32 name_count
+//   lib_count  * lib_name         (NUL-terminated, e.g. "libcaustic.csl")
+//   name_count * sym_name         (NUL-terminated, each DISTINCT symbol once)
+//   import_count * {
+//     u32 rtype                   (R_X86_64_*: 2=PC32, 4=PLT32, 1=64 …)
+//     u32 lib_idx                 (into the library table)
+//     u32 name_idx                (into the name table)
+//     u32 pad
+//     u64 site_vaddr              (absolute vaddr of the field to patch)
+//   }
+//
+// The names are interned, and that is the difference between this being worth
+// doing and not. There is one entry per RELOCATION SITE, not per symbol: a
+// program calling outs fifty times has fifty imports of it. Spelling the name
+// out at each one meant ~90 bytes per call — the mangled names carry their
+// whole source path — against the ~20 bytes of syscall stub the import was
+// replacing. Measured on the first attempt: the compositor grew 6.7 KB, wm 5.5
+// KB, and the image grew 86 KB overall. Sharing the library made every program
+// that used it BIGGER.
+//
+// Interned, a call site costs 24 fixed bytes and the name is paid once.
+//
+// Minor 1 had a single library name and no per-import index, because with one
+// library the question never arose. It is gone rather than kept alongside: no
+// loader ever consumed it (the CausticOS kernel ignored the fields outright)
+// and no build emitted it, so there is no compatibility to preserve — only a
+// second format to keep working.
+//
+// The name table grows. It was a fixed 4096, and past that every further
+// import was written against name 0 with only a message — an image that
+// resolved those imports to the wrong symbol.
+let is *i64 as _imp_name_ptr with mut;
+let is *i32 as _imp_name_len with mut;
+let is i64 as _imp_name_count with mut = 0;
+let is i64 as _imp_name_cap with mut = 0;
+
+fn _imp_names_grow() as void {
+    let is i64 as nc with mut = _imp_name_cap * 2;
+    if (nc == 0) { nc = 256; }
+    let is *i64 as np = cast(*i64, om.opt_alloc(nc * 8));
+    let is *i32 as nl = cast(*i32, om.opt_alloc(nc * 4));
+    let is i64 as i with mut = 0;
+    while (i < _imp_name_count) { np[i] = _imp_name_ptr[i]; nl[i] = _imp_name_len[i]; i = i + 1; }
+    if (_imp_name_cap > 0) {
+        om.opt_free(cast(*u8, _imp_name_ptr));
+        om.opt_free(cast(*u8, _imp_name_len));
+    }
+    _imp_name_ptr = np;
+    _imp_name_len = nl;
+    _imp_name_cap = nc;
+}
+
+fn _imp_name_eq(i as i64, nm as *u8, nl as i32) as i32 {
+    if (_imp_name_len[i] != nl) { return 0; }
+    let is *u8 as a = cast(*u8, _imp_name_ptr[i]);
+    let is i32 as k with mut = 0;
+    while (k < nl) {
+        if (a[k] != nm[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+// Index of `nm` in the name table, adding it if new.
+fn _imp_intern(nm as *u8, nl as i32) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < _imp_name_count) {
+        if (_imp_name_eq(i, nm, nl) == 1) { return i; }
+        i = i + 1;
+    }
+    if (_imp_name_count >= _imp_name_cap) { _imp_names_grow(); }
+    _imp_name_ptr[_imp_name_count] = cast(i64, nm);
+    _imp_name_len[_imp_name_count] = nl;
+    _imp_name_count = _imp_name_count + 1;
+    return _imp_name_count - 1;
+}
+
+fn cse_emit_import_table(out as *reader.ByteBuffer, ls as *linker.LinkerState, n as i32) as void {
+    // Pass one: intern every distinct symbol, so the counts in the header are
+    // known before anything is written.
+    _imp_name_count = 0;
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as obj = linker.get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+            let is i32 as nl with mut = 0;
+            let is *u8 as nm = _cse_import_name(ls, obj, rel, &nl);
+            if (cast(i64, nm) != 0) { _imp_intern(nm, nl); }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+
+    reader.buf_emit32_le(out, cast(i64, n));
+    let is i64 as nlibs = dyns.dynsyms_count();
+    reader.buf_emit32_le(out, nlibs);
+    reader.buf_emit32_le(out, _imp_name_count);
+
+    let is i64 as li with mut = 0;
+    while (li < nlibs) {
+        let is *u8 as ln = dyns.dynsyms_lib_name(li);
+        let is i64 as l with mut = 0;
+        while (ln[l] != 0) { l = l + 1; }
+        reader.buf_append(out, ln, l);
+        reader.buf_emit8(out, 0);
+        li = li + 1;
+    }
+    let is i64 as ni with mut = 0;
+    while (ni < _imp_name_count) {
+        reader.buf_append(out, cast(*u8, _imp_name_ptr[ni]), cast(i64, _imp_name_len[ni]));
+        reader.buf_emit8(out, 0);
+        ni = ni + 1;
+    }
+
+    oi = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as obj = linker.get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+            let is i32 as nl with mut = 0;
+            let is *u8 as nm = _cse_import_name(ls, obj, rel, &nl);
+            if (cast(i64, nm) != 0) {
+                let is i64 as site with mut = 0;
+                if (rel.section == reader.SECIDX_TEXT) { site = ls.text_vaddr + obj.text_offset + rel.offset; }
+                else if (rel.section == reader.SECIDX_DATA) { site = ls.data_vaddr + obj.data_offset + rel.offset; }
+                let is i64 as lidx with mut = _cse_import_lib(nm, nl);
+                // An undefined symbol no library claims cannot be written as an
+                // import: the loader would resolve it against nothing. It is
+                // recorded against library 0 and reported, so the failure names
+                // the symbol here instead of appearing as a jump to 0 later.
+                if (lidx < 0) {
+                    io.print("caustic-ld: warning: no .csl exports '");
+                    io.print(nm);
+                    io.print("' — import left unresolved\n");
+                    lidx = 0;
+                }
+                let is i64 as nidx = _imp_intern(nm, nl);
+                reader.buf_emit32_le(out, rel.rtype);
+                reader.buf_emit32_le(out, lidx);
+                reader.buf_emit32_le(out, nidx);
+                reader.buf_emit32_le(out, 0);
+                reader.buf_emit64_le(out, site);
+            }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+}
+
+fn cse_emit_cst_v2(out as *reader.ByteBuffer, ls as *linker.LinkerState) as i32 {
+    let is *reader.ByteBuffer as text_buf = linker.get_text(ls);
+    let is *reader.ByteBuffer as rodata_buf = linker.get_rodata(ls);
+    let is *reader.ByteBuffer as data_buf = linker.get_data(ls);
+    let is *reader.ByteBuffer as csec_mbufs = cast(*reader.ByteBuffer, ls.csec_bufs);
+    let is *i64 as csec_sizes = cast(*i64, ls.csec_sizes);
+    let is *i64 as csec_vaddrs = cast(*i64, ls.csec_vaddrs);
+
+    let is [40]i64 as sv;     // vaddr
+    let is [40]i64 as sptr;   // *u8 file bytes (0 = zero-fill / bss)
+    let is [40]i64 as sfsz;   // file_size
+    let is [40]i64 as smsz;   // mem_size
+    let is [40]i32 as sperm;  // perms: 1=R 2=W 4=X
+    let is i32 as n with mut = 0;
+
+    if (ls.text_size > 0) {
+        sv[n] = ls.text_vaddr; sptr[n] = cast(i64, text_buf.data);
+        sfsz[n] = ls.text_size; smsz[n] = ls.text_size; sperm[n] = 5; n = n + 1;   // R+X
+    }
+    if (ls.rodata_size > 0) {
+        sv[n] = ls.rodata_vaddr; sptr[n] = cast(i64, rodata_buf.data);
+        sfsz[n] = ls.rodata_size; smsz[n] = ls.rodata_size; sperm[n] = 1; n = n + 1; // R
+    }
+    if (ls.data_size > 0) {
+        sv[n] = ls.data_vaddr; sptr[n] = cast(i64, data_buf.data);
+        sfsz[n] = ls.data_size; smsz[n] = ls.data_size; sperm[n] = 3; n = n + 1;     // R+W
+    }
+    let is i32 as ci with mut = 0;
+    while (ci < ls.csec_count) {
+        if (csec_sizes[ci] > 0) {
+            // Reserve one slot for bss below.
+            if (n >= CSE_MAX_SEGS - 1) {
+                let is *u8 as msg = "caustic-ld: CSE: too many sections for the image segment table (max 16)\n";
+                io._write_fd(io.STDERR, msg, cast(i64, reader.strlen(msg)));
+                return 1;
+            }
+            sv[n] = csec_vaddrs[ci]; sptr[n] = cast(i64, csec_mbufs[ci].data);
+            sfsz[n] = csec_sizes[ci]; smsz[n] = csec_sizes[ci];
+            // A section holding code (a function with `with section(...)`) maps
+            // R+X; data sections stay R+W.
+            let is *i32 as cx = cast(*i32, ls.csec_execs);
+            if (cx[ci] == 1) { sperm[n] = 5; } else { sperm[n] = 3; }
+            n = n + 1;
+        }
+        ci = ci + 1;
+    }
+    if (ls.bss_total > 0) {
+        sv[n] = ls.bss_vaddr; sptr[n] = 0;
+        sfsz[n] = 0; smsz[n] = ls.bss_total; sperm[n] = 3; n = n + 1;
+    }
+
+    // Pack file offsets after header + segment table (v3 header is 48 bytes).
+    let is [40]i64 as sfoff;
+    let is i64 as cursor with mut = 48 + cast(i64, n) * 24;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (sfsz[i] > 0) { sfoff[i] = cursor; cursor = cursor + sfsz[i]; }
+        else { sfoff[i] = 0; }
+        i = i + 1;
+    }
+
+    // Optional free-form program version: a NUL-terminated string appended
+    // after the segment data. The header @0x1C holds its file offset (0 if
+    // unset). `cursor` is the end of segment data = where it will go.
+    let is *u8 as ver_ptr = tgt.app_version_ptr_get();
+    let is i32 as ver_len = tgt.app_version_len_get();
+    let is i64 as ver_off with mut = 0;
+    if (ver_len > 0) { ver_off = cursor; }
+
+    // Dynamic imports (CST_ v3): the import table lands after the segment data
+    // and the optional version string.
+    let is i32 as imp_n = cse_count_imports(ls);
+    let is i64 as import_off with mut = 0;
+    if (imp_n > 0) {
+        import_off = cursor;
+        if (ver_len > 0) { import_off = import_off + cast(i64, ver_len) + 1; }
+    }
+
+    // Header.
+    reader.buf_emit8(out, 67); reader.buf_emit8(out, 83);
+    reader.buf_emit8(out, 84); reader.buf_emit8(out, 95);   // "CST_"
+    // version: major 3, minor in the high byte. minor 2 marks the multi-library
+    // import table — the one that says WHICH library each symbol comes from. A
+    // static image stays 3.0; 3.1 is the fat multi-arch container, which only
+    // ever wraps images and never is one, so the three cannot collide.
+    let is i64 as cse_minor with mut = 0;
+    if (imp_n > 0) { cse_minor = 2; }
+    reader.buf_emit16_le(out, cast(i32, 3 + (cse_minor << 8)));
+    reader.buf_emit8(out, cast(i32, tgt.target_get().arch));   // 1 = x86_64, 2 = aarch64
+    // flags byte: the manifest (cse_manifest_flags below). The comment that used
+    // to live here described bit0/bit1 only; the byte is built in one place now.
+    let is i32 as cse_flags = cse_manifest_flags();
+    reader.buf_emit8(out, cast(i32, cse_flags));   // flags
+    reader.buf_emit64_le(out, ls.entry_vaddr);     // entry_point
+    reader.buf_emit64_le(out, ls.base_addr);       // base_addr
+    reader.buf_emit32_le(out, cast(i64, n));       // seg_count
+    reader.buf_emit32_le(out, ver_off);            // 0x1C app_version file offset (0 = none)
+    reader.buf_emit64_le(out, import_off);         // 0x20 import-table file offset (0 = none)
+    reader.buf_emit32_le(out, cast(i64, imp_n));   // 0x28 import count
+    reader.buf_emit32_le(out, cast(i64, tgt.cse_stack_size_get()));  // 0x2C declared user-stack bytes
+
+    // Segment table.
+    i = 0;
+    while (i < n) {
+        reader.buf_emit64_le(out, sv[i]);
+        reader.buf_emit32_le(out, sfoff[i]);
+        reader.buf_emit32_le(out, sfsz[i]);
+        reader.buf_emit32_le(out, smsz[i]);
+        reader.buf_emit32_le(out, cast(i64, sperm[i]));
+        i = i + 1;
+    }
+
+    // Packed segment bytes (same order as the table).
+    i = 0;
+    while (i < n) {
+        if (sfsz[i] > 0) { reader.buf_append(out, cast(*u8, sptr[i]), sfsz[i]); }
+        i = i + 1;
+    }
+
+    // Append the version string (NUL-terminated) at ver_off.
+    if (ver_len > 0) {
+        reader.buf_append(out, ver_ptr, cast(i64, ver_len));
+        reader.buf_emit8(out, 0);
+    }
+    // Dynamic import table at import_off (CST_ v3).
+    if (imp_n > 0) { cse_emit_import_table(out, ls, imp_n); }
+    return 0;
+}
+
+// Pure mode. The image is wrapped in the same container a multi-architecture
+// build produces, holding exactly one slice — so every .cse has one shape and
+// the loader has one path, whether it names one architecture or several.
+fn write_cse_pure(ls as *linker.LinkerState, output_path as *u8) as i32 {
+    // Resolve relocations against the assigned vaddrs (static; CausticOS
+    // syscall ABI means no dynamic linking in the MVP).
+    reloc.apply_relocations(ls);
+    let is reader.ByteBuffer as img = reader.buf_init(65536);
+    if (cse_emit_cst_v2(&img, ls) != 0) { return 1; }
+
+    let is reader.ByteBuffer as out = reader.buf_init(65536);
+    reader.buf_emit8(&out, 67); reader.buf_emit8(&out, 83);
+    reader.buf_emit8(&out, 84); reader.buf_emit8(&out, 95);      // "CST_"
+    reader.buf_emit8(&out, cast(i32, CSE_CONTAINER_MAJOR));
+    reader.buf_emit8(&out, cast(i32, CSE_CONTAINER_MINOR));
+    reader.buf_emit8(&out, 1);                                   // image_count
+    reader.buf_emit8(&out, cast(i32, cse_manifest_flags()));     // flags
+    reader.buf_emit32_le(&out, cast(i64, CSE_FAT_HDR));          // index_off
+    reader.buf_emit32_le(&out, 0);                               // reserved
+    let is i64 as img_off = (cast(i64, CSE_FAT_HDR) + 8 + 15) & (0 - 16);
+    reader.buf_emit8(&out, cast(i32, img.data[6]));              // arch, from the image
+    reader.buf_emit8(&out, 0); reader.buf_emit8(&out, 0); reader.buf_emit8(&out, 0);
+    reader.buf_emit32_le(&out, img_off);
+    reader.buf_pad_to(&out, img_off);
+    reader.buf_append(&out, img.data, img.len);
+    return cse_write_buf_to_file(&out, output_path);
+}
+
+// === compat / bundle: self-extracting Linux + CST output ===
+//
+// This is the in-process path: a single caustic-target link produces one
+// object set (relocated at the ELF base), so it can emit a native-Linux
+// self-extractor carrying the CST body — but NOT a native Windows PE (that
+// needs a separate windows-x86_64 build with its own relocation + imports).
+// For the full tri-format Windows+Linux+CausticOS polyglot, build the three
+// targets separately and weld them with `caustic-ld --cse-combine`
+// (write_cse_combine_ape above — empirically verified under wine, sh and
+// bash). compat and bundle here emit a portable self-extracting executable:
+//
+//   #!/bin/sh
+//   <extractor: dd the embedded ELF out of $0, chmod +x, exec it with "$@">
+//   exit 1
+//   #### padding to CSE_BODY_OFF (keeps the shell-parsed region NUL-free)
+//   [CSE_BODY_OFF] standalone ELF body   (native Linux execution)
+//   [.. aligned ]  CST body (CST_ header + flat image) for CausticOS
+//
+// The ELF body runs natively on Linux; the CST body carries the CausticOS
+// image (locatable by its "CST_" magic). bundle keeps the ELF and CST as two
+// independent complete bodies. compat currently shares this layout — the
+// shared-.text + native-PE optimisation (Cosmopolitan-style) is future work
+// (needs a NUL-free header bash won't reject + a second PE-base relocation).
+let is i64 as CSE_BODY_OFF with imut = 512;  // shell stub fits here; ELF starts at 512
+
+// Append the decimal text of n (>= 0) to out.
+fn cse_emit_decimal(out as *reader.ByteBuffer, n as i64) as void {
+    if (n == 0) { reader.buf_emit8(out, 48); return; }
+    let is [24]u8 as tmp;
+    let is i32 as i with mut = 0;
+    let is i64 as v with mut = n;
+    while (v > 0) {
+        tmp[i] = cast(u8, 48 + cast(i32, v % 10));
+        v = v / 10;
+        i = i + 1;
+    }
+    while (i > 0) {
+        i = i - 1;
+        reader.buf_emit8(out, cast(i32, tmp[i]));
+    }
+}
+
+// Append a literal NUL-terminated string to out.
+fn cse_emit_str(out as *reader.ByteBuffer, s as *u8) as void {
+    reader.buf_append(out, s, reader.strlen(s));
+}
+
+// Read the whole file at `path` into `out` (appended at the current position),
+// in fixed chunks so no heap allocation is needed. Returns total bytes read,
+// or -1 on open error.
+fn cse_read_file_into(out as *reader.ByteBuffer, path as *u8) as i64 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is [8192]u8 as chunk;
+    let is i64 as total with mut = 0;
+    let is i64 as got with mut = io._read_fd(fd, cast(*u8, &chunk), 8192);
+    while (got > 0) {
+        reader.buf_append(out, cast(*u8, &chunk), got);
+        total = total + got;
+        got = io._read_fd(fd, cast(*u8, &chunk), 8192);
+    }
+    io._close_fd(fd);
+    return total;
+}
+
+// Build the CST body (CST_ header + flat image) into a fresh buffer; returns
+// it by writing the buffer struct through `out_body`. Caller appends it.
+fn cse_build_cst_body(ls as *linker.LinkerState, out_body as *reader.ByteBuffer) as i32 {
+    return cse_emit_cst_v2(out_body, ls);
+}
+
+// Shared implementation for compat + bundle.
+// The extractor below runs the native body from a TEMP file, so the running
+// binary knows nothing about where the image it came from was installed. The
+// compiler locates its stdlib at <binary>/../lib/caustic, which from /tmp is
+// /lib/caustic — it never resolves, and the search silently falls through to
+// /usr/local/lib/caustic, quite possibly an older install. Only the stub still
+// knows the real path, so it passes it on in CAUSTIC_LIB.
+//
+// Passing it as an argument instead is not an option: the compiler only accepts
+// --version and --help as the FIRST argument, so prepending anything to argv
+// breaks them. A caller who already set CAUSTIC_LIB keeps it. $0 with no slash
+// means a PATH lookup, so it is resolved before the dirname is taken. Every
+// byte lands in a NUL-free, quote-free region, hence no single quotes.
+fn cse_emit_lib_env(out as *reader.ByteBuffer) as void {
+    cse_emit_str(out, "__p=$0;case $__p in */*) ;; *) __p=$(command -v -- \"$__p\" 2>/dev/null||echo \"$__p\");;esac\n");
+    cse_emit_str(out, "__d=$(CDPATH= cd -- \"${__p%/*}/../lib/caustic\" 2>/dev/null&&pwd)\n");
+    cse_emit_str(out, "[ -n \"$__d\" ]&&[ -z \"${CAUSTIC_LIB:-}\" ]&&export CAUSTIC_LIB=$__d\n");
+}
+
+fn write_cse_selfextract(ls as *linker.LinkerState, output_path as *u8) as i32 {
+    reloc.apply_relocations(ls);
+
+    // 1. Produce a standalone ELF body via the existing ELF writer, then read
+    //    it back. The ELF is relocated at base 0x400000 (same as ls), so it is
+    //    a valid Linux executable when extracted.
+    // Derive the scratch name from the output path (mirrors main.cst's
+    // cse_path_with_suffix). A fixed name in the CWD collides when two links
+    // run in parallel, and fails outright if the CWD is not writable.
+    let is [512]u8 as elf_tmp_buf;
+    let is *u8 as elf_tmp = cast(*u8, &elf_tmp_buf);
+    let is i64 as op_len with mut = reader.strlen(output_path);
+    if (op_len > 480) { op_len = 480; }
+    let is i64 as ti with mut = 0;
+    while (ti < op_len) { elf_tmp[ti] = output_path[ti]; ti = ti + 1; }
+    let is *u8 as sfx = ".__cse_elf.tmp";
+    let is i64 as si with mut = 0;
+    while (si < 14) { elf_tmp[op_len + si] = sfx[si]; si = si + 1; }
+    elf_tmp[op_len + 14] = cast(u8, 0);
+
+    let is i32 as elf_err = elfw.write_executable(ls, elf_tmp);
+    if (elf_err != 0) {
+        io._write_fd(io.STDERR, "caustic-ld: CSE: failed to build inner ELF body\n", 48);
+        return 1;
+    }
+
+    let is reader.ByteBuffer as elf_body = reader.buf_init(131072);
+    let is i64 as elf_size = cse_read_file_into(&elf_body, elf_tmp);
+    io.unlink(elf_tmp);
+    if (elf_size <= 0) {
+        io._write_fd(io.STDERR, "caustic-ld: CSE: failed to read inner ELF body\n", 47);
+        return 1;
+    }
+
+    // 2. Build the CST body (CausticOS image).
+    let is reader.ByteBuffer as cst_body = reader.buf_init(65536);
+    if (cse_build_cst_body(ls, &cst_body) != 0) { return 1; }
+
+    // 3. Assemble the polyglot.
+    let is reader.ByteBuffer as out = reader.buf_init(262144);
+    cse_emit_str(&out, "#!/bin/sh\n");
+    // Extractor: copy ELF bytes [CSE_BODY_OFF, +elf_size) to a temp file, exec.
+    cse_emit_str(&out, "__o=");
+    cse_emit_decimal(&out, CSE_BODY_OFF);
+    cse_emit_str(&out, ";__s=");
+    cse_emit_decimal(&out, elf_size);
+    cse_emit_str(&out, ";\n");
+    cse_emit_lib_env(&out);
+    cse_emit_str(&out, "__t=$(mktemp);tail -c +$((__o+1)) \"$0\"|head -c $__s>\"$__t\";chmod +x \"$__t\";exec \"$__t\" \"$@\"\n");
+    cse_emit_str(&out, "exit 1\n");
+    // Pad with '#' comment bytes to CSE_BODY_OFF (NUL-free shell region).
+    while (out.len < CSE_BODY_OFF) { reader.buf_emit8(&out, 35); }  // '#'
+
+    // ELF body at CSE_BODY_OFF.
+    reader.buf_append(&out, elf_body.data, elf_size);
+    // CST body 8-aligned after the ELF (carries its own CST_ magic).
+    let is i64 as cst_off = (out.len + 7) & (0 - 8);
+    reader.buf_pad_to(&out, cst_off);
+    reader.buf_append(&out, cst_body.data, cst_body.len);
+
+    return cse_write_buf_to_file(&out, output_path);
+}
+
+// === Full tri-format APE polyglot combiner ===
+//
+// EMPIRICALLY VERIFIED: a single file can be a valid Windows PE, a Linux shell
+// script that extracts+execs an embedded ELF, AND carry a CST body — running
+// natively on Windows (wine), Linux (sh/bash), and CausticOS. The shell-trick
+// works because bash/sh only binary-check the FIRST line: starting with
+// `MZqFpD='\n` keeps line 1 clean (MZ for PE + an opening single-quote), and
+// the NUL bytes of e_lfanew (0x3C) then sit harmlessly inside the multi-line
+// quoted string.
+//
+// The three bodies must be built separately (different relocation bases /
+// import tables), so this combiner takes three finished executables:
+//   --pe  <windows-x86_64 build>   (runs under Windows/wine)
+//   --elf <linux-x86_64 build>     (extracted + exec'd on Linux)
+//   --cst <caustic pure .cse>      (CausticOS image; optional)
+// and welds them into one APE. The PE is shifted by CSE_APE_SHIFT so its file
+// offsets clear the shell stub; e_lfanew and every PointerToRawData (plus the
+// COFF symbol-table pointer) are bumped by the same amount.
+let is i64 as CSE_APE_SHIFT with imut = 512;   // 0x200 — multiple of PE FileAlignment
+// CST* mini-header version. v1 stored the body offset/size as raw u64 LE, which
+// could plant a 0x27 (') inside the shell-quoted region; v2 stores them as ASCII
+// decimal. The kernel gates on this so a v1-era loader rejects rather than
+// misreads. Bump together with causticos/kernel/sys/cse.cst.
+let is i32 as CSE_MINI_VERSION with imut = 3;
+
+fn cse_rd_u16(p as *u8, off as i32) as i32 {
+    return cast(i32, p[off]) + cast(i32, p[off + 1]) * 256;
+}
+fn cse_rd_u32(p as *u8, off as i32) as i64 {
+    return cast(i64, p[off]) + cast(i64, p[off + 1]) * 256
+         + cast(i64, p[off + 2]) * 65536 + cast(i64, p[off + 3]) * 16777216;
+}
+fn cse_wr_u32(p as *u8, off as i32, v as i64) as void {
+    p[off]     = cast(u8, v & 255);
+    p[off + 1] = cast(u8, (v >> 8) & 255);
+    p[off + 2] = cast(u8, (v >> 16) & 255);
+    p[off + 3] = cast(u8, (v >> 24) & 255);
+}
+fn cse_pad_spaces(out as *reader.ByteBuffer, target as i64) as void {
+    while (out.len < target) { reader.buf_emit8(out, 32); }  // ' '
+}
+
+// Emit `n` as `width` zero-padded ASCII decimal digits.
+//
+// The CST* mini-header lives inside the single-quoted shell region, so every
+// byte it contributes must not be 0x27 ('). Raw little-endian u64 offsets do
+// not satisfy that: a body offset anywhere in [0x2700,0x27FF] (and every 64 KiB
+// window after) puts 0x27 in byte 1, the quote closes early, and /bin/sh then
+// parses the embedded machine code as script. Digits are 0x30-0x39, always safe.
+fn cse_emit_decimal_fixed(out as *reader.ByteBuffer, n as i64, width as i32) as void {
+    let is [24]u8 as tmp;
+    let is i32 as i with mut = 0;
+    let is i64 as v with mut = n;
+    if (v < 0) { v = 0; }
+    while (v > 0 && i < 24) { tmp[i] = cast(u8, 48 + cast(i32, v % 10)); v = v / 10; i = i + 1; }
+    let is i32 as pad with mut = width - i;
+    while (pad > 0) { reader.buf_emit8(out, 48); pad = pad - 1; }   // '0'
+    while (i > 0) { i = i - 1; reader.buf_emit8(out, cast(i32, tmp[i])); }
+}
+
+// Translate an RVA to a file offset using the (still unshifted) section table.
+// Returns -1 when no section covers it.
+fn _cse_rva_to_off(pd as *u8, sect as i32, nsec as i32, rva as i64) as i64 {
+    let is i32 as i with mut = 0;
+    while (i < nsec) {
+        let is i32 as so = sect + i * 40;
+        let is i64 as va = cse_rd_u32(pd, so + 12);   // VirtualAddress
+        let is i64 as vsz = cse_rd_u32(pd, so + 8);   // VirtualSize
+        let is i64 as raw = cse_rd_u32(pd, so + 16);  // SizeOfRawData
+        let is i64 as span with mut = vsz;
+        if (raw > span) { span = raw; }
+        if (rva >= va && rva < va + span) {
+            return cse_rd_u32(pd, so + 20) + (rva - va);   // PointerToRawData + delta
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Shift every IMAGE_DEBUG_DIRECTORY.PointerToRawData by CSE_APE_SHIFT. Must run
+// before the section headers are shifted, since it resolves the directory's RVA
+// through them. DataDirectory[6] sits at opt_hdr + 112 for PE32+ (magic 0x20B);
+// PE32 puts it at +96. A PE without a debug directory is a no-op.
+fn _cse_shift_debug_dir(pd as *u8, pe_size as i64, eo as i32, opt_sz as i32,
+                        sect as i32, nsec as i32) as void {
+    if (opt_sz < 128) { return; }
+    let is i32 as opt = eo + 24;
+    let is i32 as magic = cse_rd_u16(pd, opt);
+    let is i32 as dd_base with mut = opt + 112;          // PE32+
+    if (magic == 267) { dd_base = opt + 96; }            // 0x10B = PE32
+    let is i32 as dd6 = dd_base + 48;                    // DataDirectory[6] = Debug
+    if (cast(i64, dd6) + 8 > cast(i64, eo) + 24 + cast(i64, opt_sz)) { return; }
+    let is i64 as dbg_rva = cse_rd_u32(pd, dd6);
+    let is i64 as dbg_size = cse_rd_u32(pd, dd6 + 4);
+    if (dbg_rva == 0 || dbg_size < 28) { return; }
+    let is i64 as dbg_off = _cse_rva_to_off(pd, sect, nsec, dbg_rva);
+    if (dbg_off < 0 || dbg_off + dbg_size > pe_size) { return; }
+    let is i64 as n = dbg_size / 28;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is i32 as e = cast(i32, dbg_off + k * 28);
+        let is i64 as ptr = cse_rd_u32(pd, e + 24);      // PointerToRawData
+        if (ptr != 0) { cse_wr_u32(pd, e + 24, ptr + CSE_APE_SHIFT); }
+        k = k + 1;
+    }
+}
+
+fn write_cse_combine_ape(pe_path as *u8, elf_path as *u8, elf_a64_path as *u8,
+                         pe_a64_path as *u8, cst_path as *u8, output_path as *u8) as i32 {
+    let is reader.ByteBuffer as pe = reader.buf_init(262144);
+    let is i64 as pe_size = cse_read_file_into(&pe, pe_path);
+    if (pe_size <= 0) {
+        io._write_fd(io.STDERR, "caustic-ld: --cse-combine: cannot read PE\n", 42);
+        return 1;
+    }
+    let is reader.ByteBuffer as elf = reader.buf_init(262144);
+    let is i64 as elf_size = cse_read_file_into(&elf, elf_path);
+    if (elf_size <= 0) {
+        io._write_fd(io.STDERR, "caustic-ld: --cse-combine: cannot read ELF\n", 43);
+        return 1;
+    }
+    // Second ELF body, for AArch64 hosts. Optional: without it the stub only
+    // knows how to serve x86_64 and says so on anything else.
+    let is reader.ByteBuffer as elf_a64 = reader.buf_init(262144);
+    let is i64 as elf_a64_size with mut = 0;
+    if (cast(i64, elf_a64_path) != 0) {
+        elf_a64_size = cse_read_file_into(&elf_a64, elf_a64_path);
+        if (elf_a64_size <= 0) {
+            io._write_fd(io.STDERR, "caustic-ld: --cse-combine: cannot read AArch64 ELF\n", 51);
+            return 1;
+        }
+    }
+    // ARM64 Windows body. The PE loader can only ever see one Machine, so this
+    // is not reachable by Windows itself: it is carried for the entry stub to
+    // find, detect an ARM64 host via IsWow64Process2 and relaunch. Until that
+    // stub exists the body is inert, but its location is recorded so turning it
+    // on changes nothing about the container.
+    let is reader.ByteBuffer as pe_a64 = reader.buf_init(262144);
+    let is i64 as pe_a64_size with mut = 0;
+    if (cast(i64, pe_a64_path) != 0) {
+        pe_a64_size = cse_read_file_into(&pe_a64, pe_a64_path);
+        if (pe_a64_size <= 0) {
+            io._write_fd(io.STDERR, "caustic-ld: --cse-combine: cannot read ARM64 PE\n", 48);
+            return 1;
+        }
+    }
+    let is reader.ByteBuffer as cst = reader.buf_init(131072);
+    let is i64 as cst_size with mut = 0;
+    if (cast(i64, cst_path) != 0) { cst_size = cse_read_file_into(&cst, cst_path); }
+
+    let is *u8 as pd = pe.data;
+    // Validate MZ + locate PE header.
+    if (pd[0] != 77 || pd[1] != 90) {   // 'M','Z'
+        io._write_fd(io.STDERR, "caustic-ld: --cse-combine: --pe is not a PE (no MZ)\n", 51);
+        return 1;
+    }
+    let is i64 as orig_elfanew = cse_rd_u32(pd, 0x3C);
+    // e_lfanew, nsec and opt_sz all come from the input file; every offset
+    // derived from them indexes `pd` directly, so bound them before use.
+    if (orig_elfanew < 0 || orig_elfanew + 24 > pe_size) {
+        io._write_fd(io.STDERR, "caustic-ld: --cse-combine: --pe has a bad e_lfanew\n", 50);
+        return 1;
+    }
+    let is i64 as H = orig_elfanew + CSE_APE_SHIFT;   // new e_lfanew = room for shell stub
+
+    // Patch PE file offsets in-place (all shift by CSE_APE_SHIFT).
+    let is i32 as eo = cast(i32, orig_elfanew);
+    let is i32 as nsec = cse_rd_u16(pd, eo + 6);
+    let is i32 as opt_sz = cse_rd_u16(pd, eo + 20);
+    let is i32 as sect = eo + 24 + opt_sz;
+    if (cast(i64, sect) + cast(i64, nsec) * 40 > pe_size) {
+        io._write_fd(io.STDERR, "caustic-ld: --cse-combine: --pe section table runs past EOF\n", 60);
+        return 1;
+    }
+
+    // The CodeView debug directory records a *file* offset (PointerToRawData at
+    // +24 of each 28-byte IMAGE_DEBUG_DIRECTORY), which lives in section content
+    // rather than a section header — so the loop below never sees it and the
+    // shift would leave every debugger reading 512 bytes short. Patch it first,
+    // while the section headers still hold their pre-shift PointerToRawData.
+    _cse_shift_debug_dir(pd, pe_size, eo, opt_sz, sect, nsec);
+
+    let is i64 as symptr = cse_rd_u32(pd, eo + 8);
+    if (symptr != 0) { cse_wr_u32(pd, eo + 8, symptr + CSE_APE_SHIFT); }
+    let is i32 as i with mut = 0;
+    while (i < nsec) {
+        let is i32 as so = sect + i * 40;
+        let is i64 as rp = cse_rd_u32(pd, so + 20);   // PointerToRawData
+        if (rp != 0) { cse_wr_u32(pd, so + 20, rp + CSE_APE_SHIFT); }
+        i = i + 1;
+    }
+
+    // elf_off in the final file = (pe bytes after stub) end. pe_part is
+    // pd[orig_elfanew:], placed at H, so it ends at H + (pe_size-orig_elfanew)
+    // = pe_size + CSE_APE_SHIFT.
+    let is i64 as elf_off = pe_size + CSE_APE_SHIFT;
+    // AArch64 ELF body, then the CST body, each 8-aligned. All known up front so
+    // the shell stub and the CST* mini-header can name their offsets.
+    let is i64 as elf_a64_off with mut = 0;
+    let is i64 as after_elfs with mut = elf_off + elf_size;
+    if (elf_a64_size > 0) {
+        elf_a64_off = (after_elfs + 7) & (0 - 8);
+        after_elfs = elf_a64_off + elf_a64_size;
+    }
+    let is i64 as pe_a64_off with mut = 0;
+    if (pe_a64_size > 0) {
+        pe_a64_off = (after_elfs + 15) & (0 - 16);
+        after_elfs = pe_a64_off + pe_a64_size;
+    }
+    let is i64 as cst_off = (after_elfs + 7) & (0 - 8);
+
+    // Assemble the polyglot.
+    let is reader.ByteBuffer as out = reader.buf_init(524288);
+    cse_emit_str(&out, "MZqFpD='\n");          // MZ (PE) + open quote + early newline
+    cse_pad_spaces(&out, 0x3C);
+    reader.buf_emit32_le(&out, H);             // e_lfanew @ 0x3C (NULs ok inside quote)
+    // CST* mini-header @0x40 (32 bytes) — the CausticOS loader reads this to
+    // locate the CST body without scanning for the CST_ magic. It sits inside
+    // the single-quoted shell region, so both offsets are ASCII decimal (see
+    // cse_emit_decimal_fixed); v1 wrote them as raw u64 and a body offset whose
+    // second byte was 0x27 closed the quote and broke the file on Linux.
+    //   0x40 4  "CST*"
+    //   0x44 2  version = 2      0x46 2 reserved
+    //   0x48 12 cst_body_offset  (zero-padded ASCII decimal)
+    //   0x54 12 cst_body_size     0x60 12 pe_arm64_offset
+    //   0x6C 12 pe_arm64_size    (0 = absent)                  -> ends at 0x78
+    cse_emit_str(&out, "CST*");                        // 0x40 magic
+    reader.buf_emit16_le(&out, CSE_MINI_VERSION);      // 0x44 version = 2
+    reader.buf_emit16_le(&out, 0);                     // 0x46 reserved
+    cse_emit_decimal_fixed(&out, cst_off, 12);         // 0x48 cst_body_offset
+    let is i64 as cst_body_size = cast(i64, cst_size);
+    cse_emit_decimal_fixed(&out, cst_body_size, 12);   // 0x54 cst_body_size
+    cse_emit_decimal_fixed(&out, pe_a64_off, 12);      // 0x60 pe_arm64_offset
+    cse_emit_decimal_fixed(&out, pe_a64_size, 12);     // 0x6C pe_arm64_size (ends 0x78)
+    // Belt and braces: every byte between the opening quote (offset 7) and the
+    // closing one is shell-parsed. A stray 0x27 there terminates the string
+    // early and /bin/sh starts executing the binary payload. The encodings above
+    // make that unreachable — fail the link rather than ship it if a future
+    // field slips. Checked before the closing quote is appended.
+    let is i64 as quoted_end = out.len;
+    let is i64 as qi with mut = 8;
+    while (qi < quoted_end) {
+        if (out.data[qi] == 39) {   // '\''
+            io._write_fd(io.STDERR,
+                "caustic-ld: --cse-combine: quote byte (0x27) inside the shell header\n", 68);
+            return 1;
+        }
+        qi = qi + 1;
+    }
+    cse_emit_str(&out, "'\n");                  // close quote @0x60
+    // Extractor (pure ASCII, no NUL). Picks the body matching the machine, cuts
+    // it out of $0 and execs it. Numbers live after the closing quote, so they
+    // are ordinary shell source and no encoding constraint applies — but they
+    // must not be zero-padded, or $(( )) would read them as octal.
+    cse_emit_str(&out, "case $(uname -m) in\n");
+    cse_emit_str(&out, "x86_64|amd64) __o=");
+    cse_emit_decimal(&out, elf_off);
+    cse_emit_str(&out, ";__s=");
+    cse_emit_decimal(&out, elf_size);
+    cse_emit_str(&out, ";;\n");
+    if (elf_a64_size > 0) {
+        cse_emit_str(&out, "aarch64|arm64) __o=");
+        cse_emit_decimal(&out, elf_a64_off);
+        cse_emit_str(&out, ";__s=");
+        cse_emit_decimal(&out, elf_a64_size);
+        cse_emit_str(&out, ";;\n");
+    }
+    cse_emit_str(&out, "*) echo \"caustic: no body for $(uname -m)\" >&2;exit 1;;\n");
+    cse_emit_str(&out, "esac\n");
+    cse_emit_lib_env(&out);
+    cse_emit_str(&out, "__t=$(mktemp);tail -c +$((__o+1)) \"$0\"|head -c $__s>\"$__t\";chmod +x \"$__t\";exec \"$__t\" \"$@\"\n");
+    cse_emit_str(&out, "exit 1\n");
+    // The stub is padded out to the PE header; if it ever outgrows that gap the
+    // PE would be overwritten, so fail instead.
+    if (out.len > H) {
+        io._write_fd(io.STDERR, "caustic-ld: --cse-combine: shell stub does not fit before the PE header\n", 72);
+        return 1;
+    }
+    while (out.len < H) { reader.buf_emit8(&out, 35); }  // '#' pad to PE header
+
+    // Shifted PE (header + sections), then ELF body, then CST body.
+    reader.buf_append(&out, cast(*u8, cast(i64, pd) + orig_elfanew), pe_size - orig_elfanew);
+    reader.buf_append(&out, elf.data, elf_size);
+    if (elf_a64_size > 0) {
+        reader.buf_pad_to(&out, elf_a64_off);
+        reader.buf_append(&out, elf_a64.data, elf_a64_size);
+    }
+    if (pe_a64_size > 0) {
+        reader.buf_pad_to(&out, pe_a64_off);
+        reader.buf_append(&out, pe_a64.data, pe_a64_size);
+    }
+    if (cst_size > 0) {
+        reader.buf_pad_to(&out, cst_off);   // == align8(elf_off+elf_size); recorded in mini-header
+        reader.buf_append(&out, cst.data, cst_size);
+    }
+    let is i32 as werr = cse_write_buf_to_file(&out, output_path);
+    if (werr != 0) { return werr; }
+    // The polyglot runs as itself on Linux (the shell stub at its head picks the
+    // ELF body), so it leaves the linker executable like any ELF it writes.
+    // Without this the first `./prog.cse.exe` said "permission denied".
+    io.make_executable(output_path);
+    return 0;
+}
+
+// === CST_ v4 — multi-architecture container ==========================
+//
+// v4 is a thin index over N complete, unmodified CST_ v3 images. Keeping each
+// per-arch payload byte-identical to what a single-target link produces means
+// the loader's validated v3 path is reused verbatim: pick an index entry, then
+// parse from image_off exactly as before.
+//
+//   Header (16 bytes):
+//     0x00 4  "CST_"
+//     0x04 1  major = 3     0x05 1  minor = 1
+//     0x06 1  image_count
+//     0x07 1  flags
+//     0x08 4  index_off  (= 0x10)
+//     0x0C 4  reserved
+//   Index, image_count * 8 bytes from index_off:
+//     +0x00 1  arch        (1 = x86_64, 2 = aarch64 — copied from the image)
+//     +0x01 3  reserved
+//     +0x04 4  image_off   (file offset of a complete CST_ v3 image)
+//   Then: the images, each 16-byte aligned.
+
+// Fuse `n` finished pure .cse images into one v4 container. Each input must be
+// a CST_ image; its arch byte is read from the image itself, so callers do not
+// have to name it.
+fn write_cse_fat(paths as *u8, n_in as i32, output_path as *u8) as i32 {
+    let is i32 as n with mut = n_in;
+    if (n_in <= 0 || n_in > CSE_FAT_MAX) {
+        io._write_fd(io.STDERR, "caustic-ld: --cse-fat needs 1..8 --image=<file>\n", 48);
+        return 1;
+    }
+    let is *i64 as pp = cast(*i64, paths);
+
+    let is [8]i64 as bufs;
+    let is [8]i64 as sizes;
+    let is [8]i32 as archs;
+    let is i32 as n_img with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n_in) {
+        let is *u8 as bb = om.opt_alloc(sizeof(reader.ByteBuffer));
+        let is *reader.ByteBuffer as b = cast(*reader.ByteBuffer, bb);
+        let is reader.ByteBuffer as tmp = reader.buf_init(65536);
+        b.data = tmp.data; b.len = tmp.len; b.cap = tmp.cap;
+        let is i64 as got = cse_read_file_into(b, cast(*u8, pp[i]));
+        if (got <= 0) {
+            io._write_fd(io.STDERR, "caustic-ld: --cse-fat: cannot read ", 35);
+            io._write_fd(io.STDERR, cast(*u8, pp[i]), cast(i64, reader.strlen(cast(*u8, pp[i]))));
+            io._write_fd(io.STDERR, "\n", 1);
+            return 1;
+        }
+        let is *u8 as d = b.data;
+        if (d[0] != 67 || d[1] != 83 || d[2] != 84 || d[3] != 95) {   // "CST_"
+            io._write_fd(io.STDERR, "caustic-ld: --cse-fat: not a CST_ image: ", 41);
+            io._write_fd(io.STDERR, cast(*u8, pp[i]), cast(i64, reader.strlen(cast(*u8, pp[i]))));
+            io._write_fd(io.STDERR, "\n", 1);
+            return 1;
+        }
+        // Inputs are containers now (a single-target link wraps its image in
+        // one), so unwrap to the images inside rather than nesting. A plain
+        // image — minor 0 — is taken as it stands.
+        if (d[4] == 3 && d[5] == 1) {
+            let is i32 as ic = cast(i32, d[6]);
+            let is i64 as idx = cse_rd_u32(d, 8);
+            let is i32 as k with mut = 0;
+            while (k < ic) {
+                if (n_img >= CSE_FAT_MAX) {
+                    io._write_fd(io.STDERR, "caustic-ld: --cse-fat: too many images\n", 39);
+                    return 1;
+                }
+                let is i64 as e = idx + cast(i64, k) * 8;
+                let is i64 as ioff = cse_rd_u32(d, cast(i32, e) + 4);
+                let is i64 as iend with mut = got;
+                if (k + 1 < ic) { iend = cse_rd_u32(d, cast(i32, e) + 8 + 4); }
+                bufs[n_img] = cast(i64, d) + ioff;
+                sizes[n_img] = iend - ioff;
+                archs[n_img] = cast(i32, d[cast(i32, ioff) + 6]);
+                n_img = n_img + 1;
+                k = k + 1;
+            }
+        } else {
+            if (n_img >= CSE_FAT_MAX) {
+                io._write_fd(io.STDERR, "caustic-ld: --cse-fat: too many images\n", 39);
+                return 1;
+            }
+            bufs[n_img] = cast(i64, b.data);
+            sizes[n_img] = got;
+            archs[n_img] = cast(i32, d[6]);
+            n_img = n_img + 1;
+        }
+        i = i + 1;
+    }
+    n = n_img;
+
+    // Reject duplicate architectures — the loader picks the first match, so a
+    // duplicate would silently shadow rather than fail.
+    i = 0;
+    while (i < n) {
+        let is i32 as j with mut = i + 1;
+        while (j < n) {
+            if (archs[i] == archs[j]) {
+                io._write_fd(io.STDERR, "caustic-ld: --cse-fat: two images share one architecture\n", 57);
+                return 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Layout: header + index, then each image 16-byte aligned.
+    let is [8]i64 as offs;
+    let is i64 as cur with mut = cast(i64, CSE_FAT_HDR) + cast(i64, n) * 8;
+    i = 0;
+    while (i < n) {
+        cur = (cur + 15) & (0 - 16);
+        offs[i] = cur;
+        cur = cur + sizes[i];
+        i = i + 1;
+    }
+
+    let is reader.ByteBuffer as out = reader.buf_init(262144);
+    reader.buf_emit8(&out, 67); reader.buf_emit8(&out, 83);
+    reader.buf_emit8(&out, 84); reader.buf_emit8(&out, 95);      // "CST_"
+    reader.buf_emit8(&out, cast(i32, CSE_CONTAINER_MAJOR));
+    reader.buf_emit8(&out, cast(i32, CSE_CONTAINER_MINOR));
+    reader.buf_emit8(&out, cast(i32, n));                        // image_count
+    reader.buf_emit8(&out, cast(i32, cse_manifest_flags()));     // flags
+    reader.buf_emit32_le(&out, cast(i64, CSE_FAT_HDR));          // index_off
+    reader.buf_emit32_le(&out, 0);                               // reserved
+    i = 0;
+    while (i < n) {
+        reader.buf_emit8(&out, cast(i32, archs[i]));
+        reader.buf_emit8(&out, 0); reader.buf_emit8(&out, 0); reader.buf_emit8(&out, 0);
+        reader.buf_emit32_le(&out, offs[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        reader.buf_pad_to(&out, offs[i]);
+        reader.buf_append(&out, cast(*u8, bufs[i]), sizes[i]);
+        i = i + 1;
+    }
+    return cse_write_buf_to_file(&out, output_path);
+}
+
+// === .csl — Caustic Standard Library (shared lib, CSE family) =========
+// A CSL_ image: CST_ v2-style segment table + an EXPORT table (name->vaddr)
+// so our loader can resolve a program's stdlib imports. No entry point.
+// flags bit 0: 0 = pure (CausticOS only), 1 = compat (polyglot, our loader).
+//   Header (44 bytes — v1 was 32; std/csl_loader.cst gates on the version):
+//     0x00 4 "CSL_"  0x04 2 version=2  0x06 1 arch  0x07 1 flags
+//     0x08 8 base_addr   0x10 4 seg_count   0x14 4 export_count   0x18 8 export_off
+//     0x20 8 kimport_off   0x28 4 kimport_count
+//   Segment table: seg_count * 24 (vaddr, file_off, file_size, mem_size, perms)
+//   Packed segment bytes.
+//   Export table @export_off: export_count * 12 (name_off u32, vaddr u64),
+//     then a packed NUL-terminated string blob (name_off is an abs file offset).
+// Is this global a real export of the .csl? register_csl_imp_gsyms marks every
+// __imp_<sym> slot as `defined` before this scan runs (so relocations resolve),
+// which would otherwise publish the kernel32 thunk table as public CSL exports.
+fn _csl_is_export(g as *linker.GlobalSym) as i32 {
+    if (g.defined != 1 || g.name_len <= 0 || g.section == 0) { return 0; }
+    if (g.name_len > 6
+        && g.name[0] == 95 && g.name[1] == 95 && g.name[2] == 105
+        && g.name[3] == 109 && g.name[4] == 112 && g.name[5] == 95) { return 0; }  // "__imp_"
+    return 1;
+}
+
+fn cse_emit_csl_image(out as *reader.ByteBuffer, ls as *linker.LinkerState, flags as i32, imp_base as i64) as void {
+    let is *reader.ByteBuffer as text_buf = linker.get_text(ls);
+    let is *reader.ByteBuffer as rodata_buf = linker.get_rodata(ls);
+    let is *reader.ByteBuffer as data_buf = linker.get_data(ls);
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+
+    let is [40]i64 as sv;
+    let is [40]i64 as sptr;
+    let is [40]i64 as sfsz;
+    let is [40]i64 as smsz;
+    let is [40]i32 as sperm;
+    let is i32 as n with mut = 0;
+    if (ls.text_size > 0) { sv[n] = ls.text_vaddr; sptr[n] = cast(i64, text_buf.data); sfsz[n] = ls.text_size; smsz[n] = ls.text_size; sperm[n] = 5; n = n + 1; }
+    if (ls.rodata_size > 0) { sv[n] = ls.rodata_vaddr; sptr[n] = cast(i64, rodata_buf.data); sfsz[n] = ls.rodata_size; smsz[n] = ls.rodata_size; sperm[n] = 1; n = n + 1; }
+    if (ls.data_size > 0) { sv[n] = ls.data_vaddr; sptr[n] = cast(i64, data_buf.data); sfsz[n] = ls.data_size; smsz[n] = ls.data_size; sperm[n] = 3; n = n + 1; }
+    if (ls.bss_total > 0) { sv[n] = ls.bss_vaddr; sptr[n] = 0; sfsz[n] = 0; smsz[n] = ls.bss_total; sperm[n] = 3; n = n + 1; }
+    // __imp_ slot table: one zero-init i64 per kernel32 import (loader fills).
+    if (ls.cstimport_count > 0) { sv[n] = imp_base; sptr[n] = 0; sfsz[n] = 0; smsz[n] = cast(i64, ls.cstimport_count) * 8; sperm[n] = 3; n = n + 1; }
+
+    let is i32 as ne with mut = 0;
+    let is i64 as estr_total with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (_csl_is_export(g) == 1) { ne = ne + 1; estr_total = estr_total + cast(i64, g.name_len) + 1; }
+        gi = gi + 1;
+    }
+
+    let is [40]i64 as sfoff;
+    let is i64 as cursor with mut = 44 + cast(i64, n) * 24;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (sfsz[i] > 0) { sfoff[i] = cursor; cursor = cursor + sfsz[i]; } else { sfoff[i] = 0; }
+        i = i + 1;
+    }
+    let is i64 as export_off = cursor;
+    let is i64 as estr_off = export_off + cast(i64, ne) * 12;
+    let is i64 as kimport_off with mut = 0;
+    if (ls.cstimport_count > 0) { kimport_off = estr_off + estr_total; }
+
+    reader.buf_emit8(out, 67); reader.buf_emit8(out, 83); reader.buf_emit8(out, 76); reader.buf_emit8(out, 95);  // "CSL_"
+    reader.buf_emit16_le(out, 2);                   // version 2 (+ kernel32 import table)
+    reader.buf_emit8(out, cast(i32, tgt.target_get().arch));   // 1 = x86_64, 2 = aarch64
+    reader.buf_emit8(out, flags);
+    reader.buf_emit64_le(out, ls.base_addr);
+    reader.buf_emit32_le(out, cast(i64, n));
+    reader.buf_emit32_le(out, cast(i64, ne));
+    reader.buf_emit64_le(out, export_off);
+    reader.buf_emit64_le(out, kimport_off);          // 0x20 kernel32 import table off (0 = none)
+    reader.buf_emit32_le(out, cast(i64, ls.cstimport_count));  // 0x28 kernel32 import count → header is 44 bytes
+
+    i = 0;
+    while (i < n) {
+        reader.buf_emit64_le(out, sv[i]);
+        reader.buf_emit32_le(out, sfoff[i]);
+        reader.buf_emit32_le(out, sfsz[i]);
+        reader.buf_emit32_le(out, smsz[i]);
+        reader.buf_emit32_le(out, cast(i64, sperm[i]));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) { if (sfsz[i] > 0) { reader.buf_append(out, cast(*u8, sptr[i]), sfsz[i]); } i = i + 1; }
+
+    // export entries
+    let is i64 as cur_str with mut = 0;
+    gi = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (_csl_is_export(g) == 1) {
+            reader.buf_emit32_le(out, estr_off + cur_str);
+            reader.buf_emit64_le(out, g.vaddr);
+            cur_str = cur_str + cast(i64, g.name_len) + 1;
+        }
+        gi = gi + 1;
+    }
+    // string blob
+    gi = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (_csl_is_export(g) == 1) {
+            reader.buf_append(out, g.name, cast(i64, g.name_len));
+            reader.buf_emit8(out, 0);
+        }
+        gi = gi + 1;
+    }
+    // kernel32 import table @kimport_off: N × { slot_vaddr u64, name (NUL-term) }.
+    // The loader resolves each name in its own kernel32 and writes the address
+    // into the slot at slot_vaddr, so the .csl's `call [__imp_X]` reaches it.
+    if (ls.cstimport_count > 0) {
+        let is *i64 as lsp = cast(*i64, ls.cstimport_sym_ptrs);
+        let is *i32 as lsl = cast(*i32, ls.cstimport_sym_lens);
+        let is i32 as ki with mut = 0;
+        while (ki < ls.cstimport_count) {
+            reader.buf_emit64_le(out, imp_base + cast(i64, ki) * 8);
+            reader.buf_append(out, cast(*u8, lsp[ki]), cast(i64, lsl[ki]));
+            reader.buf_emit8(out, 0);
+            ki = ki + 1;
+        }
+    }
+}
+
+fn write_csl(ls as *linker.LinkerState, output_path as *u8, flags as i32) as i32 {
+    // Gather kernel32 imports (compat Windows path) and give each an __imp_ slot
+    // just past the segments, so `call [__imp_X]` relocations resolve to a slot
+    // the loader fills. Must run BEFORE apply_relocations.
+    linker.collect_all_cstimports(ls);
+    let is i64 as imp_base = _csl_imp_base(ls);
+    register_csl_imp_gsyms(ls, imp_base);
+    reloc.apply_relocations(ls);
+    let is reader.ByteBuffer as out = reader.buf_init(65536);
+    cse_emit_csl_image(&out, ls, flags, imp_base);
+    return cse_write_buf_to_file(&out, output_path);
+}
+
+// Mode dispatcher: relocation + per-mode emission (mirrors the PE writer,
+// which also owns relocation internally).
+fn write_cse(ls as *linker.LinkerState, output_path as *u8) as i32 {
+    let is i32 as mode = tgt.cse_mode_get();
+    if (ls.is_shared == 1) {
+        // .csl shared library: pure (mode 0) or compat (mode 1/2) flag.
+        let is i32 as flags with mut = 0;
+        if (mode != 0) { flags = 1; }
+        return write_csl(ls, output_path, flags);
+    }
+    if (mode == 0) { return write_cse_pure(ls, output_path); }
+    if (mode == 1) { return write_cse_selfextract(ls, output_path); }  // compat
+    if (mode == 2) { return write_cse_selfextract(ls, output_path); }  // bundle
+    io._write_fd(io.STDERR, "caustic-ld: unknown CSE mode\n", 28);
+    return 1;
+}

@@ -1,0 +1,355 @@
+use "../core/asm_defs.cst" as def;
+use "../core/buf.cst" as buf;
+use "encoder_util.cst" as eu;
+
+// SSE / floating-point family: scalar f32/f64 arithmetic, conversions and moves,
+// plus the existing packed SSE2 operations.
+// Returns the encoded size in bytes, or eu.ENC_SKIP if not handled here.
+fn _encode_xmm_source(b as *buf.ByteBuffer, op1 as *def.Operand, op2 as *def.Operand,
+                      prefix as i32, opcode as i32, memory_width as i32) as i32 {
+    if (op1.kind != def.OP_REG || eu.is_xmm(op1.reg_id) != 1) { return eu.ENC_SKIP; }
+    let is i32 as rex_x with mut = 0;
+    let is i32 as rex_b with mut = 0;
+    if (op2.kind == def.OP_REG) {
+        if (eu.is_xmm(op2.reg_id) != 1) { return eu.ENC_SKIP; }
+        rex_b = eu.reg_ext(op2.reg_id);
+    } else if (op2.kind == def.OP_MEM || op2.kind == def.OP_RIP_LABEL) {
+        if (op2.mem_size != 0 && op2.mem_size != memory_width) { return eu.ENC_SKIP; }
+        if (op2.kind == def.OP_MEM) {
+            if (op2.mem_base != def.REG_NONE) { rex_b = eu.reg_ext(op2.mem_base); }
+            if (eu.has_sib(op2) == 1) { rex_x = eu.reg_ext(op2.mem_index); }
+        }
+    } else { return eu.ENC_SKIP; }
+    let is i64 as start = b.len;
+    // prefix < 0: the instruction has no mandatory prefix (movaps, ucomiss).
+    if (prefix >= 0) { buf.buf_emit8(b, prefix); }
+    let is i32 as rex_r = eu.reg_ext(op1.reg_id);
+    if (rex_r != 0 || rex_x != 0 || rex_b != 0) { buf.buf_emit8(b, eu.make_rex(0, rex_r, rex_x, rex_b)); }
+    buf.buf_emit8(b, 15);
+    buf.buf_emit8(b, opcode);
+    if (op2.kind == def.OP_REG) {
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+    } else if (op2.kind == def.OP_RIP_LABEL) {
+        buf.buf_emit8(b, eu.make_modrm(0, eu.reg_code(op1.reg_id), 5));
+        buf.buf_emit32_le(b, 0);
+    } else if (eu.has_sib(op2) == 1) {
+        eu.emit_mem_modrm_sib(b, eu.reg_code(op1.reg_id), op2.mem_base, op2.mem_index, op2.mem_scale, op2.mem_disp);
+    } else {
+        eu.emit_mem_modrm(b, eu.reg_code(op1.reg_id), op2.mem_base, op2.mem_disp);
+    }
+    return cast(i32, b.len - start);
+}
+
+fn encode_sse(b as *buf.ByteBuffer, inst as i32, op1 as *def.Operand, op2 as *def.Operand) as i32 {
+    let is i64 as start = b.len;
+
+    // --- MOVQ (SSE) ---
+    if (inst == def.INST_MOVQ) {
+        if (op1.kind == def.OP_REG && eu.reg_size(op1.reg_id) == 128 && op2.kind == def.OP_REG) {
+            // movq xmm, r64: 66 REX.W 0F 6E
+            buf.buf_emit8(b, 102);
+            buf.buf_emit8(b, eu.make_rex(1, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, 110);
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+            return cast(i32, b.len - start);
+        }
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.reg_size(op2.reg_id) == 128) {
+            // movq r64, xmm: 66 REX.W 0F 7E
+            buf.buf_emit8(b, 102);
+            buf.buf_emit8(b, eu.make_rex(1, eu.reg_ext(op2.reg_id), 0, eu.reg_ext(op1.reg_id)));
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, 126);
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op2.reg_id), eu.reg_code(op1.reg_id)));
+            return cast(i32, b.len - start);
+        }
+    }
+
+    // --- MOVSD ---
+    // F2 0F 10 /r — movsd xmm, xmm/m64 (load form)
+    // F2 0F 11 /r — movsd xmm/m64, xmm (store form)
+    if (inst == def.INST_MOVSD) {
+        // xmm, xmm  — use load form
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 1 && eu.is_xmm(op2.reg_id) == 1) {
+            buf.buf_emit8(b, 242); // F2
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+            }
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, 16); // 0x10
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+            return cast(i32, b.len - start);
+        }
+        // xmm, [mem]  — load
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM && eu.is_xmm(op1.reg_id) == 1) {
+            let is i32 as dst_code = eu.reg_code(op1.reg_id);
+            buf.buf_emit8(b, 242); // F2
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op2) == 1 && eu.reg_ext(op2.mem_index) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                let is i32 as rex_x with mut = 0;
+                if (eu.has_sib(op2) == 1) { rex_x = eu.reg_ext(op2.mem_index); }
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), rex_x, eu.reg_ext(op2.mem_base)));
+            }
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, 16); // 0x10
+            if (eu.has_sib(op2) == 1) {
+                eu.emit_mem_modrm_sib(b, dst_code, op2.mem_base, op2.mem_index, op2.mem_scale, op2.mem_disp);
+            } else {
+                eu.emit_mem_modrm(b, dst_code, op2.mem_base, op2.mem_disp);
+            }
+            return cast(i32, b.len - start);
+        }
+        // [mem], xmm  — store
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_REG && eu.is_xmm(op2.reg_id) == 1) {
+            let is i32 as src_code = eu.reg_code(op2.reg_id);
+            buf.buf_emit8(b, 242); // F2
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op2.reg_id) == 1 || eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                let is i32 as rex_x with mut = 0;
+                if (eu.has_sib(op1) == 1) { rex_x = eu.reg_ext(op1.mem_index); }
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op2.reg_id), rex_x, eu.reg_ext(op1.mem_base)));
+            }
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, 17); // 0x11
+            if (eu.has_sib(op1) == 1) {
+                eu.emit_mem_modrm_sib(b, src_code, op1.mem_base, op1.mem_index, op1.mem_scale, op1.mem_disp);
+            } else {
+                eu.emit_mem_modrm(b, src_code, op1.mem_base, op1.mem_disp);
+            }
+            return cast(i32, b.len - start);
+        }
+    }
+
+    // Scalar arithmetic: F2 for double, F3 for single; register or memory rhs.
+    if (inst == def.INST_ADDSD || inst == def.INST_SUBSD || inst == def.INST_MULSD || inst == def.INST_DIVSD || inst == def.INST_SQRTSD ||
+        inst == def.INST_ADDSS || inst == def.INST_SUBSS || inst == def.INST_MULSS || inst == def.INST_DIVSS || inst == def.INST_SQRTSS) {
+        let is i32 as prefix with mut = 242;
+        let is i32 as width with mut = 64;
+        if (inst >= def.INST_ADDSS && inst <= def.INST_SQRTSS) { prefix = 243; width = 32; }
+        let is i32 as opcode with mut = 81;
+        if (inst == def.INST_ADDSD || inst == def.INST_ADDSS) { opcode = 88; }
+        if (inst == def.INST_SUBSD || inst == def.INST_SUBSS) { opcode = 92; }
+        if (inst == def.INST_MULSD || inst == def.INST_MULSS) { opcode = 89; }
+        if (inst == def.INST_DIVSD || inst == def.INST_DIVSS) { opcode = 94; }
+        return _encode_xmm_source(b, op1, op2, prefix, opcode, width);
+    }
+
+    // --- XORPD xmm, xmm ---
+    if (inst == def.INST_XORPD && op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 1 && eu.is_xmm(op2.reg_id) == 1) {
+        buf.buf_emit8(b, 102); // 66 prefix
+        let is i32 as need_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+        if (need_rex == 1) {
+            buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        }
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 87);
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+
+    // --- UCOMISD xmm, xmm ---  66 [REX] 0F 2E /r
+    if (inst == def.INST_UCOMISD && op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 1 && eu.is_xmm(op2.reg_id) == 1) {
+        buf.buf_emit8(b, 102); // 66 prefix
+        let is i32 as need_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+        if (need_rex == 1) {
+            buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        }
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 46); // 2E
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+
+    // --- CVTTSD2SI r64, xmm ---
+    if (inst == def.INST_CVTTSD2SI && op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 0 && eu.is_xmm(op2.reg_id) == 1) {
+        // F2 REX.W 0F 2C /r (mod=11) — dst is a GP reg, src an xmm
+        buf.buf_emit8(b, 242); // F2
+        buf.buf_emit8(b, eu.make_rex(1, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        buf.buf_emit8(b, 15);  // 0F
+        buf.buf_emit8(b, 44);  // 2C
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+
+    // --- CVTSI2SD xmm, r64 ---
+    if (inst == def.INST_CVTSI2SD && op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 1 && eu.is_xmm(op2.reg_id) == 0) {
+        // F2 REX.W 0F 2A /r (mod=11) — dst is an xmm, src a GP reg
+        buf.buf_emit8(b, 242); // F2
+        buf.buf_emit8(b, eu.make_rex(1, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        buf.buf_emit8(b, 15);  // 0F
+        buf.buf_emit8(b, 42);  // 2A
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+
+    if (inst == def.INST_CVTSI2SS && op1.kind == def.OP_REG && op2.kind == def.OP_REG &&
+        eu.is_xmm(op1.reg_id) == 1 && (eu.reg_size(op2.reg_id) == 32 || eu.reg_size(op2.reg_id) == 64)) {
+        let is i32 as wide with mut = 0;
+        if (eu.reg_size(op2.reg_id) == 64) { wide = 1; }
+        buf.buf_emit8(b, 243);
+        if (wide != 0 || eu.reg_ext(op1.reg_id) != 0 || eu.reg_ext(op2.reg_id) != 0) {
+            buf.buf_emit8(b, eu.make_rex(wide, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        }
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 42);
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+    if (inst == def.INST_CVTSD2SS) { return _encode_xmm_source(b, op1, op2, 242, 90, 64); }
+
+    // --- MOVSS ---  F3 0F 10 /r load (xmm, xmm/m32), F3 0F 11 /r store (m32, xmm)
+    if (inst == def.INST_MOVSS) {
+        if (op1.kind == def.OP_MEM) { return _encode_xmm_source(b, op2, op1, 243, 17, 32); }
+        return _encode_xmm_source(b, op1, op2, 243, 16, 32);
+    }
+    // --- MOVAPS xmm, xmm/m128 ---  0F 28 /r
+    if (inst == def.INST_MOVAPS) { return _encode_xmm_source(b, op1, op2, 0 - 1, 40, 128); }
+    // --- UCOMISS xmm, xmm/m32 ---  0F 2E /r
+    if (inst == def.INST_UCOMISS) { return _encode_xmm_source(b, op1, op2, 0 - 1, 46, 32); }
+    // --- UCOMISD xmm, m64 ---  66 0F 2E /r (the register form is above)
+    if (inst == def.INST_UCOMISD && op1.kind == def.OP_REG && op2.kind != def.OP_REG) {
+        return _encode_xmm_source(b, op1, op2, 102, 46, 64);
+    }
+    // --- CVTTSS2SI r64, xmm ---  F3 REX.W 0F 2C /r
+    if (inst == def.INST_CVTTSS2SI && op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 0 && eu.is_xmm(op2.reg_id) == 1) {
+        buf.buf_emit8(b, 243);
+        buf.buf_emit8(b, eu.make_rex(1, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 44);
+        buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+        return cast(i32, b.len - start);
+    }
+    if (inst == def.INST_CVTSS2SD) { return _encode_xmm_source(b, op1, op2, 243, 90, 32); }
+
+    // --- MOVD xmm, r32 / MOVD r32, xmm ---
+    if (inst == def.INST_MOVD) {
+        if (op1.kind == def.OP_REG && eu.reg_size(op1.reg_id) == 128 && op2.kind == def.OP_REG) {
+            // movd xmm, r32: 66 [REX] 0F 6E /r
+            buf.buf_emit8(b, 102); // 66
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+            }
+            buf.buf_emit8(b, 15);  // 0F
+            buf.buf_emit8(b, 110); // 6E
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+            return cast(i32, b.len - start);
+        }
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.reg_size(op2.reg_id) == 128) {
+            // movd r32, xmm: 66 [REX] 0F 7E /r
+            buf.buf_emit8(b, 102); // 66
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op2.reg_id), 0, eu.reg_ext(op1.reg_id)));
+            }
+            buf.buf_emit8(b, 15);  // 0F
+            buf.buf_emit8(b, 126); // 7E
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op2.reg_id), eu.reg_code(op1.reg_id)));
+            return cast(i32, b.len - start);
+        }
+    }
+
+    // --- Packed SSE2 arithmetic (reg,reg): 66 [REX] 0F <op> /r ---
+    if (inst == def.INST_ADDPD || inst == def.INST_SUBPD || inst == def.INST_MULPD
+        || inst == def.INST_DIVPD || inst == def.INST_PADDD || inst == def.INST_PADDQ
+        || inst == def.INST_PSUBD || inst == def.INST_PSUBQ
+        || inst == def.INST_PXOR) {
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 1 && eu.is_xmm(op2.reg_id) == 1) {
+            buf.buf_emit8(b, 102); // 66
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id)));
+            }
+            buf.buf_emit8(b, 15);
+            if (inst == def.INST_ADDPD) { buf.buf_emit8(b, 88); }   // 0x58
+            if (inst == def.INST_SUBPD) { buf.buf_emit8(b, 92); }   // 0x5C
+            if (inst == def.INST_MULPD) { buf.buf_emit8(b, 89); }   // 0x59
+            if (inst == def.INST_DIVPD) { buf.buf_emit8(b, 94); }   // 0x5E
+            if (inst == def.INST_PADDD) { buf.buf_emit8(b, 254); }  // 0xFE
+            if (inst == def.INST_PADDQ) { buf.buf_emit8(b, 212); }  // 0xD4
+            if (inst == def.INST_PSUBD) { buf.buf_emit8(b, 250); }  // 0xFA
+            if (inst == def.INST_PSUBQ) { buf.buf_emit8(b, 251); }  // 0xFB
+            if (inst == def.INST_PXOR)  { buf.buf_emit8(b, 239); }  // 0xEF
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+            return cast(i32, b.len - start);
+        }
+    }
+
+    // --- PSRLDQ xmm, imm8 (byte shift right): 66 [REX] 0F 73 /3 ib ---
+    if (inst == def.INST_PSRLDQ && op1.kind == def.OP_REG && op2.kind == def.OP_IMM && eu.is_xmm(op1.reg_id) == 1) {
+        buf.buf_emit8(b, 102); // 66
+        if (eu.reg_ext(op1.reg_id) == 1) { buf.buf_emit8(b, eu.make_rex(0, 0, 0, eu.reg_ext(op1.reg_id))); }
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, 115); // 0x73
+        buf.buf_emit8(b, eu.make_modrm(3, 3, eu.reg_code(op1.reg_id))); // /3 opcode-ext, rm=xmm
+        buf.buf_emit8(b, cast(i32, op2.imm) & 255);
+        return cast(i32, b.len - start);
+    }
+
+    // --- MOVUPD (66 0F 10 load / 11 store) and MOVDQU (F3 0F 6F load / 7F store) ---
+    // mirror MOVSD's three forms (reg,reg / xmm,[mem] / [mem],xmm) with the packed
+    // prefix+opcode.
+    if (inst == def.INST_MOVUPD || inst == def.INST_MOVDQU) {
+        let is i32 as pfx with mut = 102;   // 66
+        let is i32 as ld with mut = 16;     // 0x10
+        let is i32 as st with mut = 17;     // 0x11
+        if (inst == def.INST_MOVDQU) { pfx = 243; ld = 111; st = 127; }  // F3, 0x6F, 0x7F
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG && eu.is_xmm(op1.reg_id) == 1 && eu.is_xmm(op2.reg_id) == 1) {
+            buf.buf_emit8(b, pfx);
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            if (need_rex == 1) { buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), 0, eu.reg_ext(op2.reg_id))); }
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, ld);
+            buf.buf_emit8(b, eu.make_modrm(3, eu.reg_code(op1.reg_id), eu.reg_code(op2.reg_id)));
+            return cast(i32, b.len - start);
+        }
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM && eu.is_xmm(op1.reg_id) == 1) {   // load: dst xmm, [mem]
+            let is i32 as dst_code = eu.reg_code(op1.reg_id);
+            buf.buf_emit8(b, pfx);
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op2) == 1 && eu.reg_ext(op2.mem_index) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                let is i32 as rex_x with mut = 0;
+                if (eu.has_sib(op2) == 1) { rex_x = eu.reg_ext(op2.mem_index); }
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op1.reg_id), rex_x, eu.reg_ext(op2.mem_base)));
+            }
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, ld);
+            if (eu.has_sib(op2) == 1) { eu.emit_mem_modrm_sib(b, dst_code, op2.mem_base, op2.mem_index, op2.mem_scale, op2.mem_disp); }
+            else { eu.emit_mem_modrm(b, dst_code, op2.mem_base, op2.mem_disp); }
+            return cast(i32, b.len - start);
+        }
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_REG && eu.is_xmm(op2.reg_id) == 1) {   // store: [mem], src xmm
+            let is i32 as src_code = eu.reg_code(op2.reg_id);
+            buf.buf_emit8(b, pfx);
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op2.reg_id) == 1 || eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            if (need_rex == 1) {
+                let is i32 as rex_x with mut = 0;
+                if (eu.has_sib(op1) == 1) { rex_x = eu.reg_ext(op1.mem_index); }
+                buf.buf_emit8(b, eu.make_rex(0, eu.reg_ext(op2.reg_id), rex_x, eu.reg_ext(op1.mem_base)));
+            }
+            buf.buf_emit8(b, 15);
+            buf.buf_emit8(b, st);
+            if (eu.has_sib(op1) == 1) { eu.emit_mem_modrm_sib(b, src_code, op1.mem_base, op1.mem_index, op1.mem_scale, op1.mem_disp); }
+            else { eu.emit_mem_modrm(b, src_code, op1.mem_base, op1.mem_disp); }
+            return cast(i32, b.len - start);
+        }
+    }
+
+    return eu.ENC_SKIP;
+}

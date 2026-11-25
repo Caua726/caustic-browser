@@ -8,7 +8,9 @@
 // and its pages as one and so cannot put the strip in the title bar. A stack holds
 // the pages. What the toolbar shows belongs to the tab, so each page has its own.
 
+use "../motor/host.cst" as jshost;
 use "std/io.cst" as io;
+if (__target_is_linux) use "std/os/linux.cst" as linux;
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
 use "std/env.cst" as env;
@@ -62,6 +64,7 @@ let is i64 as TAB_TITLE with imut = 96;    // bytes of a page's title on its tab
 // One tab: its widgets, and the document it owns. A Doc stays in its slot for as long
 // as the tab lives, so a view can keep pointing at its list; `order` is what moves.
 struct Doc {
+    focus_pg as *pg.Page;   // the frame that has the keyboard, when one does
     used  as i64;
     load_push as i64;
     load_y    as f64;
@@ -127,6 +130,7 @@ let is i64 as _pend_push with mut = 0;
 let is i64 as _pend_mode with mut = 0;
 let is f64 as _pend_y with mut = 0.0;
 let is [MAX_URL]u8 as _pend_url with mut;
+let is *pg.Page as _pend_page with mut = cast(*pg.Page, 0);
 // A form's body to go with it. It has to outlast the page that made it, which the load
 // replaces before it sends anything.
 let is i64 as MAX_POST with imut = 4194304;
@@ -459,6 +463,8 @@ fn _request(d as *Doc, u as *u8, push as i64, y as f64) as void {
     _pend_mode = GO_PLAIN;
     _pend_post = 0;
     _pend_y = y;
+    _pend_page = cast(*pg.Page, 0);
+    if (cast(i64, d.pg) != 0 && pg.is_frame(d.pg) == 1) { _pend_page = d.pg; }
     _copy_cut(cast(*u8, &_pend_url), u, MAX_URL);
 }
 
@@ -669,11 +675,14 @@ fn _lay_out(d as *Doc) as void {
     d.view_w = w;
     d.view_h = h;
     pv.clear_selection(br.t, d.view);
-    pg.relayout(d.pg, w, h, &d.list);
+    let is *pg.Page as top = pg.top_of(d.pg);
+    pg.relayout(top, w, h, &d.list);
+    pg.list_made();
     pv.set_list(br.t, d.view, &d.list);
-    pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
+    pv.set_size(br.t, d.view, top.doc_w, top.doc_h);
     _place_editor(d);
     _keep_moving(d);
+    _keep_js(d);
 }
 
 fn _fragment_of(u as *u8) as *u8 {
@@ -704,6 +713,11 @@ fn _go_to_fragment(d as *Doc, u as *u8) as i64 {
 
 // Whatever was open on the page, closed: it is leaving, or at least about to.
 fn _let_go_of_page(d as *Doc) as void {
+    jshost.focus_asked = cast(*dom.Node, 0);
+    _js_over = cast(*dom.Node, 0);
+    _js_over_pg = cast(*pg.Page, 0);
+    _hover_pg = cast(*pg.Page, 0);
+    d.focus_pg = cast(*pg.Page, 0);
     _hush();
     if (_ed_doc == d) { _close_editor(); }
     if (_cal_doc == d) { _cal_doc = cast(*Doc, 0); }
@@ -712,8 +726,85 @@ fn _let_go_of_page(d as *Doc) as void {
 }
 
 // The load that was asked for, if any.
+// focus() from a script, on what can be typed in, once there is a box for it.
+fn _follow_script_focus() as void {
+    if (jshost.focus_asked == null) { return; }
+    let is *Doc as fd with mut = _doc_of_page(jshost.focus_owner);
+    if (fd == null) { fd = _doc_holding(jshost.focus_owner); }
+    if (fd == null || cast(i64, fd.pg) == 0) { jshost.focus_asked = cast(*dom.Node, 0); return; }
+    let is *pg.Page as fp = cast(*pg.Page, jshost.focus_owner);
+    if (fp.loaded == 0 || fp.root == null || fd.pg.root == null) { return; }
+    let is *dom.Node as n = jshost.focus_asked;
+    jshost.focus_asked = cast(*dom.Node, 0);
+    if (_is_typed_in(n) == 0 || n == _ed_node) { return; }
+    let is *pg.Page as root = fd.pg;
+    fd.pg = fp;
+    if (fp != root) { fd.focus_pg = fp; }
+    _focus_element(fd, n, 0);
+    fd.pg = root;
+}
+// form.submit() from a script: the same as pressing a submit button of it, without one.
+fn _follow_script_submit() as void {
+    if (jshost.submit_form == null) { return; }
+    let is *dom.Node as form = jshost.submit_form;
+    jshost.submit_form = cast(*dom.Node, 0);
+    let is *Doc as fd with mut = _doc_of_page(jshost.submit_owner);
+    if (fd == null) { fd = _doc_holding(jshost.submit_owner); }
+    if (fd == null || cast(i64, fd.pg) == 0) { return; }
+    let is *pg.Page as root = fd.pg;
+    fd.pg = cast(*pg.Page, jshost.submit_owner);
+    _submit(fd, form, cast(*dom.Node, 0));
+    fd.pg = root;
+}
 fn _service() as void {
+    _follow_script_focus();
+    _follow_script_submit();
+    if (jshost.nav_wanted == 1) {
+        jshost.nav_wanted = 0;
+        let is *Doc as nd with mut = _doc_of_page(jshost.nav_owner);
+        if (nd != null) {
+            let is i64 as np with mut = 1;
+            if (jshost.nav_replace == 1) { np = 0; }
+            if (jshost.nav_replace == 2) {
+                // window.open: a new tab, if a person has just done something to ask for one.
+                if (time.now_ms() - _last_press_ms < 1000 && new_tab() == 1) { _request(_doc(br.cur), cast(*u8, &jshost.nav_url), 1, 0.0); }
+            } else {
+                _request(nd, cast(*u8, &jshost.nav_url), np, 0.0);
+            }
+        } else {
+            nd = _doc_holding(jshost.nav_owner);
+            if (nd != null) {
+                let is *pg.Page as fp = cast(*pg.Page, jshost.nav_owner);
+                if (jshost.nav_replace == 2) {
+                    if (time.now_ms() - _last_press_ms < 1000 && new_tab() == 1) { _request(_doc(br.cur), cast(*u8, &jshost.nav_url), 1, 0.0); }
+                } else {
+                    pg.begin(fp, cast(*u8, &jshost.nav_url), fp.vw, fp.vh);
+                }
+            }
+        }
+    }
     if (_pend_slot < 0) { return; }
+    if (cast(i64, _pend_page) != 0) {
+        // Something a frame asked for stays in the frame.
+        let is *pg.Page as c = _pend_page;
+        let is *Doc as fd = &br.docs[_pend_slot];
+        _pend_page = cast(*pg.Page, 0);
+        _pend_slot = 0 - 1;
+        let is i64 as frame_post = _pend_post;
+        _pend_post = 0;
+        if (fd.used == 1 && cast(i64, fd.pg) != 0 && pg.holds(fd.pg, c) == 1) {
+            if (frame_post == 1) {
+                let is *u8 as origin with mut = cast(*u8, &_pend_origin);
+                if (_pend_origin[0] == 0) { origin = "null"; }
+                let is *u8 as referer with mut = cast(*u8, &_pend_referer);
+                if (_pend_referer[0] == 0) { referer = cast(*u8, 0); }
+                pg.begin_post(c, cast(*u8, &_pend_url), c.vw, c.vh, cast(*u8, &_pend_type), _pend_body, _pend_body_n, origin, referer);
+            } else {
+                pg.begin(c, cast(*u8, &_pend_url), c.vw, c.vh);
+            }
+        }
+        return;
+    }
     let is *Doc as d = &br.docs[_pend_slot];
     _pend_slot = 0 - 1;
     if (d.used == 0) { return; }
@@ -787,9 +878,38 @@ fn _doc_of_page(owner as *u8) as *Doc {
 // the last of them always shown.
 let is i64 as PICTURES_EVERY_MS with imut = 150;
 
+// The tab a frame's page is in, however deep.
+fn _doc_holding(owner as *u8) as *Doc {
+    let is i64 as i with mut = 0;
+    while (i < br.n) {
+        let is *Doc as d = _doc(i);
+        if (d.used == 1 && cast(i64, d.pg) != 0 && pg.holds(d.pg, cast(*pg.Page, owner)) == 1) { return d; }
+        i = i + 1;
+    }
+    return cast(*Doc, 0);
+}
+fn _frame_answer(d as *Doc, c as *pg.Page, j as *fetcher.Job) as void {
+    if (pg.is_current(c, j) == 0) { return; }
+    if (pg.is_document(j) == 1) {
+        if (_ed_widget != 0 && cast(i64, _ed_pg) == cast(i64, c)) { _drop_editor(); }
+        if (d.focus_pg == c) { d.focus_pg = cast(*pg.Page, 0); }
+        _js_over = cast(*dom.Node, 0);
+        _js_over_pg = cast(*pg.Page, 0);
+        _hover_pg = cast(*pg.Page, 0);
+    }
+    pg.frame_answer(c, j);
+    pg.js_clear();
+    _restyle_frames(d);
+    _keep_js(d);
+}
 fn _answer(j as *fetcher.Job) as void {
-    let is *Doc as d = _doc_of_page(j.owner);
-    if (d == null || pg.is_current(d.pg, j) == 0) { return; }
+    let is *Doc as d with mut = _doc_of_page(j.owner);
+    if (d == null) {
+        d = _doc_holding(j.owner);
+        if (d != null) { _frame_answer(d, cast(*pg.Page, j.owner), j); }
+        return;
+    }
+    if (pg.is_current(d.pg, j) == 0) { return; }
     if (pg.is_document(j) == 1) {
         // The document that was showing is about to go, and all that points into it.
         _let_go_of_page(d);
@@ -803,8 +923,11 @@ fn _answer(j as *fetcher.Job) as void {
     if (shown == 0 || was_document == 1) {
         _first_paint(d);
         d.laid_at = time.now_ms();
+        _keep_js(d);
         return;
     }
+    if (pg.js_changed() != 0) { _restyle(d); pg.js_clear(); }
+    _keep_js(d);
     d.pictures_due = 1;
 }
 
@@ -857,6 +980,7 @@ fn _follow_view() as void {
     if (w == d.view_w && h == d.view_h) {
         // What a person did changed the document or what a rule sees in it.
         if (d.pg.dirty == 1) { _restyle(d); }
+        else if (pg.any_dirty(d.pg) == 1) { _restyle_frames(d); }
         return;
     }
     d.pg.dirty = 0;
@@ -868,11 +992,27 @@ let is dl.Snap as _shown with mut;
 
 fn _restyle(d as *Doc) as void {
     dl.snap(&d.list, &_shown);
-    pg.refresh(d.pg, &d.list);
+    let is *pg.Page as top = pg.top_of(d.pg);
+    pg.refresh(top, &d.list);
+    pg.list_made();
+    top.dirty = 0;
+    d.pg.dirty = 0;
     pv.set_list_changed(br.t, d.view, &d.list, &_shown);
-    pv.set_size(br.t, d.view, d.pg.doc_w, d.pg.doc_h);
+    pv.set_size(br.t, d.view, top.doc_w, top.doc_h);
     _place_editor(d);
     _keep_moving(d);
+    _keep_js(d);
+}
+
+// What changed was inside a frame: this page keeps its boxes, and only its list changes.
+fn _restyle_frames(d as *Doc) as void {
+    dl.snap(&d.list, &_shown);
+    pg.repaint(pg.top_of(d.pg), &d.list);
+    pg.list_made();
+    pv.set_list_changed(br.t, d.view, &d.list, &_shown);
+    _place_editor(d);
+    _keep_moving(d);
+    _keep_js(d);
 }
 
 // --- What moves on its own ---
@@ -928,6 +1068,7 @@ fn _motion_due(user as *u8) as void {
             if (pg.css_moving(d.pg) == 1) {
                 dl.snap(&d.list, &_shown);
                 if (pg.tick(d.pg, &d.list, pv.scroll_y(br.t, d.view)) == 1) {
+                    pg.list_made();
                     let is f64 as x0 with mut = 0.0;
                     let is f64 as y0 with mut = 0.0;
                     let is f64 as x1 with mut = 0.0;
@@ -945,6 +1086,65 @@ fn _motion_due(user as *u8) as void {
     }
 }
 
+// browser --run: when the page showing has nothing more coming, its document on stdout.
+let is i64 as _run_started with mut = 0;
+fn _run_check(user as *u8) as void {
+    let is i64 as now = time.now_ms();
+    if (now - _run_started > 60000) { io.write_str(2, "--run: gave up after 60 s\n"); linux.exit(3); }
+    if (br.n == 0) { return; }
+    let is *Doc as d = _doc(br.cur);
+    if (_has_page(d) == 0 || pg.settled(d.pg) == 0 || pg.js_wait(d.pg) >= 0 || _js_unpainted != 0) { return; }
+    pg.write_document(d.pg);
+    linux.exit(0);
+}
+fn report_when_settled() as void {
+    _run_started = time.now_ms();
+    ui.timer.add(ui.app.timers(br.a), _run_started, 1, 1, fn_ptr(_run_check), cast(*u8, 0));
+}
+
+// A page's timers. One waits for the soonest of them; what ran may set more.
+let is i64 as _js_id with mut = 0;
+let is i64 as _js_at with mut = 0;
+// What timers change is drawn a frame at a time, however many times it changed in between.
+let is i64 as _js_unpainted with mut = 0;
+let is i64 as _js_painted_at with mut = 0;
+fn _js_due(user as *u8) as void {
+    _js_id = 0;
+    if (br.n == 0 || ui.app.window_valid(br.a, br.win) == 0) { return; }
+    let is *Doc as d = _doc(br.cur);
+    if (_has_page(d) == 0) { return; }
+    let is i64 as stepped = pg.js_step(d.pg);
+    if ((stepped & 1) != 0) { _js_unpainted = 1; }
+    else if (stepped != 0 && _js_unpainted == 0) { _js_unpainted = 2; }
+    pg.js_clear();
+    let is i64 as now = time.now_ms();
+    if (_js_unpainted != 0 && now - _js_painted_at >= 16) {
+        let is i64 as what = _js_unpainted;
+        _js_unpainted = 0;
+        _js_painted_at = now;
+        if (what == 1) { _restyle(d); } else { _restyle_frames(d); }
+    }
+    _keep_js(d);
+}
+fn _keep_js(d as *Doc) as void {
+    if (_has_page(d) == 0) { return; }
+    let is i64 as w with mut = pg.js_wait(d.pg);
+    if (_js_unpainted != 0) {
+        let is i64 as left with mut = 16 - (time.now_ms() - _js_painted_at);
+        if (left < 0) { left = 0; }
+        if (w < 0 || w > left) { w = left; }
+    }
+    if (w < 0) { return; }
+    // What was armed may be for much later than what has just come up: a message, a timer of 0.
+    let is i64 as now = time.now_ms();
+    if (_js_id != 0) {
+        if (_js_at <= now + w) { return; }
+        ui.timer.cancel(ui.app.timers(br.a), _js_id);
+    }
+    _js_at = now + w;
+    _js_id = ui.timer.add(ui.app.timers(br.a), now, w, 0, fn_ptr(_js_due), cast(*u8, 0));
+}
+
 fn _keep_moving(d as *Doc) as void {
     if (_motion_id != 0 || _has_page(d) == 0 || pg.moving(d.pg) == 0) { return; }
     _motion_id = ui.timer.add(ui.app.timers(br.a), time.now_ms(), 16, 16, fn_ptr(_motion_due), cast(*u8, 0));
@@ -959,6 +1159,7 @@ fn _keep_moving(d as *Doc) as void {
 // there is only ever one of these.
 
 let is *Doc as _ed_doc with mut = cast(*Doc, 0);
+let is *pg.Page as _ed_pg with mut = cast(*pg.Page, 0);    // its page: the tab's, or a frame's
 let is *dom.Node as _ed_node with mut = cast(*dom.Node, 0);
 let is i64 as _ed_widget with mut = 0;
 let is i64 as _ed_area with mut = 0;
@@ -985,11 +1186,18 @@ fn _drop_editor() as void {
 
 fn _close_editor() as void {
     if (_ed_widget == 0) { return; }
+    let is *pg.Page as ed_p = _ed_pg;
+    if (pg.holds(_ed_doc.pg, ed_p) == 0) { _drop_editor(); return; }
     let is i64 as n with mut = 0;
     let is *u8 as s = _ed_text(&n);
-    forms.set_value(&_ed_doc.pg.doc, _ed_node, s, n);
-    _ed_doc.pg.dirty = 1;
+    forms.set_value(&ed_p.doc, _ed_node, s, n);
+    ed_p.dirty = 1;
+    let is *Doc as ed_d = _ed_doc;
+    let is *dom.Node as ed_n = _ed_node;
     _drop_editor();
+    pg.js_event(ed_p, ed_n, "change", 6, cast(*i64, 0));
+    pg.js_clear();
+    _keep_js(ed_d);
 }
 
 // Inside its border: the border is the page's, and so is the outline around it.
@@ -1011,7 +1219,8 @@ fn _is_fixed(b0 as *bx.Box) as i64 {
 
 fn _place_editor(d as *Doc) as void {
     if (_ed_doc != d || _ed_widget == 0) { return; }
-    let is *bx.Box as b = layout.box_of(d.pg.root, _ed_node);
+    if (pg.holds(pg.top_of(d.pg), _ed_pg) == 0) { _drop_editor(); return; }
+    let is *bx.Box as b = layout.box_of(_ed_pg.root, _ed_node);
     if (b == null) {
         _close_editor();
         return;
@@ -1021,6 +1230,7 @@ fn _place_editor(d as *Doc) as void {
     let is f64 as w with mut = 0.0;
     let is f64 as h with mut = 0.0;
     _inner_rect(b, &x, &y, &w, &h);
+    pg.frame_offset(_ed_pg, &x, &y);
     pv.move_field(br.t, d.view, x, y, w, h);
 }
 
@@ -1050,7 +1260,7 @@ fn _caret_at(d as *Doc, n as *dom.Node, b as *bx.Box, p as *pv.Pointer) as i64 {
     if (vn == 0) { return 0; }
     let is *bx.Box as tb = _text_box(b);
     let is *u8 as run with mut = cast(*u8, 0);
-    let is i64 as off = pv.text_at(br.t, d.view, p.x, p.y, &run);
+    let is i64 as off = pv.text_at(br.t, d.view, p.x + _lp_dx, p.y + _lp_dy, &run);
     if (off < 0 || tb == null) { return vn; }
     let is i64 as at with mut = cast(i64, run) - cast(i64, tb.text);
     if (at < 0 || at > tb.tlen) { return vn; }
@@ -1100,6 +1310,7 @@ fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
     let is f64 as w with mut = 0.0;
     let is f64 as h with mut = 0.0;
     _inner_rect(b, &x, &y, &w, &h);
+    pg.frame_offset(d.pg, &x, &y);
     let is *ui.style.Theme as th = ui.tree.theme(t);
     let is i64 as area = cast(i64, forms.kind_of(n) == forms.AREA);
     let is f64 as ix with mut = b.p[bx.LEFT] - th.metrics.control_pad_x;
@@ -1163,6 +1374,7 @@ fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
     _ed_widget = ed;
     _ed_node = n;
     _ed_doc = d;
+    _ed_pg = d.pg;
     _ed_area = area;
     _ed_enter = 0;
     let is i64 as from with mut = caret;
@@ -1178,7 +1390,28 @@ fn _open_editor(d as *Doc, n as *dom.Node, caret as i64) as void {
 
 // Between events: Enter submits, and a field the focus has left goes back to the page. A
 // menu holds the focus without the field having lost it, as its own right-click menu does.
+let is i64 as _ed_seen with mut = 0;
 fn _follow_editor() as void {
+    // What was typed since the last look, for the page's scripts, as they would have it.
+    if (_ed_widget != 0 && pg.holds(_ed_doc.pg, _ed_pg) == 0) { _drop_editor(); }
+    if (_ed_widget != 0 && pg.js_on(_ed_pg) == 1) {
+        let is i64 as tn0 with mut = 0;
+        let is *u8 as tx = _ed_text(&tn0);
+        let is i64 as hh with mut = tn0 + 1;
+        let is i64 as ti with mut = 0;
+        while (ti < tn0) { hh = hh * 1099511628211 + cast(i64, tx[ti]); ti = ti + 1; }
+        if (hh != _ed_seen) {
+            let is i64 as was_seen = _ed_seen;
+            _ed_seen = hh;
+            if (was_seen != 0) {
+                forms.set_value(&_ed_pg.doc, _ed_node, tx, tn0);
+                pg.js_event(_ed_pg, _ed_node, "input", 5, cast(*i64, 0));
+                _ed_pg.dirty = 1;
+                pg.js_clear();
+                _keep_js(_ed_doc);
+            }
+        }
+    } else if (_ed_widget == 0) { _ed_seen = 0; }
     if (_ed_widget == 0 || br.n == 0 || ui.app.window_valid(br.a, br.win) == 0) { return; }
     let is *Doc as d = _ed_doc;
     if (_ed_enter == 1) {
@@ -1316,6 +1549,7 @@ fn _select_chosen(t as *ui.tree.Tree, m as i64, arg as *u8, user as *u8) as void
 // The options under a <select>, against its box. Made each time, as they can only differ
 // by what is chosen but a list of them is only ever this long-lived.
 fn _open_select(d as *Doc, n as *dom.Node, by_keys as i64) as void {
+    if (pg.is_frame(d.pg) == 1) { return; }
     let is *ui.tree.Tree as t = br.t;
     let is *bx.Box as b = layout.box_of(d.pg.root, n);
     if (b == null) { return; }
@@ -1389,6 +1623,7 @@ fn _color_settled(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void
 }
 
 fn _open_color(d as *Doc, n as *dom.Node) as void {
+    if (pg.is_frame(d.pg) == 1) { return; }
     let is *ui.tree.Tree as t = br.t;
     let is *bx.Box as b = layout.box_of(d.pg.root, n);
     if (b == null) { return; }
@@ -1440,6 +1675,7 @@ fn _cal_typed(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
 }
 
 fn _open_calendar(d as *Doc, n as *dom.Node) as void {
+    if (pg.is_frame(d.pg) == 1) { return; }
     let is *ui.tree.Tree as t = br.t;
     let is *bx.Box as b = layout.box_of(d.pg.root, n);
     if (b == null) { return; }
@@ -1508,6 +1744,7 @@ fn _select_step(d as *Doc, n as *dom.Node, by as i64) as void {
 // --- The focus inside a page ---
 
 fn _reveal(d as *Doc, b as *bx.Box) as void {
+    if (pg.is_frame(d.pg) == 1) { return; }
     if (_is_fixed(b) == 1) { return; }
     let is f64 as w with mut = 0.0;
     let is f64 as h with mut = 0.0;
@@ -1574,6 +1811,7 @@ fn _file_chosen(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
 }
 
 fn _choose_file(d as *Doc, n as *dom.Node) as void {
+    if (pg.is_frame(d.pg) == 1) { return; }
     let is *ui.tree.Tree as dt = ui.dialog.window_tree(br.t);
     if (_file_dialog_made == 0 || ui.dialog.ref_valid(&_file_dialog) == 0) {
         let is i64 as fc = ui.file_chooser(dt, ui.filechooser.OPEN, "Escolher arquivo");
@@ -1635,11 +1873,17 @@ fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
             let is i64 as n = pg.link_from(d.pg, x, cast(*u8, &to), MAX_URL);
             // Pages have javascript:, mailto: and tel: links, and none of them lead anywhere here.
             if (n == 0 || _can_follow(cast(*u8, &to), n) == 0) { return; }
-            if ((mods & cast(i64, keys.MOD_CONTROL)) != 0) {
+            let is *dom.Attr as tg_at = dom.find_attr(x, "target", 6);
+            if ((mods & cast(i64, keys.MOD_CONTROL)) != 0 || (tg_at != null && pg.is_frame(d.pg) == 1 && _same_word(tg_at.value, tg_at.value_len, "_blank") == 1)) {
                 if (new_tab() == 1) { _request(_doc(br.cur), cast(*u8, &to), 1, 0.0); }
                 return;
             }
             _request(d, cast(*u8, &to), 1, 0.0);
+            // Out of the frame, to the whole tab.
+            if (tg_at != null && (_same_word(tg_at.value, tg_at.value_len, "_top") == 1 || _same_word(tg_at.value, tg_at.value_len, "_parent") == 1)) {
+                _pend_page = cast(*pg.Page, 0);
+                if (_same_word(tg_at.value, tg_at.value_len, "_parent") == 1 && pg.is_frame(d.pg.parent) == 1) { _pend_page = d.pg.parent; }
+            }
             return;
         }
         x = x.parent;
@@ -1712,7 +1956,7 @@ fn _range_follow(d as *Doc, n as *dom.Node, p as *pv.Pointer) as void {
     if (forms.range_set(&d.pg.doc, n, lo + frac * (hi - lo)) == 1) { d.pg.dirty = 1; }
 }
 
-fn _page_pressed(user as *u8, p as *pv.Pointer) as i64 {
+fn _pressed_in(user as *u8, p as *pv.Pointer) as i64 {
     let is *Doc as d = cast(*Doc, user);
     if (_has_page(d) == 0) {
         ui.router.focus(br.t, br.r, d.view, 0);
@@ -1757,7 +2001,7 @@ fn _page_pressed(user as *u8, p as *pv.Pointer) as i64 {
     return cast(i64, k != forms.NONE);
 }
 
-fn _page_released(user as *u8, p as *pv.Pointer) as void {
+fn _released_in(user as *u8, p as *pv.Pointer) as void {
     let is *Doc as d = cast(*Doc, user);
     _range_node = cast(*dom.Node, 0);
     if (_has_page(d) == 1) { pg.set_active(d.pg, cast(*dom.Node, 0)); }
@@ -1765,7 +2009,10 @@ fn _page_released(user as *u8, p as *pv.Pointer) as void {
 
 // What is under the pointer shows it: the rules for :hover, the link's address in the
 // corner, the shape the page asks for. Off the page, x is negative. The shape comes back.
-fn _page_moved(user as *u8, p as *pv.Pointer) as i64 {
+let is *dom.Node as _js_over with mut = cast(*dom.Node, 0);
+let is *pg.Page as _js_over_pg with mut = cast(*pg.Page, 0);
+let is *pg.Page as _hover_pg with mut = cast(*pg.Page, 0);
+fn _moved_in(user as *u8, p as *pv.Pointer) as i64 {
     let is *Doc as d = cast(*Doc, user);
     if (_has_page(d) == 0 || p.x < 0.0) {
         if (_has_page(d) == 1) { pg.set_hover(d.pg, cast(*dom.Node, 0)); }
@@ -1779,6 +2026,25 @@ fn _page_moved(user as *u8, p as *pv.Pointer) as i64 {
     }
     let is layout.Hit as h with mut;
     _hit_of(d, p, &h);
+    if (_js_over_pg != d.pg) {
+        _js_over = cast(*dom.Node, 0);
+        _js_over_pg = d.pg;
+    }
+    if (pg.js_on(d.pg) == 1 && h.node != null) {
+        let is [6]i64 as info;
+        info[0] = cast(i64, p.x + p.sx); info[1] = cast(i64, p.y + p.sy); info[2] = 0; info[3] = 0; info[4] = 0; info[5] = 0;
+        let is i64 as seen with mut = 0;
+        if (h.node != _js_over) {
+            if (_js_over != null) { pg.js_event(d.pg, _js_over, "mouseout", 8, cast(*i64, &info)); seen = pg.js_changed(); }
+            _js_over = h.node;
+            pg.js_event(d.pg, h.node, "mouseover", 9, cast(*i64, &info));
+            seen = seen | pg.js_changed();
+        }
+        pg.js_event(d.pg, h.node, "mousemove", 9, cast(*i64, &info));
+        seen = seen | pg.js_changed();
+        if (seen != 0) { _restyle(d); pg.js_clear(); }
+        _keep_js(d);
+    }
     pg.set_hover(d.pg, h.node);
     let is i64 as had = d.link_n;
     d.link_n = pg.link_from(d.pg, h.node, cast(*u8, &d.link), MAX_URL);
@@ -1788,8 +2054,10 @@ fn _page_moved(user as *u8, p as *pv.Pointer) as i64 {
 }
 
 // A click does what it does on what it landed on. The middle button only opens links.
-fn _page_clicked(user as *u8, p as *pv.Pointer) as void {
+let is i64 as _last_press_ms with mut = 0;
+fn _clicked_in(user as *u8, p as *pv.Pointer) as void {
     let is *Doc as d = cast(*Doc, user);
+    _last_press_ms = time.now_ms();
     if (_has_page(d) == 0 || (p.button != 1 && p.button != 2)) { return; }
     let is layout.Hit as h with mut;
     _hit_of(d, p, &h);
@@ -1802,13 +2070,152 @@ fn _page_clicked(user as *u8, p as *pv.Pointer) as void {
         }
         return;
     }
+    let is [6]i64 as info;
+    info[0] = cast(i64, p.x + p.sx); info[1] = cast(i64, p.y + p.sy); info[2] = 0; info[3] = 0; info[4] = 0; info[5] = 0;
+    let is i64 as seen with mut = 0;
+    pg.js_event(d.pg, h.node, "mousedown", 9, cast(*i64, &info));
+    seen = pg.js_changed();
+    pg.js_event(d.pg, h.node, "mouseup", 7, cast(*i64, &info));
+    seen = seen | pg.js_changed();
+    // A box is already checked by the time its click is heard, and goes back if that is stopped.
+    let is i64 as ck = forms.kind_of(h.node);
+    let is i64 as toggles = cast(i64, (ck == forms.CHECK || ck == forms.RADIO) && forms.is_disabled(h.node) == 0 && pg.js_on(d.pg) == 1);
+    if (toggles == 1) { forms.toggle(&d.pg.doc, h.node); d.pg.dirty = 1; }
+    let is i64 as ran = pg.js_event(d.pg, h.node, "click", 5, cast(*i64, &info));
+    seen = seen | pg.js_changed();
+    if (toggles == 1) {
+        if ((ran & 2) != 0) {
+            if (ck == forms.CHECK) { forms.toggle(&d.pg.doc, h.node); d.pg.dirty = 1; }
+        } else {
+            pg.js_event(d.pg, h.node, "input", 5, cast(*i64, &info));
+            seen = seen | pg.js_changed();
+            pg.js_event(d.pg, h.node, "change", 6, cast(*i64, &info));
+            seen = seen | pg.js_changed();
+        }
+    }
+    if (seen != 0) { _restyle(d); pg.js_clear(); }
+    _keep_js(d);
+    if ((ran & 2) != 0 || toggles == 1) { return; }
     _activate(d, h.node, p.mods);
+}
+
+// --- Frames, for what a person does ---
+//
+// The pointer is worked out down to the page under it, and the same handlers run with that page
+// as the tab's for as long as they take. What they paint goes through the top page; what they
+// load stays in the frame (see _request).
+let is pv.Pointer as _lp with mut;
+let is f64 as _lp_dx with mut = 0.0;   // from where a frame's pointer says it is, to the view
+let is f64 as _lp_dy with mut = 0.0;
+
+fn _frame_under(d as *Doc, p as *pv.Pointer) as *pg.Page {
+    _lp_dx = 0.0;
+    _lp_dy = 0.0;
+    let is *pg.Page as cur with mut = d.pg;
+    let is f64 as x with mut = p.x + p.sx;
+    let is f64 as y with mut = p.y + p.sy;
+    let is f64 as sx with mut = p.sx;
+    let is f64 as sy with mut = p.sy;
+    let is i64 as found with mut = 0;
+    while (1 == 1) {
+        let is layout.Hit as h with mut;
+        pg.hit_at(cur, x, y, sx, sy, &h);
+        let is *pg.Frame as fr = pg.frame_of(cur, h.node);
+        if (fr == null || fr.pg.loaded == 0 || fr.pg.root == null) { break; }
+        pg.frame_local(fr, h.box, &x, &y);
+        sx = 0.0;
+        sy = fr.sy;
+        cur = fr.pg;
+        found = 1;
+    }
+    if (found == 0) { return cast(*pg.Page, 0); }
+    _lp = *p;
+    _lp.x = x - sx;
+    _lp.y = y - sy;
+    _lp.sx = sx;
+    _lp.sy = sy;
+    _lp_dx = p.x - _lp.x;
+    _lp_dy = p.y - _lp.y;
+    return cur;
+}
+fn _page_pressed(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0) { return _pressed_in(user, p); }
+    let is *pg.Page as c = _frame_under(d, p);
+    if (cast(i64, c) == 0) {
+        d.focus_pg = cast(*pg.Page, 0);
+        return _pressed_in(user, p);
+    }
+    let is pv.Pointer as lp with mut = _lp;
+    let is *pg.Page as root = d.pg;
+    d.focus_pg = c;
+    d.pg = c;
+    let is i64 as r = _pressed_in(user, &lp);
+    d.pg = root;
+    return r;
+}
+fn _page_released(user as *u8, p as *pv.Pointer) as void {
+    let is *Doc as d = cast(*Doc, user);
+    _released_in(user, p);
+    if (_has_page(d) == 1) { pg.clear_active_in_frames(d.pg); }
+}
+fn _page_moved(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    let is *pg.Page as c with mut = cast(*pg.Page, 0);
+    if (_has_page(d) == 1 && p.x >= 0.0) { c = _frame_under(d, p); }
+    if (cast(i64, _hover_pg) != 0 && _hover_pg != c) {
+        if (cast(i64, d.pg) != 0 && pg.holds(d.pg, _hover_pg) == 1) { pg.set_hover(_hover_pg, cast(*dom.Node, 0)); }
+    }
+    _hover_pg = c;
+    if (cast(i64, c) == 0) { return _moved_in(user, p); }
+    let is pv.Pointer as lp with mut = _lp;
+    let is *pg.Page as root = d.pg;
+    d.pg = c;
+    let is i64 as r = _moved_in(user, &lp);
+    d.pg = root;
+    return r;
+}
+fn _page_clicked(user as *u8, p as *pv.Pointer) as void {
+    let is *Doc as d = cast(*Doc, user);
+    if (_has_page(d) == 0) { _clicked_in(user, p); return; }
+    let is *pg.Page as c = _frame_under(d, p);
+    if (cast(i64, c) == 0) { _clicked_in(user, p); return; }
+    let is pv.Pointer as lp with mut = _lp;
+    let is *pg.Page as root = d.pg;
+    d.pg = c;
+    _clicked_in(user, &lp);
+    d.pg = root;
+}
+fn _page_key(user as *u8, p as *pv.Pointer) as i64 {
+    let is *Doc as d = cast(*Doc, user);
+    let is *pg.Page as c = d.focus_pg;
+    if (cast(i64, c) == 0 || cast(i64, d.pg) == 0 || pg.holds(d.pg, c) == 0) { return _key_in(user, p); }
+    let is *pg.Page as root = d.pg;
+    d.pg = c;
+    let is i64 as r = _key_in(user, p);
+    d.pg = root;
+    return r;
 }
 
 // The wheel goes to the nearest box under the pointer that can still scroll that way.
 fn _page_wheel(user as *u8, p as *pv.Pointer) as i64 {
     let is *Doc as d = cast(*Doc, user);
     if (_has_page(d) == 0) { return 0; }
+    let is *pg.Page as fw = _frame_under(d, p);
+    if (cast(i64, fw) != 0) {
+        let is layout.Hit as fh with mut;
+        pg.hit_at(fw, _lp.x + _lp.sx, _lp.y + _lp.sy, _lp.sx, _lp.sy, &fh);
+        if (fh.box != null && layout.scroll_boxes(fh.box, p.dx, p.dy) == 1) {
+            pg.replace(fw, &fw.frame.list);
+            _restyle_frames(d);
+            return 1;
+        }
+        if (pg.frame_scroll(fw, p.dy) == 1) {
+            _restyle_frames(d);
+            return 1;
+        }
+        return 0;
+    }
     let is layout.Hit as h with mut;
     _hit_of(d, p, &h);
     if (h.box == null || layout.scroll_boxes(h.box, p.dx, p.dy) == 0) { return 0; }
@@ -1846,10 +2253,33 @@ fn _date_key(d as *Doc, n as *dom.Node, k as i32, mods as i64) as i64 {
     return 1;
 }
 
-fn _page_key(user as *u8, p as *pv.Pointer) as i64 {
+fn _key_in(user as *u8, p as *pv.Pointer) as i64 {
     let is *Doc as d = cast(*Doc, user);
     if (_has_page(d) == 0) { return 0; }
     let is i32 as k = cast(i32, p.key);
+    if (pg.js_on(d.pg) == 1) {
+        // The focus, or the body when nothing has it, and the name a script knows the key by.
+        let is *dom.Node as at0 with mut = pg.focused(d.pg);
+        if (at0 == null) { at0 = pg.first_of(d.pg, "body"); }
+        if (at0 != null) {
+            let is [8]u8 as ch;
+            let is *u8 as nm with mut = cast(*u8, &ch);
+            let is i64 as nn0 with mut = 1;
+            let is i64 as kv = cast(i64, k);
+            if (kv >= 32 && kv < 127) { ch[0] = cast(u8, kv); }
+            else if (k == keys.TAB) { nm = "Tab"; nn0 = 3; }
+            else if (k == keys.RETURN) { nm = "Enter"; nn0 = 5; }
+            else if (k == keys.ESCAPE) { nm = "Escape"; nn0 = 6; }
+            else if (k == keys.BACKSPACE) { nm = "Backspace"; nn0 = 9; }
+            else { nm = "Unidentified"; nn0 = 12; }
+            let is [6]i64 as info;
+            info[0] = 0; info[1] = 0; info[2] = 0; info[3] = cast(i64, nm); info[4] = nn0; info[5] = kv;
+            let is i64 as ran = pg.js_event(d.pg, at0, "keydown", 7, cast(*i64, &info));
+            if (pg.js_changed() != 0) { _restyle(d); pg.js_clear(); }
+            _keep_js(d);
+            if ((ran & 2) != 0) { return 1; }
+        }
+    }
     if (k == keys.TAB && (p.mods & cast(i64, keys.MOD_CONTROL | keys.MOD_ALT)) == 0) {
         let is i64 as back = cast(i64, (p.mods & cast(i64, keys.MOD_SHIFT)) != 0);
         let is *dom.Node as next = forms.next_focusable(&d.pg.doc, pg.focused(d.pg), back);
@@ -1950,7 +2380,9 @@ fn run() as void {
     }
 }
 
-fn _start_fetching() as void { fetcher.start(fn_ptr(_tell_loop), cast(*u8, 0)); }
+fn _release_frame_image(im as *dl.Image) as void { pv.release_image(br.t, im); }
+fn _start_fetching() as void {
+    pg.image_release = cast(*u8, fn_ptr(_release_frame_image)); fetcher.start(fn_ptr(_tell_loop), cast(*u8, 0)); }
 
 // After the program closed: the views are gone, so the lists can go. The textures went
 // with the device.

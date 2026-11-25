@@ -1,0 +1,489 @@
+use "../../std/io.cst" as io;
+
+// === Target descriptor ===
+// Minimal struct kept deliberately small: SysV ABI is maintained internally
+// in all codegen, and FFI ABI conversion (System V → MS x64) happens at
+// IR_FFI_CALL sites driven by extern "dll.dll" annotations — not by reading
+// fields from this struct. We only track OS-specific facts that the
+// compiler genuinely needs at multiple stages.
+struct Target {
+    name as *u8;             // e.g. "linux-x86_64" — also basis for <TARGET> expansion
+    name_len as i32;
+    arch as i32;             // 1 = x86_64, 2 = AArch64, 3 = wasm32, 4 = wasm64
+    syscall_supported as i32;  // 0 → semantic rejects builtin syscall(...)
+    object_format as i32;    // 1 = ELF, 2 = COFF/PE, 3 = CSE, 4 = WASM (.wasm module, no link step)
+    cse_mode as i32;         // 0 = pure, 1 = compat, 2 = bundle (meaningful when object_format == 3)
+    cse_multiarch as i32;    // 1 = the triple names more than one architecture ("caustic",
+                             // "caustic-x86_64-aarch64"), so the driver builds each one and
+                             // fuses them. A single-arch triple links directly.
+    cse_extension_ptr as *u8;  // --extension=<s>. A CSE output always ends in
+    cse_extension_len as i32;  // ".cse", plus ".<s>" unless <s> is "cse" itself.
+                               // Defaults to "exe" for a POLYGLOT, whose offset 0
+                               // is MZ and which Windows will not run without it.
+                               // A pure image starts with CST_ — there is nothing
+                               // in it for Windows to run — so it defaults to a
+                               // plain ".cse". See cse_normalize_output.
+    cse_extension_explicit as i32;  // 1 = --extension= was given, so it wins over
+                                    // whatever the mode would have chosen.
+    allow_unsupported as i32; // 1 → __compile_error() is downgraded to a no-op (build anyway)
+    app_version_ptr as *u8;   // free-form program version string for the CSE header, or null
+    app_version_len as i32;
+    cse_stack_size as i32;    // user-stack bytes for the CSE header (0x2C). 0 = not set by a
+                              // flag → codegen COMPUTES it from the call graph (sa_compute).
+                              // >0 = explicit --stack-size override. For a dynamic-stack
+                              // program (below) this is reinterpreted as the reserve CEILING.
+    cse_stack_dynamic as i32; // 1 = the program's worst case is undecidable statically
+                              // (recursion / indirect call), so codegen emits prologue stack
+                              // probes that grow the committed stack on demand via SYS_COMMIT.
+                              // The CSE header flags byte (0x07 bit0) carries this to the
+                              // loader, which reserves the ceiling but commits only an initial
+                              // window. Explicit growth — NOT demand paging.
+    cse_window as i32;        // 1 = --window: the program opens its own window on the
+                              // CausticOS desktop (CSE header flags bit1). A desktop runs
+                              // anything without it in a terminal.
+    cse_service as i32;       // 1 = --service: the system starts it, with the channels or
+                              // configuration it needs (CSE header flags bit2). A desktop
+                              // does not offer it as an app to click.
+    cse_fixture as i32;       // 1 = --fixture: a development fixture, not an application
+                              // (CSE header flags bit3). Nothing offers it to a user.
+    debug as i32;             // 1 = -g: emit debug info (DWARF for ELF, always on for PE).
+}
+
+let is i32 as ARCH_X86_64 with imut = 1;
+let is i32 as ARCH_AARCH64 with imut = 2;
+let is i32 as ARCH_WASM32 with imut = 3;   // WebAssembly, 32-bit linear memory
+let is i32 as ARCH_WASM64 with imut = 4;   // WebAssembly, 64-bit linear memory (memory64)
+
+// Active target — global struct, populated once via target_init() then
+// reconfigured by load_target() when --target= is parsed.
+let is Target as g_target with mut;
+let is i32 as _target_inited with mut = 0;
+
+// Module-only (separate compilation): when set, codegen emits ONLY the
+// functions/globals whose mangled name starts with g_module_prefix (the input
+// module's own prefix), leaving everything else as external symbols resolved at
+// link time. The prefix is computed by semantic's analyze() from the input path
+// (so the input module is compiled with its canonical import prefix, not the
+// unprefixed root convention). Default off — normal whole-program builds are
+// untouched.
+let is i32 as g_module_only with mut = 0;
+let is *u8 as g_module_prefix_ptr with mut = cast(*u8, 0);
+let is i32 as g_module_prefix_len with mut = 0;
+
+// Unwind tables: a Linux x86_64 ELF executable gets a loaded .eh_frame and
+// .eh_frame_hdr from caustic-ld, and caustic-ld defines `__eh_frame_hdr` for
+// the program to find them (std/exceptions.cst's backtrace reads them). Builds
+// that link some other way do not: a shared object, a freestanding image, the
+// dynamic stdlib (-lcaustic) or a link against -l libraries. main.cst turns
+// this off for those; the `__unwind_tables` builtin and the -O2 frame-pointer
+// omission both read it.
+let is i32 as g_unwind_off with mut = 0;
+fn unwind_tables_off() as void { g_unwind_off = 1; }
+fn unwind_tables() as i32 {
+    target_init();
+    if (g_unwind_off == 1) { return 0; }
+    if (g_target.object_format != 1 || g_target.arch != ARCH_X86_64) { return 0; }
+    return 1;
+}
+
+fn module_only_get() as i32 { return g_module_only; }
+fn module_only_set(v as i32) as void { g_module_only = v; }
+fn module_prefix_set(ptr as *u8, len as i32) as void { g_module_prefix_ptr = ptr; g_module_prefix_len = len; }
+fn module_prefix_ptr_get() as *u8 { return g_module_prefix_ptr; }
+fn module_prefix_len_get() as i32 { return g_module_prefix_len; }
+
+// --emit-deps <file>: after semantic, write the normalized path of every
+// module loaded during this compile (one per line). The maker uses it to drive
+// per-module separate compilation. Null = off.
+let is *u8 as g_emit_deps_path with mut = cast(*u8, 0);
+fn emit_deps_path_set(p as *u8) as void { g_emit_deps_path = p; }
+fn emit_deps_path_get() as *u8 { return g_emit_deps_path; }
+// --write-deps: the same list, by a build that goes on to build.
+let is *u8 as g_write_deps_path with mut = cast(*u8, 0);
+fn write_deps_path_set(p as *u8) as void { g_write_deps_path = p; }
+fn write_deps_path_get() as *u8 { return g_write_deps_path; }
+
+// --csti-dir <dir>: directory holding per-module binary interface images
+// (<dir>/<mod-prefix>.csti). Stage 3: when set, an importer reads an import's
+// interface from here (skipping full re-analysis) instead of its source, and
+// --emit-csti writes the image here. Null = off (whole-program never uses .csti).
+let is *u8 as g_csti_dir with mut = cast(*u8, 0);
+let is i32 as g_csti_dir_len with mut = 0;
+fn csti_dir_set(p as *u8, len as i32) as void { g_csti_dir = p; g_csti_dir_len = len; }
+fn csti_dir_get() as *u8 { return g_csti_dir; }
+fn csti_dir_len_get() as i32 { return g_csti_dir_len; }
+
+fn target_init() as void {
+    if (_target_inited == 1) { return; }
+    g_target.name = "linux-x86_64";
+    g_target.name_len = 12;
+    g_target.arch = ARCH_X86_64;
+    g_target.syscall_supported = 1;
+    g_target.object_format = 1;
+    g_target.cse_multiarch = 0;
+    g_target.cse_mode = 0;
+    g_target.cse_extension_ptr = "exe";
+    g_target.cse_extension_len = 3;
+    g_target.cse_extension_explicit = 0;
+    g_target.allow_unsupported = 0;
+    g_target.app_version_ptr = cast(*u8, 0);
+    g_target.app_version_len = 0;
+    g_target.cse_stack_size = 0;   // 0 = compute from call graph; --stack-size overrides
+    g_target.cse_stack_dynamic = 0;   // set by sa_compute on recursion/indirect call
+    g_target.cse_window = 0;
+    g_target.cse_service = 0;
+    g_target.cse_fixture = 0;
+    g_target.debug = 0;
+    _target_inited = 1;
+}
+
+fn target_get() as *Target {
+    if (_target_inited == 0) { target_init(); }
+    return &g_target;
+}
+
+// CSE mode/extension accessors. Kept as plain functions (rather than letting
+// callers reach into g_target across modules) to match how the rest of the
+// codebase reads the target — through target_get() — and to keep the storage
+// private to this module.
+fn cse_multiarch_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_multiarch;
+}
+
+fn cse_mode_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_mode;
+}
+
+fn cse_mode_set(m as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_mode = m;
+}
+
+fn cse_extension_ptr_get() as *u8 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_extension_ptr;
+}
+
+fn cse_extension_len_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_extension_len;
+}
+
+fn cse_extension_explicit_get() as i32 {
+    target_init();
+    return g_target.cse_extension_explicit;
+}
+
+fn cse_extension_set(p as *u8, l as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_extension_ptr = p;
+    g_target.cse_extension_len = l;
+    g_target.cse_extension_explicit = 1;
+}
+
+// Declared user-stack size (CSE header 0x2C). Programs that recurse deeply
+// (the self-host compiler) raise it via --stack-size.
+fn cse_stack_size_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_stack_size;
+}
+
+fn cse_stack_size_set(n as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_stack_size = n;
+}
+
+// Dynamic-stack flag (CSE header 0x07 bit0): the program grows its stack via
+// prologue probes + SYS_COMMIT instead of declaring a fixed committed size.
+fn cse_stack_dynamic_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_stack_dynamic;
+}
+
+fn cse_stack_dynamic_set(v as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_stack_dynamic = v;
+}
+
+// Window flag (CSE header 0x07 bit1): the program opens its own window, so a
+// desktop launching it starts it as is instead of inside a terminal.
+fn cse_window_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_window;
+}
+
+fn cse_window_set(v as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_window = v;
+}
+
+// Service flag (CSE header 0x07 bit2): the system starts this program, with the
+// channels or configuration it needs. A desktop does not offer it as an app.
+fn cse_service_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_service;
+}
+
+fn cse_service_set(v as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_service = v;
+}
+
+// Fixture flag (CSE header 0x07 bit3): a development fixture, not an
+// application. Nothing offers it to a user.
+fn cse_fixture_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.cse_fixture;
+}
+
+fn cse_fixture_set(v as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.cse_fixture = v;
+}
+
+// -g: emit debug info. For ELF this turns on the .cstdebug/.cstlocals/.cstsigs/
+// .cststructs producer and the linker's DWARF emission; the PE path emits its
+// CodeView/PDB debug info unconditionally and ignores this flag.
+fn debug_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.debug;
+}
+
+fn debug_set(v as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.debug = v;
+}
+
+// __compile_error() downgrade flag. When set (via --allow-unsupported, the
+// __allow_unsupported builtin, or a Causticfile `allow_unsupported` key),
+// codegen skips compile-error markers instead of aborting the build.
+fn allow_unsupported_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.allow_unsupported;
+}
+
+fn allow_unsupported_set(v as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.allow_unsupported = v;
+}
+
+// Whether this target's loader can open a foreign library at all: a DLL is
+// Windows', a shared object (.so, .so.N) every other system's. An ELF that
+// calls into user32.dll, or a PE that calls into libc.so.6, can only reach
+// that call on a path the program never takes on this target. CSE (both
+// systems in one image) and WASM decide for themselves: always loadable here.
+fn foreign_library_loadable(lib as *u8, len as i32) as i32 {
+    if (_target_inited == 0) { target_init(); }
+    let is i32 as fmt = g_target.object_format;
+    if (fmt == 3 || fmt == 4) { return 1; }
+    if (fmt == 2) { return cast(i32, _is_shared_object(lib, len) == 0); }
+    return cast(i32, _ends_with_ci(lib, len, ".dll", 4) == 0);
+}
+
+fn _lower(c as u8) as u8 {
+    if (c >= cast(u8, 65) && c <= cast(u8, 90)) { return c + cast(u8, 32); }
+    return c;
+}
+
+fn _ends_with_ci(s as *u8, n as i32, suffix as *u8, sn as i32) as i32 {
+    if (n < sn) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < sn) {
+        if (_lower(s[n - sn + i]) != suffix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// "libc.so", "libX11.so.6": ".so" at the end or followed by a version.
+fn _is_shared_object(s as *u8, n as i32) as i32 {
+    if (_ends_with_ci(s, n, ".so", 3) == 1) { return 1; }
+    let is i32 as i with mut = 0;
+    while (i + 4 <= n) {
+        if (s[i] == cast(u8, 46) && _lower(s[i + 1]) == cast(u8, 115) && _lower(s[i + 2]) == cast(u8, 111) &&
+            s[i + 3] == cast(u8, 46)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// A call into a library foreign_library_loadable() refuses. Whole-program
+// builds (`-c` included) stop here, naming it: the call is reachable on this
+// target. Module-only emission cannot know, and lets the caller emit a trap.
+fn unloadable_foreign_call(name as *u8, name_len as i32, lib as *u8, lib_len as i32) as void {
+    if (g_module_only == 1 || allow_unsupported_get() == 1) { return; }
+    io.eprint_str("error: call to ");
+    io._write_fd(io.STDERR, name, cast(i64, name_len));
+    io.eprint_str(" in ");
+    io._write_fd(io.STDERR, lib, cast(i64, lib_len));
+    io.eprint_str(" reached codegen for a target that cannot load that library; guard it with os.current()\n");
+    io.exit(1);
+}
+
+// Free-form program version string embedded in the CSE binary. The header
+// (@0x1C) holds a file offset to a NUL-terminated copy of this string (0 if
+// unset). Set from --app-version=<string> (or the Causticfile `version`).
+fn app_version_set(ptr as *u8, len as i32) as void {
+    if (_target_inited == 0) { target_init(); }
+    g_target.app_version_ptr = ptr;
+    g_target.app_version_len = len;
+}
+
+fn app_version_ptr_get() as *u8 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.app_version_ptr;
+}
+
+fn app_version_len_get() as i32 {
+    if (_target_inited == 0) { target_init(); }
+    return g_target.app_version_len;
+}
+
+fn str_eq_local(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Parse triple string → reconfigures g_target. Returns 1 on success, 0 on unknown.
+// Accepts: "linux-x86_64", "windows-x86_64", "caustic-x86_64".
+// Note: cse_mode / cse_extension are NOT reset here — they are owned by the
+// --mode= / --extension= flags and zero-initialised in target_init(), so this
+// stays agnostic to flag ordering on the command line.
+fn load_target(triple as *u8, triple_len as i32) as i32 {
+    target_init();
+    if (str_eq_local(triple, triple_len, "linux-x86_64", 12) == 1) {
+        g_target.name = "linux-x86_64";
+        g_target.name_len = 12;
+        g_target.arch = ARCH_X86_64;
+        g_target.syscall_supported = 1;
+        g_target.object_format = 1;
+        return 1;
+    }
+    if (str_eq_local(triple, triple_len, "linux-aarch64", 13) == 1) {
+        g_target.name = "linux-aarch64";
+        g_target.name_len = 13;
+        g_target.arch = ARCH_AARCH64;
+        g_target.syscall_supported = 1;
+        g_target.object_format = 1;
+        return 1;
+    }
+    if (str_eq_local(triple, triple_len, "windows-x86_64", 14) == 1) {
+        g_target.name = "windows-x86_64";
+        g_target.name_len = 14;
+        g_target.arch = ARCH_X86_64;
+        g_target.syscall_supported = 0;
+        g_target.object_format = 2;
+        return 1;
+    }
+    if (str_eq_local(triple, triple_len, "windows-aarch64", 15) == 1) {
+        // Windows on ARM64. Same PE container as windows-x86_64; the callee ABI
+        // is AAPCS64, so the backend needs no argument reshuffle — only the
+        // COFF Machine field, the IAT call sequence and the unwind tables differ.
+        g_target.name = "windows-aarch64";
+        g_target.name_len = 15;
+        g_target.arch = ARCH_AARCH64;
+        g_target.syscall_supported = 0;
+        g_target.object_format = 2;
+        return 1;
+    }
+    if (str_eq_local(triple, triple_len, "caustic-x86_64", 14) == 1) {
+        // CausticOS native target. ABI is Linux-syscall-compatible in the MVP,
+        // so syscall(...) is permitted; the final executable is emitted in the
+        // CSE format by caustic-linker (object_format == 3).
+        g_target.name = "caustic-x86_64";
+        g_target.name_len = 14;
+        g_target.arch = ARCH_X86_64;
+        g_target.syscall_supported = 1;
+        g_target.object_format = 3;
+        return 1;
+    }
+    // "caustic" and "caustic-x86_64-aarch64" name every architecture CausticOS
+    // runs on. The suffixed forms below name exactly one, matching how
+    // linux-x86_64 and windows-x86_64 read.
+    if (str_eq_local(triple, triple_len, "caustic", 7) == 1
+        || str_eq_local(triple, triple_len, "caustic-x86_64-aarch64", 22) == 1) {
+        g_target.name = "caustic-x86_64-aarch64";
+        g_target.name_len = 22;
+        g_target.arch = ARCH_X86_64;      // the driver overrides this per sub-build
+        g_target.syscall_supported = 1;
+        g_target.object_format = 3;
+        g_target.cse_multiarch = 1;
+        return 1;
+    }
+    if (str_eq_local(triple, triple_len, "caustic-aarch64", 15) == 1) {
+        // CausticOS on AArch64. Same CSE container as caustic-x86_64 — only the
+        // arch byte in the image header and the code inside differ. The linker's
+        // relocation pass already resolves R_AARCH64_*, so nothing else changes.
+        g_target.name = "caustic-aarch64";
+        g_target.name_len = 15;
+        g_target.arch = ARCH_AARCH64;
+        g_target.syscall_supported = 1;
+        g_target.object_format = 3;
+        return 1;
+    }
+    // WebAssembly. Accept the conventional spellings (wasm32-wasi / wasm32,
+    // wasm64-wasi / wasm64) but normalise the internal name to the os-arch form
+    // "wasm-wasm32" / "wasm-wasm64" so target_os_name() yields "wasm" (drives
+    // <TARGET> facade paths → std/io/wasm.cst) and target_arch_name() yields
+    // "wasm32"/"wasm64" (drives the codegen memory model). No raw syscall(...)
+    // (syscall_supported = 0 → WASI imports instead); object_format = 4 emits a
+    // complete .wasm module directly from codegen, bypassing assembler + linker.
+    if (str_eq_local(triple, triple_len, "wasm32-wasi", 11) == 1
+        || str_eq_local(triple, triple_len, "wasm32", 6) == 1) {
+        g_target.name = "wasm-wasm32";
+        g_target.name_len = 11;
+        g_target.arch = ARCH_WASM32;
+        g_target.syscall_supported = 0;
+        g_target.object_format = 4;
+        return 1;
+    }
+    if (str_eq_local(triple, triple_len, "wasm64-wasi", 11) == 1
+        || str_eq_local(triple, triple_len, "wasm64", 6) == 1) {
+        g_target.name = "wasm-wasm64";
+        g_target.name_len = 11;
+        g_target.arch = ARCH_WASM64;
+        g_target.syscall_supported = 0;
+        g_target.object_format = 4;
+        return 1;
+    }
+    return 0;
+}
+
+// Just the OS portion of the triple ("linux" or "windows") — for <TARGET>
+// expansion in `use` paths so that `std/io/<TARGET>.cst` resolves to
+// `std/io/linux.cst` rather than `std/io/linux-x86_64.cst`.
+fn target_os_name(out_len as *i32) as *u8 {
+    target_init();
+    let is i32 as i with mut = 0;
+    while (i < g_target.name_len) {
+        if (g_target.name[i] == 45) {  // '-'
+            *out_len = i;
+            return g_target.name;
+        }
+        i = i + 1;
+    }
+    *out_len = g_target.name_len;
+    return g_target.name;
+}
+
+// Architecture component of the target triple ("x86_64" or "aarch64").
+fn target_arch_name(out_len as *i32) as *u8 {
+    target_init();
+    let is i32 as i with mut = 0;
+    while (i < g_target.name_len) {
+        if (g_target.name[i] == 45) {
+            *out_len = g_target.name_len - i - 1;
+            return cast(*u8, cast(i64, g_target.name) + cast(i64, i) + 1);
+        }
+        i = i + 1;
+    }
+    *out_len = 0;
+    return g_target.name;
+}

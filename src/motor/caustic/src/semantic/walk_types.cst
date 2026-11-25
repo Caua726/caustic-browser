@@ -1,0 +1,201 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "types.cst" as ty;
+use "generics.cst" as gn;
+use "modules.cst" as mod;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../lexer/tokens.cst" as tok;
+use "../lexer/lexer.cst" as lex;
+use "../parser/top.cst" as top;
+use "../parser/cache_read.cst" as cr;
+use "../codegen/target.cst" as tgt;
+
+// === Module loading (needs lexer+parser) ===
+
+fn load_module(path_ptr as *u8, path_len as i32) as *u8 {
+    // Resolve + normalize relative to current source directory
+    let is i32 as norm_len with mut = 0;
+    let is *u8 as norm = sc.resolve_module_path(path_ptr, path_len, &norm_len);
+
+    // Stage 3: when --csti-dir is configured (incremental --module-only build),
+    // read this import's interface from <csti_dir>/<prefix>.csti — a binary image
+    // carrying types/signatures/globals + imut bodies + generic templates (regular
+    // fn bodies stripped). Skips full re-analysis of the import. GATED on csti_dir
+    // so whole-program builds never consume .csti. Freshness via mtime.
+    let is *u8 as cdir = tgt.csti_dir_get();
+    if (cast(i64, cdir) != 0) {
+        let is i32 as cdlen = tgt.csti_dir_len_get();
+        let is *u8 as pfx = sc.get_mod_prefix(norm, norm_len);
+        let is i32 as pfxlen = sc.get_mod_prefix_len(norm, norm_len);
+        let is *u8 as cpath = d.sem_alloc(cast(i64, cdlen) + cast(i64, pfxlen) + 7);
+        mem.memcpy(cpath, cdir, cast(i64, cdlen));
+        cpath[cdlen] = cast(u8, 47); // '/'
+        mem.memcpy(cast(*u8, cast(i64, cpath) + cast(i64, cdlen) + 1), pfx, cast(i64, pfxlen));
+        let is i32 as eat = cdlen + 1 + pfxlen;
+        mem.memcpy(cast(*u8, cast(i64, cpath) + cast(i64, eat)), ".csti", 5);
+        cpath[eat + 5] = cast(u8, 0);
+        let is i64 as cmt = io.mtime(cpath);
+        if (cmt > 0 && cmt >= io.mtime(norm)) {
+            let is *ast.Node as csti_root = cr.read_csti_nocheck(cpath);
+            if (cast(i64, csti_root) != 0) {
+                // current_source_dir lets the module's own `use` lines (carried in
+                // the image) resolve transitively (they also hit this .csti path).
+                let is i32 as ndl = sc.get_dir_len(norm, norm_len);
+                if (ndl > 0) {
+                    sc.current_source_dir_ptr = d.str_dup(norm, ndl);
+                    sc.current_source_dir_len = ndl;
+                } else {
+                    sc.current_source_dir_ptr = cast(*u8, 0);
+                    sc.current_source_dir_len = 0;
+                }
+                mod.last_loaded_src = cast(*u8, 0);
+                mod.last_loaded_src_len = 0;
+                mod.last_loaded_tl = cast(*u8, 0);
+                mod.last_loaded_filename = norm;
+                return cast(*u8, csti_root);
+            }
+        }
+    }
+
+    // Check if .csti interface exists and is newer than .cst
+    let is *u8 as load_path with mut = norm;
+    let is i32 as load_len with mut = norm_len;
+    // Build .csti path: norm + "i"
+    let is *u8 as csti_path = d.sem_alloc(cast(i64, norm_len) + 2);
+    mem.memcpy(csti_path, norm, cast(i64, norm_len));
+    csti_path[norm_len] = 105; // 'i'
+    csti_path[norm_len + 1] = cast(u8, 0);
+    let is i64 as csti_mtime = io.mtime(csti_path);
+    if (csti_mtime > 0 && csti_mtime >= io.mtime(norm)) {
+        load_path = csti_path;
+        load_len = norm_len + 1;
+    }
+
+    let is i64 as file_size with mut = 0;
+    let is *u8 as src = mod.read_file(load_path, &file_size);
+    if (cast(i64, src) == 0) {
+        io.write_str(io.STDERR, "Erro: nao foi possivel ler modulo: '");
+        io.write_bytes(io.STDERR, norm, cast(i64, norm_len));
+        io.write_str(io.STDERR, "'\n");
+        io.exit(cast(i32, cast(i32, 1)));
+    }
+    // Update current_source_dir to normalized path's directory
+    let is i32 as new_dir_len = sc.get_dir_len(norm, norm_len);
+    if (new_dir_len > 0) {
+        sc.current_source_dir_ptr = d.str_dup(norm, new_dir_len);
+        sc.current_source_dir_len = new_dir_len;
+    } else {
+        sc.current_source_dir_ptr = cast(*u8, 0);
+        sc.current_source_dir_len = 0;
+    }
+
+    let is *tok.TokenList as tl_heap = cast(*tok.TokenList, d.sem_alloc(sizeof(tok.TokenList)));
+    let is tok.TokenList as tokens = lex.tokenize(src, file_size, load_path);
+    tl_heap.data = tokens.data;
+    tl_heap.count = tokens.count;
+    tl_heap.cap = tokens.cap;
+    let is *ast.Node as parsed_root = top.parse_file(tl_heap, src, file_size, load_path);
+
+    // Save module src/tokens for error reporting
+    mod.last_loaded_src = src;
+    mod.last_loaded_src_len = file_size;
+    mod.last_loaded_tl = cast(*u8, tl_heap);
+    mod.last_loaded_filename = norm;
+
+    return cast(*u8, parsed_root);
+}
+
+// === Generic struct instantiation wrapper ===
+
+fn try_instantiate_generic_struct(ty_ptr as *u8) as void {
+    if (cast(i64, ty_ptr) == 0) { return; }
+    let is *ast.Type as t = cast(*ast.Type, ty_ptr);
+    if (t.kind == ast.TY_STRUCT && cast(i64, t.fields) == 0 && t.gen_arg_count > 0 && t.base_name_len > 0) {
+        // Check if already exists
+        let is *u8 as existing with mut = ty.lookup_struct(t.name_ptr, t.name_len);
+        if (cast(i64, existing) != 0) { return; }
+        // Try with module prefix
+        if (sc.current_mod_prefix_len > 0) {
+            let is i32 as mlen with mut = 0;
+            let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, t.name_ptr, t.name_len, &mlen);
+            existing = ty.lookup_struct(mangled, mlen);
+            if (cast(i64, existing) != 0) { d.sem_free(mangled); return; }
+            d.sem_free(mangled);
+        }
+        // Handle dot-qualified base names (e.g. "sl.Slice", "hub.sl.Slice")
+        let is i32 as tail_off with mut = 0;
+        let is i32 as chain_only with mut = 0;
+        let is *d.Module as chain_mod = sc.resolve_mod_path(t.base_name_ptr, t.base_name_len, &tail_off, &chain_only);
+        if (cast(i64, chain_mod) != 0) {
+            let is *u8 as tname_ptr = cast(*u8, cast(i64, t.base_name_ptr) + cast(i64, tail_off));
+            let is i32 as tname_len = t.base_name_len - tail_off;
+            let is *d.Module as modd with mut = chain_mod;
+            // Look up template by type name with matching module prefix
+            let is *d.GenericTemplate as tmpl with mut = gn.lookup_template_prefixed(tname_ptr, tname_len, modd.prefix_ptr, modd.prefix_len);
+            // Fallback: search submodules (for 'only' imports)
+            if (cast(i64, tmpl) == 0 && chain_only == 1) {
+                let is *d.SubModule as sm with mut = cast(*d.SubModule, modd.submodules);
+                while (cast(i64, sm) != 0 && cast(i64, tmpl) == 0) {
+                    let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                    tmpl = gn.lookup_template_prefixed(tname_ptr, tname_len, sub.prefix_ptr, sub.prefix_len);
+                    if (cast(i64, tmpl) != 0) {
+                        modd = sub;
+                    }
+                    sm = cast(*d.SubModule, sm.next);
+                }
+            }
+            if (cast(i64, tmpl) != 0 && tmpl.is_function == 0) {
+                // Build proper mangled name: prefix_TypeName_Args
+                let is *u8 as real_base = gn.mangle_generic(tname_ptr, tname_len, t.gen_args, t.gen_arg_count);
+                let is i32 as rb_len = gn.str_len(real_base);
+                let is i32 as full_len with mut = 0;
+                let is *u8 as full_name = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, real_base, rb_len, &full_len);
+                // Check if already exists with proper name
+                existing = ty.lookup_struct(full_name, full_len);
+                if (cast(i64, existing) == 0) {
+                    gn.instantiate_struct(tmpl, t.gen_args, t.gen_arg_count, full_name, full_len);
+                }
+                // Update type to use proper mangled name
+                t.name_ptr = full_name;
+                t.name_len = full_len;
+            }
+        } else {
+            // Look up template by base name (no dot)
+            let is *d.GenericTemplate as tmpl = gn.lookup_template(t.base_name_ptr, t.base_name_len);
+            if (cast(i64, tmpl) != 0 && tmpl.is_function == 0) {
+                gn.instantiate_struct(tmpl, t.gen_args, t.gen_arg_count, t.name_ptr, t.name_len);
+            }
+        }
+    }
+    // Recurse into pointer/array base
+    if (t.kind == ast.TY_PTR || t.kind == ast.TY_ARRAY) {
+        if (cast(i64, t.base) != 0) {
+            try_instantiate_generic_struct(cast(*u8, t.base));
+        }
+    }
+}
+
+fn resolve_type(ty_ptr as *u8) as void {
+    try_instantiate_generic_struct(ty_ptr);
+    ty.resolve_type_ref(ty_ptr);
+}
+
+// Resolve type and return the proper pointer (handles aliases -> singletons)
+fn resolve_type_ptr(ty_ptr as *u8) as *ast.Type {
+    let is *u8 as resolved = ty.resolve_alias(ty_ptr);
+    if (cast(i64, resolved) != cast(i64, ty_ptr)) {
+        // Aliases are normally resolved by resolve_fields (pass 3), but an
+        // alias can reach us unresolved when its module body never went
+        // through that sweep — a .csti image on the incremental path. Resolving
+        // here is a no-op once it has fields, so it only ever fills a hole.
+        resolve_type(resolved);
+        return cast(*ast.Type, resolved);
+    }
+    resolve_type(ty_ptr);
+    return cast(*ast.Type, ty_ptr);
+}
+
+// === Extracted walk helpers ===
+

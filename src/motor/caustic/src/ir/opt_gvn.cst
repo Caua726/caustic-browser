@@ -1,0 +1,361 @@
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "dom.cst" as dom;
+use "../parser/ast.cst" as ast;
+use "phi.cst" as phi;
+
+// === GVN: global (cross-block) common-subexpression elimination ===
+//
+// -O2 only. Reuses the CFG + dominator tree (cfg.cst/dom.cst) that until now
+// only mem2reg used. Replaces a redundant pure computation with a MOV from an
+// earlier identical one when that earlier def DOMINATES the current site (the
+// allocator's George coalescing then folds the MOV away).
+//
+// SAFETY for Caustic's MULTI-DEF IR: a vreg can be reassigned (the IR reuses
+// `v0` across `IMM v0=0; IMM v0=10`), so "same vreg" does NOT imply "same value"
+// in general. We sidestep this entirely by only ever touching expressions whose
+// VREG operands AND whose dest are SINGLE-DEF (defined exactly once in the
+// function). For a single-def vreg, its value is the same at every program point
+// it is live, so a dominating identical expression is provably the same value.
+// Conservative (skips multi-def operands) but never miscompiles.
+
+// does block `a` dominate block `b`?  (idom chain walk; entry == block 0)
+fn gvn_dominates(blocks as *cfg.BasicBlock, a as i32, b as i32) as i32 {
+    if (a == 0) { return 1; }          // entry dominates everything
+    let is i32 as x with mut = b;
+    while (x > 0) {
+        if (x == a) { return 1; }
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, x) * sizeof(cfg.BasicBlock));
+        if (bb.idom < 0) { return 0; } // unreachable block
+        if (bb.idom == x) { return 0; }
+        x = bb.idom;
+    }
+    return 0;
+}
+
+fn pass_gvn(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+
+    // --- build CFG + dominators (same sequence as mem2reg) ---
+    let is i32 as lc = func.label_count + 1;
+    let is i32 as cfg_cap = cfg.count_blocks(func) + 1;
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg_cap) * sizeof(cfg.BasicBlock)));
+    let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as nblocks with mut = 0;
+    cfg.build_cfg(func, blocks, cfg_cap, &nblocks, label_to_bb);
+    if (nblocks <= 0) { return; }
+    let is i32 as max_edges = nblocks * 2 + 4;
+    let is *i32 as preds_arr = cast(*i32, d.opt_alloc(cast(i64, max_edges) * 4));
+    let is *i32 as pred_starts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is *i32 as pred_counts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    cfg.build_preds(blocks, nblocks, preds_arr, pred_starts, pred_counts);
+    let is *i32 as rpo_order = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is i32 as rpo_count with mut = 0;
+    cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
+    dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds_arr, pred_starts, pred_counts);
+
+    // Loop headers: a block that dominates one of its predecessors. A value a
+    // header computes is never reused from another block: loop rotation
+    // (opt_rotate.cst, at codegen) copies the header's test to the bottom of
+    // the loop only when nothing else reads the header's values, and the
+    // header's work is the cheap test of the loop variable (anything
+    // invariant in it LICM has hoisted already).
+    let is *u8 as is_hdr = d.opt_alloc(cast(i64, nblocks) + 1);
+    let is i32 as hb with mut = 0;
+    while (hb < nblocks) {
+        is_hdr[hb] = cast(u8, 0);
+        let is i32 as pc = *(cast(*i32, cast(i64, pred_counts) + cast(i64, hb) * 4));
+        let is i32 as ps = *(cast(*i32, cast(i64, pred_starts) + cast(i64, hb) * 4));
+        let is i32 as pk with mut = 0;
+        while (pk < pc) {
+            let is i32 as p = *(cast(*i32, cast(i64, preds_arr) + cast(i64, ps + pk) * 4));
+            if (gvn_dominates(blocks, hb, p) == 1) { is_hdr[hb] = cast(u8, 1); }
+            pk = pk + 1;
+        }
+        hb = hb + 1;
+    }
+
+    // --- per-vreg LIVE def counts + defining instruction (single-def filter,
+    //     copy resolution). Dead defs (e.g. the IR's reused v0 = dead IMMs) are
+    //     not counted, so an arg vreg copied into temps reads as single-def. ---
+    let is *i32 as def_count = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4); *p = 0;
+        let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, i) * 8); *q = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as ins with mut = func.instructions;
+    while (cast(i64, ins) != 0) {
+        if (ins.is_dead == 0 && ins.dest.op_type == d.OP_VREG && ins.op != d.IR_STORE && ins.op != d.IR_COPY
+            && ins.dest.vreg >= 0 && ins.dest.vreg < vc) {
+            let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, ins.dest.vreg) * 4); *p = *p + 1;
+            let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, ins.dest.vreg) * 8); *q = cast(i64, ins);
+        }
+        ins = ins.next;
+    }
+    // On the SSA form a vreg that destruction gives several definitions (a
+    // version of a variable, a phi) is never replaced nor offered as a value:
+    // such a value is a loop variable, and a copy of an earlier one in its
+    // place would turn the step an induction variable is recognized by into a
+    // MOV. As an operand it is one value like any other (one definition, which
+    // dominates every use), so `CAST k` twice, or `j * M` twice, in a loop
+    // over k and j is computed once.
+    let is *u8 as ml = phi.ssa_multi_like(func);
+    // same[v]: a CAST left in place whose value an earlier one computes.
+    let is *i32 as same = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
+    i = 0;
+    while (i < vc) { *(cast(*i32, cast(i64, same) + cast(i64, i) * 4)) = cast(i32, 0 - 1); i = i + 1; }
+
+    // aonly[v]: every read of v is the address of a load or a store. Such a
+    // value, a base plus a constant, is recomputed in another block rather
+    // than carried there: the access that reads it folds the sum into its
+    // address for free. (A scaled index is still shared: the forwarding of a
+    // stored element to the next iteration's load, opt_rotate.cst, keys on
+    // the one address.)
+    let is *u8 as aonly = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { aonly[i] = cast(u8, 1); i = i + 1; }
+    ins = func.instructions;
+    while (cast(i64, ins) != 0) {
+        if (ins.is_dead == 0) {
+            if (ins.src1.op_type == d.OP_VREG && ins.op != d.IR_LOAD && ins.src1.vreg >= 0 && ins.src1.vreg < vc) { aonly[ins.src1.vreg] = cast(u8, 0); }
+            if (ins.src2.op_type == d.OP_VREG && ins.src2.vreg >= 0 && ins.src2.vreg < vc) { aonly[ins.src2.vreg] = cast(u8, 0); }
+            if (ins.dest.op_type == d.OP_VREG && (ins.op == d.IR_COPY || ins.op == d.IR_CMOV)
+                && ins.dest.vreg >= 0 && ins.dest.vreg < vc) { aonly[ins.dest.vreg] = cast(u8, 0); }
+            if (ins.op == d.IR_PHI) {
+                let is i32 as pn = phi.phi_nargs(ins);
+                let is i32 as pk2 with mut = 0;
+                while (pk2 < pn) {
+                    let is i32 as pv = phi.phi_val(ins, pk2);
+                    if (pv >= 0 && pv < vc) { aonly[pv] = cast(u8, 0); }
+                    pk2 = pk2 + 1;
+                }
+            }
+        }
+        ins = ins.next;
+    }
+
+    // --- value table (open-addressed) ---
+    let is i32 as cap with mut = 256;
+    while (cap < nblocks * 8 + 64) { cap = cap + cap; }
+    let is *i32 as h_used = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    let is *i32 as h_op   = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    let is *i32 as h_s1t  = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    let is *i64 as h_s1v  = cast(*i64, d.opt_alloc(cast(i64, cap) * 8));
+    let is *i32 as h_s2t  = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    let is *i64 as h_s2v  = cast(*i64, d.opt_alloc(cast(i64, cap) * 8));
+    let is *i32 as h_dst  = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    let is *i32 as h_blk  = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    i = 0;
+    while (i < cap) { let is *i32 as p = cast(*i32, cast(i64, h_used) + cast(i64, i) * 4); *p = 0; i = i + 1; }
+    let is i32 as mask = cap - 1;
+
+    // --- main walk: track current block, CSE eligible pure ops ---
+    let is i32 as cur_blk with mut = 0;
+    let is i32 as next_bi with mut = 1;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        // advance current block when we reach the next block's first instruction
+        if (next_bi < nblocks) {
+            let is *cfg.BasicBlock as nb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, next_bi) * sizeof(cfg.BasicBlock));
+            if (cast(i64, nb.first) == cast(i64, inst)) { cur_blk = next_bi; next_bi = next_bi + 1; }
+        }
+        if (inst.is_dead == 0 && gvn_is_pure(inst.op)) {
+            // reachable block only
+            let is *cfg.BasicBlock as cb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, cur_blk) * sizeof(cfg.BasicBlock));
+            let is i32 as reach with mut = 1;
+            if (cur_blk != 0 && cb.idom < 0) { reach = 0; }
+            // eligibility: dest + all vreg operands single-def
+            let is i32 as elig with mut = reach;
+            if (inst.dest.op_type != d.OP_VREG) { elig = 0; }
+            else if (gvn_defc(def_count, vc, inst.dest.vreg) != 1) { elig = 0; }
+            else if (ml[inst.dest.vreg] == cast(u8, 1)) { elig = 0; }
+            if (elig == 1 && inst.src1.op_type == d.OP_VREG && gvn_defc(def_count, vc, inst.src1.vreg) != 1) { elig = 0; }
+            if (elig == 1 && inst.src2.op_type == d.OP_VREG && gvn_defc(def_count, vc, inst.src2.vreg) != 1) { elig = 0; }
+            if (elig == 1) {
+                let is i32 as s1t = cast(i32, inst.src1.op_type);
+                let is i64 as s1v with mut = 0;
+                if (s1t == d.OP_VREG) { s1v = cast(i64, gvn_resolve(def_inst, def_count, same, vc, inst.src1.vreg)); } else if (s1t == d.OP_IMM) { s1v = inst.src1.imm; }
+                let is i32 as s2t = cast(i32, inst.src2.op_type);
+                let is i64 as s2v with mut = 0;
+                if (s2t == d.OP_VREG) { s2v = cast(i64, gvn_resolve(def_inst, def_count, same, vc, inst.src2.vreg)); } else if (s2t == d.OP_IMM) { s2v = inst.src2.imm; }
+                // The operation key carries the type: an i32 ADD and an i64
+                // ADD of the same operands are different values (the narrow
+                // one is extended from 32 bits), f32 and f64 are never
+                // interchangeable, and a CAST is its source and target types.
+                let is i32 as value_op = cast(i32, inst.op) * 4096 + gvn_type_key(inst);
+                let is i64 as hh with mut = cast(i64, value_op) * 1000003 + s1v * 131 + s2v * 17 + cast(i64, s1t) * 7 + cast(i64, s2t) * 3;
+                if (hh < 0) { hh = 0 - hh; }
+                let is i32 as slot with mut = cast(i32, hh & cast(i64, mask));
+                let is i32 as found with mut = 0;
+                let is i32 as probes with mut = 0;
+                while (probes < cap) {
+                    let is *i32 as up = cast(*i32, cast(i64, h_used) + cast(i64, slot) * 4);
+                    if (*up == 0) { probes = cap; }   // empty -> miss
+                    else {
+                        let is *i32 as op_p = cast(*i32, cast(i64, h_op) + cast(i64, slot) * 4);
+                        let is *i32 as s1t_p = cast(*i32, cast(i64, h_s1t) + cast(i64, slot) * 4);
+                        let is *i64 as s1v_p = cast(*i64, cast(i64, h_s1v) + cast(i64, slot) * 8);
+                        let is *i32 as s2t_p = cast(*i32, cast(i64, h_s2t) + cast(i64, slot) * 4);
+                        let is *i64 as s2v_p = cast(*i64, cast(i64, h_s2v) + cast(i64, slot) * 8);
+                        if (*op_p == value_op && *s1t_p == s1t && *s1v_p == s1v && *s2t_p == s2t && *s2v_p == s2v) {
+                            // key match — does its block dominate ours?
+                            let is *i32 as blk_p = cast(*i32, cast(i64, h_blk) + cast(i64, slot) * 4);
+                            let is *i32 as dst_p = cast(*i32, cast(i64, h_dst) + cast(i64, slot) * 4);
+                            let is i32 as dom_ok = cast(i32, gvn_dominates(blocks, *blk_p, cur_blk) == 1 && *dst_p != inst.dest.vreg);
+                            if (dom_ok == 1 && inst.op == d.IR_CAST) {
+                                // A CAST stays where it is: readers that are
+                                // not merged themselves (the step of an
+                                // induction variable, say) keep a conversion
+                                // the allocator folds into a register they
+                                // share. Its readers are keyed on the earlier
+                                // value, so whatever is computed from both is
+                                // merged, and a CAST left unread goes in DCE.
+                                let is *i32 as sp = cast(*i32, cast(i64, same) + cast(i64, inst.dest.vreg) * 4);
+                                *sp = *dst_p;
+                                found = 1;
+                            } else if (dom_ok == 1 && (*blk_p == cur_blk || is_hdr[*blk_p] == cast(u8, 0))
+                                       && (*blk_p == cur_blk || aonly[inst.dest.vreg] == cast(u8, 0)
+                                           || inst.op != d.IR_ADD || inst.src2.op_type != d.OP_IMM)) {
+                                // replace this computation with a copy of the dominating value
+                                inst.op = d.IR_MOV;
+                                inst.src1.op_type = d.OP_VREG; inst.src1.vreg = *dst_p;
+                                inst.src2.op_type = d.OP_NONE;
+                                found = 1;
+                            } else {
+                                // same key but not dominating: refresh candidate to this (closer) one
+                                *blk_p = cur_blk;
+                                *dst_p = inst.dest.vreg;
+                                found = 1;
+                            }
+                            probes = cap;
+                        } else {
+                            slot = cast(i32, (cast(i64, slot) + 1) & cast(i64, mask));
+                            probes = probes + 1;
+                        }
+                    }
+                }
+                if (found == 0) {
+                    // insert new candidate at the first empty slot from `slot`
+                    let is i32 as ins_probes with mut = 0;
+                    while (ins_probes < cap) {
+                        let is *i32 as up = cast(*i32, cast(i64, h_used) + cast(i64, slot) * 4);
+                        if (*up == 0) {
+                            *up = 1;
+                            let is *i32 as op_p = cast(*i32, cast(i64, h_op) + cast(i64, slot) * 4); *op_p = value_op;
+                            let is *i32 as s1t_p = cast(*i32, cast(i64, h_s1t) + cast(i64, slot) * 4); *s1t_p = s1t;
+                            let is *i64 as s1v_p = cast(*i64, cast(i64, h_s1v) + cast(i64, slot) * 8); *s1v_p = s1v;
+                            let is *i32 as s2t_p = cast(*i32, cast(i64, h_s2t) + cast(i64, slot) * 4); *s2t_p = s2t;
+                            let is *i64 as s2v_p = cast(*i64, cast(i64, h_s2v) + cast(i64, slot) * 8); *s2v_p = s2v;
+                            let is *i32 as dst_p = cast(*i32, cast(i64, h_dst) + cast(i64, slot) * 4); *dst_p = inst.dest.vreg;
+                            let is *i32 as blk_p = cast(*i32, cast(i64, h_blk) + cast(i64, slot) * 4); *blk_p = cur_blk;
+                            ins_probes = cap;
+                        } else {
+                            slot = cast(i32, (cast(i64, slot) + 1) & cast(i64, mask));
+                            ins_probes = ins_probes + 1;
+                        }
+                    }
+                }
+            }
+        }
+        inst = inst.next;
+    }
+
+    d.opt_free(cast(*u8, h_used)); d.opt_free(cast(*u8, h_op));
+    d.opt_free(cast(*u8, h_s1t)); d.opt_free(cast(*u8, h_s1v));
+    d.opt_free(cast(*u8, h_s2t)); d.opt_free(cast(*u8, h_s2v));
+    d.opt_free(cast(*u8, h_dst)); d.opt_free(cast(*u8, h_blk));
+    d.opt_free(cast(*u8, def_inst));
+    d.opt_free(cast(*u8, def_count));
+    d.opt_free(ml);
+    d.opt_free(cast(*u8, same));
+    d.opt_free(is_hdr);
+    d.opt_free(cast(*u8, rpo_order));
+    d.opt_free(cast(*u8, pred_counts)); d.opt_free(cast(*u8, pred_starts)); d.opt_free(cast(*u8, preds_arr));
+    d.opt_free(cast(*u8, label_to_bb)); d.opt_free(cast(*u8, blocks));
+}
+
+// Resolve a vreg through single-def MOV-copy chains to its ultimate single-def
+// source. Only hops when both the current and the source vreg are single-def
+// (live), so the returned vreg holds a stable value identical to the input's —
+// making two operands that resolve to the same vreg provably equal. This is what
+// lets GVN see `v3=MOV(v0); v3+v4` and `v12=MOV(v0); v12+v13` as the same value.
+fn gvn_resolve(def_inst as *i64, def_count as *i32, same as *i32, vc as i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 64) {
+        if (cur < 0 || cur >= vc) { return cur; }
+        // a CAST kept in place reads as the earlier one with its value
+        let is i32 as sm = *(cast(*i32, cast(i64, same) + cast(i64, cur) * 4));
+        if (sm >= 0) {
+            cur = sm;
+        } else {
+            let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+            let is *d.IRInst as di = cast(*d.IRInst, *dip);
+            if (cast(i64, di) == 0) { return cur; }
+            if (di.op != d.IR_MOV || di.src1.op_type != d.OP_VREG) { return cur; }
+            let is i32 as src = di.src1.vreg;
+            if (src < 0 || src >= vc) { return cur; }
+            let is *i32 as scp = cast(*i32, cast(i64, def_count) + cast(i64, src) * 4);
+            if (*scp != 1) { return cur; }   // don't hop into a multi-def source
+            cur = src;
+        }
+        guard = guard + 1;
+    }
+    return cur;
+}
+
+// The type part of a value's key (below 4096). Integers of 64 bits, pointers
+// and untyped operations share 0, as do f64 and untyped float operations; f32
+// and each narrow integer type have their own. A CAST is keyed by both kinds.
+fn gvn_kind(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    return cast(*ast.Type, t).kind + 1;
+}
+
+fn gvn_type_key(inst as *d.IRInst) as i32 {
+    if (inst.op == d.IR_CAST) { return 1024 + gvn_kind(inst.cast_from) * 32 + gvn_kind(inst.cast_to); }
+    let is i32 as k = gvn_kind(inst.cast_to);
+    if (k == 0 || k == ast.TY_I64 + 1 || k == ast.TY_U64 + 1 || k == ast.TY_PTR + 1 || k == ast.TY_F64 + 1) { return 0; }
+    return k;
+}
+
+fn gvn_defc(def_count as *i32, vc as i32, v as i32) as i32 {
+    if (v < 0 || v >= vc) { return 99; }   // out of range -> treat as multi-def (ineligible)
+    let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, v) * 4);
+    return *p;
+}
+
+// pure, value-producing ops safe to CSE (no memory/side effects; deterministic).
+// Excludes LOAD (aliasing), DIV/MOD (rdx clobber), ADDR_GLOBAL (name-keyed),
+// calls/atomics/control. Floats included: CSE of two IDENTICAL float ops is
+// value-preserving (same operands -> bit-identical result, NaN included); the
+// MOV that replaces the redundant op is register-class-aware (XMM). A CAST is
+// a pure function of its operand and its two types (a conversion to integer
+// truncates and never traps), and its result is always materialized.
+//
+// Comparisons (EQ/NE/LT/LE/GT/GE) are DELIBERATELY excluded: instruction
+// selection fuses a compare that feeds a conditional branch straight into
+// `cmp; jcc` and never materialises the boolean result into its assigned
+// register/slot (the comparison is consumed by the branch alone). GVN CSEing a
+// comparison creates a SECOND consumer — a `MOV dst, <cmp_result>` in another
+// block — which then reads the boolean's slot that the fused branch never wrote,
+// yielding garbage. (This is exactly what miscompiled `_magic_s64`'s repeated
+// `d < 0` tests at -O2 and broke the -O2 self-host.) Recomputing a comparison is
+// a single `cmp`, so the lost CSE is negligible; the arithmetic ops below are
+// where GVN's wins actually are.
+fn gvn_is_pure(op as i32) as i32 {
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
+        || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR
+        || op == d.IR_SHL || op == d.IR_SHR || op == d.IR_NEG || op == d.IR_NOT
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8
+        || op == d.IR_BITS
+        || op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG
+        || op == d.IR_CAST) {
+        return 1;
+    }
+    return 0;
+}

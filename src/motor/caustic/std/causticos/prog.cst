@@ -1,0 +1,231 @@
+// std/causticos/prog.cst — tiny runtime for CausticOS userspace programs.
+//
+// A program spawned by the shell gets a console channel as its stdout key —
+// 1, as the std names it (std/os/causticos.cst) — and argv on its stack. This
+// wraps the two things every little program needs: write to stdout, and read
+// argv. `out*` go to stdout -> the shell renders them on the framebuffer (or,
+// run bare with no console, they fall back to serial).
+// argv (from main's 2nd param) is char** — a NUL-terminated array of string
+// pointers; arg(argv, i) returns the i-th.
+use "../os/causticos.cst" as sys;
+
+fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
+
+// What a program returns when the reader of its output is gone. The std's own
+// choice — the kernel never assigns it — kept above 128 like the kernel's
+// EXIT_* codes (the shells' convention), so it cannot pass for a status a
+// program returned itself. The code is not the whole story, though: the exit
+// says WHY with END_REASON_OUTPUT_CLOSED as well, and that is what a shell
+// shows — "output closed", not "Exit 141" (bugs.md N133).
+let is i32 as EXIT_PIPE with imut = 141;
+
+// Everything in s[0..n) to stdout. A channel takes what fits and says how
+// much; one write used to be taken for the whole of it, and output larger than
+// the pipe's free space lost its tail. The reader gone (E_PIPE) ends the
+// program: there is no one left to write for, and a producer like
+// `yes | head -n 3` otherwise ran forever. Other errors are dropped, as
+// before — stdout has nowhere to report them.
+fn out(s as *u8, n as i64) as void {
+    if (__target_is_caustic == 0) { __compile_error("std/causticos/prog I/O is CausticOS-only — build with a CausticOS target"); }
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = sys.write(cast(i64, 1), cast(*u8, cast(i64, s) + done), n - done);
+        if (r == sys.E_PIPE) { sys.exit_reason(EXIT_PIPE, sys.END_REASON_OUTPUT_CLOSED); }
+        if (r <= 0) { return; }
+        done = done + r;
+    }
+}
+fn outs(s as *u8) as void { out(s, slen(s)); }
+
+// Write directly to stderr. A stderr that reaches a terminal says so in its
+// key's label (sys.is_terminal); redirected diagnostics stay byte-for-byte plain.
+fn _err_write(s as *u8, n as i64) as void {
+    if (__target_is_caustic == 0) { __compile_error("std/causticos/prog I/O is CausticOS-only — build with a CausticOS target"); }
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = sys.write(cast(i64, 2), cast(*u8, cast(i64, s) + done), n - done);
+        if (r <= 0) { return; }
+        done = done + r;
+    }
+}
+fn _stderr_is_terminal() as i64 {
+    if (sys.is_terminal(2) == 0) { return 0; }
+    // And the terminal is still there to read it.
+    let is [3]i64 as p;
+    p[0] = 2; p[1] = sys.POLL_WRITABLE; p[2] = 0;
+    let is i64 as ready = sys.poll(cast(*i64, &p[0]), 1, 0);
+    if (ready <= 0 || (p[2] & sys.POLL_WRITABLE) == 0) { return 0; }
+    if ((p[2] & (sys.POLL_CLOSED | sys.POLL_ERROR)) != 0) { return 0; }
+    return 1;
+}
+fn err(s as *u8, n as i64) as void {
+    if (__target_is_caustic == 0) { __compile_error("std/causticos/prog I/O is CausticOS-only — build with a CausticOS target"); }
+    if (_stderr_is_terminal() == 1) {
+        _err_write("\x1b[38;2;239;83;80m", 17);
+        _err_write(s, n);
+        _err_write("\x1b[39m", 5);
+    } else { _err_write(s, n); }
+}
+fn errs(s as *u8) as void { err(s, slen(s)); }
+
+// Prompts and other intentional non-errors can still use stderr without color.
+fn err_raw(s as *u8, n as i64) as void { _err_write(s, n); }
+fn errs_raw(s as *u8) as void { err_raw(s, slen(s)); }
+
+fn out_num(v as i64) as void {
+    if (v == 0) { out("0", 1); return; }
+    let is [24]u8 as b;
+    let is i64 as x with mut = v;
+    if (x < 0) { out("-", 1); x = 0 - x; }
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    out(cast(*u8, &b[i]), 24 - i);
+}
+fn err_num(v as i64) as void {
+    if (v == 0) { err("0", 1); return; }
+    let is [24]u8 as b;
+    let is i64 as x with mut = v;
+    if (x < 0) { err("-", 1); x = 0 - x; }
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    err(cast(*u8, &b[i]), 24 - i);
+}
+
+
+// pad_num(v, width): write v right-justified in `width` columns, space-padded
+// on the left. For lining up table columns (ps/top/free/df).
+fn pad_num(v as i64, width as i64) as void {
+    let is i64 as t with mut = v;
+    let is i64 as w with mut = 1;
+    if (t < 0) { w = 2; t = 0 - t; }          // a digit for the sign
+    while (t >= 10) { t = t / 10; w = w + 1; }
+    let is i64 as k with mut = w;
+    while (k < width) { out(" ", 1); k = k + 1; }
+    out_num(v);
+}
+
+// --- stdin (fd 0): a program spawned by the terminal gets fd 0 = a channel the
+// terminal feeds keystrokes into, one raw byte per key, no echo (the program
+// echoes what it wants). Run bare with no terminal, fd 0 doesn't exist and read
+// returns an error → getc reports EOF. ---
+
+// getc(): read one byte from stdin. Blocks until a key arrives. Returns the
+// byte (0..255), or -1 on EOF / no stdin.
+fn getc() as i64 {
+    if (__target_is_caustic == 0) { __compile_error("std/causticos/prog I/O is CausticOS-only — build with a CausticOS target"); }
+    let is [1]u8 as b;
+    let is i64 as r = sys.read(cast(i64, 0), cast(*u8, &b[0]), 1);
+    if (r <= 0) { return 0 - 1; }
+    return cast(i64, b[0]);
+}
+
+// getline(buf, cap): read a line into buf (up to cap-1 bytes), ECHOING each
+// char as typed (raw mode → the program echoes) and handling Backspace. Enter
+// ends the line and is not stored. Returns the length, or -1 on EOF before any
+// byte. A convenience over getc for prompt-style input.
+fn getline(buf as *u8, cap as i64) as i64 {
+    let is i64 as len with mut = 0;
+    while (1 == 1) {
+        let is i64 as c = getc();
+        if (c < 0) { if (len == 0) { return 0 - 1; } return len; }   // EOF
+        if (c == 0x0A) { return len; }                               // Enter
+        if (c == 0x08 || c == 0x7F) {                                // Backspace / Del
+            if (len > 0) {
+                len = len - 1;
+                let is [3]u8 as er;
+                er[0] = cast(u8, 0x08); er[1] = cast(u8, 0x20); er[2] = cast(u8, 0x08);
+                out(cast(*u8, &er[0]), 3);                           // erase: BS space BS
+            }
+        } else if (len < cap - 1) {
+            buf[len] = cast(u8, c & 0xFF);
+            len = len + 1;
+            let is [1]u8 as e;
+            e[0] = cast(u8, c & 0xFF);
+            out(cast(*u8, &e[0]), 1);                                // echo
+        }
+    }
+    return len;
+}
+
+// arg(argv, i): the i-th command-line argument as a NUL-terminated *u8.
+fn arg(argv as *u8, i as i64) as *u8 {
+    let is *i64 as p = cast(*i64, argv);
+    return cast(*u8, p[i]);
+}
+
+// --- The directory this program was started in ---
+//
+// The kernel keeps no directory per process (no ambient namespace). A shell
+// keeps its own, and at every spawn it hands the child the directory it is in
+// AT THAT MOMENT as the key KEY_DIR: a directory key (sys.dir_open), which
+// holds the directory itself rather than its name. A cd in the shell
+// afterwards does not move a program already started, and neither does a
+// rename lose it: the kernel says where the directory is each time a name is
+// resolved under it (sys.dir_resolve), and the std opens a relative name there
+// (sys.openat). It used to be the path, copied into a segment — rename the
+// directory between the spawn and the first relative name, and the program
+// pointed at nothing (bugs.md N124). No key means "/". A key whose directory
+// was removed resolves nothing: dir() is then empty and a relative name comes
+// out empty, so opening it fails instead of meaning some other directory.
+let is i64 as PATH_MAX with imut = 255;
+let is [256]u8 as _dir with mut;
+let is i64 as _dir_len with mut = 0;
+
+fn _dir_now() as void {
+    let is i64 as dk = sys.key(sys.KEY_DIR);
+    if (dk < 0) { _dir[0] = cast(u8, 47); _dir[1] = cast(u8, 0); _dir_len = 1; return; }
+    let is i64 as n = sys.dir_resolve(dk, cast(*u8, ""), 0, cast(*u8, &_dir[0]), 256);
+    if (n < 0) { _dir[0] = cast(u8, 0); _dir_len = 0; return; }
+    _dir_len = n;
+}
+
+// dir(): the directory this program was started in, where it is now:
+// NUL-terminated, absolute; empty once it was removed.
+fn dir() as *u8 { _dir_now(); return cast(*u8, &_dir[0]); }
+fn dir_len() as i64 { _dir_now(); return _dir_len; }
+
+// dir_for_child(): my own directory key, to hand a child as its KEY_DIR, so a
+// relative path it is given means what it meant here — the same directory,
+// not one looked up again by name. Borrowed: not to be closed. -1 when I have
+// none (the child is then in "/", as I am).
+fn dir_for_child() as i64 { return sys.key(sys.KEY_DIR); }
+
+// abspath(raw, out): `raw` as an absolute path. One that starts with '/' comes
+// back unchanged; any other is resolved where the start directory is now, "."
+// and ".." folded, into `out`, which holds 256 bytes (PATH_MAX and its NUL). A
+// result longer than the kernel takes, or a name under a removed directory,
+// comes back empty, and opening it fails.
+fn abspath(raw as *u8, out as *u8) as *u8 {
+    if (raw[0] == cast(u8, 47)) { return raw; }
+    let is i64 as dk = sys.key(sys.KEY_DIR);
+    if (dk >= 0) {
+        if (sys.dir_resolve(dk, raw, slen(raw), out, 256) < 0) { out[0] = cast(u8, 0); }
+        return out;
+    }
+    // No key: the start directory is "/".
+    out[0] = cast(u8, 47);
+    let is i64 as n with mut = 1;
+    let is i64 as i with mut = 0;
+    while (raw[i] != 0) {
+        let is i64 as s = i;
+        while (raw[i] != 0 && raw[i] != cast(u8, 47)) { i = i + 1; }
+        let is i64 as len = i - s;
+        if (raw[i] == cast(u8, 47)) { i = i + 1; }
+        if (len == 0 || (len == 1 && raw[s] == cast(u8, 46))) { continue; }   // "" or "."
+        if (len == 2 && raw[s] == cast(u8, 46) && raw[s + 1] == cast(u8, 46)) {
+            // "..": back to the previous '/', never above the root.
+            while (n > 1 && out[n - 1] != cast(u8, 47)) { n = n - 1; }
+            if (n > 1) { n = n - 1; }
+            continue;
+        }
+        if (n > 1) {
+            if (n >= PATH_MAX) { out[0] = cast(u8, 0); return out; }
+            out[n] = cast(u8, 47); n = n + 1;
+        }
+        if (n + len > PATH_MAX) { out[0] = cast(u8, 0); return out; }
+        let is i64 as k with mut = 0;
+        while (k < len) { out[n] = raw[s + k]; n = n + 1; k = k + 1; }
+    }
+    out[n] = cast(u8, 0);
+    return out;
+}

@@ -1,0 +1,38 @@
+<!doctype html><html><head><title>T</title><style>.box{width:100px;height:50px;padding:5px;display:block;color:red}.hid{display:none}</style></head>
+<body><div id="a" class="x y" data-k="v"><span>one</span><span class="s">two</span>text<!--c--></div><ul id="u"><li>1</li><li class="m">2</li><li>3</li></ul><input id="i" value="v0" type="text"><a id="l" href="/z">z</a><pre id="out"></pre>
+<script>
+var R=[];function P(){R.push(Array.prototype.slice.call(arguments).map(String).join(' '))}
+var a=document.getElementById('a'),u=document.querySelector('#u');
+P(a.tagName,a.nodeName,a.nodeType,a.id,a.className,a.getAttribute('data-k'),a.hasAttribute('x'),a.children.length,a.childNodes.length,a.firstChild.tagName,a.lastChild.nodeType,a.lastChild.data,a.firstElementChild.textContent,a.lastElementChild.className);
+P(a.textContent,a.innerHTML,a.parentNode.tagName,a.nextElementSibling.id,a.ownerDocument===document,document.nodeType,document.documentElement.tagName,document.body.tagName,document.head.tagName,document.title);
+P(document.querySelectorAll('li').length,document.querySelector('ul > li.m').textContent,document.querySelectorAll('ul li, span').length,document.querySelector('span + span').className,document.querySelector('span ~ span').className,document.querySelector('div span.s').textContent,document.querySelector('[data-k="v"]').id,document.querySelector('.nothing'),document.getElementsByTagName('LI').length,document.getElementsByClassName('m').length,u.querySelector('li').textContent);
+var d=document.createElement('DIV');d.id='new';d.className='k';d.setAttribute('title','t');d.textContent='<b>x</b>';P(d.tagName,d.innerHTML,d.getAttribute('title'),d.title,d.parentNode,d.isConnected);document.body.appendChild(d);P(d.parentNode.tagName,d.isConnected,document.getElementById('new')===d);
+d.innerHTML='<b>bold</b> and <i class="q">it</i>&amp;';P(d.children.length,d.children[1].className,d.textContent,d.innerHTML);
+var t=document.createTextNode('tx');d.insertBefore(t,d.firstChild);P(d.firstChild===t,t.nodeValue,t.nodeName,t.parentNode===d);t.nodeValue='ty';t.data='tz';P(d.textContent.slice(0,3));d.removeChild(t);P(d.firstChild.tagName);
+var c=d.cloneNode(true),s=d.cloneNode(false);P(c.innerHTML===d.innerHTML,s.childNodes.length,c.id);d.firstChild.remove();P(d.firstChild.nodeType);d.replaceChild(document.createElement('hr'),d.lastChild);P(d.lastChild.tagName,d.contains(d.lastChild),document.contains(d),d.contains(document.body));
+var f=document.createDocumentFragment();f.appendChild(document.createElement('p'));f.appendChild(document.createElement('h1'));P(f.nodeType,f.childNodes.length);d.appendChild(f);P(f.childNodes.length,d.lastChild.tagName);
+d.classList.add('c1','c2');d.classList.remove('k');d.classList.toggle('c3');P(d.className,d.classList.contains('c1'));
+d.style.color='red';d.style.backgroundColor='blue';d.style.setProperty('margin-top','2px');P(d.style.color,d.style.backgroundColor,d.style.getPropertyValue('margin-top'),d.getAttribute('style').replace(/ /g,''));d.style.color='';P(d.getAttribute('style').indexOf('color:red'));
+var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');P(svg.tagName,svg.namespaceURI);svg.setAttribute('viewBox','0 0 1 1');P(svg.getAttribute('viewBox'));
+var i=document.getElementById('i');P(i.value,i.type,i.disabled,i.required);i.disabled=true;P(i.disabled,i.hasAttribute('disabled'));i.disabled=false;P(i.hasAttribute('disabled'));
+var log=[];var hc=function(e){log.push('cap:'+e.currentTarget.id+':'+e.eventPhase)},hb=function(e){log.push('bub:'+e.currentTarget.id+':'+e.eventPhase+':'+e.target.tagName)};
+a.addEventListener('click',hc,true);a.addEventListener('click',hb);var sp=a.querySelector('span');sp.id='sp';sp.addEventListener('click',hb);sp.addEventListener('click',hc,true);
+sp.click();P(log.join());log.length=0;a.removeEventListener('click',hb);sp.dispatchEvent(new Event('click',{bubbles:false}));P(log.join());log.length=0;
+sp.addEventListener('click',function(e){e.stopPropagation();e.preventDefault();log.push('stop:'+e.defaultPrevented)});a.addEventListener('click',function(){log.push('never')});sp.click();P(log.join());log.length=0;
+window.addEventListener('zed',function(e){log.push('win')});document.body.addEventListener('zed',function(e){log.push('body')});d.dispatchEvent(new Event('zed',{bubbles:true}));P(log.join());log.length=0;
+var ce=new CustomEvent('q',{detail:5});d.addEventListener('q',function(e){log.push(e.detail+':'+e.type)});d.dispatchEvent(ce);P(log.join());log.length=0;
+d.onclick=function(e){log.push('prop')};d.click();P(log.join());log.length=0;
+var st=document.createElement('style');st.textContent='#new{color:rgb(9,8,7);width:300px}';document.head.appendChild(st);
+var ln=document.createElement('link');ln.rel='stylesheet';ln.href='/t.css';var p=document.createElement('p');p.id='fromlink';document.body.appendChild(p);document.head.appendChild(ln);
+var bx=document.createElement('div');bx.className='box';bx.id='bx';document.body.appendChild(bx);
+P(typeof window,window===globalThis,window.document===document,typeof navigator.userAgent,typeof location.href,typeof innerWidth,typeof requestAnimationFrame,typeof matchMedia('(x)').matches);
+document.addEventListener('DOMContentLoaded',function(){log.push('dcl')});window.addEventListener('load',function(){log.push('load')});
+setTimeout(function(){
+ P(log.join());
+ var cs=getComputedStyle(bx);P(cs.display,cs.position,cs.width,cs.height,cs.color,cs.getPropertyValue('font-size'),getComputedStyle(d).color,getComputedStyle(d).width);
+ var r=bx.getBoundingClientRect();P(r.width,r.height,bx.offsetWidth,bx.offsetHeight,typeof r.x,r.bottom-r.top);
+ bx.className='hid';P(getComputedStyle(bx).display);
+ fetch('/data.json').then(function(r){P(r.status,r.ok,r.headers.get('content-type').indexOf('json')>=0);return r.json()}).then(function(j){P(j.hello,j.n.length);var x=new XMLHttpRequest();x.open('GET','/data.json');x.onload=function(){P(x.status,JSON.parse(x.responseText).hello);return fetch('/nope.json').then(function(r){P(r.status,r.ok);
+ setTimeout(function(){P(getComputedStyle(p).color);document.getElementById('out').textContent=R.join('\n');document.body.setAttribute('data-done','1')},50)})};x.send()});
+},30);
+</script></body></html>

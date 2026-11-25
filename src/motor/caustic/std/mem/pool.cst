@@ -1,0 +1,223 @@
+// =======================================================
+// std/mem/pool.cst
+// Pool allocator — fixed-size slots, O(1) alloc/free
+// create() — fast, no safety checks
+// create_debug() — with bitmap for O(1) double-free detection
+// =======================================================
+
+use "core.cst" as core;
+
+// THREADS: single-owner by default (no lock — keeps the hottest alloc path, e.g.
+// the compiler's per-worker IR instruction pool, overhead-free). A shared Pool
+// must be guarded by the caller (sync.Mutex). The compiler's Etapa-C design
+// gives each worker its own Pool, so no locking is needed there.
+struct Pool {
+    region as *u8;
+    bitmap as *u8;
+    region_size as i64;
+    bitmap_size as i64;
+    freelist as *u8;
+    slot_size as i64;
+    total_slots as i64;
+    used_slots as i64;
+    debug as i64;
+    high_water as i64;   // next never-yet-handed-out slot index (bump pointer)
+    committed as i64;    // bytes backed from region start. The region is RESERVED
+                         // (VA only); alloc commits a chunk before bumping into it.
+                         // On Linux/Windows reserve already backed it lazily and
+                         // commit is a no-op, so RSS still tracks slots in use; on
+                         // CausticOS (strict reserve/commit, no demand paging) this
+                         // is what keeps a 1M-slot pool from committing ~150 MB up
+                         // front and OOM-ing.
+}
+
+let is i64 as _POOL_COMMIT_CHUNK with imut = 65536;
+
+
+
+fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
+    let is Pool as p;
+
+    if (slot_size <= 0 || count <= 0) {
+        p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+        p.region_size = 0; p.bitmap_size = 0;
+        p.freelist = cast(*u8, 0); p.slot_size = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+        p.committed = 0;
+        return p;
+    }
+
+    let is i64 as aligned with mut = (slot_size + 7) & (0 - 8);
+    if (aligned < 8) { aligned = 8; }
+
+    let is i64 as total = aligned * count;
+    // RESERVE the whole region (VA only); commit grows on demand in alloc(). On
+    // Linux/Windows reserve_anon is a lazy mmap (commit no-ops), so this is the
+    // same behaviour as before; on CausticOS it avoids committing `total` (which
+    // for the compiler's 1M-slot IRInst pool is ~150 MB) up front.
+    let is *u8 as region = core.reserve_anon(total);
+    if (cast(i64, region) < 0) {
+        p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+        p.region_size = 0; p.bitmap_size = 0;
+        p.freelist = cast(*u8, 0); p.slot_size = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+        p.committed = 0;
+        return p;
+    }
+    // Back the first chunk so the initial slots are usable.
+    let is i64 as first with mut = total;
+    if (first > _POOL_COMMIT_CHUNK) { first = _POOL_COMMIT_CHUNK; }
+    if (core.commit_anon(region, first) != cast(i32, 0)) {
+        core.munmap(region, total);
+        p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+        p.region_size = 0; p.bitmap_size = 0;
+        p.freelist = cast(*u8, 0); p.slot_size = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+        p.committed = 0;
+        return p;
+    }
+
+    p.region = region;
+    p.region_size = total;
+    p.slot_size = aligned;
+    p.total_slots = count;
+    p.used_slots = 0;
+    p.debug = with_debug;
+    p.committed = first;
+
+    // Bitmap (only if debug)
+    if (with_debug == 1) {
+        let is i64 as bm_size = (count + 7) >> 3;
+        let is *u8 as bm = core.mmap_anon(bm_size);
+        if (cast(i64, bm) < 0) {
+            core.munmap(region, total);
+            p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+            p.region_size = 0; p.bitmap_size = 0;
+            p.freelist = cast(*u8, 0); p.slot_size = 0;
+            p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+            p.committed = 0;
+            return p;
+        }
+        p.bitmap = bm;
+        p.bitmap_size = bm_size;
+        let is i64 as bi with mut = 0;
+        while (bi < bm_size) { bm[bi] = 255; bi = bi + 1; }
+        let is i64 as extra = bm_size * 8 - count;
+        if (extra > 0) { bm[bm_size - 1] = cast(u8, (1 << (8 - extra)) - 1); }
+    } else {
+        p.bitmap = cast(*u8, 0);
+        p.bitmap_size = 0;
+    }
+
+    // Lazy: do NOT pre-link a freelist across every slot — that write-touches
+    // one page per slot and commits the whole region up front (a 1M-slot pool
+    // would resident ~150 MB before a single alloc). Instead hand out fresh
+    // slots by bumping high_water, and let free() build a freelist only for
+    // slots actually returned. RSS stays proportional to slots in use.
+    p.freelist = cast(*u8, 0);
+    p.high_water = 0;
+
+    return p;
+}
+
+// --- Public API ---
+
+// debug=0: fast, no double-free detection
+// debug=1: with bitmap for O(1) double-free detection
+fn create(slot_size as i64, count as i64, debug as i64) as Pool {
+    return _init_pool(slot_size, count, debug);
+}
+
+// Alloc — O(1)
+fn alloc(p as *Pool) as *u8 {
+    let is *u8 as slot with mut = cast(*u8, 0);
+    if (cast(i64, p.freelist) != 0) {
+        // reuse a previously freed slot
+        slot = p.freelist;
+        let is *i64 as np = cast(*i64, slot);
+        p.freelist = cast(*u8, *np);
+    } else {
+        // bump a never-used slot (touches just this page)
+        if (p.high_water >= p.total_slots) { return cast(*u8, 0); }
+        slot = cast(*u8, cast(i64, p.region) + p.high_water * p.slot_size);
+        // Commit-on-grow: back [slot, slot+slot_size) before handing it out. On
+        // Linux/Windows commit_anon no-ops (reserve was lazy); on CausticOS this
+        // commits a fresh chunk so the strict reserve/commit OS never has to back
+        // the whole region. Out of physical RAM here returns null cleanly.
+        let is i64 as need_end = p.high_water * p.slot_size + p.slot_size;
+        if (need_end > p.committed) {
+            let is i64 as newc with mut = (need_end + (_POOL_COMMIT_CHUNK - 1)) & (0 - _POOL_COMMIT_CHUNK);
+            if (newc > p.region_size) { newc = p.region_size; }
+            if (core.commit_anon(cast(*u8, cast(i64, p.region) + p.committed), newc - p.committed) != cast(i32, 0)) {
+                return cast(*u8, 0);
+            }
+            p.committed = newc;
+        }
+        p.high_water = p.high_water + 1;
+    }
+
+    if (p.debug == 1) {
+        let is i64 as si = (cast(i64, slot) - cast(i64, p.region)) / p.slot_size;
+        core.bit_clear(p.bitmap, si);
+    }
+
+    p.used_slots = p.used_slots + 1;
+    return slot;
+}
+
+// Free — O(1)
+fn free(p as *Pool, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+
+    let is i64 as offset = cast(i64, ptr) - cast(i64, p.region);
+    if (offset < 0 || offset >= p.region_size) { return; }
+    if ((offset % p.slot_size) != 0) { return; }
+
+    if (p.debug == 1) {
+        let is i64 as si = offset / p.slot_size;
+        if (core.bit_test(p.bitmap, si) == 1) { return; }
+        core.bit_set(p.bitmap, si);
+    }
+
+    let is *i64 as np = cast(*i64, ptr);
+    *np = cast(i64, p.freelist);
+    p.freelist = ptr;
+    p.used_slots = p.used_slots - 1;
+}
+
+// Destroy
+fn destroy(p as *Pool) as void {
+    if (cast(i64, p.region) != 0) { core.munmap(p.region, p.region_size); }
+    if (cast(i64, p.bitmap) != 0) { core.munmap(p.bitmap, p.bitmap_size); }
+    p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+    p.freelist = cast(*u8, 0);
+    p.region_size = 0; p.bitmap_size = 0;
+    p.slot_size = 0; p.total_slots = 0;
+    p.used_slots = 0; p.debug = 0; p.high_water = 0;
+}
+
+// Reset
+fn reset(p as *Pool) as void {
+    if (cast(i64, p.region) == 0 || p.total_slots == 0) { return; }
+
+    // O(1) reset: drop the freelist and rewind the bump pointer. Frees every
+    // slot without touching the region (so RSS doesn't balloon on reset).
+    p.freelist = cast(*u8, 0);
+    p.high_water = 0;
+
+    if (p.debug == 1) {
+        let is i64 as i with mut = 0;
+        while (i < p.bitmap_size) { p.bitmap[i] = 255; i = i + 1; }
+        let is i64 as extra = p.bitmap_size * 8 - p.total_slots;
+        if (extra > 0) { p.bitmap[p.bitmap_size - 1] = cast(u8, (1 << (8 - extra)) - 1); }
+    }
+
+    p.used_slots = 0;
+}
+
+// --- Introspection ---
+
+fn used(p as *Pool) as i64 { return p.used_slots; }
+fn available(p as *Pool) as i64 { return p.total_slots - p.used_slots; }
+fn capacity(p as *Pool) as i64 { return p.total_slots; }
+fn slot_size(p as *Pool) as i64 { return p.slot_size; }

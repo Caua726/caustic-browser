@@ -1,0 +1,119 @@
+use "../../src/ir/opt_mem.cst" as om;
+use "../core/buf.cst" as buf;
+use "../encoder/encoder_util.cst" as enc;
+use "custom_sections.cst" as cs;
+
+// === .cstimport "dll.dll" symbol — Windows DLL import declarations ===
+//
+// Codegen emits one of these per FFI call site. The assembler records the
+// (dll, sym) pair so the COFF writer can dump them into a custom .cstimport
+// section (or, if outputting ELF as a Linux-format intermediary, leave the
+// info in an analogous ELF custom section). The linker then walks this
+// section to build the PE import table at link time.
+//
+// The table grows. It was a fixed 256 entries and cstimport_add returned in
+// silence past that, which on ELF is worse than it sounds: the linker builds
+// DT_NEEDED from this section alone, while the PLT relocations come from the
+// calls themselves and were all still there. A program whose first 256
+// imports came from one library lost the NEEDED entry of every library after
+// it, linked cleanly, and died at exec with an undefined symbol — 240 imports
+// worked, 280 did not, and 770 from a single library did.
+let is i32 as CSTIMPORTS_INITIAL with imut = 256;
+let is i32 as cstimport_cap with mut = 0;
+let is *u8 as cstimport_dll_ptrs with mut;   // cap * 8
+let is *u8 as cstimport_dll_lens with mut;   // cap * 4
+let is *u8 as cstimport_sym_ptrs with mut;   // cap * 8
+let is *u8 as cstimport_sym_lens with mut;   // cap * 4
+let is i32 as cstimport_count with mut = 0;
+
+fn cstimport_init() as void {
+    cstimport_cap = CSTIMPORTS_INITIAL;
+    cstimport_dll_ptrs = om.opt_alloc(cast(i64, cstimport_cap) * 8);
+    cstimport_dll_lens = om.opt_alloc(cast(i64, cstimport_cap) * 4);
+    cstimport_sym_ptrs = om.opt_alloc(cast(i64, cstimport_cap) * 8);
+    cstimport_sym_lens = om.opt_alloc(cast(i64, cstimport_cap) * 4);
+    cstimport_count = 0;
+}
+
+fn _grow_copy(old as *u8, used as i64, new_size as i64) as *u8 {
+    let is *u8 as nb = om.opt_alloc(new_size);
+    let is i64 as i with mut = 0;
+    while (i < used) { nb[i] = old[i]; i = i + 1; }
+    om.opt_free(old);
+    return nb;
+}
+
+// Double the four parallel arrays.
+fn _cstimport_grow() as void {
+    let is i64 as n = cast(i64, cstimport_count);
+    let is i64 as nc = cast(i64, cstimport_cap) * 2;
+    cstimport_dll_ptrs = _grow_copy(cstimport_dll_ptrs, n * 8, nc * 8);
+    cstimport_dll_lens = _grow_copy(cstimport_dll_lens, n * 4, nc * 4);
+    cstimport_sym_ptrs = _grow_copy(cstimport_sym_ptrs, n * 8, nc * 8);
+    cstimport_sym_lens = _grow_copy(cstimport_sym_lens, n * 4, nc * 4);
+    cstimport_cap = cast(i32, nc);
+}
+
+// Serialize the collected cstimport entries into a custom ELF section
+// named ".cstimport" so the linker can consume them when building the PE
+// import table. Layout:
+//
+//   u32 count
+//   for each entry:
+//     u32 dll_len
+//     u32 sym_len
+//     byte[dll_len] dll_name  (no NUL — linker uses len)
+//     byte[sym_len] sym_name
+//
+// Variable-size records keep the format trivial to parse without a strtab.
+fn cstimport_emit_section() as void {
+    if (cstimport_count == 0) { return; }
+    let is i32 as idx = cs.csec_find_or_add(".cstimport", 10);
+    let is *i64 as bp = cast(*i64, cs.csec_buf_ptrs);
+    let is *buf.ByteBuffer as bb = cast(*buf.ByteBuffer, bp[idx]);
+    buf.buf_emit32_le(bb, cast(i64, cstimport_count));
+    let is *i64 as dp = cast(*i64, cstimport_dll_ptrs);
+    let is *i32 as dl = cast(*i32, cstimport_dll_lens);
+    let is *i64 as sp = cast(*i64, cstimport_sym_ptrs);
+    let is *i32 as sl = cast(*i32, cstimport_sym_lens);
+    let is i32 as i with mut = 0;
+    while (i < cstimport_count) {
+        buf.buf_emit32_le(bb, cast(i64, dl[i]));
+        buf.buf_emit32_le(bb, cast(i64, sl[i]));
+        let is *u8 as dn = cast(*u8, dp[i]);
+        let is i32 as j with mut = 0;
+        while (j < dl[i]) { buf.buf_emit8(bb, cast(i32, dn[j])); j = j + 1; }
+        let is *u8 as sn = cast(*u8, sp[i]);
+        j = 0;
+        while (j < sl[i]) { buf.buf_emit8(bb, cast(i32, sn[j])); j = j + 1; }
+        i = i + 1;
+    }
+}
+
+fn cstimport_add(dll as *u8, dll_len as i32, sym as *u8, sym_len as i32) as void {
+    // Dedup — if same (dll, sym) already registered, skip.
+    let is *i64 as dp0 = cast(*i64, cstimport_dll_ptrs);
+    let is *i32 as dl0 = cast(*i32, cstimport_dll_lens);
+    let is *i64 as sp0 = cast(*i64, cstimport_sym_ptrs);
+    let is *i32 as sl0 = cast(*i32, cstimport_sym_lens);
+    let is i32 as i with mut = 0;
+    while (i < cstimport_count) {
+        if (dl0[i] == dll_len && sl0[i] == sym_len
+            && enc.streq(cast(*u8, dp0[i]), dl0[i], dll, dll_len) == 1
+            && enc.streq(cast(*u8, sp0[i]), sl0[i], sym, sym_len) == 1) {
+            return;
+        }
+        i = i + 1;
+    }
+    if (cstimport_count >= cstimport_cap) { _cstimport_grow(); }
+    let is *i64 as dp = cast(*i64, cstimport_dll_ptrs);
+    let is *i32 as dl = cast(*i32, cstimport_dll_lens);
+    let is *i64 as sp = cast(*i64, cstimport_sym_ptrs);
+    let is *i32 as sl = cast(*i32, cstimport_sym_lens);
+    let is i32 as idx = cstimport_count;
+    dp[idx] = cast(i64, dll);
+    dl[idx] = dll_len;
+    sp[idx] = cast(i64, sym);
+    sl[idx] = sym_len;
+    cstimport_count = cstimport_count + 1;
+}

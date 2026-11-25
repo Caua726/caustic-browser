@@ -1,0 +1,274 @@
+// loader/webfont.cst — the fonts pages bring, for the text service to find by name.
+//
+// The service asks a resolver for a family list, a weight and a style. This one goes first:
+// if the list names a font some page brought, what it gets is a font of those faces with the
+// system's answer behind them, for whatever they do not draw. Otherwise it gets the system's
+// answer as it was.
+//
+// They are kept for as long as the program runs, one to a URL, which also makes them a cache:
+// sites use the same few, on every page. A family's name means the same in every tab; two
+// sites with different files under one name share whichever came last.
+
+use "std/mem.cst" as mem;
+use "../css/sheet.cst" as sh;
+use "../layout/measure.cst" as measure;
+use "caustic-media/text/fonts/chain.cst" as chain;
+use "caustic-media/text/fonts/face.cst" as face;
+use "caustic-media/text/layout/font.cst" as font;
+use "caustic-media/text/sfnt/cmap.cst" as cmap;
+use "caustic-media/text/sfnt/sfnt.cst" as sfnt;
+use "caustic-media/text/sfnt/table.cst" as table;
+use "caustic-media/text/sfnt/var.cst" as var;
+use "caustic-media/ui/text.cst" as txt;
+
+let is i64 as MAX_MEMBERS with imut = 16;
+let is i64 as MAX_FACES with imut = 256;
+let is i64 as MAX_BYTES with imut = 268435456;
+let is i64 as MAX_NAME with imut = 128;
+let is i64 as MAX_RANGES with imut = 64;
+
+struct _Face {
+    url    as [4096]u8;
+    family as [MAX_NAME]u8;
+    flen   as i64;
+    wlo    as f64;
+    whi    as f64;
+    italic as i64;
+    ranges as [128]i64;
+    nranges as i64;
+    data   as *u8;
+    size   as i64;
+    f      as table.Face;
+    next   as *_Face;
+}
+
+struct _Comp {
+    fo      as font.Font;
+    list    as [512]u8;
+    list_n  as i64;
+    weight  as i64;
+    italic  as i32;
+    members as [MAX_MEMBERS]*_Face;
+    n       as i64;
+    behind  as *font.Font;
+    next    as *_Comp;
+}
+
+let is *_Face as _faces with mut = cast(*_Face, 0);
+let is i64 as _nfaces with mut = 0;
+let is i64 as _bytes with mut = 0;
+let is *_Comp as _comps with mut = cast(*_Comp, 0);
+let is *txt.Service as _svc with mut = cast(*txt.Service, 0);
+let is txt.ResolveFn as _system with mut;
+let is *u8 as _system_user with mut = cast(*u8, 0);
+
+fn _lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn same_ci(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) {
+        if (_lower(cast(i64, a[i])) != _lower(cast(i64, b[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _covers(f as *_Face, cp as i64) as i64 {
+    if (f.nranges == 0) { return 1; }
+    let is i64 as i with mut = 0;
+    while (i < f.nranges) {
+        if (cp >= f.ranges[i * 2] && cp <= f.ranges[i * 2 + 1]) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _find(user as *u8, cp0 as i64) as i64 {
+    let is *_Comp as c = cast(*_Comp, user);
+    let is i64 as cp = cp0 & (chain.EMOJI_ASKED - 1);
+    let is i64 as i with mut = 0;
+    while (i < c.n) {
+        if (_covers(c.members[i], cp) == 1 && cmap.glyph(&c.members[i].f, cp) != 0) { return i; }
+        i = i + 1;
+    }
+    let is i64 as r = font.find(c.behind, cp0);
+    if (r < 0) { return r; }
+    return c.n + r;
+}
+
+fn _clamp(v as f64, lo as f64, hi as f64) as f64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn _face(user as *u8, index as i64, px as f64, co as *var.Coords) as *table.Face {
+    let is *_Comp as c = cast(*_Comp, user);
+    if (index >= c.n) { return call(c.behind.face, c.behind.user, index - c.n, px, co); }
+    *co = var.default_coords();
+    if (index < 0) { return cast(*table.Face, 0); }
+    let is *table.Face as f = &c.members[index].f;
+    let is var.Design as d = var.design(f);
+    if (d.n == 0) { return f; }
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        let is var.Axis as a = var.axis(f, i);
+        if (a.tag == face.TAG_WGHT) { d.v[i] = _clamp(cast(f64, c.weight), a.min, a.max); }
+        else if (a.tag == face.TAG_WDTH) { d.v[i] = _clamp(100.0, a.min, a.max); }
+        else if (a.tag == face.TAG_ITAL && c.italic != 0) { d.v[i] = _clamp(1.0, a.min, a.max); }
+        else if (a.tag == face.TAG_SLNT && c.italic != 0) { d.v[i] = _clamp(0.0 - 14.0, a.min, a.max); }
+        i = i + 1;
+    }
+    var.optical(&d, f, px);
+    *co = var.coords(f, &d);
+    return f;
+}
+
+// How far a face is from a weight and style: 0 answers it, and more is worse.
+fn distance(wlo as f64, whi as f64, italic as i64, weight as f64, want_italic as i64) as f64 {
+    let is f64 as off with mut = 0.0;
+    if (weight < wlo) { off = wlo - weight; }
+    if (weight > whi) { off = weight - whi; }
+    if (italic != want_italic) { off = off + 10000.0; }
+    return off;
+}
+
+// The next name of a family list, as chain reads them: at the index it returns, -1 at the end.
+fn next_name(list as *u8, at as i64, out as **u8, out_n as *i64) as i64 {
+    if (cast(i64, list) == 0 || list[at] == 0) { return 0 - 1; }
+    let is i64 as end with mut = at;
+    while (list[end] != 0 && list[end] != 44) { end = end + 1; }
+    let is i64 as a with mut = at;
+    let is i64 as b with mut = end;
+    while (a < b && list[a] == 32) { a = a + 1; }
+    while (b > a && list[b - 1] == 32) { b = b - 1; }
+    if (b - a >= 2 && (list[a] == 34 || list[a] == 39) && list[b - 1] == list[a]) {
+        a = a + 1;
+        b = b - 1;
+    }
+    *out = &list[a];
+    *out_n = b - a;
+    if (list[end] == 44) { return end + 1; }
+    return end;
+}
+
+fn _make(list as *u8, weight as i64, italic as i32) as *_Comp {
+    let is *_Comp as c = cast(*_Comp, mem.core.mmap_anon(sizeof(_Comp)));
+    let is i64 as at with mut = 0;
+    let is *u8 as name with mut = cast(*u8, 0);
+    let is i64 as nn with mut = 0;
+    at = next_name(list, 0, &name, &nn);
+    while (at >= 0) {
+        let is f64 as best with mut = 1000000.0;
+        let is *_Face as f with mut = _faces;
+        while (f != null) {
+            if (same_ci(cast(*u8, &f.family), f.flen, name, nn) == 1) {
+                let is f64 as off = distance(f.wlo, f.whi, f.italic, cast(f64, weight), cast(i64, italic));
+                if (off < best) { best = off; }
+            }
+            f = f.next;
+        }
+        f = _faces;
+        // All the nearest: one family is often split by the characters each file has.
+        while (f != null) {
+            if (c.n < MAX_MEMBERS && same_ci(cast(*u8, &f.family), f.flen, name, nn) == 1 &&
+                distance(f.wlo, f.whi, f.italic, cast(f64, weight), cast(i64, italic)) == best) {
+                c.members[c.n] = f;
+                c.n = c.n + 1;
+            }
+            f = f.next;
+        }
+        at = next_name(list, at, &name, &nn);
+    }
+    return c;
+}
+
+fn _resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font {
+    let is *font.Font as sys = call(_system, _system_user, family, weight, italic);
+    if (_faces == null || cast(i64, family) == 0) { return sys; }
+    let is i64 as ln with mut = 0;
+    while (family[ln] != 0 && ln < 511) { ln = ln + 1; }
+    let is *_Comp as c with mut = _comps;
+    while (c != null) {
+        if (c.weight == weight && c.italic == italic && same_ci(cast(*u8, &c.list), c.list_n, family, ln) == 1) {
+            if (c.n == 0) { return sys; }
+            return &c.fo;
+        }
+        c = c.next;
+    }
+    c = _make(family, weight, italic);
+    mem.core.memcpy(cast(*u8, &c.list), family, ln);
+    c.list_n = ln;
+    c.weight = weight;
+    c.italic = italic;
+    c.behind = sys;
+    c.fo.user = cast(*u8, c);
+    c.fo.find = fn_ptr(_find);
+    c.fo.face = fn_ptr(_face);
+    c.next = _comps;
+    _comps = c;
+    if (c.n == 0) { return sys; }
+    return &c.fo;
+}
+
+// The service to answer for. Once, before any page has text.
+fn attach(s as *txt.Service) as void {
+    if (_svc != null || s == null) { return; }
+    _svc = s;
+    _system = s.resolve;
+    _system_user = s.user;
+    s.resolve = fn_ptr(_resolve);
+}
+
+fn have(u as *u8, n as i64) as i64 {
+    let is *_Face as f with mut = _faces;
+    while (f != null) {
+        let is i64 as i with mut = 0;
+        while (i < n && f.url[i] == u[i]) { i = i + 1; }
+        if (i == n && f.url[n] == 0) { return 1; }
+        f = f.next;
+    }
+    return 0;
+}
+
+// A font that arrived. Everything already asked about fonts may have a new answer, so what
+// was remembered goes, and what was resolved before stays good for whatever still holds it.
+fn add(from as *sh.FontFace, u as *u8, n as i64, data as *u8, size as i64) as void {
+    if (size <= 0 || n >= 4096 || _nfaces >= MAX_FACES || _bytes + size > MAX_BYTES) { return; }
+    if (from.flen >= MAX_NAME || have(u, n) == 1) { return; }
+    let is *u8 as kept = mem.core.mmap_anon(size);
+    mem.core.memcpy(kept, data, size);
+    let is table.Face as opened = sfnt.open(kept, size, 0);
+    if (opened.ok != 1) {
+        mem.core.munmap(kept, size);
+        return;
+    }
+    let is *_Face as f = cast(*_Face, mem.core.mmap_anon(sizeof(_Face)));
+    mem.core.memcpy(cast(*u8, &f.url), u, n);
+    mem.core.memcpy(cast(*u8, &f.family), from.family, from.flen);
+    f.flen = from.flen;
+    f.wlo = from.wlo;
+    f.whi = from.whi;
+    f.italic = from.italic;
+    let is i64 as r with mut = 0;
+    while (r < from.nranges && r < MAX_RANGES) {
+        f.ranges[r * 2] = from.ranges[r * 2];
+        f.ranges[r * 2 + 1] = from.ranges[r * 2 + 1];
+        r = r + 1;
+    }
+    f.nranges = r;
+    f.data = kept;
+    f.size = size;
+    f.f = opened;
+    f.next = _faces;
+    _faces = f;
+    _nfaces = _nfaces + 1;
+    _bytes = _bytes + size;
+    _comps = cast(*_Comp, 0);
+    if (_svc != null) { _svc.nfonts = 0; }
+    measure.forget();
+}

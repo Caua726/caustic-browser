@@ -1,0 +1,636 @@
+// =======================================================
+// std/sort.cst
+// Algoritmos de ordenacao para arrays de inteiros
+// Refactored to use fn_ptr comparators (call() feature)
+// =======================================================
+
+use "mem.cst" only bins, core as mem;
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(16384); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn _free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
+// =======================================================
+// Comparators
+// =======================================================
+
+fn cmp_asc_i64(a as i64, b as i64) as i32 {
+    if (a < b) { return cast(i32, 0 - 1); }
+    if (a > b) { return 1; }
+    return 0;
+}
+
+fn cmp_desc_i64(a as i64, b as i64) as i32 {
+    if (a > b) { return cast(i32, 0 - 1); }
+    if (a < b) { return 1; }
+    return 0;
+}
+
+fn cmp_asc_i32(a as i32, b as i32) as i32 {
+    if (a < b) { return cast(i32, 0 - 1); }
+    if (a > b) { return 1; }
+    return 0;
+}
+
+fn cmp_desc_i32(a as i32, b as i32) as i32 {
+    if (a > b) { return cast(i32, 0 - 1); }
+    if (a < b) { return 1; }
+    return 0;
+}
+
+// =======================================================
+// Utilities
+// =======================================================
+
+fn swap_i64(arr as *i64, a as i64, b as i64) as void {
+    let is i64 as tmp = arr[a];
+    arr[a] = arr[b];
+    arr[b] = tmp;
+}
+
+fn swap_i32(arr as *i32, a as i64, b as i64) as void {
+    let is i32 as tmp = arr[a];
+    arr[a] = arr[b];
+    arr[b] = tmp;
+}
+
+fn reverse_i64(arr as *i64, count as i64) as void {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = count - 1;
+    while (lo < hi) {
+        swap_i64(arr, lo, hi);
+        lo = lo + 1;
+        hi = hi - 1;
+    }
+}
+
+fn reverse_i32(arr as *i32, count as i64) as void {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = count - 1;
+    while (lo < hi) {
+        swap_i32(arr, lo, hi);
+        lo = lo + 1;
+        hi = hi - 1;
+    }
+}
+
+fn is_sorted_i64(arr as *i64, count as i64) as i64 {
+    let is i64 as i with mut = 1;
+    while (i < count) {
+        if (arr[i] < arr[i - 1]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn is_sorted_i32(arr as *i32, count as i64) as i64 {
+    let is i64 as i with mut = 1;
+    while (i < count) {
+        if (arr[i] < arr[i - 1]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// =======================================================
+// 1. Insertion Sort
+// =======================================================
+
+fn _insertion_sort_i64(arr as *i64, count as i64, cmp as *u8) as void {
+    let is i64 as i with mut = 1;
+    while (i < count) {
+        let is i64 as key = arr[i];
+        let is i64 as j with mut = i - 1;
+        while (j >= 0) {
+            if (call(cmp, arr[j], key) > 0) {
+                arr[j + 1] = arr[j];
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        arr[j + 1] = key;
+        i = i + 1;
+    }
+}
+
+fn _insertion_sort_i32(arr as *i32, count as i64, cmp as *u8) as void {
+    let is i64 as i with mut = 1;
+    while (i < count) {
+        let is i32 as key = arr[i];
+        let is i64 as j with mut = i - 1;
+        while (j >= 0) {
+            if (call(cmp, arr[j], key) > 0) {
+                arr[j + 1] = arr[j];
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        arr[j + 1] = key;
+        i = i + 1;
+    }
+}
+
+fn insertion_sort_i64(arr as *i64, count as i64) as void {
+    _insertion_sort_i64(arr, count, fn_ptr(cmp_asc_i64));
+}
+
+fn insertion_sort_desc_i64(arr as *i64, count as i64) as void {
+    _insertion_sort_i64(arr, count, fn_ptr(cmp_desc_i64));
+}
+
+fn insertion_sort_i32(arr as *i32, count as i64) as void {
+    _insertion_sort_i32(arr, count, fn_ptr(cmp_asc_i32));
+}
+
+fn insertion_sort_desc_i32(arr as *i32, count as i64) as void {
+    _insertion_sort_i32(arr, count, fn_ptr(cmp_desc_i32));
+}
+
+// =======================================================
+// 2. Bubble Sort
+// =======================================================
+
+fn _bubble_sort_i64(arr as *i64, count as i64, cmp as *u8) as void {
+    let is i64 as n with mut = count;
+    while (n > 1) {
+        let is i64 as swapped with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < n - 1) {
+            if (call(cmp, arr[i], arr[i + 1]) > 0) {
+                swap_i64(arr, i, i + 1);
+                swapped = 1;
+            }
+            i = i + 1;
+        }
+        if (swapped == 0) {
+            return;
+        }
+        n = n - 1;
+    }
+}
+
+fn _bubble_sort_i32(arr as *i32, count as i64, cmp as *u8) as void {
+    let is i64 as n with mut = count;
+    while (n > 1) {
+        let is i64 as swapped with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < n - 1) {
+            if (call(cmp, arr[i], arr[i + 1]) > 0) {
+                swap_i32(arr, i, i + 1);
+                swapped = 1;
+            }
+            i = i + 1;
+        }
+        if (swapped == 0) {
+            return;
+        }
+        n = n - 1;
+    }
+}
+
+fn bubble_sort_i64(arr as *i64, count as i64) as void {
+    _bubble_sort_i64(arr, count, fn_ptr(cmp_asc_i64));
+}
+
+fn bubble_sort_desc_i64(arr as *i64, count as i64) as void {
+    _bubble_sort_i64(arr, count, fn_ptr(cmp_desc_i64));
+}
+
+fn bubble_sort_i32(arr as *i32, count as i64) as void {
+    _bubble_sort_i32(arr, count, fn_ptr(cmp_asc_i32));
+}
+
+fn bubble_sort_desc_i32(arr as *i32, count as i64) as void {
+    _bubble_sort_i32(arr, count, fn_ptr(cmp_desc_i32));
+}
+
+// =======================================================
+// 3. Quicksort
+// =======================================================
+
+// --- i64 ---
+
+fn _qs_median3_i64(arr as *i64, a as i64, b as i64, c as i64, cmp as *u8) as i64 {
+    let is i64 as va = arr[a];
+    let is i64 as vb = arr[b];
+    let is i64 as vc = arr[c];
+    // find median of three using comparator
+    if (call(cmp, va, vb) > 0) {
+        if (call(cmp, vb, vc) > 0) {
+            return b;
+        }
+        if (call(cmp, va, vc) > 0) {
+            return c;
+        }
+        return a;
+    }
+    if (call(cmp, va, vc) > 0) {
+        return a;
+    }
+    if (call(cmp, vb, vc) > 0) {
+        return c;
+    }
+    return b;
+}
+
+fn _qs_partition_i64(arr as *i64, lo as i64, hi as i64, cmp as *u8) as i64 {
+    let is i64 as mid = lo + (hi - lo) / 2;
+    let is i64 as piv_idx = _qs_median3_i64(arr, lo, mid, hi, cmp);
+    let is i64 as pivot = arr[piv_idx];
+    swap_i64(arr, piv_idx, hi);
+    let is i64 as store with mut = lo;
+    let is i64 as i with mut = lo;
+    while (i < hi) {
+        if (call(cmp, arr[i], pivot) < 0) {
+            swap_i64(arr, i, store);
+            store = store + 1;
+        }
+        i = i + 1;
+    }
+    swap_i64(arr, store, hi);
+    return store;
+}
+
+fn _qs_impl_i64(arr as *i64, lo as i64, hi as i64, cmp as *u8) as void {
+    if (hi - lo < 16) {
+        // inline insertion sort for small partitions
+        let is i64 as i with mut = lo + 1;
+        while (i <= hi) {
+            let is i64 as key = arr[i];
+            let is i64 as j with mut = i - 1;
+            while (j >= lo) {
+                if (call(cmp, arr[j], key) > 0) {
+                    arr[j + 1] = arr[j];
+                    j = j - 1;
+                } else {
+                    break;
+                }
+            }
+            arr[j + 1] = key;
+            i = i + 1;
+        }
+        return;
+    }
+    let is i64 as p = _qs_partition_i64(arr, lo, hi, cmp);
+    if (p > lo) {
+        _qs_impl_i64(arr, lo, p - 1, cmp);
+    }
+    if (p < hi) {
+        _qs_impl_i64(arr, p + 1, hi, cmp);
+    }
+}
+
+fn quicksort_i64(arr as *i64, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    _qs_impl_i64(arr, 0, count - 1, fn_ptr(cmp_asc_i64));
+}
+
+fn quicksort_desc_i64(arr as *i64, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    _qs_impl_i64(arr, 0, count - 1, fn_ptr(cmp_desc_i64));
+}
+
+// --- i32 ---
+
+fn _qs_median3_i32(arr as *i32, a as i64, b as i64, c as i64, cmp as *u8) as i64 {
+    let is i32 as va = arr[a];
+    let is i32 as vb = arr[b];
+    let is i32 as vc = arr[c];
+    if (call(cmp, va, vb) > 0) {
+        if (call(cmp, vb, vc) > 0) {
+            return b;
+        }
+        if (call(cmp, va, vc) > 0) {
+            return c;
+        }
+        return a;
+    }
+    if (call(cmp, va, vc) > 0) {
+        return a;
+    }
+    if (call(cmp, vb, vc) > 0) {
+        return c;
+    }
+    return b;
+}
+
+fn _qs_partition_i32(arr as *i32, lo as i64, hi as i64, cmp as *u8) as i64 {
+    let is i64 as mid = lo + (hi - lo) / 2;
+    let is i64 as piv_idx = _qs_median3_i32(arr, lo, mid, hi, cmp);
+    let is i32 as pivot = arr[piv_idx];
+    swap_i32(arr, piv_idx, hi);
+    let is i64 as store with mut = lo;
+    let is i64 as i with mut = lo;
+    while (i < hi) {
+        if (call(cmp, arr[i], pivot) < 0) {
+            swap_i32(arr, i, store);
+            store = store + 1;
+        }
+        i = i + 1;
+    }
+    swap_i32(arr, store, hi);
+    return store;
+}
+
+fn _qs_impl_i32(arr as *i32, lo as i64, hi as i64, cmp as *u8) as void {
+    if (hi - lo < 16) {
+        let is i64 as i with mut = lo + 1;
+        while (i <= hi) {
+            let is i32 as key = arr[i];
+            let is i64 as j with mut = i - 1;
+            while (j >= lo) {
+                if (call(cmp, arr[j], key) > 0) {
+                    arr[j + 1] = arr[j];
+                    j = j - 1;
+                } else {
+                    break;
+                }
+            }
+            arr[j + 1] = key;
+            i = i + 1;
+        }
+        return;
+    }
+    let is i64 as p = _qs_partition_i32(arr, lo, hi, cmp);
+    if (p > lo) {
+        _qs_impl_i32(arr, lo, p - 1, cmp);
+    }
+    if (p < hi) {
+        _qs_impl_i32(arr, p + 1, hi, cmp);
+    }
+}
+
+fn quicksort_i32(arr as *i32, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    _qs_impl_i32(arr, 0, count - 1, fn_ptr(cmp_asc_i32));
+}
+
+fn quicksort_desc_i32(arr as *i32, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    _qs_impl_i32(arr, 0, count - 1, fn_ptr(cmp_desc_i32));
+}
+
+// =======================================================
+// 4. Heapsort
+// =======================================================
+
+// --- i64 ---
+
+fn _sift_down_i64(arr as *i64, start as i64, end as i64, cmp as *u8) as void {
+    let is i64 as root with mut = start;
+    while (root * 2 + 1 <= end) {
+        let is i64 as child with mut = root * 2 + 1;
+        if (child + 1 <= end) {
+            // pick the child that comes later in sort order
+            if (call(cmp, arr[child], arr[child + 1]) < 0) {
+                child = child + 1;
+            }
+        }
+        if (call(cmp, arr[root], arr[child]) < 0) {
+            swap_i64(arr, root, child);
+            root = child;
+        } else {
+            return;
+        }
+    }
+}
+
+fn _heapsort_i64(arr as *i64, count as i64, cmp as *u8) as void {
+    if (count < 2) {
+        return;
+    }
+    // build max-heap (max w.r.t. comparator)
+    let is i64 as start with mut = (count - 2) / 2;
+    while (start >= 0) {
+        _sift_down_i64(arr, start, count - 1, cmp);
+        start = start - 1;
+    }
+    // extract
+    let is i64 as end with mut = count - 1;
+    while (end > 0) {
+        swap_i64(arr, 0, end);
+        end = end - 1;
+        _sift_down_i64(arr, 0, end, cmp);
+    }
+}
+
+fn heapsort_i64(arr as *i64, count as i64) as void {
+    _heapsort_i64(arr, count, fn_ptr(cmp_asc_i64));
+}
+
+fn heapsort_desc_i64(arr as *i64, count as i64) as void {
+    _heapsort_i64(arr, count, fn_ptr(cmp_desc_i64));
+}
+
+// --- i32 ---
+
+fn _sift_down_i32(arr as *i32, start as i64, end as i64, cmp as *u8) as void {
+    let is i64 as root with mut = start;
+    while (root * 2 + 1 <= end) {
+        let is i64 as child with mut = root * 2 + 1;
+        if (child + 1 <= end) {
+            if (call(cmp, arr[child], arr[child + 1]) < 0) {
+                child = child + 1;
+            }
+        }
+        if (call(cmp, arr[root], arr[child]) < 0) {
+            swap_i32(arr, root, child);
+            root = child;
+        } else {
+            return;
+        }
+    }
+}
+
+fn _heapsort_i32(arr as *i32, count as i64, cmp as *u8) as void {
+    if (count < 2) {
+        return;
+    }
+    let is i64 as start with mut = (count - 2) / 2;
+    while (start >= 0) {
+        _sift_down_i32(arr, start, count - 1, cmp);
+        start = start - 1;
+    }
+    let is i64 as end with mut = count - 1;
+    while (end > 0) {
+        swap_i32(arr, 0, end);
+        end = end - 1;
+        _sift_down_i32(arr, 0, end, cmp);
+    }
+}
+
+fn heapsort_i32(arr as *i32, count as i64) as void {
+    _heapsort_i32(arr, count, fn_ptr(cmp_asc_i32));
+}
+
+fn heapsort_desc_i32(arr as *i32, count as i64) as void {
+    _heapsort_i32(arr, count, fn_ptr(cmp_desc_i32));
+}
+
+// =======================================================
+// 5. Mergesort
+// =======================================================
+
+// --- i64 ---
+
+fn _merge_i64(arr as *i64, tmp as *i64, lo as i64, mid as i64, hi as i64, cmp as *u8) as void {
+    let is i64 as i with mut = lo;
+    while (i <= hi) {
+        tmp[i] = arr[i];
+        i = i + 1;
+    }
+    let is i64 as left with mut = lo;
+    let is i64 as right with mut = mid + 1;
+    let is i64 as k with mut = lo;
+    while (left <= mid) {
+        if (right > hi) {
+            arr[k] = tmp[left];
+            left = left + 1;
+            k = k + 1;
+        } else {
+            if (call(cmp, tmp[left], tmp[right]) <= 0) {
+                arr[k] = tmp[left];
+                left = left + 1;
+            } else {
+                arr[k] = tmp[right];
+                right = right + 1;
+            }
+            k = k + 1;
+        }
+    }
+    while (right <= hi) {
+        arr[k] = tmp[right];
+        right = right + 1;
+        k = k + 1;
+    }
+}
+
+fn _ms_impl_i64(arr as *i64, tmp as *i64, lo as i64, hi as i64, cmp as *u8) as void {
+    if (lo >= hi) {
+        return;
+    }
+    let is i64 as mid = lo + (hi - lo) / 2;
+    _ms_impl_i64(arr, tmp, lo, mid, cmp);
+    _ms_impl_i64(arr, tmp, mid + 1, hi, cmp);
+    _merge_i64(arr, tmp, lo, mid, hi, cmp);
+}
+
+fn mergesort_i64(arr as *i64, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    let is *i64 as tmp = cast(*i64, _alloc(count * 8));
+    _ms_impl_i64(arr, tmp, 0, count - 1, fn_ptr(cmp_asc_i64));
+    _free(cast(*u8, tmp));
+}
+
+fn mergesort_desc_i64(arr as *i64, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    let is *i64 as tmp = cast(*i64, _alloc(count * 8));
+    _ms_impl_i64(arr, tmp, 0, count - 1, fn_ptr(cmp_desc_i64));
+    _free(cast(*u8, tmp));
+}
+
+// --- i32 ---
+
+fn _merge_i32(arr as *i32, tmp as *i32, lo as i64, mid as i64, hi as i64, cmp as *u8) as void {
+    let is i64 as i with mut = lo;
+    while (i <= hi) {
+        tmp[i] = arr[i];
+        i = i + 1;
+    }
+    let is i64 as left with mut = lo;
+    let is i64 as right with mut = mid + 1;
+    let is i64 as k with mut = lo;
+    while (left <= mid) {
+        if (right > hi) {
+            arr[k] = tmp[left];
+            left = left + 1;
+            k = k + 1;
+        } else {
+            if (call(cmp, tmp[left], tmp[right]) <= 0) {
+                arr[k] = tmp[left];
+                left = left + 1;
+            } else {
+                arr[k] = tmp[right];
+                right = right + 1;
+            }
+            k = k + 1;
+        }
+    }
+    while (right <= hi) {
+        arr[k] = tmp[right];
+        right = right + 1;
+        k = k + 1;
+    }
+}
+
+fn _ms_impl_i32(arr as *i32, tmp as *i32, lo as i64, hi as i64, cmp as *u8) as void {
+    if (lo >= hi) {
+        return;
+    }
+    let is i64 as mid = lo + (hi - lo) / 2;
+    _ms_impl_i32(arr, tmp, lo, mid, cmp);
+    _ms_impl_i32(arr, tmp, mid + 1, hi, cmp);
+    _merge_i32(arr, tmp, lo, mid, hi, cmp);
+}
+
+fn mergesort_i32(arr as *i32, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    let is *i32 as tmp = cast(*i32, _alloc(count * 4));
+    _ms_impl_i32(arr, tmp, 0, count - 1, fn_ptr(cmp_asc_i32));
+    _free(cast(*u8, tmp));
+}
+
+fn mergesort_desc_i32(arr as *i32, count as i64) as void {
+    if (count < 2) {
+        return;
+    }
+    let is *i32 as tmp = cast(*i32, _alloc(count * 4));
+    _ms_impl_i32(arr, tmp, 0, count - 1, fn_ptr(cmp_desc_i32));
+    _free(cast(*u8, tmp));
+}
+
+// =======================================================
+// Generic sort with custom comparator (uses quicksort)
+// =======================================================
+
+fn sort_i64(arr as *i64, count as i64, cmp as *u8) as void {
+    if (count < 2) {
+        return;
+    }
+    _qs_impl_i64(arr, 0, count - 1, cmp);
+}
+
+fn sort_i32(arr as *i32, count as i64, cmp as *u8) as void {
+    if (count < 2) {
+        return;
+    }
+    _qs_impl_i32(arr, 0, count - 1, cmp);
+}

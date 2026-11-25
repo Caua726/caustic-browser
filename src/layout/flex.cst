@@ -146,6 +146,21 @@ fn _basis(c as *bx.Ctx, b as *bx.Box, it as *bx.Box, row as i64, main as f64) as
     }
     it.base = v;
     it.hypo = _clamp_main(it, v, row, main);
+    // min-height: auto: a column with no height of its own has nothing to flex against, and
+    // an item that asked to start from nothing still takes the height of what is in it.
+    if (row == 0 && main < 0.0 && it.kind != bx.B_REPLACED && v == 0.0 && bk != pr.K_AUTO
+        && it.st.v.i[pr.P_MIN_HEIGHT] == pr.K_AUTO && it.st.v.i[pr.P_OVERFLOW_Y] == pr.K_VISIBLE) {
+        let is f64 as w with mut = 0.0;
+        if (flow.specified_w(it, b.w, &w) == 0) {
+            w = _max(b.w - it.m[bx.LEFT] - it.m[bx.RIGHT] - bx.edges_w(it), 0.0);
+            if (_stretches(b, it) == 0) {
+                flow.intrinsic(c, it);
+                w = _min(w, it.max_cw);
+            }
+        }
+        it.def_h = 0.0 - 1.0;
+        it.hypo = _max(it.hypo, _lay_at_width(c, it, w, 0.0 - 1.0));
+    }
 }
 
 fn _clamp_main(it as *bx.Box, v as f64, row as i64, main as f64) as f64 {

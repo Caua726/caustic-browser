@@ -1,0 +1,57 @@
+5 function true undefined
+9
+6
+true true 
+true true
+3 12 5  12 11 11
+function true
+1
+2
+3
+3 5 24 true anonymous
+SyntaxError
+RangeError r
+SyntaxError
+199990000
+2 named 1
+42
+p
+Thu, 05 Nov 2026 18:07:09 GMT Thu Nov 05 2026 18:07:09 GMT+0000 (Coordinated Universal Time) Thu Nov 05 2026 18:07:09 GMT+0000 (Coordinated Universal Time) 2026-11-05T18:07:09.250Z
+1793902090250
+1793901662003
+1793926862003
+1793408462003
+1804035662003
+951786062003
+951786062005
+0 Thu, 01 Jan 1970 00:00:00 GMT Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time) -1 0 "1970-01-01T00:00:00.000Z"
+23 59 59 1000 946771200000 Invalid Date 9/9/2001
+a=1|b=two -1
+false
+function function true /   true true function
+string,late
+
+#x true
+1.5 63 258 2 -2.25
+true false true false 1,9,3 1,3 1.570796 1.570796 3 3 3 5 1.175201 1.543081 0.761594 5.5 1.23e+3 a%20b A
+true false sq id,class,data-foo-bar 3 id 1 2 true <section id="sq" class="k" data-foo-bar="1"><b id="in1">x</b><i>y</i></section>
+v
+true
+<b id="in1">x</b>T<i>y</i>B<u>z</u>
+PxTyBzA
+only
+1 1 1 true 1 CSS1Compat UTF-8 visible function true
+/p/q ?x=1 #h true /p/q?x=1#h
+true a.png
+v 1
+false
+true
+function
+function 4 36 2 a 3 2 true false Netscape true false 24
+INPUT
+20 10 true true
+1 7 true  function true
+error heard
+IMG 4 5
+object v 
+true

@@ -1,0 +1,281 @@
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../../src/ir/opt_mem.cst" as om;
+
+// PE file alignment (0x200). Local copy — the only pe_writer constant the
+// import-layout code needs; everything else is passed in or computed.
+let is i64 as FILE_ALIGN with imut = 512;
+
+// --- Layout state, populated by compute_idata_layout ---
+struct ImportLayout {
+    // arrays of size ls.cstimport_count, parallel to ls.cstimport_*
+    iat_slot_rvas as *u8;     // i64[] — RVA of each symbol's IAT slot
+    ilt_slot_rvas as *u8;     // i64[] — RVA of each symbol's ILT slot
+    hint_rvas as *u8;         // i64[] — RVA of each symbol's hint/name entry
+    // per-DLL grouping (one entry per UNIQUE DLL, in first-seen order):
+    dll_name_ptrs as *u8;     // i64[] — *u8 dll name from ls
+    dll_name_lens as *u8;     // i32[] — i32 dll name len
+    dll_name_rvas as *u8;     // i64[] — RVA where DLL name string sits
+    dll_iat_first_rvas as *u8;// i64[] — RVA of first IAT entry for this DLL
+    dll_ilt_first_rvas as *u8;// i64[] — RVA of first ILT entry for this DLL
+    dll_iid_offset as *u8;    // i32[] — offset within IID array
+    dll_count as i32;
+    // overall layout
+    iat_total_size as i64;
+    iid_size as i64;
+    ilt_total_size as i64;
+    hint_total_size as i64;
+    dllname_total_size as i64;
+    idata_virt_size as i64;
+    idata_raw_size as i64;
+}
+
+// Helper: linear find dll index in layout's dll_name_ptrs (returns -1 if not present)
+fn _find_dll_idx(lay as *ImportLayout, dll as *u8, dll_len as i32) as i32 {
+    let is *i64 as dnp = cast(*i64, lay.dll_name_ptrs);
+    let is *i32 as dnl = cast(*i32, lay.dll_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < lay.dll_count) {
+        let is i32 as eq with mut = 1;
+        if (dnl[i] != dll_len) { eq = 0; }
+        if (eq == 1) {
+            let is i32 as k with mut = 0;
+            let is *u8 as nm = cast(*u8, dnp[i]);
+            while (k < dll_len) {
+                if (nm[k] != dll[k]) { eq = 0; k = dll_len; }
+                k = k + 1;
+            }
+        }
+        if (eq == 1) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn compute_idata_layout(ls as *linker.LinkerState, idata_rva as i64) as ImportLayout {
+    let is ImportLayout as lay;
+    let is i32 as n = ls.cstimport_count;
+    lay.iat_slot_rvas = om.opt_alloc(cast(i64, n) * 8);
+    lay.ilt_slot_rvas = om.opt_alloc(cast(i64, n) * 8);
+    lay.hint_rvas = om.opt_alloc(cast(i64, n) * 8);
+    lay.dll_name_ptrs = om.opt_alloc(cast(i64, n) * 8);
+    lay.dll_name_lens = om.opt_alloc(cast(i64, n) * 4);
+    lay.dll_name_rvas = om.opt_alloc(cast(i64, n) * 8);
+    lay.dll_iat_first_rvas = om.opt_alloc(cast(i64, n) * 8);
+    lay.dll_ilt_first_rvas = om.opt_alloc(cast(i64, n) * 8);
+    lay.dll_iid_offset = om.opt_alloc(cast(i64, n) * 4);
+    lay.dll_count = 0;
+
+    // First, group the cstimport entries by DLL — record unique DLL list in
+    // first-seen order, plus the per-DLL count of symbols.
+    let is *i64 as ldp = cast(*i64, ls.cstimport_dll_ptrs);
+    let is *i32 as ldl = cast(*i32, ls.cstimport_dll_lens);
+    let is *i32 as lsl = cast(*i32, ls.cstimport_sym_lens);
+
+    let is *i64 as dnp = cast(*i64, lay.dll_name_ptrs);
+    let is *i32 as dnl = cast(*i32, lay.dll_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as d = cast(*u8, ldp[i]);
+        let is i32 as didx = _find_dll_idx(&lay, d, ldl[i]);
+        if (didx < 0) {
+            let is i32 as idx = lay.dll_count;
+            dnp[idx] = cast(i64, d);
+            dnl[idx] = ldl[i];
+            lay.dll_count = lay.dll_count + 1;
+        }
+        i = i + 1;
+    }
+
+    // Layout: IAT region first, then IID, then ILT, then hint/name, then DLL names.
+    // Each DLL's IAT block is (count_of_syms_in_this_dll + 1) × 8 (with null term).
+    // Same for ILT.
+
+    // Pre-compute per-DLL sym count
+    let is *u8 as dll_sym_counts = om.opt_alloc(cast(i64, lay.dll_count) * 4);
+    let is *i32 as dsc = cast(*i32, dll_sym_counts);
+    let is i32 as di with mut = 0;
+    while (di < lay.dll_count) { dsc[di] = 0; di = di + 1; }
+    i = 0;
+    while (i < n) {
+        let is i32 as didx = _find_dll_idx(&lay, cast(*u8, ldp[i]), ldl[i]);
+        dsc[didx] = dsc[didx] + 1;
+        i = i + 1;
+    }
+
+    // IAT region: sum over DLLs of (count+1)*8
+    let is i64 as iat_off with mut = 0;
+    let is *i64 as diatf = cast(*i64, lay.dll_iat_first_rvas);
+    di = 0;
+    while (di < lay.dll_count) {
+        diatf[di] = idata_rva + iat_off;
+        iat_off = iat_off + cast(i64, dsc[di] + 1) * 8;
+        di = di + 1;
+    }
+    lay.iat_total_size = iat_off;
+
+    // IID array: (dll_count + 1) * 20 bytes
+    let is i64 as iid_start = lay.iat_total_size;
+    lay.iid_size = cast(i64, lay.dll_count + 1) * 20;
+    let is *i32 as diido = cast(*i32, lay.dll_iid_offset);
+    di = 0;
+    while (di < lay.dll_count) { diido[di] = cast(i32, iid_start + cast(i64, di) * 20); di = di + 1; }
+
+    // ILT region: mirrors IAT
+    let is i64 as ilt_start = iid_start + lay.iid_size;
+    let is i64 as ilt_off with mut = ilt_start;
+    let is *i64 as diltf = cast(*i64, lay.dll_ilt_first_rvas);
+    di = 0;
+    while (di < lay.dll_count) {
+        diltf[di] = idata_rva + ilt_off;
+        ilt_off = ilt_off + cast(i64, dsc[di] + 1) * 8;
+        di = di + 1;
+    }
+    lay.ilt_total_size = ilt_off - ilt_start;
+
+    // Per-symbol IAT/ILT slot RVAs: fill in by walking imports in input
+    // order but assigning to per-DLL counters.
+    let is *u8 as dll_iat_cur = om.opt_alloc(cast(i64, lay.dll_count) * 8);
+    let is *u8 as dll_ilt_cur = om.opt_alloc(cast(i64, lay.dll_count) * 8);
+    let is *i64 as diatc = cast(*i64, dll_iat_cur);
+    let is *i64 as diltc = cast(*i64, dll_ilt_cur);
+    di = 0;
+    while (di < lay.dll_count) {
+        diatc[di] = diatf[di];
+        diltc[di] = diltf[di];
+        di = di + 1;
+    }
+    let is *i64 as iatr = cast(*i64, lay.iat_slot_rvas);
+    let is *i64 as iltr = cast(*i64, lay.ilt_slot_rvas);
+    i = 0;
+    while (i < n) {
+        let is i32 as didx = _find_dll_idx(&lay, cast(*u8, ldp[i]), ldl[i]);
+        iatr[i] = diatc[didx];
+        diatc[didx] = diatc[didx] + 8;
+        iltr[i] = diltc[didx];
+        diltc[didx] = diltc[didx] + 8;
+        i = i + 1;
+    }
+
+    // Hint/name table: per symbol, 2-byte hint + name + NUL, padded so the
+    // total entry size is a multiple of 16. Matches the conventional layout
+    // produced by MSVC/lld-link — Wine's import resolver is happier when
+    // each hint/name entry sits on a 16-byte boundary.
+    let is i64 as hint_start = ilt_off;
+    let is i64 as hint_off with mut = hint_start;
+    let is *i64 as hr = cast(*i64, lay.hint_rvas);
+    i = 0;
+    while (i < n) {
+        hr[i] = idata_rva + hint_off;
+        let is i64 as entry_sz with mut = 2 + cast(i64, lsl[i]) + 1;
+        // Pad up to next multiple of 16
+        if ((entry_sz & 15) != 0) { entry_sz = entry_sz + (16 - (entry_sz & 15)); }
+        hint_off = hint_off + entry_sz;
+        i = i + 1;
+    }
+    lay.hint_total_size = hint_off - hint_start;
+
+    // DLL name strings: per DLL, name + NUL, padded to multiple of 16.
+    let is i64 as dlln_start = hint_off;
+    let is i64 as dlln_off with mut = dlln_start;
+    let is *i64 as dnr = cast(*i64, lay.dll_name_rvas);
+    di = 0;
+    while (di < lay.dll_count) {
+        dnr[di] = idata_rva + dlln_off;
+        let is i64 as entry_sz with mut = cast(i64, dnl[di]) + 1;
+        if ((entry_sz & 15) != 0) { entry_sz = entry_sz + (16 - (entry_sz & 15)); }
+        dlln_off = dlln_off + entry_sz;
+        di = di + 1;
+    }
+    lay.dllname_total_size = dlln_off - dlln_start;
+
+    lay.idata_virt_size = dlln_off;
+    // Round raw size to FILE_ALIGN
+    lay.idata_raw_size = lay.idata_virt_size;
+    if (lay.idata_raw_size % FILE_ALIGN != 0) {
+        lay.idata_raw_size = lay.idata_raw_size + (FILE_ALIGN - lay.idata_raw_size % FILE_ALIGN);
+    }
+    if (lay.idata_raw_size < FILE_ALIGN) { lay.idata_raw_size = FILE_ALIGN; }
+    return lay;
+}
+
+// Pre-register every __imp_<sym> as a global symbol whose vaddr is its IAT
+// slot's absolute virtual address. apply_relocations() (existing core code)
+// will then resolve PC32 relocations against __imp_<sym> to the IAT slot,
+// so the indirect call `call qword ptr [rip+__imp_X]` lands correctly.
+fn register_imp_gsyms(ls as *linker.LinkerState, lay as *ImportLayout) as void {
+    let is *i64 as lsp = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as lsl = cast(*i32, ls.cstimport_sym_lens);
+    let is *i64 as iatr = cast(*i64, lay.iat_slot_rvas);
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as i with mut = 0;
+    while (i < ls.cstimport_count) {
+        // Build "__imp_<sym>"
+        let is i32 as sl = lsl[i];
+        let is *u8 as full = om.opt_alloc(cast(i64, sl) + 7);
+        full[0] = 95; full[1] = 95; full[2] = 105; full[3] = 109; full[4] = 112; full[5] = 95;
+        let is *u8 as sn = cast(*u8, lsp[i]);
+        let is i32 as k with mut = 0;
+        while (k < sl) { full[6 + k] = sn[k]; k = k + 1; }
+        full[6 + sl] = cast(u8, 0);
+        let is i32 as full_len = sl + 6;
+        let is i64 as vaddr = ls.base_addr + iatr[i];
+        // Upsert: if a __imp_<sym> entry already exists (placed by the
+        // obj-symbol-merge pass with defined=0), patch its vaddr and mark
+        // defined. Otherwise add fresh. This avoids the linker's
+        // "undefined symbol" warning AND ensures relocations resolve.
+        let is i32 as existing = linker.gsym_find(gsyms, full, full_len);
+        if (existing >= 0) {
+            let is *linker.GlobalSym as g = linker.gsym_get(gsyms, existing);
+            g.vaddr = vaddr;
+            g.section = reader.SECIDX_DATA;
+            g.defined = 1;
+        } else {
+            linker.gsym_add(gsyms, full, full_len, reader.SECIDX_DATA, vaddr, 0, 1);
+        }
+        i = i + 1;
+    }
+}
+
+// Look up the IAT slot RVA for an imported symbol by name (e.g. "ExitProcess").
+// Returns -1 if not found in the collected cstimport list.
+fn _has_cstimport(ls as *linker.LinkerState, name as *u8, name_len as i32) as i32 {
+    let is *i64 as lsp = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as lsl = cast(*i32, ls.cstimport_sym_lens);
+    let is i32 as i with mut = 0;
+    while (i < ls.cstimport_count) {
+        if (lsl[i] == name_len) {
+            let is i32 as eq with mut = 1;
+            let is *u8 as sn = cast(*u8, lsp[i]);
+            let is i32 as k with mut = 0;
+            while (k < name_len) {
+                if (sn[k] != name[k]) { eq = 0; k = name_len; }
+                k = k + 1;
+            }
+            if (eq == 1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _find_iat_rva(ls as *linker.LinkerState, lay as *ImportLayout, name as *u8, name_len as i32) as i64 {
+    let is *i64 as lsp = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as lsl = cast(*i32, ls.cstimport_sym_lens);
+    let is *i64 as iatr = cast(*i64, lay.iat_slot_rvas);
+    let is i32 as i with mut = 0;
+    while (i < ls.cstimport_count) {
+        if (lsl[i] == name_len) {
+            let is i32 as eq with mut = 1;
+            let is *u8 as sn = cast(*u8, lsp[i]);
+            let is i32 as k with mut = 0;
+            while (k < name_len) {
+                if (sn[k] != name[k]) { eq = 0; k = name_len; }
+                k = k + 1;
+            }
+            if (eq == 1) { return iatr[i]; }
+        }
+        i = i + 1;
+    }
+    return cast(i64, 0 - 1);
+}

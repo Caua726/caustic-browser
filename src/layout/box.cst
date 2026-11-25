@@ -216,6 +216,7 @@ struct Ctx {
     ext_r  as f64;            // and so far, within the nearest thing that clips
     ext_b  as f64;
     images as ImageFn;
+    frames as *u8;    // called for an <iframe>'s box when it is painted
     user   as *u8;
     base   as *u8;
 }

@@ -1,0 +1,268 @@
+use "../../std/mem.cst" as mem;
+use "../../src/ir/opt_mem.cst" as om;
+use "../core/asm_defs.cst" as def;
+
+// Line kinds
+let is i32 as LINE_EMPTY     with imut = 0;
+let is i32 as LINE_LABEL     with imut = 1;
+let is i32 as LINE_INST      with imut = 2;
+let is i32 as LINE_DIRECTIVE with imut = 3;
+
+// Directive kinds
+let is i32 as DIR_TEXT     with imut = 1;
+let is i32 as DIR_DATA     with imut = 2;
+let is i32 as DIR_RODATA   with imut = 3;
+let is i32 as DIR_BSS      with imut = 4;
+let is i32 as DIR_GLOBL    with imut = 5;
+let is i32 as DIR_STRING   with imut = 6;
+let is i32 as DIR_BYTE     with imut = 7;
+let is i32 as DIR_WORD     with imut = 8;
+let is i32 as DIR_LONG     with imut = 9;
+let is i32 as DIR_QUAD     with imut = 10;
+let is i32 as DIR_ZERO     with imut = 11;
+let is i32 as DIR_SECTION  with imut = 12;
+let is i32 as DIR_INTEL    with imut = 13;
+let is i32 as DIR_OTHER    with imut = 14;
+let is i32 as DIR_ASCII    with imut = 15;
+let is i32 as DIR_CSTIMPORT with imut = 16;
+let is i32 as DIR_INCBIN   with imut = 17;
+let is i32 as DIR_FILE     with imut = 18;
+let is i32 as DIR_LOC      with imut = 19;
+// Call Frame Information directives (SysV .eh_frame). dir_num carries the
+// numeric operand (offset), dir_arg_len the register id for the reg-taking
+// forms (dir_arg_len is otherwise unused by these directives).
+let is i32 as DIR_CFI_STARTPROC        with imut = 20;
+let is i32 as DIR_CFI_ENDPROC          with imut = 21;
+let is i32 as DIR_CFI_DEF_CFA_OFFSET   with imut = 22;
+let is i32 as DIR_CFI_DEF_CFA_REGISTER with imut = 23;
+let is i32 as DIR_CFI_OFFSET           with imut = 24;
+// `.dbg_prologue_end`: the offset where the prologue (frame setup + parameter
+// spills) is done. The line-table row at it is flagged DW_LNS_set_prologue_end
+// so a debugger sets a breakpoint on a function past it, where the parameters
+// are already in their stack slots.
+let is i32 as DIR_DBG_PROLOGUE_END     with imut = 25;
+// `.p2align N[, fill[, max]]`: pad to a 2^N boundary of the section, with
+// multi-byte nops in code; skipped when it would take more than `max` bytes
+// (max in op1_imm, 0 = no limit; the fill operand is not supported).
+let is i32 as DIR_P2ALIGN              with imut = 26;
+
+// === ParsedLine structs ===
+
+// Low-cardinality fields narrowed (i32->i16/i8) to shrink the line: the whole
+// .s is held as one ParsedLine array (~305K lines for the self-host .s), so each
+// byte trimmed is ~0.3MB off the assembler's resident set. Storage only — reads
+// widen back to i32. Register fields use i16, not i8, because REG_NONE == 255
+// does not fit a signed i8. Values that can be large (imm/disp/num/offset;
+// line_no for big files) stay i64/i32.
+//
+// A DIRECTIVE'S ARGUMENT IS NOT LOW-CARDINALITY. `.string` carries a whole
+// string literal and `.zero` a whole array's size, and both were i16: a literal
+// of 32768 source characters wrapped to negative, the data landed truncated or
+// garbled, and every later offset was computed off it. Silently — the only
+// symptom was a program reading nonsense out of its own constant. 32767 worked.
+// A 40 KB string literal in a generated table is an ordinary thing to write, so
+// dir_arg_len, decoded_len and size are i32.
+struct ParsedLine {
+    kind as i8;
+    section as i8;
+    inst_id as i16;
+    // op1 flattened
+    op1_kind as i8;
+    op1_reg_id as i16;        // 0..79 or REG_NONE(255)
+    op1_imm as i64;
+    op1_mem_base as i16;
+    op1_mem_disp as i64;
+    op1_mem_size as i8;
+    op1_mem_index as i16;
+    op1_mem_scale as i8;
+    op1_mem_seg as i8;          // segment override prefix byte, 0 = none
+    op1_label_ptr as *u8;
+    op1_label_len as i16;
+    // op2 flattened
+    op2_kind as i8;
+    op2_reg_id as i16;
+    op2_imm as i64;
+    op2_mem_base as i16;
+    op2_mem_disp as i64;
+    op2_mem_size as i8;
+    op2_mem_index as i16;
+    op2_mem_scale as i8;
+    op2_mem_seg as i8;
+    op2_label_ptr as *u8;
+    op2_label_len as i16;
+    // other
+    label_ptr as *u8;
+    label_len as i16;
+    dir_kind as i8;
+    dir_arg_ptr as *u8;
+    dir_arg_len as i32;
+    dir_num as i64;
+    decoded_ptr as *u8;
+    decoded_len as i32;
+    offset as i64;
+    size as i32;
+    line_no as i32;
+}
+
+struct ParsedLines {
+    data as *u8;
+    count as i32;
+    cap as i32;
+}
+
+fn pl_init(hint as i32) as ParsedLines {
+    let is i32 as cap with mut = hint;
+    if (cap < 4096) { cap = 4096; }
+    let is ParsedLines as pl;
+    pl.data = om.opt_alloc(cast(i64, cap) * sizeof(ParsedLine));
+    pl.count = 0;
+    pl.cap = cap;
+    return pl;
+}
+
+fn pl_get(pl as *ParsedLines, idx as i32) as *ParsedLine {
+    return cast(*ParsedLine, cast(i64, pl.data) + cast(i64, idx) * sizeof(ParsedLine));
+}
+
+// Release the parsed-line array. Safe once encoding (pass2) is done: the
+// output buffers hold the encoded bytes; label pointers reference source text.
+fn pl_free(pl as *ParsedLines) as void {
+    om.opt_free(pl.data);
+    pl.data = cast(*u8, 0);
+    pl.count = 0;
+    pl.cap = 0;
+}
+
+fn pl_add(pl as *ParsedLines) as *ParsedLine {
+    if (pl.count >= pl.cap) {
+        let is i32 as new_cap = pl.cap * 2;
+        let is *u8 as new_data = om.opt_alloc(cast(i64, new_cap) * sizeof(ParsedLine));
+        mem.memcpy(new_data, pl.data, cast(i64, pl.count) * sizeof(ParsedLine));
+        om.opt_free(pl.data);
+        pl.data = new_data;
+        pl.cap = new_cap;
+    }
+    let is *ParsedLine as line = pl_get(pl, pl.count);
+    // Fast word-at-a-time zero
+    let is *u8 as lp = cast(*u8, line);
+    let is i64 as sz = sizeof(ParsedLine);
+    let is i64 as wi with mut = 0;
+    let is i64 as wn = sz / 8;
+    while (wi < wn) {
+        let is *i64 as wp = cast(*i64, cast(i64, lp) + wi * 8);
+        *wp = 0;
+        wi = wi + 1;
+    }
+    // sizeof(ParsedLine) is no longer a multiple of 8 (fields narrowed), so the
+    // word loop leaves a tail; zero it byte-wise so trailing fields start clean.
+    let is i64 as bi with mut = wn * 8;
+    while (bi < sz) { lp[bi] = cast(u8, 0); bi = bi + 1; }
+    line.op1_reg_id = def.REG_NONE;
+    line.op1_mem_base = def.REG_NONE;
+    line.op1_mem_index = def.REG_NONE;
+    line.op2_reg_id = def.REG_NONE;
+    line.op2_mem_base = def.REG_NONE;
+    line.op2_mem_index = def.REG_NONE;
+    pl.count = pl.count + 1;
+    return line;
+}
+
+// === Operand helpers ===
+
+// A [rip+label] operand is an ordinary memory operand with rip as its base,
+// except in the forms that had their own encoding before every instruction
+// took one: lea, call, and the 64-bit load `mov r64, [rip+label]`, which on an
+// undefined label means the label's GOT slot (an `extern let`).
+fn _rip_is_memory(line as *ParsedLine, which as i32) as i32 {
+    let is i32 as inst = cast(i32, line.inst_id);
+    if (inst == def.INST_LEA || inst == def.INST_CALL) { return 0; }
+    if (inst == def.INST_MOV && which == 2 && line.op1_kind == def.OP_REG
+        && line.op1_reg_id >= 0 && line.op1_reg_id < 16) { return 0; }
+    return 1;
+}
+
+fn make_op(line as *ParsedLine, which as i32) as def.Operand {
+    let is def.Operand as op;
+    if (which == 1) {
+        op.kind = line.op1_kind;
+        op.reg_id = line.op1_reg_id;
+        op.imm = line.op1_imm;
+        op.mem_base = line.op1_mem_base;
+        op.mem_disp = line.op1_mem_disp;
+        op.mem_size = line.op1_mem_size;
+        op.mem_index = line.op1_mem_index;
+        op.mem_scale = line.op1_mem_scale;
+        op.mem_seg = line.op1_mem_seg;
+        op.label_ptr = line.op1_label_ptr;
+        op.label_len = line.op1_label_len;
+    } else {
+        op.kind = line.op2_kind;
+        op.reg_id = line.op2_reg_id;
+        op.imm = line.op2_imm;
+        op.mem_base = line.op2_mem_base;
+        op.mem_disp = line.op2_mem_disp;
+        op.mem_size = line.op2_mem_size;
+        op.mem_index = line.op2_mem_index;
+        op.mem_scale = line.op2_mem_scale;
+        op.mem_seg = line.op2_mem_seg;
+        op.label_ptr = line.op2_label_ptr;
+        op.label_len = line.op2_label_len;
+    }
+    if (op.kind == def.OP_RIP_LABEL && _rip_is_memory(line, which) == 1) {
+        op.kind = def.OP_MEM;
+        op.mem_base = def.REG_RIP;
+        op.mem_index = def.REG_NONE;
+        op.mem_scale = 0;
+        op.mem_disp = 0;
+    }
+    return op;
+}
+
+fn set_op_reg(line as *ParsedLine, which as i32, reg_id as i32) as void {
+    if (which == 1) { line.op1_kind = def.OP_REG; line.op1_reg_id = cast(i16, reg_id); }
+    else { line.op2_kind = def.OP_REG; line.op2_reg_id = cast(i16, reg_id); }
+}
+
+fn set_op_imm(line as *ParsedLine, which as i32, val as i64) as void {
+    if (which == 1) { line.op1_kind = def.OP_IMM; line.op1_imm = val; }
+    else { line.op2_kind = def.OP_IMM; line.op2_imm = val; }
+}
+
+fn set_op_mem(line as *ParsedLine, which as i32, base as i32, disp as i64, sz as i32) as void {
+    if (which == 1) { line.op1_kind = def.OP_MEM; line.op1_mem_base = cast(i16, base); line.op1_mem_disp = disp; line.op1_mem_size = cast(i8, sz); line.op1_mem_index = def.REG_NONE; line.op1_mem_scale = 0; }
+    else { line.op2_kind = def.OP_MEM; line.op2_mem_base = cast(i16, base); line.op2_mem_disp = disp; line.op2_mem_size = cast(i8, sz); line.op2_mem_index = def.REG_NONE; line.op2_mem_scale = 0; }
+}
+
+fn set_op_mem_sib(line as *ParsedLine, which as i32, base as i32, index as i32, scale as i32, disp as i64, sz as i32) as void {
+    if (which == 1) {
+        line.op1_kind = def.OP_MEM;
+        line.op1_mem_base = cast(i16, base);
+        line.op1_mem_index = cast(i16, index);
+        line.op1_mem_scale = cast(i8, scale);
+        line.op1_mem_disp = disp;
+        line.op1_mem_size = cast(i8, sz);
+    } else {
+        line.op2_kind = def.OP_MEM;
+        line.op2_mem_base = cast(i16, base);
+        line.op2_mem_index = cast(i16, index);
+        line.op2_mem_scale = cast(i8, scale);
+        line.op2_mem_disp = disp;
+        line.op2_mem_size = cast(i8, sz);
+    }
+}
+
+fn set_op_label(line as *ParsedLine, which as i32, ptr as *u8, len as i32) as void {
+    if (which == 1) { line.op1_kind = def.OP_LABEL; line.op1_label_ptr = ptr; line.op1_label_len = cast(i16, len); }
+    else { line.op2_kind = def.OP_LABEL; line.op2_label_ptr = ptr; line.op2_label_len = cast(i16, len); }
+}
+
+// The segment a memory operand already set by set_op_mem/_sib is read through.
+fn set_op_seg(line as *ParsedLine, which as i32, seg as i32) as void {
+    if (which == 1) { line.op1_mem_seg = cast(i8, seg); }
+    else { line.op2_mem_seg = cast(i8, seg); }
+}
+
+fn set_op_rip(line as *ParsedLine, which as i32, ptr as *u8, len as i32, sz as i32) as void {
+    if (which == 1) { line.op1_kind = def.OP_RIP_LABEL; line.op1_label_ptr = ptr; line.op1_label_len = cast(i16, len); line.op1_mem_size = cast(i8, sz); }
+    else { line.op2_kind = def.OP_RIP_LABEL; line.op2_label_ptr = ptr; line.op2_label_len = cast(i16, len); line.op2_mem_size = cast(i8, sz); }
+}

@@ -1,0 +1,618 @@
+// =======================================================
+// std/mem/bins.cst
+// Bin allocator — O(1) alloc/free, zero header overhead, lazy mmap
+//
+// - 16 default size classes: 8,16,24,32,48,64,96,128,192,256,384,512,768,1024,2048,4096
+// - Lookup table for O(1) bin selection
+// - 8-byte header per block (bin index, slot index, slab index) for O(1) free
+// - Bitmap per slab for O(1) double-free detection
+// - Freelist per slab (LIFO pop/push)
+// - Multiple slabs per bin (auto-growth); the slabs with a free slot are kept
+//   on a list of their own, so alloc never walks the full ones, and each bin
+//   has a table of its slabs, so free finds the owner from the header
+// - Full introspection (stats, overhead, waste)
+// =======================================================
+
+use "core.cst" as core;
+
+// --- Constants ---
+
+let is i64 as HEADER_SIZE with imut = 8;
+// Header byte 0 for an allocation served straight from mmap rather than from a
+// bin. 255 cannot collide: bin_count is 20 by default and the field is one
+// byte, so a real index is never near it.
+let is i64 as BIG_INDEX with imut = 255;
+
+fn _round_up(n as i64, to as i64) as i64 { return ((n + to - 1) / to) * to; }
+let is i64 as NUM_DEFAULT_BINS with imut = 20;
+let is i64 as LOOKUP_SIZE with imut = 8193;
+
+// --- Structs ---
+
+struct Slab {
+    region as *u8;
+    bitmap as *u8;
+    freelist as *u8;
+    region_size as i64;
+    total_slots as i64;
+    used_slots as i64;
+    next as *u8;          // every slab of the bin
+    free_next as *u8;     // slabs with a free slot (Bin.free_head)
+    in_free as i64;       // 1 while on that list
+    index as i64;         // position in Bin.slabs
+}
+
+struct Bin {
+    slot_size as i64;
+    alloc_size as i64;
+    slab_head as *u8;
+    page_size as i64;
+    free_head as *u8;     // first slab with a free slot, 0 when none
+    slabs as *u8;         // *Slab per slab index (the header's bytes 4-7)
+    slab_count as i64;
+    slab_cap as i64;
+}
+
+struct Bins {
+    bin_data as *u8;
+    bin_count as i64;
+    page_size as i64;
+    lookup as *u8;
+    lookup_entries as i64;
+    lock as u32;          // B6: lazy futex lock (no-op until mem.set_mt())
+    _pad as u32;
+}
+
+
+// --- Internal: slab ---
+
+fn _slab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
+    // A slot is its size class PLUS HEADER_SIZE, so the largest classes do not
+    // fit a page-sized slab: the 65536 bin needs 65544 and the slab has 65536.
+    // Refusing here left that bin unable to ever carve a slot — a size class
+    // declared in the table that served nobody, and the request failed with no
+    // message at all. Grow the region to hold at least one slot instead, so the
+    // declared table is the table you actually get.
+    let is i64 as region_size with mut = page_size;
+    if (alloc_size > region_size) {
+        region_size = ((alloc_size + 4095) / 4096) * 4096;
+    }
+
+    let is i64 as total_slots = region_size / alloc_size;
+    if (total_slots == 0) { return cast(*Slab, 0); }
+
+    let is i64 as bitmap_bytes = (total_slots + 7) >> 3;
+    let is i64 as meta_size = sizeof(Slab) + bitmap_bytes;
+
+    let is *u8 as meta = core.mmap_anon(meta_size);
+    if (cast(i64, meta) < 0) { return cast(*Slab, 0); }
+
+    let is *u8 as region = core.mmap_anon(region_size);
+    if (cast(i64, region) < 0) {
+        core.munmap(meta, meta_size);
+        return cast(*Slab, 0);
+    }
+
+    let is *Slab as slab = cast(*Slab, meta);
+    slab.region = region;
+    slab.bitmap = cast(*u8, cast(i64, meta) + sizeof(Slab));
+    slab.region_size = region_size;
+    slab.total_slots = total_slots;
+    slab.used_slots = 0;
+    slab.next = cast(*u8, 0);
+    slab.free_next = cast(*u8, 0);
+    slab.in_free = 0;
+    slab.index = 0;
+
+    // Init bitmap: all 1s (all free)
+    let is i64 as i with mut = 0;
+    while (i < bitmap_bytes) {
+        slab.bitmap[i] = 255;
+        i = i + 1;
+    }
+    let is i64 as extra = bitmap_bytes * 8 - total_slots;
+    if (extra > 0) {
+        let is i64 as last = bitmap_bytes - 1;
+        slab.bitmap[last] = cast(u8, (1 << (8 - extra)) - 1);
+    }
+
+    // Build freelist. A free slot holds the next free slot in its first word
+    // and, when the slot has room for it (alloc_size >= 16), its own index in
+    // the second, so alloc writes the header without dividing.
+    i = 0;
+    while (i < total_slots - 1) {
+        let is *u8 as slot = cast(*u8, cast(i64, region) + i * alloc_size);
+        let is *i64 as np = cast(*i64, slot);
+        *np = cast(i64, region) + (i + 1) * alloc_size;
+        if (alloc_size >= 16) { np[1] = i; }
+        i = i + 1;
+    }
+    let is *u8 as last_slot = cast(*u8, cast(i64, region) + (total_slots - 1) * alloc_size);
+    let is *i64 as last_np = cast(*i64, last_slot);
+    *last_np = 0;
+    if (alloc_size >= 16) { last_np[1] = total_slots - 1; }
+
+    slab.freelist = region;
+    return slab;
+}
+
+fn _slab_destroy(slab as *Slab) as void {
+    let is i64 as bitmap_bytes = (slab.total_slots + 7) >> 3;
+    core.munmap(slab.region, slab.region_size);
+    core.munmap(cast(*u8, slab), sizeof(Slab) + bitmap_bytes);
+}
+
+// --- Internal: bin helpers ---
+
+fn _bin_at(b as *Bins, idx as i64) as *Bin {
+    return cast(*Bin, cast(i64, b.bin_data) + idx * sizeof(Bin));
+}
+
+// Record slab in bin's table (grown by doubling); 0 when out of memory.
+fn _bin_add_slab(bin as *Bin, slab as *Slab) as i32 {
+    if (bin.slab_count == bin.slab_cap) {
+        let is i64 as cap with mut = bin.slab_cap * 2;
+        if (cap < 16) { cap = 16; }
+        let is *u8 as t = core.mmap_anon(cap * 8);
+        if (cast(i64, t) < 0) { return 0; }
+        let is *i64 as nt = cast(*i64, t);
+        let is *i64 as ot = cast(*i64, bin.slabs);
+        let is i64 as k with mut = 0;
+        while (k < bin.slab_count) { nt[k] = ot[k]; k = k + 1; }
+        if (bin.slab_cap > 0) { core.munmap(bin.slabs, bin.slab_cap * 8); }
+        bin.slabs = t;
+        bin.slab_cap = cap;
+    }
+    let is *i64 as tab = cast(*i64, bin.slabs);
+    tab[bin.slab_count] = cast(i64, slab);
+    slab.index = bin.slab_count;
+    bin.slab_count = bin.slab_count + 1;
+    return 1;
+}
+
+fn _build_lookup(b as *Bins) as void {
+    let is i64 as entries = b.lookup_entries;
+    let is i64 as i with mut = 0;
+    while (i < entries * 2) {
+        b.lookup[i] = 255;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < entries) {
+        let is i64 as size with mut = i * 8;
+        if (size == 0) { size = 1; }
+        let is i64 as j with mut = 0;
+        while (j < b.bin_count) {
+            let is *Bin as bin = _bin_at(b, j);
+            if (bin.slot_size >= size) {
+                let is *u8 as lp = cast(*u8, cast(i64, b.lookup) + i * 2);
+                lp[0] = cast(u8, j & 255);
+                lp[1] = cast(u8, (j >> 8) & 255);
+                break;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn _lookup_bin(b as *Bins, size as i64) as i64 {
+    let is i64 as idx with mut = size >> 3;
+    if ((size & 7) != 0) { idx = idx + 1; }
+    if (idx >= b.lookup_entries) { return 0 - 1; }
+    let is *u8 as lp = cast(*u8, cast(i64, b.lookup) + idx * 2);
+    let is i64 as bin_idx = cast(i64, lp[0]) + cast(i64, lp[1]) * 256;
+    if (bin_idx >= 255) { return 0 - 1; }
+    return bin_idx;
+}
+
+fn _setup_default(b as *Bins) as void {
+    let is [20]i64 as sizes;
+    sizes[0] = 8;     sizes[1] = 16;    sizes[2] = 24;    sizes[3] = 32;
+    sizes[4] = 48;    sizes[5] = 64;    sizes[6] = 96;    sizes[7] = 128;
+    sizes[8] = 192;   sizes[9] = 256;   sizes[10] = 384;  sizes[11] = 512;
+    sizes[12] = 768;  sizes[13] = 1024; sizes[14] = 2048; sizes[15] = 4096;
+    sizes[16] = 8192; sizes[17] = 16384; sizes[18] = 32768; sizes[19] = 65536;
+
+    let is i64 as i with mut = 0;
+    while (i < 20) {
+        let is *Bin as bin = _bin_at(b, i);
+        bin.slot_size = sizes[i];
+        bin.alloc_size = sizes[i] + HEADER_SIZE;
+        bin.slab_head = cast(*u8, 0);
+        bin.page_size = b.page_size;
+        bin.free_head = cast(*u8, 0);
+        bin.slabs = cast(*u8, 0);
+        bin.slab_count = 0;
+        bin.slab_cap = 0;
+        i = i + 1;
+    }
+}
+
+// --- Public API ---
+
+fn bins_new(page_size as i64) as Bins {
+    let is Bins as b;
+    // FIRST, and before any early return below. `b` is a local: it arrives
+    // holding whatever was on the stack, and every other field here is written
+    // on some path, but the lock never was. Nothing noticed while the program
+    // was single-threaded, because `_lk` is a no-op until mem.set_mt() — and
+    // then the first allocation through such a heap finds a non-zero lock word,
+    // futex-waits on a lock nobody holds, and never wakes. No error, no crash,
+    // just a process that stops.
+    b.lock = cast(u32, 0);
+    b._pad = cast(u32, 0);
+    b.bin_count = NUM_DEFAULT_BINS;
+    b.page_size = page_size;
+
+    let is i64 as meta_size = NUM_DEFAULT_BINS * sizeof(Bin);
+    b.bin_data = core.mmap_anon(meta_size);
+    if (cast(i64, b.bin_data) < 0) {
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+        return b;
+    }
+
+    b.lookup_entries = LOOKUP_SIZE;
+    b.lookup = core.mmap_anon(LOOKUP_SIZE * 2);
+    if (cast(i64, b.lookup) < 0) {
+        core.munmap(b.bin_data, meta_size);
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+        return b;
+    }
+
+    _setup_default(&b);
+    _build_lookup(&b);
+    return b;
+}
+
+fn bins_custom(page_size as i64, sizes as *i64, count as i64) as Bins {
+    let is Bins as b;
+    b.lock = cast(u32, 0);      // see bins_new
+    b._pad = cast(u32, 0);
+    if (count <= 0) {
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+        b.page_size = 0;
+        b.lookup = cast(*u8, 0);
+        b.lookup_entries = 0;
+        return b;
+    }
+
+    // Validate ascending order
+    let is i64 as v with mut = 1;
+    while (v < count) {
+        if (sizes[v] <= sizes[v - 1]) {
+            b.bin_data = cast(*u8, 0);
+            b.bin_count = 0;
+            b.page_size = 0;
+            b.lookup = cast(*u8, 0);
+            b.lookup_entries = 0;
+            return b;
+        }
+        v = v + 1;
+    }
+
+    b.bin_count = count;
+    b.page_size = page_size;
+    let is i64 as meta_size = count * sizeof(Bin);
+    b.bin_data = core.mmap_anon(meta_size);
+    if (cast(i64, b.bin_data) < 0) {
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+        return b;
+    }
+
+    let is i64 as max_size = sizes[count - 1];
+    b.lookup_entries = (max_size >> 3) + 2;
+    b.lookup = core.mmap_anon(b.lookup_entries * 2);
+    if (cast(i64, b.lookup) < 0) {
+        core.munmap(b.bin_data, meta_size);
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+        return b;
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is *Bin as bin = _bin_at(&b, i);
+        bin.slot_size = sizes[i];
+        bin.alloc_size = sizes[i] + HEADER_SIZE;
+        bin.slab_head = cast(*u8, 0);
+        bin.page_size = page_size;
+        bin.free_head = cast(*u8, 0);
+        bin.slabs = cast(*u8, 0);
+        bin.slab_count = 0;
+        bin.slab_cap = 0;
+        i = i + 1;
+    }
+
+    _build_lookup(&b);
+    return b;
+}
+
+// Alloc — O(1) lookup + O(1) freelist pop
+// Public entry: lazy-locked wrapper (no-op lock until mem.set_mt()).
+fn bins_alloc(b as *Bins, size as i64) as *u8 {
+    core._lk(&b.lock);
+    let is *u8 as r = _bins_alloc_inner(b, size);
+    core._unlk(&b.lock);
+    return r;
+}
+
+fn _bins_alloc_inner(b as *Bins, size as i64) as *u8 {
+    if (size <= 0) { return cast(*u8, 0); }
+
+    // Lazy auto-init: if caller forgot bins_new (or we're loading from a
+    // cache path that bypassed init), do it on first alloc. Triggers when
+    // lookup_entries == 0 (uninitialized state on a zero-filled struct).
+    // Runs UNDER the lock (double-checked); preserve the lock word across the
+    // struct re-init since *b = bins_new(...) would otherwise zero it.
+    if (b.lookup_entries == 0) {
+        let is i64 as init_size with mut = 65536;
+        if (size > init_size) { init_size = size + 4096; }
+        let is u32 as saved_lock = b.lock;
+        *b = bins_new(init_size);
+        b.lock = saved_lock;
+    }
+
+    // Over the largest size class: serve it straight from the OS.
+    //
+    // This used to return null, silently. The caller is required to check, so
+    // the silence was defensible; the REFUSAL was not. 64 KiB is an ordinary
+    // size — a generated table, a whole file read in, a string literal in a
+    // .s — and every one of them turned into a null nobody expected, at a
+    // boundary nothing announced. Caustic's own compiler hit it: a string
+    // literal of 65536 characters made the build stop after "semantic: ok"
+    // with no output and no error, because str_dup got a null and carried on.
+    //
+    // A direct mapping carries the same 8-byte header, with bin index
+    // BIG_INDEX and the total mapped size in the remaining seven bytes, so
+    // bins_free tells the two apart without a second table to keep in step.
+    let is i64 as idx = _lookup_bin(b, size);
+    if (idx < 0) {
+        let is i64 as total = _round_up(size + HEADER_SIZE, 4096);
+        let is *u8 as big = core.mmap_anon(total);
+        if (cast(i64, big) == 0) { return cast(*u8, 0); }
+        if (cast(i64, big) == 0 - 1) { return cast(*u8, 0); }
+        *cast(*i64, big) = BIG_INDEX | (total << 8);
+        return cast(*u8, cast(i64, big) + HEADER_SIZE);
+    }
+
+    let is *Bin as bin = _bin_at(b, idx);
+
+    // A slab with a free slot, or a new one.
+    let is *Slab as slab with mut = cast(*Slab, bin.free_head);
+    if (cast(i64, slab) == 0) {
+        slab = _slab_create(bin.alloc_size, bin.page_size, idx);
+        if (cast(i64, slab) == 0) { return cast(*u8, 0); }
+        if (_bin_add_slab(bin, slab) == 0) { _slab_destroy(slab); return cast(*u8, 0); }
+        slab.next = bin.slab_head;
+        bin.slab_head = cast(*u8, slab);
+        slab.free_next = cast(*u8, 0);
+        slab.in_free = 1;
+        bin.free_head = cast(*u8, slab);
+    }
+
+    let is *u8 as slot = slab.freelist;
+    let is *i64 as np = cast(*i64, slot);
+    let is *u8 as nxt = cast(*u8, np[0]);
+    slab.freelist = nxt;
+    // Full now: off the list of slabs with room.
+    if (cast(i64, nxt) == 0) {
+        bin.free_head = slab.free_next;
+        slab.free_next = cast(*u8, 0);
+        slab.in_free = 0;
+    }
+    // Header, one little-endian word:
+    //   byte 0: bin_index
+    //   bytes 1-3: slot_index (24 bits, up to 16M slots)
+    //   bytes 4-7: slab_index in the bin's table
+    let is i64 as si with mut = 0;
+    if (bin.alloc_size >= 16) { si = np[1]; }
+    else { si = (cast(i64, slot) - cast(i64, slab.region)) / bin.alloc_size; }
+    np[0] = idx | (si << 8) | (slab.index << 32);
+    let is *u8 as bm = cast(*u8, cast(i64, slab.bitmap) + (si >> 3));
+    *bm = cast(u8, cast(i64, *bm) & ~(1 << (si & 7)));
+    slab.used_slots = slab.used_slots + 1;
+    return cast(*u8, cast(i64, slot) + HEADER_SIZE);
+}
+
+// Public entry: lazy-locked wrapper.
+fn bins_free(b as *Bins, ptr as *u8) as void {
+    core._lk(&b.lock);
+    _bins_free_inner(b, ptr);
+    core._unlk(&b.lock);
+}
+
+// Free — O(1): header read (no division) + bit test + freelist push
+fn _bins_free_inner(b as *Bins, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+
+    let is *u8 as slot = cast(*u8, cast(i64, ptr) - HEADER_SIZE);
+
+    // The header word (see _bins_alloc_inner) — no division needed.
+    let is *i64 as np = cast(*i64, slot);
+    let is i64 as h = np[0];
+    let is i64 as idx = h & 255;
+
+    // A direct mapping: hand it back to the OS. Checked BEFORE the bin_count
+    // test, which would otherwise read it as an out-of-range bin and drop it —
+    // a leak of exactly the allocations big enough to matter.
+    if (idx == BIG_INDEX) {
+        let is i64 as total = (h >> 8) & 72057594037927935;
+        if (total > 0) { core.munmap(slot, total); }
+        return;
+    }
+
+    if (idx >= b.bin_count) { return; }
+    let is i64 as si = (h >> 8) & 16777215;
+    let is i64 as slab_idx = (h >> 32) & 4294967295;
+
+    let is *Bin as bin = _bin_at(b, idx);
+
+    // The owning slab from the header; a pointer that is not inside it was not
+    // handed out by this bin, and is left alone as before.
+    if (slab_idx >= bin.slab_count) { return; }
+    let is *Slab as slab = cast(*Slab, *cast(*i64, cast(i64, bin.slabs) + slab_idx * 8));
+    let is i64 as start = cast(i64, slab.region);
+    if (cast(i64, slot) < start || cast(i64, slot) >= start + slab.region_size) { return; }
+    // Double-free detection — O(1) bit test
+    let is *u8 as bm = cast(*u8, cast(i64, slab.bitmap) + (si >> 3));
+    let is i64 as bits = cast(i64, *bm);
+    let is i64 as bit = 1 << (si & 7);
+    if ((bits & bit) != 0) { return; }
+    *bm = cast(u8, bits | bit);
+    slab.used_slots = slab.used_slots - 1;
+    // Push onto freelist, with the slot index after the link (see _slab_create)
+    np[0] = cast(i64, slab.freelist);
+    if (bin.alloc_size >= 16) { np[1] = si; }
+    slab.freelist = slot;
+    if (slab.in_free == 0) {
+        slab.free_next = bin.free_head;
+        bin.free_head = cast(*u8, slab);
+        slab.in_free = 1;
+    }
+}
+
+// Destroy
+fn bins_destroy(b as *Bins) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
+        while (cast(i64, slab) != 0) {
+            let is *Slab as next = cast(*Slab, slab.next);
+            _slab_destroy(slab);
+            slab = next;
+        }
+        if (bin.slab_cap > 0) { core.munmap(bin.slabs, bin.slab_cap * 8); }
+        bin.slab_head = cast(*u8, 0);
+        bin.free_head = cast(*u8, 0);
+        bin.slabs = cast(*u8, 0);
+        bin.slab_count = 0;
+        bin.slab_cap = 0;
+        i = i + 1;
+    }
+    if (cast(i64, b.lookup) != 0) { core.munmap(b.lookup, b.lookup_entries * 2); }
+    if (cast(i64, b.bin_data) != 0) { core.munmap(b.bin_data, b.bin_count * sizeof(Bin)); }
+    b.bin_data = cast(*u8, 0);
+    b.bin_count = 0;
+}
+
+// --- Introspection ---
+
+fn bins_which(b as *Bins, size as i64) as i64 {
+    if (size <= 0) { return 0; }
+    let is i64 as idx = _lookup_bin(b, size);
+    if (idx < 0) { return 0; }
+    return _bin_at(b, idx).slot_size;
+}
+
+fn bins_overhead(b as *Bins, size as i64) as i64 {
+    let is i64 as sc = bins_which(b, size);
+    if (sc == 0) { return 0; }
+    return sc - size + HEADER_SIZE;
+}
+
+fn bins_used(b as *Bins) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
+        while (cast(i64, slab) != 0) {
+            total = total + bin.alloc_size * slab.used_slots;
+            slab = cast(*Slab, slab.next);
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn bins_total(b as *Bins) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
+        while (cast(i64, slab) != 0) {
+            total = total + slab.region_size;
+            slab = cast(*Slab, slab.next);
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn bins_bin_count(b as *Bins) as i64 { return b.bin_count; }
+
+fn bins_bin_size(b as *Bins, bin_idx as i64) as i64 {
+    if (bin_idx < 0 || bin_idx >= b.bin_count) { return 0; }
+    return _bin_at(b, bin_idx).slot_size;
+}
+
+fn bins_waste(b as *Bins) as i64 {
+    let is i64 as tr = bins_total(b);
+    let is i64 as tu = bins_used(b);
+    if (tr == 0) { return 0; }
+    return ((tr - tu) * 100) / tr;
+}
+
+fn bins_stats(b as *Bins) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
+        let is i64 as tu with mut = 0;
+        let is i64 as tc with mut = 0;
+        let is i64 as sc with mut = 0;
+        while (cast(i64, slab) != 0) {
+            tu = tu + slab.used_slots;
+            tc = tc + slab.total_slots;
+            sc = sc + 1;
+            slab = cast(*Slab, slab.next);
+        }
+        if (tc > 0) {
+            core.write_str(1, "  bin ");
+            _write_num(bin.slot_size);
+            core.write_str(1, ": ");
+            _write_num(tu);
+            core.write_str(1, "/");
+            _write_num(tc);
+            core.write_str(1, " (");
+            _write_num(sc);
+            core.write_str(1, " slabs)\n");
+        }
+        i = i + 1;
+    }
+    core.write_str(1, "  used: ");
+    _write_num(bins_used(b));
+    core.write_str(1, " kernel: ");
+    _write_num(bins_total(b));
+    core.write_str(1, " overhead: ");
+    _write_num(HEADER_SIZE);
+    core.write_str(1, "b/blk\n");
+}
+
+fn _write_num(n as i64) as void {
+    if (n == 0) { core.write_str(1, "0"); return; }
+    if (n == (0 - 9223372036854775807 - 1)) {
+        core.write_str(1, "-9223372036854775808");
+        return;
+    }
+    let is [20]u8 as buf;
+    let is i64 as val with mut = n;
+    if (val < 0) {
+        core.write_str(1, "-");
+        val = 0 - val;
+    }
+    let is i32 as pos with mut = 19;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    core.write_int(1, cast(i64, n));
+}

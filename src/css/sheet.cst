@@ -132,6 +132,21 @@ struct Rule {
     next      as *Rule;
 }
 
+// An @font-face: what a page calls a font, and where to find it.
+struct FontFace {
+    family as *u8;
+    flen   as i64;
+    url    as *u8;
+    ulen   as i64;
+    base   as *u8;      // what the url is relative to
+    wlo    as f64;
+    whi    as f64;
+    italic as i64;
+    ranges as *i64;     // pairs of first and last character; none is all of them
+    nranges as i64;
+    next   as *FontFace;
+}
+
 struct Import {
     url  as *u8;
     n    as i64;
@@ -160,6 +175,8 @@ struct Sheet {
     nrules   as i64;
     imports  as *Import;
     viewport as i64;    // some rule depends on the window's size
+    faces    as *FontFace;
+    faces_last as *FontFace;
 }
 
 struct _P {
@@ -170,6 +187,10 @@ struct _P {
     i      as i64;
     origin as i64;
     inside as *Container;
+    src    as *u8;      // the text it came from, null when it does not matter
+    src_n  as i64;
+    base   as *u8;
+    nfaces as i64;
 }
 
 fn init(s as *Sheet, a as *arena.Arena) as void {
@@ -968,6 +989,228 @@ fn _add_rule(p as *_P, sel as *Selector, list as *v.DeclList, media as *Media) a
     p.sh.last = r;
 }
 
+// --- @font-face ---
+
+fn _lower_at(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn _text_at(s as *u8, n as i64, at as i64, w as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (w[k] != 0) {
+        if (at + k >= n || _lower_at(cast(i64, s[at + k])) != cast(i64, w[k])) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _hex_digit(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    let is i64 as l = _lower_at(c);
+    if (l >= 97 && l <= 102) { return l - 87; }
+    return 0 - 1;
+}
+
+// unicode-range is the one thing a tokenizer cannot keep: U+26 reads as a sign and a number,
+// and U+1F600-1F64F as worse. So it is read from the text, in the nth @font-face there.
+fn _raw_ranges(p as *_P, nth as i64, f as *FontFace) as void {
+    if (cast(i64, p.src) == 0) { return; }
+    let is *u8 as s = p.src;
+    let is i64 as n = p.src_n;
+    let is i64 as i with mut = 0;
+    let is i64 as seen with mut = 0;
+    while (i < n) {
+        if (_text_at(s, n, i, "/*") == 1) {
+            i = i + 2;
+            while (i < n && _text_at(s, n, i, "*/") == 0) { i = i + 1; }
+            i = i + 2;
+            continue;
+        }
+        if (_text_at(s, n, i, "@font-face") == 1) {
+            if (seen == nth) { break; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    let is i64 as cap = 64;
+    while (i < n && s[i] != 125) {
+        if (_text_at(s, n, i, "unicode-range") == 0) {
+            i = i + 1;
+            continue;
+        }
+        i = i + 13;
+        f.ranges = cast(*i64, arena.alloc(p.a, cap * 2 * sizeof(i64)));
+        while (i < n && s[i] != 59 && s[i] != 125) {
+            if (_lower_at(cast(i64, s[i])) != 117 || i + 1 >= n || s[i + 1] != 43) {
+                i = i + 1;
+                continue;
+            }
+            i = i + 2;
+            let is i64 as lo with mut = 0;
+            let is i64 as hi with mut = 0;
+            let is i64 as count with mut = 0;
+            while (i < n && count < 6 && (_hex_digit(cast(i64, s[i])) >= 0 || s[i] == 63)) {
+                let is i64 as d = _hex_digit(cast(i64, s[i]));
+                if (d < 0) {
+                    lo = lo * 16;
+                    hi = hi * 16 + 15;
+                } else {
+                    lo = lo * 16 + d;
+                    hi = hi * 16 + d;
+                }
+                count = count + 1;
+                i = i + 1;
+            }
+            if (i < n && s[i] == 45) {
+                i = i + 1;
+                hi = 0;
+                while (i < n && _hex_digit(cast(i64, s[i])) >= 0) {
+                    hi = hi * 16 + _hex_digit(cast(i64, s[i]));
+                    i = i + 1;
+                }
+            }
+            if (count > 0 && f.nranges < cap) {
+                f.ranges[f.nranges * 2] = lo;
+                f.ranges[f.nranges * 2 + 1] = hi;
+                f.nranges = f.nranges + 1;
+            }
+        }
+        return;
+    }
+}
+
+// Whether a format() is one a font reader here can be handed.
+fn _format_ok(t as *tok.Token) as i64 {
+    return cast(i64, _text_at(t.s, t.n, 0, "woff") == 1 || _text_at(t.s, t.n, 0, "truetype") == 1 ||
+                     _text_at(t.s, t.n, 0, "opentype") == 1);
+}
+
+// A value of src: the first of its list with a format this can read, or none said.
+fn _face_src(p as *_P, end as i64, f as *FontFace) as void {
+    let is *u8 as candidate with mut = cast(*u8, 0);
+    let is i64 as clen with mut = 0;
+    let is i64 as refused with mut = 0;
+    while (p.i <= end) {
+        let is i64 as k with mut = tok.T_COMMA;
+        if (p.i < end) { k = p.t[p.i].kind; }
+        if (k == tok.T_COMMA) {
+            if (cast(i64, candidate) != 0 && refused == 0 && cast(i64, f.url) == 0) {
+                f.url = arena.copy(p.a, candidate, clen);
+                f.ulen = clen;
+            }
+            candidate = cast(*u8, 0);
+            refused = 0;
+            p.i = p.i + 1;
+            continue;
+        }
+        let is *tok.Token as t = &p.t[p.i];
+        if (k == tok.T_URL) {
+            candidate = t.s;
+            clen = t.n;
+            p.i = p.i + 1;
+        } else if (k == tok.T_FUNCTION) {
+            let is i64 as at = p.i;
+            _skip_group(p);
+            let is i64 as q = _past_space(p, at + 1, p.i);
+            if (q < p.i && (p.t[q].kind == tok.T_STRING || p.t[q].kind == tok.T_IDENT)) {
+                if (_eq(t.s, t.n, "url") == 1) {
+                    candidate = p.t[q].s;
+                    clen = p.t[q].n;
+                } else if (_eq(t.s, t.n, "format") == 1) {
+                    if (_format_ok(&p.t[q]) == 0) { refused = 1; }
+                }
+            }
+        } else {
+            p.i = p.i + 1;
+        }
+    }
+}
+
+fn _font_face(p as *_P, start as i64, end as i64) as void {
+    let is *FontFace as f = cast(*FontFace, arena.alloc(p.a, sizeof(FontFace)));
+    f.wlo = 400.0;
+    f.whi = 400.0;
+    f.base = p.base;
+    _raw_ranges(p, p.nfaces, f);
+    p.nfaces = p.nfaces + 1;
+    p.i = start;
+    while (p.i < end) {
+        p.i = _past_space(p, p.i, end);
+        if (p.i >= end) { break; }
+        if (p.t[p.i].kind != tok.T_IDENT) {
+            p.i = p.i + 1;
+            continue;
+        }
+        let is *tok.Token as name = &p.t[p.i];
+        p.i = _past_space(p, p.i + 1, end);
+        if (p.i >= end || p.t[p.i].kind != tok.T_COLON) { continue; }
+        p.i = _past_space(p, p.i + 1, end);
+        let is i64 as value = p.i;
+        let is i64 as q with mut = p.i;
+        while (q < end && p.t[q].kind != tok.T_SEMI) {
+            let is i64 as k = p.t[q].kind;
+            if (k == tok.T_FUNCTION || k == tok.T_LPAREN || k == tok.T_LBRACKET) {
+                p.i = q;
+                _skip_group(p);
+                q = p.i;
+            } else {
+                q = q + 1;
+            }
+        }
+        if (_eq(name.s, name.n, "font-family") == 1 && value < q) {
+            if (p.t[value].kind == tok.T_STRING) {
+                f.family = arena.copy(p.a, p.t[value].s, p.t[value].n);
+                f.flen = p.t[value].n;
+            } else {
+                // Words, with one space between them.
+                let is *u8 as out = arena.alloc(p.a, 256);
+                let is i64 as w with mut = 0;
+                let is i64 as r with mut = value;
+                while (r < q) {
+                    if (p.t[r].kind == tok.T_IDENT && w + p.t[r].n + 1 < 256) {
+                        if (w > 0) {
+                            out[w] = cast(u8, 32);
+                            w = w + 1;
+                        }
+                        let is i64 as c with mut = 0;
+                        while (c < p.t[r].n) {
+                            out[w] = p.t[r].s[c];
+                            w = w + 1;
+                            c = c + 1;
+                        }
+                    }
+                    r = r + 1;
+                }
+                f.family = out;
+                f.flen = w;
+            }
+        } else if (_eq(name.s, name.n, "src") == 1) {
+            p.i = value;
+            _face_src(p, q, f);
+        } else if (_eq(name.s, name.n, "font-weight") == 1 && value < q) {
+            let is *tok.Token as w0 = &p.t[value];
+            if (w0.kind == tok.T_NUMBER) {
+                f.wlo = w0.num;
+                f.whi = w0.num;
+                let is i64 as second = _past_space(p, value + 1, q);
+                if (second < q && p.t[second].kind == tok.T_NUMBER) { f.whi = p.t[second].num; }
+            } else if (w0.kind == tok.T_IDENT && _eq(w0.s, w0.n, "bold") == 1) {
+                f.wlo = 700.0;
+                f.whi = 700.0;
+            }
+        } else if (_eq(name.s, name.n, "font-style") == 1 && value < q) {
+            let is *tok.Token as st = &p.t[value];
+            if (st.kind == tok.T_IDENT && (_eq(st.s, st.n, "italic") == 1 || _eq(st.s, st.n, "oblique") == 1)) { f.italic = 1; }
+        }
+        p.i = q + 1;
+    }
+    if (f.flen == 0 || f.ulen == 0) { return; }
+    if (p.sh.faces == null) { p.sh.faces = f; }
+    else { p.sh.faces_last.next = f; }
+    p.sh.faces_last = f;
+}
+
 // @container's prelude: a name if it has one, then conditions as a media query has them.
 fn _container(p as *_P, start as i64, end as i64) as *Container {
     let is *Container as c = cast(*Container, arena.alloc(p.a, sizeof(Container)));
@@ -1025,6 +1268,8 @@ fn _at_rule(p as *_P, media as *Media) as void {
         p.i = open + 1;
         _rules(p, end, inner);
         p.inside = outer;
+    } else if (_eq(s, n, "font-face") == 1) {
+        _font_face(p, open + 1, end);
     } else if (_eq(s, n, "supports") == 1) {
         enter = _supports(p, start, prelude_end);
     } else if (_eq(s, n, "layer") == 1 || _eq(s, n, "scope") == 1) {
@@ -1180,7 +1425,14 @@ fn parse(s as *Sheet, src as *u8, len as i64, origin as i64, url as *u8) as void
     ps.n = l.n;
     ps.i = 0;
     ps.inside = cast(*Container, 0);
+    ps.src = cast(*u8, 0);
+    ps.src_n = 0;
+    ps.base = cast(*u8, 0);
+    ps.nfaces = 0;
     ps.origin = origin;
+    ps.src = src;
+    ps.src_n = len;
+    ps.base = url;
     decl.set_base(url);
     _rules(&ps, ps.n, cast(*Media, 0));
 }
@@ -1198,6 +1450,10 @@ fn media_text_holds(a as *arena.Arena, s as *u8, n as i64, w as f64, h as f64) a
     ps.n = l.n;
     ps.i = 0;
     ps.inside = cast(*Container, 0);
+    ps.src = cast(*u8, 0);
+    ps.src_n = 0;
+    ps.base = cast(*u8, 0);
+    ps.nfaces = 0;
     ps.origin = ORIGIN_AUTHOR;
     let is *Query as q with mut = _media_list(&ps, ps.n);
     if (q == null) { return 1; }
@@ -1221,6 +1477,10 @@ fn parse_inline(a as *arena.Arena, src as *u8, len as i64, out as *v.DeclList, u
     ps.n = l.n;
     ps.i = 0;
     ps.inside = cast(*Container, 0);
+    ps.src = cast(*u8, 0);
+    ps.src_n = 0;
+    ps.base = cast(*u8, 0);
+    ps.nfaces = 0;
     ps.origin = ORIGIN_AUTHOR;
     decl.set_base(url);
     _decls(&ps, ps.n, out);

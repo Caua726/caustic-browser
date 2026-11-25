@@ -1,0 +1,205 @@
+// A .csl image, from bytes already in memory, that can be closed again: each open is a new copy
+// of its code and data. The format is what std/csl_loader.cst reads.
+let is i64 as HDR with imut = 44;
+struct Image { base as i64; size as i64; file as *u8; eoff as i64; ecount as i64; }
+fn _u32(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) + (cast(i64, p[off + 1]) << 8) + (cast(i64, p[off + 2]) << 16) + (cast(i64, p[off + 3]) << 24);
+}
+fn _u64(p as *u8, off as i64) as i64 { return _u32(p, off) + (_u32(p, off + 4) << 32); }
+fn open(f as *u8, n as i64, im as *Image) as i64 { return open_in(f, n, im, cast(*i64, 0)); }
+fn open_in(f as *u8, n as i64, im as *Image, room as *i64) as i64 {
+    if (n < HDR || f[0] != 67 || f[1] != 83 || f[2] != 76 || f[3] != 95) { return 0; }
+    if (cast(i64, f[4]) + (cast(i64, f[5]) << 8) != 2 || cast(i64, f[6]) != 1) { return 0; }
+    let is i64 as segs = _u32(f, 16);
+    let is i64 as size with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < segs) {
+        let is i64 as so = HDR + i * 24;
+        let is i64 as e = _u64(f, so) + _u32(f, so + 16);
+        if (e > size) { size = e; }
+        i = i + 1;
+    }
+    let is i64 as base with mut = 0;
+    if (cast(i64, room) == 0) {
+        base = syscall(9, 0, size, 7, 34, -1, 0);
+        if (base <= 0) { return 0; }
+    } else {
+        // Address space first: a runtime reserves its heap right below as soon as it starts, and
+        // what eval compiles later has to be within 2 GB of this image.
+        let is i64 as gb = 1073741824;
+        let is i64 as span = (size + 4095) & (0 - 4096);
+        let is i64 as whole = syscall(9, 0, gb + span, 0, 34 + 16384, -1, 0);
+        if (whole <= 0) { return 0; }
+        base = whole + gb;
+        if (syscall(10, base, span, 7) != 0) { return 0; }
+        room[0] = whole;
+        room[1] = whole + gb;
+    }
+    i = 0;
+    while (i < segs) {
+        let is i64 as so = HDR + i * 24;
+        let is *u8 as to = cast(*u8, base + _u64(f, so));
+        let is *u8 as from = cast(*u8, cast(i64, f) + _u32(f, so + 8));
+        let is i64 as fs = _u32(f, so + 12);
+        let is i64 as q with mut = 0;
+        while (q < fs) { to[q] = from[q]; q = q + 1; }
+        i = i + 1;
+    }
+    im.base = base;
+    im.size = size;
+    im.file = f;
+    im.eoff = _u64(f, 24);
+    im.ecount = _u32(f, 20);
+    return 1;
+}
+fn resolve(im as *Image, name as *u8) as *u8 {
+    let is i64 as i with mut = 0;
+    while (i < im.ecount) {
+        let is i64 as eo = im.eoff + i * 12;
+        let is *u8 as nm = cast(*u8, cast(i64, im.file) + _u32(im.file, eo));
+        let is i64 as q with mut = 0;
+        while (nm[q] != 0 && nm[q] == name[q]) { q = q + 1; }
+        if (nm[q] == name[q]) { return cast(*u8, im.base + _u64(im.file, eo + 4)); }
+        i = i + 1;
+    }
+    return cast(*u8, 0);
+}
+fn close(im as *Image) as void { syscall(11, im.base, im.size); }
+
+// An object file, made into running code beside the image it was compiled against: what it left
+// undefined is that image's. Beside, because the code reaches it by 32-bit offsets.
+struct Linked { base as i64; size as i64; file as *u8; syms as i64; nsyms as i64; strs as i64; secs as i64; shnum as i64; }
+fn _name_is(a as *u8, b as *u8) as i64 {
+    let is i64 as q with mut = 0;
+    while (a[q] != 0 && a[q] == b[q]) { q = q + 1; }
+    return cast(i64, a[q] == b[q]);
+}
+// page: the image, its base and its export table. room: where to put it, and where that ends,
+// space reserved beside the image before anything else could take it.
+fn link_object(f as *u8, n as i64, page as *Image, room as *i64, out as *Linked) as i64 {
+    if (n < 64 || f[0] != 127 || f[1] != 69 || f[2] != 76 || f[3] != 70) { return 0; }
+    let is i64 as shoff = _u64(f, 40);
+    let is i64 as shnum = cast(i64, f[60]) + (cast(i64, f[61]) << 8);
+    let is i64 as off = cast(i64, syscall(9, 0, shnum * 8 + 8, 3, 34, -1, 0));
+    let is *i64 as place = cast(*i64, off);
+    let is i64 as size with mut = 0;
+    let is i64 as syms with mut = 0;
+    let is i64 as nsyms with mut = 0;
+    let is i64 as strs with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < shnum) {
+        let is i64 as sh = shoff + i * 64;
+        let is i64 as ty = _u32(f, sh + 4);
+        let is i64 as flags = _u64(f, sh + 8);
+        if ((flags & 2) != 0) {
+            let is i64 as al with mut = _u64(f, sh + 48);
+            if (al < 16) { al = 16; }
+            size = (size + al - 1) & (0 - al);
+            place[i] = size;
+            size = size + _u64(f, sh + 32);
+        }
+        if (ty == 2) {
+            syms = cast(i64, f) + _u64(f, sh + 24);
+            nsyms = _u64(f, sh + 32) / 24;
+            let is i64 as st = shoff + _u32(f, sh + 40) * 64;
+            strs = cast(i64, f) + _u64(f, st + 24);
+        }
+        i = i + 1;
+    }
+    let is i64 as span = (size + 4096 + 4095) & (0 - 4096);
+    let is i64 as base = room[0];
+    if (base == 0 || base + span > room[1]) { return 0; }
+    if (syscall(10, base, span, 7) != 0) { return 0; }
+    room[0] = base + span;
+    i = 0;
+    while (i < shnum) {
+        let is i64 as sh = shoff + i * 64;
+        if ((_u64(f, sh + 8) & 2) != 0 && _u32(f, sh + 4) != 8) {
+            let is *u8 as to = cast(*u8, base + place[i]);
+            let is *u8 as from = cast(*u8, cast(i64, f) + _u64(f, sh + 24));
+            let is i64 as len = _u64(f, sh + 32);
+            let is i64 as q with mut = 0;
+            while (q < len) { to[q] = from[q]; q = q + 1; }
+        }
+        i = i + 1;
+    }
+    // Where each symbol is: 0 until asked for.
+    let is i64 as resv = cast(i64, syscall(9, 0, nsyms * 8 + 8, 3, 34, -1, 0));
+    let is *i64 as addr = cast(*i64, resv);
+    i = 0;
+    let is i64 as bad with mut = 0;
+    while (i < shnum && bad == 0) {
+        let is i64 as sh = shoff + i * 64;
+        if (_u32(f, sh + 4) == 4) {
+            let is i64 as target = _u32(f, sh + 44);
+            let is i64 as tb = base + place[target];
+            let is i64 as ro = _u64(f, sh + 24);
+            let is i64 as rn = _u64(f, sh + 32) / 24;
+            if ((_u64(f, shoff + target * 64 + 8) & 2) != 0) {
+                let is i64 as r with mut = 0;
+                while (r < rn && bad == 0) {
+                    let is i64 as ro2 = ro + r * 24;
+                    let is i64 as where = tb + _u64(f, ro2);
+                    let is i64 as info = _u64(f, ro2 + 8);
+                    let is i64 as add = _u64(f, ro2 + 16);
+                    let is i64 as sym = (info >> 32) & 4294967295;
+                    let is i64 as ty = info & 4294967295;
+                    if (addr[sym] == 0) {
+                        let is *u8 as se = cast(*u8, syms + sym * 24);
+                        let is i64 as shndx = cast(i64, se[6]) + (cast(i64, se[7]) << 8);
+                        if (shndx == 0) {
+                            let is *u8 as nm = cast(*u8, strs + _u32(se, 0));
+                            addr[sym] = cast(i64, resolve(page, nm));
+                            if (addr[sym] == 0) {
+                                syscall(1, 2, "js: eval: undefined symbol ", 27);
+                                let is i64 as l with mut = 0;
+                                while (nm[l] != 0) { l = l + 1; }
+                                syscall(1, 2, nm, l);
+                                syscall(1, 2, "\n", 1);
+                                bad = 1;
+                            }
+                        } else if (shndx >= 65280) {
+                            addr[sym] = _u64(se, 8);
+                        } else {
+                            addr[sym] = base + place[shndx] + _u64(se, 8);
+                        }
+                    }
+                    let is i64 as v = addr[sym] + add;
+                    if (ty == 1) { *cast(*i64, where) = v; }
+                    else if (ty == 2 || ty == 4 || ty == 9) {
+                        // 9: the assembler's label for any load from an undefined symbol. The code
+                        // that comes out of this compiler means the value there, not a table of addresses.
+                        let is i64 as d = v - where;
+                        if (d > 2147483647 || d < -2147483648) { bad = 1; }
+                        *cast(*i32, where) = cast(i32, d);
+                    } else if (ty == 10 || ty == 11) {
+                        *cast(*i32, where) = cast(i32, v);
+                    } else {
+                        syscall(1, 2, "js: eval: a relocation this linker does not know\n", 49);
+                        bad = 1;
+                    }
+                    r = r + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    syscall(11, resv, nsyms * 8 + 8);
+    if (bad == 1) { syscall(11, off, shnum * 8 + 8); return 0; }
+    out.base = base; out.size = size; out.file = f; out.syms = syms; out.nsyms = nsyms; out.strs = strs; out.secs = off; out.shnum = shnum;
+    return 1;
+}
+// Where a symbol the object defines ended up, or 0.
+fn linked_sym(l as *Linked, name as *u8) as *u8 {
+    let is *i64 as place = cast(*i64, l.secs);
+    let is i64 as i with mut = 0;
+    while (i < l.nsyms) {
+        let is *u8 as se = cast(*u8, l.syms + i * 24);
+        let is i64 as shndx = cast(i64, se[6]) + (cast(i64, se[7]) << 8);
+        if (shndx != 0 && shndx < 65280 && _name_is(cast(*u8, l.strs + _u32(se, 0)), name) == 1) {
+            return cast(*u8, l.base + place[shndx] + _u64(se, 8));
+        }
+        i = i + 1;
+    }
+    return cast(*u8, 0);
+}

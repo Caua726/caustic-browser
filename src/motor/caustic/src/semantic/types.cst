@@ -1,0 +1,935 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+
+// === Global state ===
+let is *d.StructDef as struct_defs with mut;
+let is *d.EnumDef as enum_defs with mut;
+let is *d.TypeAliasDef as type_aliases with mut;
+
+// Forward declaration (implemented in generics.cst, called from resolve_type_ref)
+// We'll use function pointers set at init time.
+let is *u8 as fn_instantiate_struct with mut;
+let is *u8 as fn_lookup_template with mut;
+
+// === Type hash tables (DJB2 + chaining) ===
+let is i32 as TY_HASH_BUCKETS with imut = 2048;
+let is i32 as TY_HASH_CAP with imut = 4096;
+
+// Struct hash
+let is *i32 as st_hash_buckets with mut;
+let is *i32 as st_hash_next with mut;
+let is *i64 as st_hash_ptrs with mut;
+let is i32 as st_count with mut = 0;
+
+// Enum hash
+let is *i32 as en_hash_buckets with mut;
+let is *i32 as en_hash_next with mut;
+let is *i64 as en_hash_ptrs with mut;
+let is i32 as en_count with mut = 0;
+
+// Type alias hash
+let is *i32 as ta_hash_buckets with mut;
+let is *i32 as ta_hash_next with mut;
+let is *i64 as ta_hash_ptrs with mut;
+let is i32 as ta_count with mut = 0;
+
+fn ty_hash(name_ptr as *u8, name_len as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    h = h & 9223372036854775807;
+    return cast(i32, h & cast(i64, TY_HASH_BUCKETS - 1));
+}
+
+fn ty_hash_init_buckets(buckets as *i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < TY_HASH_BUCKETS) {
+        buckets[i] = 0 - 1;
+        i = i + 1;
+    }
+}
+
+fn types_init() as void {
+    struct_defs = cast(*d.StructDef, 0);
+    enum_defs = cast(*d.EnumDef, 0);
+    type_aliases = cast(*d.TypeAliasDef, 0);
+    fn_instantiate_struct = cast(*u8, 0);
+    fn_lookup_template = cast(*u8, 0);
+
+    st_hash_buckets = cast(*i32, d.sem_alloc(cast(i64, TY_HASH_BUCKETS) * 4));
+    st_hash_next = cast(*i32, d.sem_alloc(cast(i64, TY_HASH_CAP) * 4));
+    st_hash_ptrs = cast(*i64, d.sem_alloc(cast(i64, TY_HASH_CAP) * 8));
+    ty_hash_init_buckets(st_hash_buckets);
+    st_count = 0;
+
+    en_hash_buckets = cast(*i32, d.sem_alloc(cast(i64, TY_HASH_BUCKETS) * 4));
+    en_hash_next = cast(*i32, d.sem_alloc(cast(i64, TY_HASH_CAP) * 4));
+    en_hash_ptrs = cast(*i64, d.sem_alloc(cast(i64, TY_HASH_CAP) * 8));
+    ty_hash_init_buckets(en_hash_buckets);
+    en_count = 0;
+
+    ta_hash_buckets = cast(*i32, d.sem_alloc(cast(i64, TY_HASH_BUCKETS) * 4));
+    ta_hash_next = cast(*i32, d.sem_alloc(cast(i64, TY_HASH_CAP) * 4));
+    ta_hash_ptrs = cast(*i64, d.sem_alloc(cast(i64, TY_HASH_CAP) * 8));
+    ty_hash_init_buckets(ta_hash_buckets);
+    ta_count = 0;
+}
+
+// === Type alias lookup/declare ===
+
+// A primitive is a singleton *Type: `can_narrow_literal` and friends compare
+// target types by POINTER identity, so an alias that ended up holding a copy of
+// `type_i32` (which is what resolve_type_ref's memcpy produces for an alias of
+// an alias of a primitive) would silently stop accepting literals. Map any
+// primitive-kinded type back to its singleton.
+fn canon_primitive(ty as *u8) as *u8 {
+    if (cast(i64, ty) == 0) { return ty; }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_I8)  { return cast(*u8, ast.type_i8); }
+    if (t.kind == ast.TY_I16) { return cast(*u8, ast.type_i16); }
+    if (t.kind == ast.TY_I32) { return cast(*u8, ast.type_i32); }
+    if (t.kind == ast.TY_I64) { return cast(*u8, ast.type_i64); }
+    if (t.kind == ast.TY_U8)  { return cast(*u8, ast.type_u8); }
+    if (t.kind == ast.TY_U16) { return cast(*u8, ast.type_u16); }
+    if (t.kind == ast.TY_U32) { return cast(*u8, ast.type_u32); }
+    if (t.kind == ast.TY_U64) { return cast(*u8, ast.type_u64); }
+    if (t.kind == ast.TY_F32) { return cast(*u8, ast.type_f32); }
+    if (t.kind == ast.TY_F64) { return cast(*u8, ast.type_f64); }
+    if (t.kind == ast.TY_BOOL) { return cast(*u8, ast.type_bool); }
+    if (t.kind == ast.TY_CHAR) { return cast(*u8, ast.type_char); }
+    if (t.kind == ast.TY_VOID) { return cast(*u8, ast.type_void); }
+    return ty;
+}
+
+fn declare_type_alias(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    let is *u8 as resolved = canon_primitive(ty);
+    let is *d.TypeAliasDef as ta = d.new_type_alias_def();
+    ta.name_ptr = d.str_dup(name_ptr, name_len);
+    ta.name_len = name_len;
+    ta.ty = resolved;
+    ta.next = type_aliases;
+    type_aliases = ta;
+
+    // Insert into hash table
+    if (ta_count < TY_HASH_CAP) {
+        let is i32 as h = ty_hash(name_ptr, name_len);
+        let is i32 as tidx = ta_count;
+        ta_hash_ptrs[tidx] = cast(i64, ta);
+        ta_hash_next[tidx] = ta_hash_buckets[h];
+        ta_hash_buckets[h] = tidx;
+        ta_count = ta_count + 1;
+    }
+}
+
+fn lookup_type_alias(name_ptr as *u8, name_len as i32) as *u8 {
+    let is i32 as h = ty_hash(name_ptr, name_len);
+    let is i32 as idx with mut = ta_hash_buckets[h];
+    while (idx >= 0) {
+        let is *d.TypeAliasDef as ta = cast(*d.TypeAliasDef, ta_hash_ptrs[idx]);
+        if (d.str_eq(ta.name_ptr, ta.name_len, name_ptr, name_len) == 1) {
+            return ta.ty;
+        }
+        idx = ta_hash_next[idx];
+    }
+    return cast(*u8, 0);
+}
+
+// Re-point an already-declared alias. `register_aliases` (pass 2) has to publish
+// the NAME before struct layout runs — every later pass looks the alias up by
+// name — but the RHS can only be resolved in pass 3, once the struct it names
+// has a size. Pass 3 resolves the alias node in place and calls this to re-run
+// the primitive canonicalisation over the now-resolved type.
+fn update_type_alias(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    let is i32 as h = ty_hash(name_ptr, name_len);
+    let is i32 as idx with mut = ta_hash_buckets[h];
+    while (idx >= 0) {
+        let is *d.TypeAliasDef as ta = cast(*d.TypeAliasDef, ta_hash_ptrs[idx]);
+        if (d.str_eq(ta.name_ptr, ta.name_len, name_ptr, name_len) == 1) {
+            ta.ty = canon_primitive(ty);
+            return;
+        }
+        idx = ta_hash_next[idx];
+    }
+}
+
+// Resolve a type reference that might be an alias, returning the proper *Type
+fn resolve_alias(ty_ptr as *u8) as *u8 {
+    if (cast(i64, ty_ptr) == 0) { return ty_ptr; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
+        let is *u8 as alias with mut = cast(*u8, 0);
+        // Explicit module qualification is resolved before local/root names.
+        if (cast(i64, alias) == 0) {
+            let is i32 as tail_off with mut = 0;
+            let is i32 as chain_only with mut = 0;
+            let is *d.Module as modd = sc.resolve_mod_path(ty.name_ptr, ty.name_len, &tail_off, &chain_only);
+            if (cast(i64, modd) != 0) {
+                let is *u8 as tname_ptr = cast(*u8, cast(i64, ty.name_ptr) + cast(i64, tail_off));
+                let is i32 as tname_len = ty.name_len - tail_off;
+                let is i32 as dmlen with mut = 0;
+                let is *u8 as dmangled = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tname_ptr, tname_len, &dmlen);
+                alias = lookup_type_alias(dmangled, dmlen);
+                d.sem_free(dmangled);
+                // Fallback: search submodules (for 'only' imports)
+                if (cast(i64, alias) == 0 && chain_only == 1) {
+                    let is *d.SubModule as sm with mut = cast(*d.SubModule, modd.submodules);
+                    while (cast(i64, sm) != 0 && cast(i64, alias) == 0) {
+                        let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                        let is i32 as smlen with mut = 0;
+                        let is *u8 as smangled = d.str_concat3(sub.prefix_ptr, sub.prefix_len, "_", 1, tname_ptr, tname_len, &smlen);
+                        alias = lookup_type_alias(smangled, smlen);
+                        d.sem_free(smangled);
+                        sm = cast(*d.SubModule, sm.next);
+                    }
+                }
+            }
+        }
+        if (cast(i64, alias) == 0 && sc.current_mod_prefix_len > 0) {
+            let is i32 as amlen with mut = 0;
+            let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
+            alias = lookup_type_alias(amangled, amlen);
+            d.sem_free(amangled);
+        }
+        if (cast(i64, alias) == 0) { alias = lookup_type_alias(ty.name_ptr, ty.name_len); }
+        if (cast(i64, alias) != 0) { return alias; }
+    }
+    return ty_ptr;
+}
+
+// === Struct/Enum lookup ===
+
+fn lookup_struct(name_ptr as *u8, name_len as i32) as *u8 {
+    let is i32 as h = ty_hash(name_ptr, name_len);
+    let is i32 as idx with mut = st_hash_buckets[h];
+    while (idx >= 0) {
+        let is *d.StructDef as s = cast(*d.StructDef, st_hash_ptrs[idx]);
+        if (d.str_eq(s.name_ptr, s.name_len, name_ptr, name_len) == 1) {
+            return s.ty;
+        }
+        idx = st_hash_next[idx];
+    }
+    return cast(*u8, 0);
+}
+
+fn lookup_enum(name_ptr as *u8, name_len as i32) as *u8 {
+    let is i32 as h = ty_hash(name_ptr, name_len);
+    let is i32 as idx with mut = en_hash_buckets[h];
+    while (idx >= 0) {
+        let is *d.EnumDef as e = cast(*d.EnumDef, en_hash_ptrs[idx]);
+        if (d.str_eq(e.name_ptr, e.name_len, name_ptr, name_len) == 1) {
+            return e.ty;
+        }
+        idx = en_hash_next[idx];
+    }
+    return cast(*u8, 0);
+}
+
+// The importing module's own type shadows a bare root type. Already-mangled
+// names still resolve through the final exact-key lookup.
+fn lookup_struct_pf(name_ptr as *u8, name_len as i32) as *u8 {
+    let is *u8 as def with mut = cast(*u8, 0);
+    if (sc.current_mod_prefix_len > 0) {
+        let is i32 as mlen with mut = 0;
+        let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, name_ptr, name_len, &mlen);
+        def = lookup_struct(mangled, mlen);
+        d.sem_free(mangled);
+    }
+    if (cast(i64, def) == 0) { def = lookup_struct(name_ptr, name_len); }
+    return def;
+}
+
+fn lookup_enum_pf(name_ptr as *u8, name_len as i32) as *u8 {
+    let is *u8 as def with mut = cast(*u8, 0);
+    if (sc.current_mod_prefix_len > 0) {
+        let is i32 as mlen with mut = 0;
+        let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, name_ptr, name_len, &mlen);
+        def = lookup_enum(mangled, mlen);
+        d.sem_free(mangled);
+    }
+    if (cast(i64, def) == 0) { def = lookup_enum(name_ptr, name_len); }
+    return def;
+}
+
+// === Struct/Enum registration ===
+
+fn declare_struct(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    // O(1) duplicate check via hash table
+    if (cast(i64, lookup_struct(name_ptr, name_len)) != 0) { return; }
+    let is *d.StructDef as ns = d.new_struct_def();
+    ns.name_ptr = d.str_dup(name_ptr, name_len);
+    ns.name_len = name_len;
+    ns.ty = ty;
+    ns.next = struct_defs;
+    struct_defs = ns;
+
+    // Insert into hash table
+    if (st_count < TY_HASH_CAP) {
+        let is i32 as h = ty_hash(name_ptr, name_len);
+        let is i32 as sidx = st_count;
+        st_hash_ptrs[sidx] = cast(i64, ns);
+        st_hash_next[sidx] = st_hash_buckets[h];
+        st_hash_buckets[h] = sidx;
+        st_count = st_count + 1;
+    }
+}
+
+fn declare_enum(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    if (cast(i64, lookup_enum(name_ptr, name_len)) != 0) { return; }
+    let is *d.EnumDef as ne = d.new_enum_def();
+    ne.name_ptr = d.str_dup(name_ptr, name_len);
+    ne.name_len = name_len;
+    ne.ty = ty;
+    ne.next = enum_defs;
+    enum_defs = ne;
+
+    // Insert into hash table
+    if (en_count < TY_HASH_CAP) {
+        let is i32 as h = ty_hash(name_ptr, name_len);
+        let is i32 as eidx = en_count;
+        en_hash_ptrs[eidx] = cast(i64, ne);
+        en_hash_next[eidx] = en_hash_buckets[h];
+        en_hash_buckets[h] = eidx;
+        en_count = en_count + 1;
+    }
+
+    // Calculate enum layout
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i32 as has_payload with mut = 0;
+    let is i32 as max_payload with mut = 0;
+    let is i32 as vcount with mut = 0;
+    let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+    while (cast(i64, f) != 0) {
+        vcount = vcount + 1;
+        if (cast(i64, f.ty) != 0) {
+            has_payload = 1;
+            let is *ast.Type as ft = f.ty;
+            // Resolve variant payload type
+            if (ft.kind == ast.TY_STRUCT && cast(i64, ft.fields) != 0) {
+                // Anonymous struct payload — resolve each field
+                let is *ast.Node as pf with mut = cast(*ast.Node, ft.fields);
+                while (cast(i64, pf) != 0) {
+                    resolve_type_ref(cast(*u8, pf.ty));
+                    pf = pf.next;
+                }
+            } else {
+                resolve_type_ref(cast(*u8, ft));
+            }
+            if (ft.size > max_payload) { max_payload = ft.size; }
+        }
+        f = f.next;
+    }
+
+    t.variant_count = vcount;
+    if (has_payload == 1) {
+        t.payload_offset = 8;
+        t.max_payload = max_payload;
+        t.size = 8 + max_payload;
+    } else {
+        t.payload_offset = 0;
+        t.max_payload = 0;
+        t.size = 4;
+    }
+}
+
+// === Resolve type reference ===
+
+// === Pre-folded integer constants, for array lengths in struct fields ===
+//
+// Struct layout is computed in pass 3 (resolve_fields) and globals are folded
+// in pass 5 (register_vars), so a field written `[MAX]u8` reached
+// resolve_type_ref before MAX had a value: lookup_var found nothing and the
+// field could not be sized. Reordering the passes is not on — a global whose
+// TYPE is a struct needs that struct's layout, so register_vars has to come
+// after it.
+//
+// Instead walk_module runs a cheap pass BEFORE layout that folds the top-level
+// `with imut` globals whose initializer is already a compile-time integer, and
+// parks the results here. It sees literals and arithmetic over them; a constant
+// defined in terms of ANOTHER global does not fold this early, because the
+// value it refers to has not been declared yet. That covers the shape which
+// actually appears — `let is i64 as MAX with imut = 256;` — and leaves the rest
+// to the same error as before rather than to a guess.
+// The registry is a STACK, not a flat table. Every module pushes its own
+// top-level constants before its structs are laid out and pops them after, so
+// two modules that both declare `MAX_NAME` — proto/dns.cst has 255 and
+// proto/cookie.cst has 128 — do not see each other's. A flat table would
+// resolve to whichever module the compiler reached first and size a buffer to
+// a number nobody wrote, which is the exact failure ARRAY_LEN_PENDING exists to
+// make impossible.
+let is i32 as DIM_REG_MAX with imut = 2048;
+let is [2048]i64 as _dimreg_name with mut;   // i64 stash of *u8
+let is [2048]i32 as _dimreg_nlen with mut;
+let is [2048]i64 as _dimreg_val  with mut;
+let is i32 as _dimreg_n with mut = 0;
+
+fn dim_reg_reset() as void { _dimreg_n = 0; }
+
+// Save/restore around one module's layout. See dim_reg_find for why the order
+// of the stack matters.
+fn dim_reg_mark() as i32 { return _dimreg_n; }
+fn dim_reg_release(mark as i32) as void { if (mark >= 0 && mark <= _dimreg_n) { _dimreg_n = mark; } }
+
+fn dim_reg_add(name_ptr as *u8, name_len as i32, val as i64) as void {
+    if (_dimreg_n >= DIM_REG_MAX) { return; }
+    if (name_len <= 0) { return; }
+    if (cast(i64, name_ptr) == 0) { return; }
+    _dimreg_name[_dimreg_n] = cast(i64, name_ptr);
+    _dimreg_nlen[_dimreg_n] = name_len;
+    _dimreg_val[_dimreg_n] = val;
+    _dimreg_n = _dimreg_n + 1;
+}
+
+// BACKWARDS, and that is the whole point. The stack holds the importer's
+// constants underneath the module currently being laid out, so scanning from
+// the top finds the module's own `MAX_NAME` before an importer's — which is
+// what a reader of that file expects, and the only reading that is stable when
+// two modules pick the same name.
+fn dim_reg_find(name_ptr as *u8, name_len as i32, out as *i64) as i32 {
+    let is i32 as i with mut = _dimreg_n - 1;
+    while (i >= 0) {
+        if (_dimreg_nlen[i] == name_len
+            && d.str_eq(cast(*u8, _dimreg_name[i]), _dimreg_nlen[i], name_ptr, name_len) == 1) {
+            *out = _dimreg_val[i];
+            return 1;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// The length of `[NAME]T`, from a `with imut` global — folded by walk_let if
+// we are past pass 5, or by the pre-pass above if this is struct layout.
+//
+// Returns 1 with the value in *out. On failure returns 0 and writes a reason
+// into *why, because the two failures want different advice and a single
+// message would be wrong half the time:
+//
+//   DIM_NOT_FOUND — no such constant, by either route. A typo, or a name
+//     declared somewhere this cannot see.
+//
+//   DIM_NOT_CONST — it exists and is not a foldable integer constant: a
+//     `with mut` global, or an initializer that is not a compile-time value.
+//
+// The i32 bound is not decoration: array_len is an i32 and the size product is
+// computed in i32, so a larger length would wrap to a small or negative size —
+// the same silent corruption this whole path exists to close.
+let is i32 as DIM_OK        with imut = 0;
+let is i32 as DIM_NOT_FOUND with imut = 1;
+let is i32 as DIM_NOT_CONST with imut = 2;
+
+fn fold_array_dim(name_ptr as *u8, name_len as i32, out as *i64, why as *i32) as i32 {
+    *why = DIM_NOT_FOUND;
+    if (name_len <= 0) { return 0; }
+    if (cast(i64, name_ptr) == 0) { return 0; }
+
+    // The pre-pass first: during struct layout it is the only one that has an
+    // answer, and after it the two agree.
+    let is i64 as pre with mut = 0;
+    if (dim_reg_find(name_ptr, name_len, &pre) == 1) {
+        if (pre >= 0 && pre <= 2147483647) { *out = pre; *why = DIM_OK; return 1; }
+        *why = DIM_NOT_CONST;
+        return 0;
+    }
+
+    let is *d.Variable as v = sc.lookup_var(name_ptr, name_len);
+    if (cast(i64, v) == 0) { return 0; }
+    *why = DIM_NOT_CONST;
+    if (v.has_folded_init != 1) { return 0; }
+    let is i64 as n = v.folded_init_val;
+    if (n < 0) { return 0; }
+    if (n > 2147483647) { return 0; }
+    *out = n;
+    *why = DIM_OK;
+    return 1;
+}
+
+fn resolve_type_ref(ty_ptr as *u8) as void {
+    if (cast(i64, ty_ptr) == 0) { return; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+
+    // Resolve struct/enum name references
+    if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
+        // Pre-compute dot-mangled name for module.Type references
+        let is *u8 as dot_mangled_ptr with mut = cast(*u8, 0);
+        let is i32 as dot_mangled_len with mut = 0;
+        // `mod.Type`, `mod.sub.Type`, `mod.sub.sub.Type`, ... — every leading
+        // component that names a submodule is consumed, so the depth is
+        // whatever the import graph has.
+        let is i32 as tail_off with mut = 0;
+        let is i32 as chain_only with mut = 0;
+        let is *d.Module as modd with mut = sc.resolve_mod_path(ty.name_ptr, ty.name_len, &tail_off, &chain_only);
+        // Follows dot_mangled_ptr: whichever prefix produced the key that hits
+        // is the module that owns the type, and the submodule fallback below
+        // can move it off the chain head.
+        let is *u8 as owner_pfx_ptr with mut = cast(*u8, 0);
+        let is i32 as owner_pfx_len with mut = 0;
+        if (cast(i64, modd) != 0) {
+            owner_pfx_ptr = modd.prefix_ptr;
+            owner_pfx_len = modd.prefix_len;
+            let is *u8 as tn_ptr = cast(*u8, cast(i64, ty.name_ptr) + cast(i64, tail_off));
+            let is i32 as tn_len = ty.name_len - tail_off;
+            dot_mangled_ptr = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tn_ptr, tn_len, &dot_mangled_len);
+            // Fallback: try submodule prefixes (for 'only' imports)
+            if (chain_only == 1) {
+                let is *d.SubModule as sm with mut = cast(*d.SubModule, modd.submodules);
+                while (cast(i64, sm) != 0) {
+                    let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                    let is i32 as smlen with mut = 0;
+                    let is *u8 as sm_mangled = d.str_concat3(sub.prefix_ptr, sub.prefix_len, "_", 1, tn_ptr, tn_len, &smlen);
+                    let is *u8 as sm_def = lookup_struct(sm_mangled, smlen);
+                    if (cast(i64, sm_def) != 0) {
+                        d.sem_free(dot_mangled_ptr);
+                        dot_mangled_ptr = sm_mangled;
+                        dot_mangled_len = smlen;
+                        owner_pfx_ptr = sub.prefix_ptr;
+                        owner_pfx_len = sub.prefix_len;
+                        sm = cast(*d.SubModule, 0);
+                    } else {
+                        let is *u8 as sm_edef = lookup_enum(sm_mangled, smlen);
+                        if (cast(i64, sm_edef) != 0) {
+                            d.sem_free(dot_mangled_ptr);
+                            dot_mangled_ptr = sm_mangled;
+                            dot_mangled_len = smlen;
+                            owner_pfx_ptr = sub.prefix_ptr;
+                            owner_pfx_len = sub.prefix_len;
+                            sm = cast(*d.SubModule, 0);
+                        } else {
+                            d.sem_free(sm_mangled);
+                            sm = cast(*d.SubModule, sm.next);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Explicit qualification wins; otherwise the importing module's own
+        // definition wins before an exact bare root-name fallback.
+        let is *u8 as def with mut = cast(*u8, 0);
+        let is i32 as from_dot with mut = 0;
+        if (cast(i64, dot_mangled_ptr) != 0) {
+            def = lookup_struct(dot_mangled_ptr, dot_mangled_len);
+            if (cast(i64, def) != 0) { from_dot = 1; }
+        } else {
+            def = lookup_struct_pf(ty.name_ptr, ty.name_len);
+        }
+
+        if (cast(i64, def) == 0) {
+            // Try enum lookup
+            let is *u8 as edef with mut = cast(*u8, 0);
+            if (cast(i64, dot_mangled_ptr) != 0) {
+                edef = lookup_enum(dot_mangled_ptr, dot_mangled_len);
+            } else {
+                edef = lookup_enum_pf(ty.name_ptr, ty.name_len);
+            }
+            if (cast(i64, edef) != 0) {
+                let is *ast.Type as et = cast(*ast.Type, edef);
+                ty.kind = ast.TY_ENUM;
+                ty.fields = et.fields;
+                ty.size = et.size;
+                ty.variant_count = et.variant_count;
+                ty.payload_offset = et.payload_offset;
+                ty.max_payload = et.max_payload;
+            } else {
+                // Try type alias
+                let is *u8 as alias_ty with mut = cast(*u8, 0);
+                if (cast(i64, dot_mangled_ptr) != 0) {
+                    alias_ty = lookup_type_alias(dot_mangled_ptr, dot_mangled_len);
+                } else {
+                    if (sc.current_mod_prefix_len > 0) {
+                        let is i32 as amlen with mut = 0;
+                        let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
+                        alias_ty = lookup_type_alias(amangled, amlen);
+                        d.sem_free(amangled);
+                    }
+                    if (cast(i64, alias_ty) == 0) { alias_ty = lookup_type_alias(ty.name_ptr, ty.name_len); }
+                }
+                if (cast(i64, alias_ty) != 0) {
+                    let is *ast.Type as at = cast(*ast.Type, alias_ty);
+                    mem.memcpy(cast(*u8, ty), cast(*u8, at), sizeof(ast.Type));
+                } else {
+                    io.write_str(io.STDERR, "Erro: tipo nao definido: '");
+                    io.write_bytes(io.STDERR, ty.name_ptr, cast(i64, ty.name_len));
+                    io.write_str(io.STDERR, "' (mod_prefix='");
+                    if (sc.current_mod_prefix_len > 0) {
+                        io.write_bytes(io.STDERR, sc.current_mod_prefix_ptr, cast(i64, sc.current_mod_prefix_len));
+                    }
+                    io.write_str(io.STDERR, "')\n");
+                    io.exit(cast(i32, cast(i32, 1)));
+                }
+            }
+        } else {
+            // Copy from struct def
+            let is *ast.Type as dt = cast(*ast.Type, def);
+            ty.fields = dt.fields;
+            ty.size = dt.size;
+            // Remember which module it came out of when it was named through
+            // one, so method lookup can reach its impl without depending on the
+            // caller having that module in scope.
+            if (from_dot == 1 && cast(i64, owner_pfx_ptr) != 0) {
+                ty.owner_prefix_ptr = owner_pfx_ptr;
+                ty.owner_prefix_len = owner_pfx_len;
+            }
+        }
+
+        if (cast(i64, dot_mangled_ptr) != 0) {
+            d.sem_free(dot_mangled_ptr);
+        }
+    }
+
+    // Recurse into pointer/array base
+    if (ty.kind == ast.TY_PTR || ty.kind == ast.TY_ARRAY) {
+        if (cast(i64, ty.base) != 0) {
+            resolve_type_ref(cast(*u8, ty.base));
+            // An array's byte size is element_count * element_size. The parser
+            // (parser/type.cst) computed this when the array type was parsed —
+            // but if the element is a struct/enum referenced by name (defined
+            // later, or in another module), base.size was still 0 then, leaving
+            // the array sized 0. A 0-sized .bss global reserves no space, so
+            // every such global ends up aliasing the next one's address.
+            // Recompute now that the base type is fully resolved.
+            if (ty.kind == ast.TY_ARRAY) {
+                let is *ast.Type as _bt = cast(*ast.Type, ty.base);
+                // `[MAX]u8` — the length was written as a constant's name. The
+                // parser left ARRAY_LEN_PENDING and the name in name_ptr,
+                // because it has no symbol table; this is the first point that
+                // does. Fold it, or say so — never fall through to a zero,
+                // which is the whole reason the marker exists.
+                if (ty.array_len == ast.ARRAY_LEN_PENDING) {
+                    let is i64 as dim with mut = 0;
+                    let is i32 as why with mut = 0;
+                    if (fold_array_dim(ty.name_ptr, ty.name_len, &dim, &why) == 1) {
+                        ty.array_len = cast(i32, dim);
+                        ty.name_ptr = cast(*u8, 0);
+                        ty.name_len = 0;
+                    } else {
+                        if (why == DIM_NOT_CONST) {
+                            sc.sem_error2("tamanho de array precisa ser uma constante `with imut` inteira e nao-negativa:",
+                                          ty.name_ptr, ty.name_len);
+                        } else {
+                            // Reached from struct layout, `lookup_var` has not
+                            // run yet and the pre-pass is the only source — so
+                            // "no such name" and "exists but is not a foldable
+                            // imut constant" are indistinguishable here. The
+                            // message names both rather than picking one and
+                            // being wrong half the time.
+                            sc.sem_error2("tamanho de array: nao ha constante `with imut` inteira com esse nome (ou ela nao dobra para um literal):",
+                                          ty.name_ptr, ty.name_len);
+                        }
+                        ty.array_len = 0;
+                    }
+                }
+                ty.size = ty.array_len * _bt.size;
+            }
+        }
+    }
+}
+
+// === Type checking helpers ===
+
+fn is_integer_type(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i32 as k = t.kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    if (k == ast.TY_U8 || k == ast.TY_U16 || k == ast.TY_U32 || k == ast.TY_U64) { return 1; }
+    return 0;
+}
+
+fn is_float_type(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_F32 || t.kind == ast.TY_F64) { return 1; }
+    return 0;
+}
+
+fn is_numeric_type(ty as *u8) as i32 {
+    if (is_integer_type(ty) == 1) { return 1; }
+    if (is_float_type(ty) == 1) { return 1; }
+    return 0;
+}
+
+fn is_bool_or_int(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_BOOL) { return 1; }
+    return is_integer_type(ty);
+}
+
+fn is_signed_type(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i32 as k = t.kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    if (k == ast.TY_F32 || k == ast.TY_F64) { return 1; }
+    if (k == ast.TY_CHAR) { return 1; }
+    return 0;
+}
+
+fn is_safe_conversion(from as *u8, to as *u8) as i32 {
+    if (cast(i64, from) == cast(i64, to)) { return 1; }
+    let is *ast.Type as f = cast(*ast.Type, from);
+    let is *ast.Type as t = cast(*ast.Type, to);
+    // TY_FN <-> *u8 (both are 8-byte pointers at runtime)
+    if (f.kind == ast.TY_FN && t.kind == ast.TY_PTR && t.size == 8) { return 1; }
+    if (f.kind == ast.TY_PTR && f.size == 8 && t.kind == ast.TY_FN) { return 1; }
+    if (f.kind == ast.TY_FN && t.kind == ast.TY_FN) { return fn_sig_compatible(from, to); }
+    if (f.size > t.size) { return 0; }
+    // A change of signedness keeps every value in one direction only: unsigned
+    // into a strictly wider signed type — a bool or a u8 into an i32, a u32 into
+    // an i64. Refusing that too rejected `check(a < b)` for an i32 parameter.
+    if (is_signed_type(from) != is_signed_type(to)) {
+        if (is_signed_type(from) == 1 || f.size >= t.size) { return 0; }
+    }
+    return 1;
+}
+
+// Two types a function signature may hold in the same position. Every pointer
+// matches every pointer, the way pointer assignment does (see the TODO in
+// try_implicit_convert), and a function type matches a pointer for the same
+// reason TY_FN <-> *u8 converts. Anything else has to be the same kind, and a
+// struct, enum or array the same size. An unresolved type matches anything.
+fn same_param_type(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == cast(i64, b)) { return 1; }
+    if (cast(i64, a) == 0 || cast(i64, b) == 0) { return 1; }
+    let is *ast.Type as x = cast(*ast.Type, a);
+    let is *ast.Type as y = cast(*ast.Type, b);
+    let is i32 as xp with mut = 0;
+    let is i32 as yp with mut = 0;
+    if (x.kind == ast.TY_PTR || x.kind == ast.TY_FN || x.kind == ast.TY_STRING) { xp = 1; }
+    if (y.kind == ast.TY_PTR || y.kind == ast.TY_FN || y.kind == ast.TY_STRING) { yp = 1; }
+    if (xp == 1 && yp == 1) {
+        if (x.kind == ast.TY_FN && y.kind == ast.TY_FN) { return fn_sig_compatible(a, b); }
+        return 1;
+    }
+    if (x.kind != y.kind) { return 0; }
+    if (x.kind == ast.TY_STRUCT || x.kind == ast.TY_ENUM || x.kind == ast.TY_ARRAY) {
+        if (x.size != y.size) { return 0; }
+    }
+    return 1;
+}
+
+// Whether a function of type `from` may be called through a pointer of type
+// `to`: the same number of parameters, each of the same type, and the same
+// return type. Anything looser and `fn(f64) as i64` stored into an
+// `fn(i64, *u8) as i32` is called with a pointer in a float register and its
+// i64 read back as an i32 — which compiled, ran, and printed whatever it found.
+fn fn_sig_compatible(from as *u8, to as *u8) as i32 {
+    let is *ast.Type as f = cast(*ast.Type, from);
+    let is *ast.Type as t = cast(*ast.Type, to);
+    if (f.field_count != t.field_count) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < f.field_count) {
+        if (same_param_type(cast(*u8, ast.ga_get(f.fields, i)), cast(*u8, ast.ga_get(t.fields, i))) == 0) { return 0; }
+        i = i + 1;
+    }
+    let is *u8 as fr with mut = cast(*u8, f.base);
+    let is *u8 as tr with mut = cast(*u8, t.base);
+    if (cast(i64, fr) == 0) { fr = cast(*u8, ast.type_void); }
+    if (cast(i64, tr) == 0) { tr = cast(*u8, ast.type_void); }
+    return same_param_type(fr, tr);
+}
+
+// One argument against one parameter. The same rule as a `let`, a `return`
+// and an assignment — try_implicit_convert — so a direct call, a call()
+// through a typed pointer and a plain store cannot drift apart again. They had:
+// a call and an assignment checked literals only, so a variable of the wrong
+// type went through, and call() compared size AND kind, which fired only when
+// both differed.
+fn arg_compatible(arg as *ast.Node, pt as *u8) as i32 {
+    if (cast(i64, arg) == 0 || cast(i64, pt) == 0) { return 1; }
+    return try_implicit_convert(arg, pt);
+}
+
+fn pointer_to(ty as *u8) as *u8 {
+    let is *ast.Type as p = ast.new_type(ast.TY_PTR);
+    p.base = cast(*ast.Type, ty);
+    p.size = 8;
+    return cast(*u8, p);
+}
+
+// === Literal narrowing ===
+
+fn can_narrow_literal(val as i64, target as *u8) as i32 {
+    let is i64 as tv = cast(i64, target);
+    if (tv == cast(i64, ast.type_i8) && val >= 0 - 128 && val <= 127) { return 1; }
+    if (tv == cast(i64, ast.type_i16) && val >= 0 - 32768 && val <= 32767) { return 1; }
+    if (tv == cast(i64, ast.type_i32) && val >= 0 - 2147483648 && val <= 2147483647) { return 1; }
+    if (tv == cast(i64, ast.type_u8) && val >= 0 && val <= 255) { return 1; }
+    if (tv == cast(i64, ast.type_u16) && val >= 0 && val <= 65535) { return 1; }
+    if (tv == cast(i64, ast.type_u32) && val >= 0 && val <= 4294967295) { return 1; }
+    if (tv == cast(i64, ast.type_i64)) { return 1; }
+    if (tv == cast(i64, ast.type_u64)) { return 1; }
+    return 0;
+}
+
+// Narrow a literal node to target type if possible. Returns 1 and mutates
+// node.ty on success. Returns 0 (leaves node untouched) if not possible.
+// Refuses cross-domain (float<->int) narrowing — that requires an explicit cast.
+fn can_narrow_literal_to(node as *ast.Node, target as *u8) as i32 {
+    if (cast(i64, node) == 0 || cast(i64, target) == 0) { return 0; }
+    if (node.kind != ast.NK_NUM) { return 0; }
+    if (cast(i64, node.ty) == 0) { return 0; }
+    if (cast(i64, node.ty) == cast(i64, target)) { return 1; }
+
+    let is i32 as src_int = is_integer_type(cast(*u8, node.ty));
+    let is i32 as dst_int = is_integer_type(target);
+    if (src_int == 1 && dst_int == 1) {
+        if (can_narrow_literal(node.val, target) == 1) {
+            node.ty = cast(*ast.Type, target);
+            return 1;
+        }
+        return 0;
+    }
+
+    let is i32 as src_flt = is_float_type(cast(*u8, node.ty));
+    let is i32 as dst_flt = is_float_type(target);
+    if (src_flt == 1 && dst_flt == 1) {
+        node.ty = cast(*ast.Type, target);
+        return 1;
+    }
+
+    return 0;
+}
+
+// The value of an integer expression built only from literals — `0 - 1`,
+// `1 << 4`, `-8` — or 0 when it is not one. Lets such an expression narrow the
+// way a literal does: `0 - 1` handed to an i32 parameter is -1, and nothing is
+// truncated, so asking for a cast there would only be noise.
+fn const_int_value(node as *ast.Node, out as *i64) as i32 {
+    if (cast(i64, node) == 0) { return 0; }
+    let is i32 as k = node.kind;
+    if (k == ast.NK_NUM) {
+        if (cast(i64, node.ty) != 0 && is_float_type(cast(*u8, node.ty)) == 1) { return 0; }
+        *out = node.val;
+        return 1;
+    }
+    if (k == ast.NK_NEG) {
+        let is i64 as v with mut = 0;
+        if (const_int_value(node.expr, &v) == 0) { return 0; }
+        *out = 0 - v;
+        return 1;
+    }
+    if (k != ast.NK_ADD && k != ast.NK_SUB && k != ast.NK_MUL && k != ast.NK_SHL
+        && k != ast.NK_BAND && k != ast.NK_BOR && k != ast.NK_BXOR) { return 0; }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    if (const_int_value(node.lhs, &a) == 0) { return 0; }
+    if (const_int_value(node.rhs, &b) == 0) { return 0; }
+    if (k == ast.NK_ADD) { *out = a + b; }
+    else if (k == ast.NK_SUB) { *out = a - b; }
+    else if (k == ast.NK_MUL) { *out = a * b; }
+    else if (k == ast.NK_SHL) { if (b < 0 || b > 62) { return 0; } *out = a << b; }
+    else if (k == ast.NK_BAND) { *out = a & b; }
+    else if (k == ast.NK_BOR) { *out = a | b; }
+    else { *out = a ^ b; }
+    return 1;
+}
+
+// Whether a float expression is built only from float literals — `0.0 - 40.0`.
+// A literal narrows to f32 on its own; this lets such an expression do the same
+// instead of asking for a cast around a constant.
+fn const_float_expr(node as *ast.Node) as i32 {
+    if (cast(i64, node) == 0) { return 0; }
+    let is i32 as k = node.kind;
+    if (k == ast.NK_NUM) {
+        if (cast(i64, node.ty) != 0 && is_float_type(cast(*u8, node.ty)) == 1) { return 1; }
+        return 0;
+    }
+    if (k == ast.NK_NEG) { return const_float_expr(node.expr); }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV) {
+        if (const_float_expr(node.lhs) == 1 && const_float_expr(node.rhs) == 1) { return 1; }
+    }
+    return 0;
+}
+
+// Try to implicitly convert an expression node to a target type. Returns 1
+// if convertible (literal may be narrowed in place), 0 otherwise.
+// Centralizes the rules: same-type, literal narrowing, pointer-to-pointer,
+// and safe widening via is_safe_conversion. Cross-domain (float<->int)
+// without explicit cast is always rejected.
+fn try_implicit_convert(node as *ast.Node, target as *u8) as i32 {
+    if (cast(i64, node) == 0 || cast(i64, target) == 0) { return 0; }
+    let is *ast.Type as src_ty = node.ty;
+    if (cast(i64, src_ty) == 0) { return 1; }
+    if (cast(i64, src_ty) == cast(i64, target)) { return 1; }
+
+    if (node.kind == ast.NK_NUM) {
+        if (can_narrow_literal_to(node, target) == 1) { return 1; }
+        let is i32 as src_int = is_integer_type(cast(*u8, src_ty));
+        let is i32 as dst_int = is_integer_type(target);
+        let is i32 as src_flt = is_float_type(cast(*u8, src_ty));
+        let is i32 as dst_flt = is_float_type(target);
+        if (src_flt == 1 && dst_int == 1) { return 0; }
+        if (src_int == 1 && dst_flt == 1) { return 0; }
+    }
+
+    if (node.kind != ast.NK_NUM && is_float_type(cast(*u8, src_ty)) == 1 && is_float_type(target) == 1
+        && const_float_expr(node) == 1) {
+        let is *ast.Type as dst = cast(*ast.Type, target);
+        if (src_ty.size > dst.size) {
+            // Narrow the completed expression, not its operands or arithmetic.
+            // Retain list linkage on the outer node, never on the cast operand.
+            let is *ast.Node as operand = ast.node_alloc_raw();
+            mem.memcpy(cast(*u8, operand), cast(*u8, node), sizeof(ast.Node));
+            operand.next = cast(*ast.Node, 0);
+            node.kind = ast.NK_CAST;
+            node.expr = operand;
+            node.ty = dst;
+        }
+        return 1;
+    }
+    if (node.kind != ast.NK_NUM && is_integer_type(cast(*u8, src_ty)) == 1 && is_integer_type(target) == 1) {
+        let is i64 as cv with mut = 0;
+        if (const_int_value(node, &cv) == 1 && can_narrow_literal(cv, target) == 1) { return 1; }
+    }
+
+    let is *ast.Type as dst_ty = cast(*ast.Type, target);
+    // An array where a pointer is expected is its address, as it has always
+    // been passed.
+    if (src_ty.kind == ast.TY_ARRAY && dst_ty.kind == ast.TY_PTR) { return 1; }
+    if (src_ty.kind == ast.TY_PTR && dst_ty.kind == ast.TY_PTR) {
+        // TODO(safety): the strict check from f8d2c0a rejects valid
+        // self-referential struct fields (e.g. `next as *Node` inside a
+        // struct Node definition), breaking the compiler's own bootstrap.
+        // For now, accept any pointer-to-pointer assignment as before.
+        // Future: tighten with proper named-type identity using the type
+        // hash table (st_hash_ptrs) rather than Type instance comparison.
+        return 1;
+    }
+
+    // Floats and everything else are held in different registers and converted
+    // by different instructions, so a value does not cross between them without
+    // a cast. The rule was enforced for literals only: an f64 variable passed
+    // for an i64 parameter compiled, and the callee read its other register.
+    if (is_float_type(cast(*u8, src_ty)) != is_float_type(target)) { return 0; }
+
+    return is_safe_conversion(cast(*u8, src_ty), target);
+}
+
+// === Helpers ===
+
+fn type_name_str(ty as *u8) as *u8 {
+    if (cast(i64, ty) == 0) { return "unknown"; }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_VOID) { return "void"; }
+    if (t.kind == ast.TY_I8) { return "i8"; }
+    if (t.kind == ast.TY_I16) { return "i16"; }
+    if (t.kind == ast.TY_I32) { return "i32"; }
+    if (t.kind == ast.TY_I64) { return "i64"; }
+    if (t.kind == ast.TY_U8) { return "u8"; }
+    if (t.kind == ast.TY_U16) { return "u16"; }
+    if (t.kind == ast.TY_U32) { return "u32"; }
+    if (t.kind == ast.TY_U64) { return "u64"; }
+    if (t.kind == ast.TY_F32) { return "f32"; }
+    if (t.kind == ast.TY_F64) { return "f64"; }
+    if (t.kind == ast.TY_BOOL) { return "bool"; }
+    if (t.kind == ast.TY_CHAR) { return "char"; }
+    if (t.kind == ast.TY_STRING) { return "string"; }
+    if (t.kind == ast.TY_PTR) { return "*ptr"; }
+    if (t.kind == ast.TY_ARRAY) { return "array"; }
+    if (t.kind == ast.TY_STRUCT && t.name_len > 0) { return t.name_ptr; }
+    if (t.kind == ast.TY_ENUM && t.name_len > 0) { return t.name_ptr; }
+    return "unknown";
+}

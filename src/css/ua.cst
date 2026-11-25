@@ -4,7 +4,7 @@
 // left out. It is written in CSS and goes through the same parser and cascade as a
 // page's own, so no element is special anywhere else in the engine.
 //
-// Scripting is off for good, so <noscript> stays visible.
+// Scripting is on, so <noscript> is not shown.
 
 use "./sheet.cst" as sh;
 use "../loader/url.cst" as url;
@@ -88,7 +88,7 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "a:-webkit-any-link:active { color: #ee0000; }");
     _r(s, "input[type=checkbox], input[type=radio] { box-sizing: border-box; width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; vertical-align: -2px; border: 1px solid #767676; border-radius: 2px; cursor: default; }");
     _r(s, "input[type=radio] { border-radius: 50%; }");
-    _r(s, "input[type=submit], input[type=button], input[type=reset], button, select { border: 1px solid #767676; border-radius: 3px; background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; }");
+    _r(s, "input[type=submit], input[type=button], input[type=reset], button, select { border: 1px solid #767676; border-radius: 3px; background-color: #efefef; padding: 2px 7px; text-align: center; cursor: default; box-sizing: border-box; }");
     _r(s, "select { background-color: white; padding: 2px 5px; text-align: start; }");
     _r(s, "input:disabled, textarea:disabled, select:disabled { background-color: rgba(239, 239, 239, 0.3); border-color: rgba(118, 118, 118, 0.3); }");
     _r(s, "input[type=checkbox]:disabled, input[type=radio]:disabled { background-color: transparent; border-color: #cbcbcb; }");
@@ -99,7 +99,9 @@ fn load(s as *sh.Sheet) as void {
     _r(s, "input[type=range] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; border-radius: 0; background-color: transparent; cursor: default; }");
     _r(s, "input[type=color] { width: 44px; height: 23px; padding: 1px 2px; background-color: #efefef; cursor: default; }");
     _r(s, "option, optgroup, datalist { display: none; }");
-    _r(s, "noscript { display: inline; }");
+    _r(s, "noscript { display: none; }");
+    _r(s, "iframe { border: 2px inset #767676; }");
+    _r(s, "iframe[frameborder=\"0\"], iframe[frameborder=\"no\"] { border: none; }");
     _r(s, "ruby { display: inline; }");
     _r(s, "rt { font-size: 50%; }");
 }

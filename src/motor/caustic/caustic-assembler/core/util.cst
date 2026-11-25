@@ -1,0 +1,86 @@
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+use "../../src/ir/opt_mem.cst" as om;
+
+// === I/O & string helpers shared across the assembler ===
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn print_str(s as *u8) as void {
+    io._write_fd(io.STDOUT, s, strlen(s));
+}
+
+fn print_int(n as i64) as void {
+    if (n == 0) { io._write_fd(io.STDOUT, "0", 1); return; }
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i64 as start = cast(i64, pos) + 1;
+    io._write_fd(io.STDOUT, cast(*u8, cast(i64, &buf) + start), 24 - start);
+}
+
+// stderr variants of print_str/print_int — used by the diagnostic path so
+// errors land on fd 2 (and never get interleaved with the .s on stdout).
+fn eprint_str(s as *u8) as void {
+    io._write_fd(io.STDERR, s, strlen(s));
+}
+
+fn eprint_int(n as i64) as void {
+    if (n == 0) { io._write_fd(io.STDERR, "0", 1); return; }
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i64 as start = cast(i64, pos) + 1;
+    io._write_fd(io.STDERR, cast(*u8, cast(i64, &buf) + start), 24 - start);
+}
+
+fn read_file(path as *u8) as *u8 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (size <= 0) { io._close_fd(fd); return cast(*u8, 0); }
+    let is *u8 as buf = om.opt_alloc(size + 1);
+    io._read_fd(fd, buf, size);
+    buf[size] = cast(u8, 0);
+    io._close_fd(fd);
+    return buf;
+}
+
+fn read_file_size(path as *u8) as i64 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._close_fd(fd);
+    return size;
+}
+
+fn make_output_name(input as *u8) as *u8 {
+    let is i64 as len = strlen(input);
+    let is *u8 as out = om.opt_alloc(len + 3);
+    mem.memcpy(out, input, len);
+    out[len] = 46;     // '.'
+    out[len + 1] = 111; // 'o'
+    out[len + 2] = 0;
+    return out;
+}

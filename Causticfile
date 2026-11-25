@@ -30,6 +30,15 @@ target "test_tok" { src "tests/test_tok.cst" out "build/test_tok" }
 
 // The tokenizer and paint tests open no window and link nothing, so they run
 // anywhere. test-ui opens the real window on a private X server and drives it.
+// The engine, packed into the browser: its runtime, the compiler, the std files they need.
+// Run this before building `browser` the first time and when any of them changes.
+script "motor" {
+    "mkdir -p build/motor"
+    "caustic -q -O1 tools/motor_pack.cst -o build/motor/pack"
+    "caustic -q -O2 --target=caustic-x86_64 --shared --mode=compat src/motor/caustic/src/main.cst -o build/motor/caustic.csl"
+    "./build/motor/pack"
+}
+
 script "test" {
     "caustic-mk build test_tok"
     "./build/test_tok"

@@ -1,0 +1,599 @@
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../../std/time.cst" as time;
+use "../parser/ast.cst" as ast;
+use "alloc_gc.cst" as gc;
+
+// === Quiet flag ===
+let is i32 as cg_quiet with mut = 0;
+
+// === Work counters (--stats) ===
+// What a build did, as counts a test can compare: a time limit fails on a busy machine
+// and passes on a fast one, a count of how often a list was walked does neither. The
+// counters live on a page shared across the emission fork, set up by main, so the
+// workers' work reaches the parent.
+let is i64 as STAT_RODATA_VISITS with imut = 0;
+let is i64 as STAT_OUTSIDE_CALLS with imut = 8;
+let is i64 as STAT_MODULES with imut = 16;
+let is i64 as STAT_TOKENS_LIVE with imut = 24;
+let is i64 as STAT_LARGE_MAPS with imut = 32;
+let is i64 as STAT_FUNCS_EMITTED with imut = 40;
+let is i64 as STAT_OBJS_REUSED with imut = 48;
+let is i64 as STAT_OBJS_EMITTED with imut = 56;
+let is i64 as stats_page with mut = 0;
+
+fn stats_add(slot as i64, n as i64) as void {
+    if (stats_page != 0) { atomic_add(cast(*i64, stats_page + slot), n); }
+}
+
+// === Output buffer ===
+let is *u8 as out_buf with mut;
+let is i64 as out_len with mut;
+let is i64 as out_cap with mut;
+let is i32 as out_fd with mut;
+// Sticky: set when a flush could not write the whole buffer (out_flush below).
+// The assembly is also captured in memory, so the assembler still gets the real
+// text — but the .s on disk is truncated, and main checks this flag before
+// reporting the compile as successful.
+let is i32 as out_failed with mut = 0;
+
+// === In-memory .s capture ===
+// When enabled, every flushed chunk is ALSO appended to a growing buffer so the
+// in-process assembler can tokenize the assembly straight from memory instead of
+// reading the .s file back from disk (the file is still written, as a cache).
+// The buffer is mmap'd directly (not the opt_bins arena) so it survives the AST
+// arena destroy that runs between codegen and assembly.
+let is *u8 as _cap_buf with mut;
+let is i64 as _cap_len with mut;
+let is i64 as _cap_cap with mut;
+let is i32 as _cap_on  with mut = 0;
+
+fn capture_begin() as void { _cap_on = 1; _cap_len = 0; }
+fn capture_end()   as void { _cap_on = 0; }
+fn capture_ptr()   as *u8  { return _cap_buf; }
+fn capture_len()   as i64  { return _cap_len; }
+fn capture_free()  as void {
+    if (cast(i64, _cap_buf) != 0) { mem.core.munmap(_cap_buf, _cap_cap); }
+    _cap_buf = cast(*u8, 0); _cap_len = 0; _cap_cap = 0; _cap_on = 0;
+}
+fn _cap_append(p as *u8, n as i64) as void {
+    if (_cap_len + n > _cap_cap) {
+        let is i64 as nc with mut = _cap_cap * 2;
+        if (nc < _cap_len + n) { nc = _cap_len + n; }
+        if (nc < 1048576) { nc = 1048576; }
+        let is *u8 as nb = mem.core.mmap_anon(nc);
+        if (cast(i64, nb) == 0 || cast(i64, nb) == 0 - 1) { mem.core.oom("the generated assembly", nc); }
+        if (_cap_len > 0) { mem.memcpy(nb, _cap_buf, _cap_len); }
+        if (cast(i64, _cap_buf) != 0) { mem.core.munmap(_cap_buf, _cap_cap); }
+        _cap_buf = nb; _cap_cap = nc;
+    }
+    mem.memcpy(cast(*u8, cast(i64, _cap_buf) + _cap_len), p, n);
+    _cap_len = _cap_len + n;
+}
+
+// === Per-module string-literal filtering (--module-only / batch codegen) ===
+// A module's object should carry ONLY the string literals its own functions
+// reference, not the whole-program table. `str_mark` is called when a string
+// ref (`lea reg,[rip+.LC<sid>]`) is emitted; emit_rodata consults `str_is_used`.
+// On overflow (sid beyond the bitmap) filtering disables → emit all (safe).
+let is i32 as STR_USED_CAP with imut = 65536;
+let is [65536]u8 as _str_used with mut;
+let is i32 as _str_filter with mut = 0;
+let is i32 as _str_overflow with mut = 0;
+
+// In the order this module first used them: the strings of an object must not depend on
+// what other modules registered before it, or an unchanged module's object would change.
+let is [65536]i32 as _str_order with mut;
+let is i32 as _str_order_n with mut = 0;
+fn str_order_count() as i32 { return _str_order_n; }
+fn str_order_at(i as i32) as i32 { return _str_order[i]; }
+
+fn str_filter_reset(active as i32) as void {
+    _str_order_n = 0;
+    _str_filter = active;
+    _str_overflow = 0;
+    if (active == 1) { mem.memset(cast(*u8, &_str_used), 0, cast(i64, STR_USED_CAP)); }
+}
+fn str_mark(sid as i32) as void {
+    if (sid < 0 || sid >= STR_USED_CAP) { _str_overflow = 1; return; }
+    if (_str_used[sid] == cast(u8, 0)) {
+        _str_order[_str_order_n] = sid;
+        _str_order_n = _str_order_n + 1;
+    }
+    _str_used[sid] = cast(u8, 1);
+}
+fn str_filter_active() as i32 {
+    if (_str_filter == 1 && _str_overflow == 0) { return 1; }
+    return 0;
+}
+fn str_is_used(sid as i32) as i32 {
+    if (sid < 0 || sid >= STR_USED_CAP) { return 1; }
+    return cast(i32, _str_used[sid]);
+}
+
+// === Debug info ===
+// === Constant pool: f64 constants read as [rip+.LCF<k>] (x86) ===
+// One pool per codegen() call (a whole program, or one module), emitted after
+// the functions. fc_hash holds index + 1 per slot, 0 = empty.
+let is i32 as FC_CAP with imut = 4096;
+let is [4096]i64 as fc_bits with mut;
+let is [8192]i32 as fc_hash with mut;
+let is i32 as fc_n with mut = 0;
+
+fn fc_reset() as void {
+    fc_n = 0;
+    let is i32 as i with mut = 0;
+    while (i < 8192) { fc_hash[i] = 0; i = i + 1; }
+}
+
+// The pool index of `bits`, added if new; -1 when the pool is full.
+fn fc_index(bits as i64) as i32 {
+    let is i64 as h with mut = (bits ^ (bits >> 29)) * 7046029254386353131;
+    let is i32 as slot with mut = cast(i32, (h >> 40) & 8191);
+    while (fc_hash[slot] != 0) {
+        let is i32 as k = fc_hash[slot] - 1;
+        if (fc_bits[k] == bits) { return k; }
+        slot = (slot + 1) & 8191;
+    }
+    if (fc_n >= FC_CAP) { return 0 - 1; }
+    fc_bits[fc_n] = bits;
+    fc_hash[slot] = fc_n + 1;
+    fc_n = fc_n + 1;
+    return fc_n - 1;
+}
+
+// "QWORD PTR [rip+.LCF<k>]"
+fn fc_out_ref(k as i64) as void {
+    out_str("QWORD PTR [rip+.LCF", 19);
+    out_int(k);
+    out_str("]", 1);
+}
+
+fn fc_emit_pool() as void {
+    if (fc_n == 0) { return; }
+    out_str(".section .rodata\n.p2align 3\n", 28);
+    let is i32 as k with mut = 0;
+    while (k < fc_n) {
+        out_str(".LCF", 4); out_int(cast(i64, k)); out_str(":\n  .quad ", 10);
+        out_int(fc_bits[k]); out_char(10);
+        k = k + 1;
+    }
+}
+
+let is *u8 as cg_filename with mut;
+let is i32 as cg_filename_len with mut;
+
+// === Simple peephole for -O0: skip redundant reload after store ===
+let is i32 as ph_vreg with mut = 99999;
+let is i32 as ph_ridx with mut = 99999;
+
+// === Register cache: track which phys reg holds which spilled vreg ===
+// rc_vreg[reg_idx] = vreg currently cached in that register (99999 = empty)
+// Only tracks SPILLED vregs (register-allocated vregs don't need caching).
+let is [16]i32 as rc_vreg with mut;
+
+fn rc_init() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
+    sxd_init();
+}
+
+// === Sign-extended-ness tracking (E) ===
+// One bit per physical reg: 1 = currently holds a 32-bit-sign-extended i64.
+// `emit_narrow_truncate(reg, i32-signed)` checks this and skips the redundant
+// `movsxd r, rd` when the bit is already set. Reset at labels/calls because
+// control-flow merges can lose the property.
+let is [16]i32 as sxd_state with mut;
+
+fn sxd_init() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { sxd_state[i] = 0; i = i + 1; }
+}
+fn sxd_clear_all() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { sxd_state[i] = 0; i = i + 1; }
+}
+fn sxd_set(idx as i32) as void { if (idx >= 0 && idx < 16) { sxd_state[idx] = 1; } }
+fn sxd_clear(idx as i32) as void { if (idx >= 0 && idx < 16) { sxd_state[idx] = 0; } }
+fn sxd_is(idx as i32) as i32 { if (idx >= 0 && idx < 16) { return sxd_state[idx]; } return 0; }
+// `mov dst, src`: dst inherits src's sxd state.
+fn sxd_copy(dst as i32, src as i32) as void {
+    if (dst >= 0 && dst < 16 && src >= 0 && src < 16) {
+        sxd_state[dst] = sxd_state[src];
+    }
+}
+
+fn ph_invalidate() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { rc_vreg[i] = 99999; sxd_state[i] = 0; i = i + 1; }
+}
+
+// Invalidate a specific register (e.g., when it's overwritten)
+fn rc_invalidate_reg(idx as i32) as void {
+    if (idx >= 0 && idx < 16) { rc_vreg[idx] = 99999; sxd_state[idx] = 0; }
+}
+
+// Record that phys reg idx now holds spilled vreg
+fn rc_set(idx as i32, vreg as i32) as void {
+    if (idx >= 0 && idx < 16) { rc_vreg[idx] = vreg; }
+}
+
+// Find which register holds a given vreg. Returns reg idx or -1.
+fn rc_find(vreg as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 16) {
+        if (rc_vreg[i] == vreg) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Invalidate all entries for a vreg (when it's redefined)
+fn rc_invalidate_vreg(vreg as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) {
+        if (rc_vreg[i] == vreg) { rc_vreg[i] = 99999; }
+        i = i + 1;
+    }
+}
+
+fn reg_name_to_idx(name as *u8) as i32 {
+    if (name[0] == 114) {
+        // r...
+        if (name[1] == 97) { return 0; } // rax
+        if (name[1] == 99) { return 1; } // rcx
+        if (name[1] == 100 && name[2] == 105) { return 5; } // rdi (check before rdx!)
+        if (name[1] == 100) { return 2; } // rdx
+        if (name[1] == 98) { return 3; } // rbx
+        if (name[1] == 115) { return 4; } // rsi
+        if (name[1] == 49 && name[2] == 53) { return 15; } // r15
+        if (name[1] == 49 && name[2] == 52) { return 12; } // r14 → idx 12
+        if (name[1] == 49 && name[2] == 51) { return 11; } // r13 → idx 11
+        if (name[1] == 49 && name[2] == 50) { return 10; } // r12 → idx 10
+        if (name[1] == 49 && name[2] == 49) { return 9; } // r11 → idx 9
+        if (name[1] == 49 && name[2] == 48) { return 8; } // r10 → idx 8
+        if (name[1] == 56) { return 6; }  // r8 → idx 6
+        if (name[1] == 57) { return 7; }  // r9 → idx 7
+    }
+    return 99999;
+}
+
+// === Per-function profiling ===
+// Each entry: name_ptr(8) + name_len(4) + vregs(4) + time_us(8) = 24 bytes
+let is i64 as cg_prof_buf with mut = 0;   // ptr to buffer
+let is i32 as cg_prof_count with mut = 0;
+let is i32 as cg_prof_max with mut = 0;
+let is i32 as cg_prof_enabled with mut = 0;
+
+fn cg_prof_init(max_entries as i32) as void {
+    cg_prof_buf = cast(i64, ast.ast_alloc(cast(i64, max_entries) * 24));
+    cg_prof_count = 0;
+    cg_prof_max = max_entries;
+    cg_prof_enabled = 1;
+}
+
+fn cg_prof_get_time_us() as i64 {
+    return time.now_us();
+}
+
+fn cg_prof_record(name_ptr as *u8, name_len as i32, vregs as i32, time_us as i64) as void {
+    if (cg_prof_count >= cg_prof_max) { return; }
+    let is i64 as off = cast(i64, cg_prof_count) * 24;
+    let is *i64 as p0 = cast(*i64, cg_prof_buf + off);
+    *p0 = cast(i64, name_ptr);
+    let is *i32 as p1 = cast(*i32, cg_prof_buf + off + 8);
+    *p1 = name_len;
+    let is *i32 as p2 = cast(*i32, cg_prof_buf + off + 12);
+    *p2 = vregs;
+    let is *i64 as p3 = cast(*i64, cg_prof_buf + off + 16);
+    *p3 = time_us;
+    cg_prof_count = cg_prof_count + 1;
+}
+
+fn out_init(fd as i32) as void {
+    out_cap = 262144; // 256KB — write buffer; out_ensure flushes when full,
+                      // so this caps RAM, not output size. Was 4MB (wasted ~3.8MB peak).
+    // Once per process: this runs for every module of a per-module build, and a new
+    // buffer each time was 256 KB a module that nothing ever gave back.
+    if (cast(i64, out_buf) == 0) { out_buf = ast.ast_alloc(out_cap); }
+    out_len = 0;
+    out_fd = fd;
+}
+
+fn out_flush() as void {
+    if (out_len > 0) {
+        if (out_fd >= 0) {
+            if (io.write_all_fd(cast(i64, out_fd), out_buf, out_len) != out_len) { out_failed = 1; }
+        }
+        if (_cap_on == 1) { _cap_append(out_buf, out_len); }
+        out_len = 0;
+    }
+}
+
+fn out_ensure(n as i64) as void {
+    if (out_len + n >= out_cap) {
+        out_flush();
+    }
+}
+
+// === Peephole: online dedup of consecutive identical mov lines ===
+// On every newline, we scan backwards from out_len to find the current line
+// boundary and compare it to the last-saved line. Identical "  mov ..."
+// lines are common after copy-chains and after the register cache hits the
+// same target multiple times. This catches them at zero IR cost.
+let is [128]u8 as peep_last_line with mut;
+let is i32 as peep_last_line_len with mut = 0;
+let is i32 as peep_enabled with mut = 0;
+
+fn peep_reset() as void { peep_last_line_len = 0; }
+fn peep_set_enabled(v as i32) as void { peep_enabled = v; if (v == 0) { peep_last_line_len = 0; } }
+
+fn peep_check_and_save() as i32 {
+    if (peep_enabled == 0) { return 0; }
+    let is i64 as line_end = out_len;
+    let is i64 as line_start with mut = line_end;
+    while (line_start > 0 && out_buf[line_start - 1] != 10) {
+        line_start = line_start - 1;
+    }
+    let is i32 as line_len = cast(i32, line_end - line_start);
+    if (line_len < 6 || line_len >= 128) { peep_last_line_len = 0; return 0; }
+    // Accept "  mov " (space-terminated) or "  movsxd " (sign-extend).
+    let is i32 as is_dedupable with mut = 0;
+    if (out_buf[line_start] == 32 && out_buf[line_start+1] == 32
+        && out_buf[line_start+2] == 109 && out_buf[line_start+3] == 111
+        && out_buf[line_start+4] == 118) {
+        if (out_buf[line_start+5] == 32) { is_dedupable = 1; }
+        else if (line_len >= 10
+            && out_buf[line_start+5] == 115 && out_buf[line_start+6] == 120
+            && out_buf[line_start+7] == 100 && out_buf[line_start+8] == 32) {
+            is_dedupable = 1;
+        }
+    }
+    if (is_dedupable == 0) {
+        peep_last_line_len = 0;
+        return 0;
+    }
+    if (line_len == peep_last_line_len) {
+        let is i32 as i with mut = 0;
+        let is i32 as eq with mut = 1;
+        while (i < line_len) {
+            if (out_buf[line_start + cast(i64, i)] != peep_last_line[i]) { eq = 0; i = line_len; }
+            else { i = i + 1; }
+        }
+        if (eq == 1) {
+            out_len = line_start;
+            return 1;
+        }
+    }
+    let is i32 as si with mut = 0;
+    while (si < line_len) {
+        peep_last_line[si] = out_buf[line_start + cast(i64, si)];
+        si = si + 1;
+    }
+    peep_last_line_len = line_len;
+    return 0;
+}
+
+fn out_char(c as u8) as void {
+    if (c == 10 && peep_enabled == 1) {
+        if (peep_check_and_save() == 1) { return; }
+    }
+    out_ensure(1);
+    out_buf[out_len] = c;
+    out_len = out_len + 1;
+}
+
+fn out_str(s as *u8, n as i32) as void {
+    // The mov-dedup peephole (peep_check_and_save) only fires on out_char('\n')
+    // and assumes peep_last_line is the IMMEDIATELY preceding emitted line. But
+    // labels, directives and many instructions emit their trailing '\n' through
+    // out_str (e.g. "]\n", ".L5:\n"). Those bypass the peephole, so without this
+    // reset a `mov` saved before such a line could be wrongly deduped against an
+    // identical `mov` after it — dropping an instruction that a jump into the
+    // label still needs. Any '\n' in out_str therefore breaks the adjacency
+    // invariant and must clear the saved line.
+    if (peep_enabled == 1) {
+        let is i32 as k with mut = 0;
+        while (k < n) {
+            if (s[k] == 10) { peep_last_line_len = 0; k = n; }
+            else { k = k + 1; }
+        }
+    }
+    out_ensure(cast(i64, n));
+    mem.memcpy(cast(*u8, cast(i64, out_buf) + out_len), s, cast(i64, n));
+    out_len = out_len + cast(i64, n);
+}
+
+fn out_cstr(s as *u8) as void {
+    let is i32 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    out_str(s, i);
+}
+
+// The frame base. With a frame pointer, the frame is addressed [rbp-N]: the
+// callee-saved pushes at rbp-8.., then locals, spills, allocas. A function
+// emitted without one (-O2, emit_driver.cst) keeps the same layout measured
+// from the address rbp would have held: fp_bias is the distance from rsp (as
+// the body sees it, after the prologue) to that address, so rbp-N becomes
+// rsp+(fp_bias-N). The return address sits at that address itself, one slot
+// lower than under push rbp, which out_fp_pos accounts for.
+let is i32 as fp_omit with mut = 0;
+let is i64 as fp_bias with mut = 0;
+
+// Writes the address text `rbp-N` / `rsp+M` (no brackets).
+fn out_fp(n as i64) as void {
+    if (fp_omit == 1) { out_str("rsp+", 4); out_int(fp_bias - n); return; }
+    out_str("rbp-", 4); out_int(n);
+}
+
+// Above the frame: `rbp+N` (N >= 16: stack arguments, variadic overflow).
+fn out_fp_pos(n as i64) as void {
+    if (fp_omit == 1) { out_str("rsp+", 4); out_int(fp_bias + n - 8); return; }
+    out_str("rbp+", 4); out_int(n);
+}
+
+fn out_int(n as i64) as void {
+    if (n == 0) { out_char(48); return; }
+    // INT64_MIN: 0 - val overflows, handle specially
+    if (n == (0 - 9223372036854775807 - 1)) {
+        out_str("-9223372036854775808", 20);
+        return;
+    }
+    let is i64 as val with mut = n;
+    let is i32 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is [24]u8 as buf;
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    out_str(cast(*u8, cast(i64, &buf) + cast(i64, pos) + 1), 23 - pos);
+}
+
+fn out_line(s as *u8) as void {
+    out_str("  ", 2);
+    out_cstr(s);
+    out_char(10);
+}
+
+fn out_line2(a as *u8, b as *u8) as void {
+    out_str("  ", 2);
+    out_cstr(a);
+    out_cstr(b);
+    out_char(10);
+}
+
+fn out_line3(a as *u8, b as *u8, c as *u8) as void {
+    out_str("  ", 2);
+    out_cstr(a);
+    out_cstr(b);
+    out_cstr(c);
+    out_char(10);
+}
+
+// === Register name tables ===
+// regs[0..11] = rax,rcx,rdx,rbx,rsi,rdi,r8,r9,r10,r11,r12,r13
+
+// Phys reg idx → xmm name. Caller is responsible for passing an XMM-range idx.
+fn reg_xmm(idx as i32) as *u8 {
+    if (idx == 16) { return "xmm0"; }
+    if (idx == 17) { return "xmm1"; }
+    if (idx == 18) { return "xmm2"; }
+    if (idx == 19) { return "xmm3"; }
+    if (idx == 20) { return "xmm4"; }
+    if (idx == 21) { return "xmm5"; }
+    if (idx == 22) { return "xmm6"; }
+    if (idx == 23) { return "xmm7"; }
+    if (idx == 24) { return "xmm8"; }
+    if (idx == 25) { return "xmm9"; }
+    if (idx == 26) { return "xmm10"; }
+    if (idx == 27) { return "xmm11"; }
+    if (idx == 28) { return "xmm12"; }
+    if (idx == 29) { return "xmm13"; }
+    if (idx == 30) { return "xmm14"; }
+    if (idx == 31) { return "xmm15"; }
+    return "xmm0";
+}
+
+fn reg64(idx as i32) as *u8 {
+    if (idx == 0) { return "rax"; }
+    if (idx == 1) { return "rcx"; }
+    if (idx == 2) { return "rdx"; }
+    if (idx == 3) { return "rbx"; }
+    if (idx == 4) { return "rsi"; }
+    if (idx == 5) { return "rdi"; }
+    if (idx == 6) { return "r8"; }
+    if (idx == 7) { return "r9"; }
+    if (idx == 8) { return "r10"; }
+    if (idx == 9) { return "r11"; }
+    if (idx == 10) { return "r12"; }
+    if (idx == 11) { return "r13"; }
+    if (idx == 12) { return "r14"; }
+    if (idx == 15) { return "r15"; }
+    return "rax";
+}
+
+fn reg32(idx as i32) as *u8 {
+    if (idx == 0) { return "eax"; }
+    if (idx == 1) { return "ecx"; }
+    if (idx == 2) { return "edx"; }
+    if (idx == 3) { return "ebx"; }
+    if (idx == 4) { return "esi"; }
+    if (idx == 5) { return "edi"; }
+    if (idx == 6) { return "r8d"; }
+    if (idx == 7) { return "r9d"; }
+    if (idx == 8) { return "r10d"; }
+    if (idx == 9) { return "r11d"; }
+    if (idx == 10) { return "r12d"; }
+    if (idx == 11) { return "r13d"; }
+    if (idx == 12) { return "r14d"; }
+    if (idx == 15) { return "r15d"; }
+    return "eax";
+}
+
+fn reg16(idx as i32) as *u8 {
+    if (idx == 0) { return "ax"; }
+    if (idx == 1) { return "cx"; }
+    if (idx == 2) { return "dx"; }
+    if (idx == 3) { return "bx"; }
+    if (idx == 4) { return "si"; }
+    if (idx == 5) { return "di"; }
+    if (idx == 6) { return "r8w"; }
+    if (idx == 7) { return "r9w"; }
+    if (idx == 8) { return "r10w"; }
+    if (idx == 9) { return "r11w"; }
+    if (idx == 10) { return "r12w"; }
+    if (idx == 11) { return "r13w"; }
+    if (idx == 12) { return "r14w"; }
+    if (idx == 15) { return "r15w"; }
+    return "ax";
+}
+
+fn reg8(idx as i32) as *u8 {
+    if (idx == 0) { return "al"; }
+    if (idx == 1) { return "cl"; }
+    if (idx == 2) { return "dl"; }
+    if (idx == 3) { return "bl"; }
+    if (idx == 4) { return "sil"; }
+    if (idx == 5) { return "dil"; }
+    if (idx == 6) { return "r8b"; }
+    if (idx == 7) { return "r9b"; }
+    if (idx == 8) { return "r10b"; }
+    if (idx == 9) { return "r11b"; }
+    if (idx == 10) { return "r12b"; }
+    if (idx == 11) { return "r13b"; }
+    if (idx == 12) { return "r14b"; }
+    if (idx == 15) { return "r15b"; }
+    return "al";
+}
+
+fn arg_reg64(idx as i32) as *u8 {
+    if (idx == 0) { return "rdi"; }
+    if (idx == 1) { return "rsi"; }
+    if (idx == 2) { return "rdx"; }
+    if (idx == 3) { return "rcx"; }
+    if (idx == 4) { return "r8"; }
+    if (idx == 5) { return "r9"; }
+    return "rax";
+}
+
+fn syscall_reg(idx as i32) as *u8 {
+    if (idx == 0) { return "rax"; }
+    if (idx == 1) { return "rdi"; }
+    if (idx == 2) { return "rsi"; }
+    if (idx == 3) { return "rdx"; }
+    if (idx == 4) { return "r10"; }
+    if (idx == 5) { return "r8"; }
+    if (idx == 6) { return "r9"; }
+    return "rax";
+}
+
+struct AddrMode {
+    base_vreg as i32;
+    index_vreg as i32;
+    scale as i32;
+    matched as i32;
+}

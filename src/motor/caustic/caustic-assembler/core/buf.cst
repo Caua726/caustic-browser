@@ -1,0 +1,85 @@
+use "../../std/mem.cst" as mem;
+use "../../src/ir/opt_mem.cst" as om;
+
+// === ByteBuffer ===
+struct ByteBuffer {
+    data as *u8;
+    len as i64;
+    cap as i64;
+}
+
+fn buf_init(cap as i64) as ByteBuffer {
+    let is ByteBuffer as b;
+    b.data = om.opt_alloc(cap);
+    b.len = 0;
+    b.cap = cap;
+    return b;
+}
+
+fn buf_free(b as *ByteBuffer) as void {
+    om.opt_free(b.data);
+    b.data = cast(*u8, 0);
+    b.len = 0;
+    b.cap = 0;
+}
+
+fn buf_ensure(b as *ByteBuffer, needed as i64) as void {
+    if (b.len + needed > b.cap) {
+        let is i64 as new_cap with mut = b.cap * 2;
+        if (new_cap < b.len + needed) {
+            new_cap = b.len + needed + 1024;
+        }
+        let is *u8 as new_data = om.opt_alloc(new_cap);
+        mem.memcpy(new_data, b.data, b.len);
+        om.opt_free(b.data);
+        b.data = new_data;
+        b.cap = new_cap;
+    }
+}
+
+fn buf_emit8(b as *ByteBuffer, val as i32) as void {
+    buf_ensure(b, 1);
+    b.data[b.len] = cast(u8, val);
+    b.len = b.len + 1;
+}
+
+fn buf_emit16_le(b as *ByteBuffer, val as i32) as void {
+    buf_ensure(b, 2);
+    b.data[b.len] = cast(u8, val & 255);
+    b.data[b.len + 1] = cast(u8, (val >> 8) & 255);
+    b.len = b.len + 2;
+}
+
+fn buf_emit32_le(b as *ByteBuffer, val as i64) as void {
+    buf_ensure(b, 4);
+    b.data[b.len]     = cast(u8, val & 255);
+    b.data[b.len + 1] = cast(u8, (val >> 8) & 255);
+    b.data[b.len + 2] = cast(u8, (val >> 16) & 255);
+    b.data[b.len + 3] = cast(u8, (val >> 24) & 255);
+    b.len = b.len + 4;
+}
+
+fn buf_emit64_le(b as *ByteBuffer, val as i64) as void {
+    buf_ensure(b, 8);
+    b.data[b.len]     = cast(u8, val & 255);
+    b.data[b.len + 1] = cast(u8, (val >> 8) & 255);
+    b.data[b.len + 2] = cast(u8, (val >> 16) & 255);
+    b.data[b.len + 3] = cast(u8, (val >> 24) & 255);
+    b.data[b.len + 4] = cast(u8, (val >> 32) & 255);
+    b.data[b.len + 5] = cast(u8, (val >> 40) & 255);
+    b.data[b.len + 6] = cast(u8, (val >> 48) & 255);
+    b.data[b.len + 7] = cast(u8, (val >> 56) & 255);
+    b.len = b.len + 8;
+}
+
+fn buf_append(dst as *ByteBuffer, src as *u8, len as i64) as void {
+    buf_ensure(dst, len);
+    mem.memcpy(cast(*u8, cast(i64, dst.data) + dst.len), src, len);
+    dst.len = dst.len + len;
+}
+
+fn buf_align(b as *ByteBuffer, align as i64) as void {
+    while (b.len % align != 0) {
+        buf_emit8(b, 0);
+    }
+}

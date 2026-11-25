@@ -1,0 +1,13 @@
+blank function 1 function
+named object true 1
+attr 0 0 <iframe frameborder="0"></iframe>
+newbound 1 2 true
+args 1:3
+kid says {"name":"kid","sib":1,"mine":true}
+queued early
+listener 1 {"echo":"hi","doc":"undefined","win":"undefined","n":1}
+onmessage {"echo":"hi","doc":"undefined","win":"undefined","n":1}
+via port port ready
+via port port got hello
+listener 2 "lib ran, self is object, 3"
+onmessage "lib ran, self is object, 3"

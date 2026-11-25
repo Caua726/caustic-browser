@@ -1,0 +1,292 @@
+use "../std/os.cst" as os;
+use "../std/io.cst" as io;
+use "core/util.cst" as util;
+use "encoder/encoder_util.cst" as enc;
+use "parser/parsed_line.cst" as pl;
+use "parser/parser.cst" as parser;
+use "output/passes.cst" as passes;
+use "encoder/encoder_emit.cst" as ence;
+use "parser/custom_sections.cst" as cs;
+use "parser/cstimport.cst" as ci;
+use "output/elf.cst" as elf;
+use "output/coff.cst" as coffw;
+use "core/buf.cst" as buf;
+use "../src/codegen/target.cst" as tgt;
+use "aarch64/assembler.cst" as a64;
+use "version.cst" as ver;
+
+// === Assembler profiling ===
+
+let is [5]i64 as asm_prof_times with mut;
+let is i32 as asm_prof_enabled with mut = 0;
+
+fn asm_prof_time() as i64 {
+    // clock_gettime(CLOCK_MONOTONIC) — Linux-only profiling timer. Gated on the
+    // target so the raw syscall is dead-stripped on Windows/CausticOS builds
+    // (os.current() folds to a literal; the wrong-target branch never reaches
+    // codegen). Profiling simply returns 0 off-Linux.
+    if (os.current() == os.OS_LINUX) {
+        let is [2]i64 as ts;
+        if (__target_is_aarch64 == 1) { syscall(113, 1, &ts); }
+        else { syscall(228, 1, &ts); }
+        return ts[0] * 1000000 + ts[1] / 1000;
+    }
+    return 0;
+}
+
+fn print_profile() as void {
+    let is i64 as total = asm_prof_times[0] + asm_prof_times[1] + asm_prof_times[2] + asm_prof_times[3] + asm_prof_times[4];
+    util.print_str("=== profile ===\n");
+    util.print_str("  tokenize:  "); util.print_int(asm_prof_times[0] / 1000); util.print_str("ms\n");
+    util.print_str("  parse:     "); util.print_int(asm_prof_times[1] / 1000); util.print_str("ms\n");
+    util.print_str("  pass1:     "); util.print_int(asm_prof_times[2] / 1000); util.print_str("ms\n");
+    util.print_str("  pass2:     "); util.print_int(asm_prof_times[3] / 1000); util.print_str("ms\n");
+    util.print_str("  write_elf: "); util.print_int(asm_prof_times[4] / 1000); util.print_str("ms\n");
+    util.print_str("  total:     "); util.print_int(total / 1000); util.print_str("ms\n");
+}
+
+// === Public API (the compiler calls this in-process) ===
+
+// Assemble from an in-memory .s buffer. The in-process compiler pipeline passes
+// codegen's assembly output straight here, skipping the round-trip of writing
+// the .s and reading it back from disk (the file is still written, as a cache).
+fn assemble_buf(src as *u8, file_size as i64, obj_path as *u8) as i32 {
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) {
+        return a64.assemble_buf(src, file_size, obj_path);
+    }
+    cs.csec_init();
+    ci.cstimport_init();
+    ence.enc_reset();
+    parser.parse_reset();
+
+    let is i64 as t1 = asm_prof_time();
+    let is i32 as line_hint = cast(i32, file_size / 24) + 1024;
+    // Streaming parse: tokenize chunk-by-chunk (bounded token memory) instead of
+    // building the whole file's token array up front.
+    let is pl.ParsedLines as lines = parser.parse_streaming(src, file_size, line_hint);
+    if (asm_prof_enabled == 1) { asm_prof_times[1] = asm_prof_time() - t1; }
+
+    // An unknown mnemonic was silently dropped during parse — the object would
+    // be missing whatever it stood for. Refuse to emit it.
+    if (parser.parse_had_error() != 0) { pl.pl_free(&lines); return 1; }
+
+    let is i64 as t2 = asm_prof_time();
+    let is elf.SymbolTable as symtab = elf.sym_init();
+    defer elf.sym_free(&symtab);      // the compiler assembles every module in one process
+    passes.pass1(&lines, &symtab);
+    if (asm_prof_enabled == 1) { asm_prof_times[2] = asm_prof_time() - t2; }
+
+    // A label defined twice used to resolve to whichever definition pass1 saw
+    // first, in silence, and every jump to that name landed there. Refuse.
+    if (passes.pass_had_error() != 0) { pl.pl_free(&lines); return 1; }
+
+    let is i64 as t3 = asm_prof_time();
+    let is buf.ByteBuffer as text_buf = buf.buf_init(65536);
+    let is buf.ByteBuffer as data_buf = buf.buf_init(4096);
+    let is buf.ByteBuffer as rodata_buf = buf.buf_init(4096);
+    let is i64 as bss_size with mut = 0;
+    let is elf.RelocList as relocs = elf.reloc_init();
+    let is elf.RelocList as data_relocs = elf.reloc_init();
+    defer buf.buf_free(&text_buf);
+    defer buf.buf_free(&data_buf);
+    defer buf.buf_free(&rodata_buf);
+    defer elf.reloc_free(&relocs);
+    defer elf.reloc_free(&data_relocs);
+    passes.pass2(&lines, &symtab, &text_buf, &data_buf, &rodata_buf, &bss_size, &relocs, &data_relocs);
+    if (asm_prof_enabled == 1) { asm_prof_times[3] = asm_prof_time() - t3; }
+    pl.pl_free(&lines);   // lines consumed by pass1/pass2; output is in the buffers now
+
+    // An unencodable instruction emits 0 bytes, desyncing every later offset —
+    // the object would be silently corrupt. Refuse to write it.
+    if (ence.enc_had_error() != 0) { return 1; }
+
+    // If any .cstimport directives were encountered, serialize them into a
+    // custom ELF section ".cstimport" so the linker can read them when
+    // building the PE import table.
+    ci.cstimport_emit_section();
+
+    let is i64 as t4 = asm_prof_time();
+    let is i64 as fd = io._open_write(obj_path);
+    if (fd < 0) {
+        util.print_str("caustic-as: error: cannot create ");
+        util.print_str(obj_path);
+        util.print_str("\n");
+        return 1;
+    }
+    // A Windows target wants a COFF .obj; everything else gets ELF.
+    if (tgt.target_get().object_format == 2) {
+        coffw.write_coff(fd, &text_buf, &data_buf, &rodata_buf, bss_size, &symtab, &relocs, &data_relocs,
+                         cs.csec_buf_ptrs, cs.csec_name_ptrs, cs.csec_name_lens, cs.csec_reloc_ptrs, cs.csec_count);
+        io._close_fd(fd);
+        return 0;
+    }
+    elf.write_elf(fd, &text_buf, &data_buf, &rodata_buf, bss_size, &symtab, &relocs, &data_relocs,
+                  cs.csec_buf_ptrs, cs.csec_name_ptrs, cs.csec_name_lens, cs.csec_reloc_ptrs, cs.csec_count);
+    io._close_fd(fd);
+    if (asm_prof_enabled == 1) { asm_prof_times[4] = asm_prof_time() - t4; }
+    return 0;
+}
+
+// === Main ===
+
+fn print_section_sizes(text_buf as *buf.ByteBuffer, data_buf as *buf.ByteBuffer,
+                       rodata_buf as *buf.ByteBuffer, bss_size as i64, relocs as *elf.RelocList) as void {
+    util.print_str("  .text: "); util.print_int(text_buf.len); util.print_str(" bytes\n");
+    util.print_str("  .data: "); util.print_int(data_buf.len); util.print_str(" bytes\n");
+    util.print_str("  .rodata: "); util.print_int(rodata_buf.len); util.print_str(" bytes\n");
+    util.print_str("  .bss: "); util.print_int(bss_size); util.print_str(" bytes\n");
+    util.print_str("  relocations: "); util.print_int(cast(i64, relocs.count)); util.print_str("\n");
+}
+
+fn main(argc as i64, argv as i64) as i32 {
+    cs.csec_init();
+    ci.cstimport_init();
+    ence.enc_reset();
+    parser.parse_reset();
+    if (argc < 2) {
+        io._write_fd(io.STDERR, "Usage: caustic-as <input.s>\n", 28);
+        return 1;
+    }
+
+    let is *i64 as argv_arr = cast(*i64, argv);
+    let is *u8 as filename with mut = cast(*u8, argv_arr[1]);
+
+    // `--version` was read as the name of a file to assemble. A build from
+    // source reports the commit it came from: install.sh --from-source writes
+    // it into version.cst for the length of the build.
+    let is i32 as flen with mut = 0;
+    while (filename[flen] != cast(u8, 0)) { flen = flen + 1; }
+    if (flen == 9 && enc.streq(filename, 9, "--version", 9) == 1) {
+        io.write_str(io.STDOUT, "caustic-as ");
+        io.write_str(io.STDOUT, ver.VERSION);
+        io.write_str(io.STDOUT, "\n");
+        return 0;
+    }
+
+    tgt.target_init();
+
+    // Check for --profile, --target= flags
+    let is i32 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as arg = cast(*u8, argv_arr[ai]);
+        let is i32 as alen with mut = 0;
+        while (arg[alen] != cast(u8, 0)) { alen = alen + 1; }
+        if (enc.streq(arg, 9, "--profile", 9) == 1) {
+            asm_prof_enabled = 1;
+        } else if (alen > 9 && arg[0] == 45 && arg[1] == 45 && arg[2] == 116 && arg[3] == 97 && arg[4] == 114 && arg[5] == 103 && arg[6] == 101 && arg[7] == 116 && arg[8] == 61) {
+            // --target=<triple>
+            let is *u8 as triple = cast(*u8, cast(i64, arg) + 9);
+            let is i32 as tlen = alen - 9;
+            let is i32 as ok = tgt.load_target(triple, tlen);
+            if (ok == 0) {
+                io._write_fd(io.STDERR, "caustic-as: unknown --target\n", 29);
+                return 1;
+            }
+        } else {
+            filename = arg;
+        }
+        ai = ai + 1;
+    }
+
+    let is i64 as file_size = util.read_file_size(filename);
+    let is *u8 as src = util.read_file(filename);
+    if (cast(i64, src) == 0) {
+        io._write_fd(io.STDERR, "Error: cannot read file\n", 24);
+        return 1;
+    }
+
+    util.print_str("caustic-as: assembling ");
+    util.print_str(filename);
+    util.print_str(" ("); util.print_int(file_size); util.print_str(" bytes)\n");
+
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) {
+        let is *u8 as a64_out_name = util.make_output_name(filename);
+        let is i32 as a64_rc = a64.assemble_buf(src, file_size, a64_out_name);
+        if (a64_rc == 0) {
+            util.print_str("  output: "); util.print_str(a64_out_name); util.print_str("\n");
+        }
+        return a64_rc;
+    }
+
+    // Parse (streaming: tokenize chunk-by-chunk, bounded token memory)
+    let is i64 as t1 = asm_prof_time();
+    let is i32 as line_hint = cast(i32, file_size / 24) + 1024;
+    let is pl.ParsedLines as lines = parser.parse_streaming(src, file_size, line_hint);
+    if (asm_prof_enabled == 1) { asm_prof_times[1] = asm_prof_time() - t1; }
+    util.print_str("  lines: "); util.print_int(cast(i64, lines.count)); util.print_str("\n");
+
+    // An unknown mnemonic was reported (and dropped) during parse — bail before
+    // emitting an object that silently omits it.
+    if (parser.parse_had_error() != 0) {
+        io._write_fd(io.STDERR, "caustic-as: aborting: unknown instruction(s)\n", 45);
+        pl.pl_free(&lines);
+        return 1;
+    }
+
+    // Pass 1
+    let is i64 as t2 = asm_prof_time();
+    let is elf.SymbolTable as symtab = elf.sym_init();
+    defer elf.sym_free(&symtab);      // the compiler assembles every module in one process
+    passes.pass1(&lines, &symtab);
+    if (asm_prof_enabled == 1) { asm_prof_times[2] = asm_prof_time() - t2; }
+    util.print_str("  symbols: "); util.print_int(cast(i64, symtab.count)); util.print_str("\n");
+
+    // See the note at the other pass1 call site.
+    if (passes.pass_had_error() != 0) {
+        io._write_fd(io.STDERR, "caustic-as: aborting: duplicate label definition(s)\n", 52);
+        pl.pl_free(&lines);
+        return 1;
+    }
+
+    // Pass 2
+    let is i64 as t3 = asm_prof_time();
+    let is buf.ByteBuffer as text_buf = buf.buf_init(65536);
+    let is buf.ByteBuffer as data_buf = buf.buf_init(4096);
+    let is buf.ByteBuffer as rodata_buf = buf.buf_init(4096);
+    let is i64 as bss_size with mut = 0;
+    let is elf.RelocList as relocs = elf.reloc_init();
+    let is elf.RelocList as data_relocs = elf.reloc_init();
+    defer buf.buf_free(&text_buf);
+    defer buf.buf_free(&data_buf);
+    defer buf.buf_free(&rodata_buf);
+    defer elf.reloc_free(&relocs);
+    defer elf.reloc_free(&data_relocs);
+    passes.pass2(&lines, &symtab, &text_buf, &data_buf, &rodata_buf, &bss_size, &relocs, &data_relocs);
+    if (asm_prof_enabled == 1) { asm_prof_times[3] = asm_prof_time() - t3; }
+    pl.pl_free(&lines);   // lines consumed by pass1/pass2; output is in the buffers now
+    print_section_sizes(&text_buf, &data_buf, &rodata_buf, bss_size, &relocs);
+
+    // Refuse to emit a corrupt object if any instruction failed to encode
+    // (the diagnostic was already printed to stderr by encode()).
+    if (ence.enc_had_error() != 0) {
+        io._write_fd(io.STDERR, "caustic-as: aborting: instruction encoding failed\n", 50);
+        return 1;
+    }
+
+    // Serialize .cstimport entries (if any) before writing ELF.
+    ci.cstimport_emit_section();
+
+    // Write ELF
+    let is *u8 as out_name = util.make_output_name(filename);
+    let is i64 as fd = io._open_write(out_name);
+    if (fd < 0) {
+        io._write_fd(io.STDERR, "Error: cannot create output\n", 28);
+        return 1;
+    }
+    let is i64 as t4 = asm_prof_time();
+    // A Windows target wants a COFF .obj; everything else gets ELF.
+    if (tgt.target_get().object_format == 2) {
+        coffw.write_coff(fd, &text_buf, &data_buf, &rodata_buf, bss_size, &symtab, &relocs, &data_relocs,
+                         cs.csec_buf_ptrs, cs.csec_name_ptrs, cs.csec_name_lens, cs.csec_reloc_ptrs, cs.csec_count);
+        io._close_fd(fd);
+        return 0;
+    }
+    elf.write_elf(fd, &text_buf, &data_buf, &rodata_buf, bss_size, &symtab, &relocs, &data_relocs,
+                  cs.csec_buf_ptrs, cs.csec_name_ptrs, cs.csec_name_lens, cs.csec_reloc_ptrs, cs.csec_count);
+    io._close_fd(fd);
+    if (asm_prof_enabled == 1) { asm_prof_times[4] = asm_prof_time() - t4; }
+
+    util.print_str("  output: "); util.print_str(out_name); util.print_str("\n");
+    if (asm_prof_enabled == 1) { print_profile(); }
+    return 0;
+}

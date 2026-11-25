@@ -1,0 +1,1605 @@
+// ── Numbers as text: the shortest digits that read back the same (Burger & Dybvig) ──
+struct Big { n as i64; w as [48]i64; }
+fn big_set(b as *Big, v as i64) as void {
+    b.n = 0;
+    let is i64 as x with mut = v;
+    while (x > 0) { b.w[b.n] = x & 4294967295; b.n = b.n + 1; x = (x >> 32) & 4294967295; }
+}
+fn big_copy(d as *Big, s as *Big) as void { d.n = s.n; let is i64 as i with mut = 0; while (i < s.n) { d.w[i] = s.w[i]; i = i + 1; } }
+fn big_mul(b as *Big, m as i64) as void {
+    let is i64 as carry with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < b.n) { let is i64 as t = b.w[i] * m + carry; b.w[i] = t & 4294967295; carry = (t >> 32) & 4294967295; i = i + 1; }
+    if (carry != 0) { b.w[b.n] = carry; b.n = b.n + 1; }
+}
+fn big_shl(b as *Big, n as i64) as void {
+    let is i64 as k with mut = n;
+    while (k >= 24) { big_mul(b, 16777216); k = k - 24; }
+    if (k > 0) { big_mul(b, 1 << k); }
+}
+fn big_cmp(a as *Big, b as *Big) as i64 {
+    if (a.n != b.n) { return a.n - b.n; }
+    let is i64 as i with mut = a.n - 1;
+    while (i >= 0) { if (a.w[i] != b.w[i]) { return a.w[i] - b.w[i]; } i = i - 1; }
+    return 0;
+}
+fn big_add(d as *Big, a as *Big, b as *Big) as void {
+    let is i64 as carry with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as m with mut = a.n;
+    if (b.n > m) { m = b.n; }
+    while (i < m) {
+        let is i64 as t with mut = carry;
+        if (i < a.n) { t = t + a.w[i]; }
+        if (i < b.n) { t = t + b.w[i]; }
+        d.w[i] = t & 4294967295;
+        carry = (t >> 32) & 4294967295;
+        i = i + 1;
+    }
+    if (carry != 0) { d.w[i] = carry; i = i + 1; }
+    d.n = i;
+}
+fn big_sub(a as *Big, b as *Big) as void {
+    let is i64 as borrow with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        let is i64 as t with mut = a.w[i] - borrow;
+        if (i < b.n) { t = t - b.w[i]; }
+        if (t < 0) { t = t + 4294967296; borrow = 1; } else { borrow = 0; }
+        a.w[i] = t;
+        i = i + 1;
+    }
+    while (a.n > 0 && a.w[a.n - 1] == 0) { a.n = a.n - 1; }
+}
+let is [32]u8 as sd with mut;
+let is i64 as sd_n with mut = 0;
+fn shortest(x as f64) as i64 {
+    // Digits to sd, and where the decimal point goes after the first k of them.
+    let is i64 as bits = *cast(*i64, &x);
+    let is i64 as be = (bits >> 52) & 2047;
+    let is i64 as fr = bits & 4503599627370495;
+    let is i64 as f with mut = fr;
+    let is i64 as e with mut = -1074;
+    if (be != 0) { f = fr + 4503599627370496; e = be - 1075; }
+    let is Big as r with mut;
+    let is Big as s with mut;
+    let is Big as mp with mut;
+    let is Big as mm with mut;
+    let is i64 as even = cast(i64, (f & 1) == 0);
+    big_set(&r, f); big_set(&s, 1); big_set(&mp, 1); big_set(&mm, 1);
+    if (e >= 0) {
+        big_shl(&r, e + 1); big_shl(&mp, e); big_shl(&mm, e); big_shl(&s, 1);
+    } else {
+        big_shl(&r, 1); big_shl(&s, 1 - e);
+    }
+    if (fr == 0 && be > 1) { big_shl(&mp, 1); big_shl(&r, 1); big_shl(&s, 1); }
+    let is i64 as k with mut = 0;
+    let is Big as t with mut;
+    while (1 == 1) {
+        big_add(&t, &r, &mp);
+        let is i64 as c = big_cmp(&t, &s);
+        if (c > 0 || (even == 1 && c == 0)) { big_mul(&s, 10); k = k + 1; } else { break; }
+    }
+    while (1 == 1) {
+        big_add(&t, &r, &mp);
+        big_mul(&t, 10);
+        let is i64 as c = big_cmp(&t, &s);
+        if (c < 0 || (even == 0 && c == 0)) { big_mul(&r, 10); big_mul(&mp, 10); big_mul(&mm, 10); k = k - 1; } else { break; }
+    }
+    sd_n = 0;
+    while (sd_n < 30) {
+        big_mul(&r, 10); big_mul(&mp, 10); big_mul(&mm, 10);
+        let is i64 as dg with mut = 0;
+        while (big_cmp(&r, &s) >= 0) { big_sub(&r, &s); dg = dg + 1; }
+        let is i64 as c1 = big_cmp(&r, &mm);
+        big_add(&t, &r, &mp);
+        let is i64 as c2 = big_cmp(&t, &s);
+        let is i64 as low = cast(i64, c1 < 0 || (even == 1 && c1 == 0));
+        let is i64 as high = cast(i64, c2 > 0 || (even == 1 && c2 == 0));
+        if (low == 0 && high == 0) { sd[sd_n] = cast(u8, 48 + dg); sd_n = sd_n + 1; continue; }
+        if (low == 1 && high == 1) {
+            big_shl(&r, 1);
+            if (big_cmp(&r, &s) >= 0) { dg = dg + 1; }
+        } else if (high == 1) { dg = dg + 1; }
+        sd[sd_n] = cast(u8, 48 + dg);
+        sd_n = sd_n + 1;
+        break;
+    }
+    return k;
+}
+let is [512]u8 as numb with mut;
+fn dbl_str(x as f64) as i64 {
+    if (x != x) { return lit("NaN"); }
+    if (x > 1.7976931348623157e308) { return lit("Infinity"); }
+    if (x < -1.7976931348623157e308) { return lit("-Infinity"); }
+    if (x == 0.0) { return lit("0"); }
+    let is f64 as a with mut = x;
+    let is i64 as p with mut = 0;
+    if (a < 0.0) { a = 0.0 - a; numb[p] = cast(u8, 45); p = p + 1; }
+    let is i64 as k = shortest(a);
+    let is i64 as i with mut = 0;
+    if (k >= 1 && k <= 21) {
+        while (i < sd_n || i < k) {
+            if (i == k) { numb[p] = cast(u8, 46); p = p + 1; }
+            if (i < sd_n) { numb[p] = sd[i]; } else { numb[p] = cast(u8, 48); }
+            p = p + 1;
+            i = i + 1;
+        }
+    } else if (k <= 0 && k > -6) {
+        numb[p] = cast(u8, 48); p = p + 1;
+        numb[p] = cast(u8, 46); p = p + 1;
+        let is i64 as z with mut = k;
+        while (z < 0) { numb[p] = cast(u8, 48); p = p + 1; z = z + 1; }
+        while (i < sd_n) { numb[p] = sd[i]; p = p + 1; i = i + 1; }
+    } else {
+        numb[p] = sd[0]; p = p + 1;
+        if (sd_n > 1) {
+            numb[p] = cast(u8, 46); p = p + 1;
+            i = 1;
+            while (i < sd_n) { numb[p] = sd[i]; p = p + 1; i = i + 1; }
+        }
+        numb[p] = cast(u8, 101); p = p + 1;
+        let is i64 as ex0 = k - 1;
+        if (ex0 < 0) { numb[p] = cast(u8, 45); } else { numb[p] = cast(u8, 43); }
+        p = p + 1;
+        let is i64 as ea with mut = ex0;
+        if (ea < 0) { ea = 0 - ea; }
+        let is [8]u8 as eb;
+        let is i64 as q with mut = 0;
+        if (ea == 0) { eb[0] = cast(u8, 48); q = 1; }
+        while (ea > 0) { eb[q] = cast(u8, 48 + ea % 10); ea = ea / 10; q = q + 1; }
+        while (q > 0) { q = q - 1; numb[p] = eb[q]; p = p + 1; }
+    }
+    return str_new(cast(i64, &numb), p);
+}
+
+// ── Shapes ──
+let is i64 as SC_SZ with imut = 16384;
+let is [49152]i64 as scache with mut;
+let is *Shape as root_object with mut = cast(*Shape, 0);
+fn NOIC() as *i64 { return cast(*i64, 0); }
+fn shape_new(parent as *Shape, key as i64, flags as i64) as *Shape {
+    let is *Shape as s = cast(*Shape, alloc(sizeof(Shape)));
+    s.parent = parent; s.key = key; s.kids = cast(*Shape, 0); s.sib = cast(*Shape, 0); s.flags = flags;
+    if (cast(i64, parent) == 0) { s.idx = -1; s.count = 0; }
+    else { s.idx = parent.count; s.count = parent.count + 1; }
+    return s;
+}
+// A big object's shape chain is long, so every 32nd shape keeps a table of a stretch of it:
+// as many keys as its count's lowest set bit, and a jump past them, as in a Fenwick tree.
+// A lookup walks at most 32 steps and then a logarithmic number of tables.
+fn shape_index(w as *Shape) as void {
+    let is i64 as span = w.count & (0 - w.count);
+    let is i64 as cap with mut = 16;
+    while (cap < span * 2) { cap = cap * 2; }
+    let is *i64 as t = cast(*i64, alloc(cap * 8));
+    let is *Shape as x with mut = w;
+    let is i64 as k with mut = 0;
+    while (k < span) {
+        let is i64 as h with mut = (x.key >> 4) & (cap - 1);
+        while (t[h] != 0) { h = (h + 1) & (cap - 1); }
+        t[h] = cast(i64, x);
+        x = x.parent;
+        k = k + 1;
+    }
+    w.ix = t;
+    w.ixmask = cap - 1;
+    w.jump = x;
+}
+fn shape_node(sh as *Shape, key as i64) as *Shape {
+    let is *Shape as w with mut = sh;
+    while (cast(i64, w.parent) != 0) {
+        if ((w.count & 31) == 0) {
+            if (cast(i64, w.ix) == 0) { shape_index(w); }
+            let is *i64 as t = w.ix;
+            let is i64 as m = w.ixmask;
+            let is i64 as h with mut = (key >> 4) & m;
+            while (t[h] != 0) {
+                let is *Shape as e = cast(*Shape, t[h]);
+                if (e.key == key) { return e; }
+                h = (h + 1) & m;
+            }
+            w = w.jump;
+        } else {
+            if (w.key == key) { return w; }
+            w = w.parent;
+        }
+    }
+    return cast(*Shape, 0);
+}
+fn shape_find(sh as *Shape, key as i64) as i64 {
+    let is i64 as h = (((cast(i64, sh) >> 4) ^ (key >> 4)) & (SC_SZ - 1)) * 3;
+    if (scache[h] == cast(i64, sh) && scache[h + 1] == key) { return scache[h + 2]; }
+    let is *Shape as w = shape_node(sh, key);
+    let is i64 as r with mut = -1;
+    if (cast(i64, w) != 0) { r = w.idx; }
+    scache[h] = cast(i64, sh); scache[h + 1] = key; scache[h + 2] = r;
+    return r;
+}
+fn shape_flags(sh as *Shape, key as i64) as i64 {
+    if (sh.flags == 0 && sh.count == 0) { return 0; }
+    let is *Shape as w = shape_node(sh, key);
+    if (cast(i64, w) != 0) { return w.flags; }
+    return 0;
+}
+// Transitions out of a shape with many: looked up here. A parent still holds its children,
+// which is what keeps them alive.
+let is i64 as tr_tab with mut = 0;
+let is i64 as tr_size with mut = 0;
+let is i64 as tr_used with mut = 0;
+fn tr_hash(sh as *Shape, key as i64, flags as i64) as i64 {
+    let is i64 as x = (cast(i64, sh) >> 4) * 31 + (key >> 4) * 17 + flags;
+    return (x ^ (x >> 17)) & (tr_size - 1);
+}
+fn tr_put(k as *Shape) as void {
+    if ((tr_used + 1) * 2 > tr_size) {
+        let is i64 as old = tr_tab;
+        let is i64 as olds = tr_size;
+        if (tr_size == 0) { tr_size = 65536; } else { tr_size = tr_size * 2; }
+        tr_tab = os_map(tr_size * 8);
+        let is i64 as i with mut = 0;
+        while (i < olds) {
+            let is i64 as e = *cast(*i64, old + i * 8);
+            if (e != 0) {
+                let is *Shape as es = cast(*Shape, e);
+                let is i64 as h with mut = tr_hash(es.parent, es.key, es.flags);
+                while (*cast(*i64, tr_tab + h * 8) != 0) { h = (h + 1) & (tr_size - 1); }
+                *cast(*i64, tr_tab + h * 8) = e;
+            }
+            i = i + 1;
+        }
+        if (old != 0) { syscall(11, old, olds * 8); }
+    }
+    let is i64 as h with mut = tr_hash(k.parent, k.key, k.flags);
+    while (*cast(*i64, tr_tab + h * 8) != 0) { h = (h + 1) & (tr_size - 1); }
+    *cast(*i64, tr_tab + h * 8) = cast(i64, k);
+    tr_used = tr_used + 1;
+}
+fn shape_next(sh as *Shape, key as i64, flags as i64) as *Shape {
+    if (sh.nkids >= 8) {
+        let is i64 as h with mut = tr_hash(sh, key, flags);
+        while (1 == 1) {
+            let is i64 as e = *cast(*i64, tr_tab + h * 8);
+            if (e == 0) { break; }
+            let is *Shape as es = cast(*Shape, e);
+            if (es.parent == sh && es.key == key && es.flags == flags) { return es; }
+            h = (h + 1) & (tr_size - 1);
+        }
+    } else {
+        let is *Shape as k with mut = sh.kids;
+        while (cast(i64, k) != 0) {
+            if (k.key == key && k.flags == flags) { return k; }
+            k = k.sib;
+        }
+    }
+    let is *Shape as n = shape_new(sh, key, flags);
+    n.sib = sh.kids;
+    sh.kids = n;
+    sh.nkids = sh.nkids + 1;
+    if (sh.nkids == 8) {
+        // The ones it already had move over.
+        let is *Shape as k with mut = sh.kids;
+        while (cast(i64, k) != 0) { tr_put(k); k = k.sib; }
+    } else if (sh.nkids > 8) { tr_put(n); }
+    return n;
+}
+fn root_for(proto as i64) as *Shape {
+    if (is_ptr(proto) == 0) {
+        if (cast(i64, root_null) == 0) { root_null = shape_new(cast(*Shape, 0), 0, 0); }
+        return root_null;
+    }
+    let is *Obj as p = cast(*Obj, proto);
+    if (cast(i64, p.kid_root) == 0) { p.kid_root = shape_new(cast(*Shape, 0), 0, 0); }
+    return p.kid_root;
+}
+let is *Shape as root_null with mut = cast(*Shape, 0);
+
+// ── Objects ──
+let is i64 as P_OBJECT with mut = 10;
+let is i64 as P_ARRAY with mut = 10;
+let is i64 as P_STRING with mut = 10;
+let is i64 as P_NUMBER with mut = 10;
+let is i64 as P_BOOLEAN with mut = 10;
+let is i64 as P_SYMBOL with mut = 10;
+let is i64 as P_FN with mut = 10;
+let is i64 as P_REGEX with mut = 10;
+let is i64 as P_GEN with mut = 10;
+let is i64 as S_prototype with mut = 0;
+let is i64 as S_constructor with mut = 0;
+let is i64 as S_length with mut = 0;
+let is i64 as S_proto with mut = 0;
+let is i64 as S_toString with mut = 0;
+let is i64 as S_valueOf with mut = 0;
+let is i64 as S_next with mut = 0;
+let is i64 as S_done with mut = 0;
+let is i64 as S_value with mut = 0;
+let is i64 as S_get with mut = 0;
+let is i64 as S_set with mut = 0;
+let is i64 as S_enumerable with mut = 0;
+let is i64 as S_configurable with mut = 0;
+let is i64 as S_writable with mut = 0;
+let is i64 as S_lastIndex with mut = 0;
+let is i64 as S_index with mut = 0;
+let is i64 as S_input with mut = 0;
+let is i64 as S_groups with mut = 0;
+let is i64 as S_name with mut = 0;
+let is i64 as S_message with mut = 0;
+let is i64 as SYM_iterator with mut = 0;
+let is i64 as SYM_hasInstance with mut = 0;
+let is i64 as SYM_toPrimitive with mut = 0;
+let is i64 as SYM_toStringTag with mut = 0;
+let is i64 as SYM_asyncIterator with mut = 0;
+let is i64 as INLINE_SLOTS with imut = 6;
+
+fn obj_with(proto as i64, sh as *Shape) as i64 {
+    let is *Obj as o = cast(*Obj, alloc(sizeof(Obj) + INLINE_SLOTS * 8));
+    o.kind = K_OBJ; o.shape = sh; o.proto = proto; o.cap = INLINE_SLOTS;
+    o.slots = cast(*i64, cast(i64, o) + sizeof(Obj));
+    o.kid_root = cast(*Shape, 0); o.code = cast(*u8, 0); o.env = cast(*i64, 0); o.frozen = 0;
+    return cast(i64, o);
+}
+fn obj_new() as i64 { return obj_with(P_OBJECT, root_object); }
+fn fn_new(code as *u8, env as *i64) as i64 {
+    let is *Obj as o = cast(*Obj, alloc(sizeof(Obj)));
+    o.kind = K_FN; o.shape = root_for(P_FN); o.proto = P_FN; o.cap = 0;
+    o.slots = cast(*i64, 0);
+    o.kid_root = cast(*Shape, 0); o.code = code; o.env = env; o.frozen = 0;
+    return cast(i64, o);
+}
+fn arr_new(cap0 as i64) as i64 {
+    let is i64 as c with mut = cap0;
+    if (c < 4) { c = 4; }
+    let is *Arr as a = cast(*Arr, alloc(sizeof(Arr)));
+    a.kind = K_ARR; a.shape = root_for(P_ARRAY); a.proto = P_ARRAY; a.cap = 0; a.slots = cast(*i64, 0);
+    a.kid_root = cast(*Shape, 0); a.code = cast(*u8, 0); a.env = cast(*i64, 0); a.frozen = 0;
+    a.len = 0; a.acap = c;
+    a.data = cast(*i64, alloc(c * 8));
+    return cast(i64, a);
+}
+fn arr_push(av as i64, v as i64) as void {
+    let is *Arr as a = cast(*Arr, av);
+    if (a.len == a.acap) {
+        let is i64 as nc = a.acap * 2;
+        let is *i64 as nd = cast(*i64, alloc(nc * 8));
+        let is i64 as i with mut = 0;
+        while (i < a.len) { nd[i] = a.data[i]; i = i + 1; }
+        a.data = nd; a.acap = nc;
+    }
+    a.data[a.len] = v;
+    a.len = a.len + 1;
+}
+fn has_shape(k as i64) as i32 {
+    if (k == K_OBJ || k == K_FN || k == K_ARR || k == K_HOST || k == K_STYLE || k == K_REGEX || k == K_PROXY || k == K_TYPED) { return 1; }
+    return 0;
+}
+fn is_obj(v as i64) as i32 {
+    if (is_ptr(v) == 0) { return 0; }
+    return has_shape(kind_of(v));
+}
+fn acc_of(v as i64) as *Acc {
+    if ((v & PTR_MASK) == 0 && kind_of(v) == K_ACC) { return cast(*Acc, v); }
+    return cast(*Acc, 0);
+}
+fn obj_add_flags(o as *Obj, key as i64, v as i64, flags as i64) as void {
+    let is *Shape as n = shape_next(o.shape, key, flags);
+    if (n.idx >= o.cap) {
+        let is i64 as nc with mut = o.cap * 2;
+        if (nc < 4) { nc = 4; }
+        let is *i64 as ns = cast(*i64, alloc(nc * 8));
+        let is i64 as i with mut = 0;
+        while (i < o.shape.count) { ns[i] = o.slots[i]; i = i + 1; }
+        o.slots = ns; o.cap = nc;
+    }
+    o.slots[n.idx] = v;
+    o.shape = n;
+}
+fn obj_add(o as *Obj, key as i64, v as i64) as void { obj_add_flags(o, key, v, 0); }
+// The same properties under new shapes, without `skip` and with `key` flagged: nothing
+// cached against the old shape can then answer for this object.
+fn shape_rebuild(o as *Obj, skip as i64, key as i64, flags as i64, fresh_root as i64) as void {
+    let is i64 as n = o.shape.count;
+    let is *i64 as keys = cast(*i64, alloc((n + 1) * 8));
+    let is *i64 as fl = cast(*i64, alloc((n + 1) * 8));
+    let is *Shape as w with mut = o.shape;
+    while (cast(i64, w.parent) != 0) { keys[w.idx] = w.key; fl[w.idx] = w.flags; w = w.parent; }
+    let is *Shape as sh with mut = root_for(o.proto);
+    if (fresh_root == 1) { sh = shape_new(cast(*Shape, 0), 0, 0); }
+    let is *i64 as ns = cast(*i64, alloc((n + 1) * 8));
+    let is i64 as out with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (keys[i] != skip) {
+            let is i64 as f with mut = fl[i];
+            if (keys[i] == key) { f = flags; }
+            sh = shape_next(sh, keys[i], f);
+            ns[out] = o.slots[i];
+            out = out + 1;
+        }
+        i = i + 1;
+    }
+    o.slots = ns; o.cap = n + 1; o.shape = sh;
+}
+fn proto_start(v as i64, k as i64) as i64 {
+    if (k == K_STR) { return P_STRING; }
+    if (k == K_SYM) { return P_SYMBOL; }
+    return UNDEF;
+}
+fn str_index_of_key(key as i64) as i64 {
+    // A canonical array index in a key string, or -1.
+    if (kind_of(key) != K_STR) { return -1; }
+    let is *Str as s = cast(*Str, key);
+    if (s.len == 0 || s.len > 10) { return -1; }
+    if (s.len > 1 && cast(i64, s.bytes[0]) == 48) { return -1; }
+    let is i64 as r with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.len) {
+        let is i64 as c = cast(i64, s.bytes[i]);
+        if (c < 48 || c > 57) { return -1; }
+        r = r * 10 + c - 48;
+        i = i + 1;
+    }
+    return r;
+}
+fn get_slow(ov as i64, key as i64, ic as *i64) as i64 {
+    let is i64 as start with mut = UNDEF;
+    if (is_ptr(ov) == 0) {
+        if (ov == UNDEF || ov == NULLV) {
+            return rt_error_key("TypeError", "Cannot read properties of undefined or null, reading ", key);
+        }
+        if ((ov & NUM_TAG) != 0) { start = P_NUMBER; } else { start = P_BOOLEAN; }
+    } else {
+        let is i64 as k = kind_of(ov);
+        if (k == K_STR) {
+            if (key == S_length) { return box_i(s_ulen(cast(*Str, ov))); }
+            let is i64 as si = str_index_of_key(key);
+            if (si >= 0) { return rt_geti(ov, box_i(si)); }
+            start = P_STRING;
+        } else if (k == K_SYM) {
+            start = P_SYMBOL;
+        } else {
+            if (k == K_PROXY) { return proxy_get(ov, key); }
+            if (k == K_ARR || k == K_TYPED) {
+                if (key == S_length) { return box_i(cast(*Arr, ov).len); }
+                let is i64 as ai = str_index_of_key(key);
+                if (ai >= 0) { return rt_geti(ov, box_i(ai)); }
+            }
+            if (k == K_HOST) { let is i64 as hv = host_get(ov, key); if (hv != 0) { return hv; } }
+            if (k == K_STYLE) { let is i64 as sv = style_get(ov, key); if (sv != 0) { return sv; } }
+            if (key == S_proto) { return cast(*Obj, ov).proto; }
+            let is *Obj as o = cast(*Obj, ov);
+            let is i64 as i = shape_find(o.shape, key);
+            if (i >= 0) {
+                let is i64 as val = o.slots[i];
+                let is *Acc as ac = acc_of(val);
+                if (cast(i64, ac) != 0) {
+                    if (ac.getter == UNDEF) { return UNDEF; }
+                    return rt_fcall(ac.getter, ov, 0, UNDEF, UNDEF, UNDEF, UNDEF);
+                }
+                if (cast(i64, ic) != 0) { ic[0] = cast(i64, o.shape); ic[1] = i; ic[2] = 0; }
+                return val;
+            }
+            if (k == K_FN && key == S_prototype) {
+                let is i64 as pr = obj_new();
+                obj_add_flags(cast(*Obj, pr), S_constructor, ov, P_NONENUM);
+                obj_add_flags(o, S_prototype, pr, P_NONENUM);
+                return pr;
+            }
+            start = o.proto;
+        }
+    }
+    let is i64 as pv with mut = start;
+    let is i64 as depth with mut = 1;
+    while (is_ptr(pv) == 1) {
+        let is *Obj as h = cast(*Obj, pv);
+        let is i64 as hi = shape_find(h.shape, key);
+        if (hi >= 0) {
+            let is i64 as val = h.slots[hi];
+            let is *Acc as ac = acc_of(val);
+            if (cast(i64, ac) != 0) {
+                if (ac.getter == UNDEF) { return UNDEF; }
+                return rt_fcall(ac.getter, ov, 0, UNDEF, UNDEF, UNDEF, UNDEF);
+            }
+            if (depth == 1 && cast(i64, ic) != 0 && is_obj(ov) == 1) {
+                ic[0] = cast(i64, cast(*Obj, ov).shape); ic[1] = hi; ic[2] = pv; ic[3] = cast(i64, h.shape);
+            }
+            return val;
+        }
+        pv = h.proto;
+        depth = depth + 1;
+    }
+    return UNDEF;
+}
+fn rt_get(ov as i64, key as i64, ic as *i64) as i64 {
+    if ((ov & PTR_MASK) == 0) {
+        let is *Obj as o = cast(*Obj, ov);
+        if (cast(i64, o.shape) == ic[0]) {
+            let is i64 as h = ic[2];
+            if (h == 0) { return o.slots[ic[1]]; }
+            let is *Obj as ho = cast(*Obj, h);
+            if (cast(i64, ho.shape) == ic[3]) { return ho.slots[ic[1]]; }
+        }
+    }
+    return get_slow(ov, key, ic);
+}
+fn rt_length(ov as i64, key as i64, ic as *i64) as i64 {
+    if ((ov & PTR_MASK) == 0) {
+        let is *Obj as o = cast(*Obj, ov);
+        if (o.kind == K_ARR) { return box_i(cast(*Arr, ov).len); }
+        if (o.kind == K_STR) { return box_i(s_ulen(cast(*Str, ov))); }
+    }
+    return rt_get(ov, key, ic);
+}
+fn set_slow(ov as i64, key as i64, v as i64, ic as *i64) as void {
+    if (is_ptr(ov) == 1 && kind_of(ov) == K_PROXY) { proxy_set(ov, key, v); return; }
+    if (is_ptr(ov) == 0) {
+        if (ov == UNDEF || ov == NULLV) { rt_error_key("TypeError", "Cannot set properties of undefined or null, setting ", key); }
+        return;
+    }
+    let is i64 as k = kind_of(ov);
+    if (has_shape(k) == 0) { return; }
+    if (k == K_ARR) {
+        if (key == S_length) {
+            let is *Arr as a = cast(*Arr, ov);
+            let is i64 as nl = cast(i64, to_num_f(v));
+            while (a.len < nl) { arr_push(ov, UNDEF); }
+            a.len = nl;
+            return;
+        }
+        let is i64 as ai = str_index_of_key(key);
+        if (ai >= 0) { rt_seti(ov, box_i(ai), v); return; }
+    }
+    if (k == K_HOST && host_set(ov, key, v) == 1) { return; }
+    if (k == K_STYLE && style_set(ov, key, v) == 1) { return; }
+    if (key == S_proto) { rt_set_proto(ov, v); return; }
+    let is *Obj as o = cast(*Obj, ov);
+    if (o.frozen == 1) { return; }
+    let is i64 as i = shape_find(o.shape, key);
+    if (i >= 0) {
+        let is *Acc as ac = acc_of(o.slots[i]);
+        if (cast(i64, ac) != 0) {
+            if (ac.setter != UNDEF) { rt_fcall(ac.setter, ov, 1, v, UNDEF, UNDEF, UNDEF); }
+            return;
+        }
+        if ((shape_flags(o.shape, key) & P_RO) != 0) { return; }
+        if (cast(i64, ic) != 0) { ic[0] = cast(i64, o.shape); ic[1] = i; ic[2] = 0; }
+        o.slots[i] = v;
+        return;
+    }
+    let is i64 as pv with mut = o.proto;
+    while (is_ptr(pv) == 1) {
+        let is *Obj as h = cast(*Obj, pv);
+        let is i64 as hi = shape_find(h.shape, key);
+        if (hi >= 0) {
+            let is *Acc as ac = acc_of(h.slots[hi]);
+            if (cast(i64, ac) != 0) {
+                if (ac.setter != UNDEF) { rt_fcall(ac.setter, ov, 1, v, UNDEF, UNDEF, UNDEF); }
+                return;
+            }
+            break;
+        }
+        pv = h.proto;
+    }
+    let is *Shape as old = o.shape;
+    obj_add(o, key, v);
+    if (cast(i64, ic) != 0) { ic[0] = cast(i64, old); ic[1] = o.shape.idx; ic[2] = cast(i64, o.shape); }
+}
+fn rt_set(ov as i64, key as i64, v as i64, ic as *i64) as void {
+    if ((ov & PTR_MASK) == 0) {
+        let is *Obj as o = cast(*Obj, ov);
+        if (cast(i64, o.shape) == ic[0]) {
+            let is i64 as t = ic[2];
+            if (t == 0) { o.slots[ic[1]] = v; return; }
+            if (ic[1] < o.cap) { o.slots[ic[1]] = v; o.shape = cast(*Shape, t); return; }
+        }
+    }
+    set_slow(ov, key, v, ic);
+}
+fn key_of(k as i64) as i64 {
+    if (is_ptr(k) == 1) {
+        let is i64 as kd = kind_of(k);
+        if (kd == K_STR) { return intern(k); }
+        if (kd == K_SYM) { return k; }
+    }
+    return intern(to_str(k));
+}
+fn rt_key_value(k as i64) as i64 { return key_of(k); }
+fn geti_slow(ov as i64, k as i64) as i64 {
+    if (is_num(k) == 1 && is_ptr(ov) == 1) {
+        let is f64 as d = to_num_f(k);
+        let is i64 as i = cast(i64, d);
+        if (cast(f64, i) == d && i >= 0) {
+            let is i64 as kd = kind_of(ov);
+            if (kd == K_ARR || kd == K_TYPED) {
+                let is *Arr as a = cast(*Arr, ov);
+                if (i < a.len) { return a.data[i]; }
+                return UNDEF;
+            }
+            if (kd == K_STR) {
+                let is *Str as s = cast(*Str, ov);
+                let is i64 as ut = unit_at(s, i);
+                if (ut < 0) { return UNDEF; }
+                if (ut < 128) { return str_raw(cast(i64, s.bytes) + u2b(s, i), 1); }
+                let is [4]u8 as ub;
+                return str_new(cast(i64, &ub), cp_put(cast(*u8, &ub), ut));
+            }
+        }
+    }
+    return get_slow(ov, key_of(k), NOIC());
+}
+fn rt_geti(ov as i64, k as i64) as i64 {
+    if ((k >> 49) == -1 && (ov & PTR_MASK) == 0) {
+        let is *Arr as a = cast(*Arr, ov);
+        if (a.kind == K_ARR) {
+            let is i64 as i = int_of(k);
+            if (i >= 0 && i < a.len) { return a.data[i]; }
+        }
+    }
+    return geti_slow(ov, k);
+}
+fn seti_slow(ov as i64, k as i64, v as i64) as void {
+    if (is_num(k) == 1 && is_ptr(ov) == 1 && kind_of(ov) == K_TYPED) {
+        let is f64 as d0 = to_num_f(k);
+        let is i64 as i0 = cast(i64, d0);
+        let is *Arr as ta = cast(*Arr, ov);
+        if (cast(f64, i0) == d0 && i0 >= 0) {
+            // Past the end, a typed array just does not take it.
+            if (i0 < ta.len) { ta.data[i0] = typed_coerce(cast(i64, ta.env), v); }
+            return;
+        }
+    }
+    if (is_num(k) == 1 && is_ptr(ov) == 1 && kind_of(ov) == K_ARR) {
+        let is f64 as d = to_num_f(k);
+        let is i64 as i = cast(i64, d);
+        if (cast(f64, i) == d && i >= 0) {
+            let is *Arr as a = cast(*Arr, ov);
+            while (a.len <= i) { arr_push(ov, UNDEF); }
+            a.data[i] = v;
+            return;
+        }
+    }
+    set_slow(ov, key_of(k), v, NOIC());
+}
+fn rt_seti(ov as i64, k as i64, v as i64) as void {
+    if ((k >> 49) == -1 && (ov & PTR_MASK) == 0) {
+        let is *Arr as a = cast(*Arr, ov);
+        if (a.kind == K_ARR) {
+            let is i64 as i = int_of(k);
+            if (i >= 0 && i < a.len) { a.data[i] = v; return; }
+        }
+    }
+    seti_slow(ov, k, v);
+}
+fn rt_set_proto(ov as i64, p as i64) as void {
+    if (is_obj(ov) == 0 || (is_obj(p) == 0 && p != NULLV)) { return; }
+    let is *Obj as o = cast(*Obj, ov);
+    o.proto = p;
+    shape_rebuild(o, 0, 0, 0, 0);
+}
+fn own_has(ov as i64, key as i64) as i32 {
+    if (is_ptr(ov) == 0) { return 0; }
+    let is i64 as k = kind_of(ov);
+    if (k == K_STR) {
+        if (key == S_length) { return 1; }
+        let is i64 as si = str_index_of_key(key);
+        if (si >= 0 && si < s_ulen(cast(*Str, ov))) { return 1; }
+        return 0;
+    }
+    if (has_shape(k) == 0) { return 0; }
+    if (k == K_PROXY) { return own_has(cast(*Obj, ov).env[0], key); }
+    if (k == K_ARR || k == K_TYPED) {
+        if (key == S_length) { return 1; }
+        let is i64 as ai = str_index_of_key(key);
+        if (ai >= 0) { if (ai < cast(*Arr, ov).len) { return 1; } return 0; }
+    }
+    if (k == K_FN && key == S_prototype) { get_slow(ov, S_prototype, NOIC()); }
+    if (shape_find(cast(*Obj, ov).shape, key) >= 0) { return 1; }
+    return 0;
+}
+fn rt_in(kv as i64, ov as i64) as i64 {
+    if (is_ptr(ov) == 1 && kind_of(ov) == K_PROXY) { return proxy_has(ov, key_of(kv)); }
+    if (is_obj(ov) == 0) { return rt_error("TypeError", "right side of 'in' is not an object"); }
+    let is i64 as key = key_of(kv);
+    let is i64 as w with mut = ov;
+    while (is_ptr(w) == 1) {
+        if (own_has(w, key) == 1) { return TRUEV; }
+        if (kind_of(w) == K_HOST && host_get(w, key) != 0) { return TRUEV; }
+        w = cast(*Obj, w).proto;
+    }
+    return FALSEV;
+}
+fn rt_delete(ov as i64, kv as i64) as i64 {
+    if (is_ptr(ov) == 1 && kind_of(ov) == K_PROXY) { return proxy_del(ov, key_of(kv)); }
+    if (is_obj(ov) == 0) { return TRUEV; }
+    let is i64 as key = key_of(kv);
+    let is *Obj as o = cast(*Obj, ov);
+    if (o.frozen == 1) { return FALSEV; }
+    if (kind_of(ov) == K_ARR) {
+        let is i64 as ai = str_index_of_key(key);
+        if (ai >= 0) { if (ai < cast(*Arr, ov).len) { cast(*Arr, ov).data[ai] = UNDEF; } return TRUEV; }
+    }
+    if (shape_find(o.shape, key) >= 0) {
+        if ((shape_flags(o.shape, key) & P_NOCONF) != 0) { return FALSEV; }
+        shape_rebuild(o, key, 0, 0, 0);
+    }
+    return TRUEV;
+}
+fn rt_instanceof(a as i64, f as i64) as i64 {
+    if (is_obj(f) == 0) { return rt_error("TypeError", "right side of instanceof is not callable"); }
+    let is i64 as hi = get_slow(f, SYM_hasInstance, NOIC());
+    if (hi != UNDEF) { return box_b(rt_truthy(rt_fcall(hi, f, 1, a, UNDEF, UNDEF, UNDEF))); }
+    if (is_obj(a) == 0) { return FALSEV; }
+    let is i64 as pr = get_slow(f, S_prototype, NOIC());
+    let is i64 as w with mut = cast(*Obj, a).proto;
+    while (is_ptr(w) == 1) {
+        if (w == pr) { return TRUEV; }
+        w = cast(*Obj, w).proto;
+    }
+    return FALSEV;
+}
+// Own keys: integer-like first in order, then the rest as they were added.
+fn own_keys(ov as i64, only_enum as i64, syms as i64) as i64 {
+    let is i64 as r = arr_new(8);
+    if (is_ptr(ov) == 0) { return r; }
+    let is i64 as k = kind_of(ov);
+    if (k == K_STR) {
+        let is i64 as i with mut = 0;
+        while (i < s_ulen(cast(*Str, ov))) { arr_push(r, intern(int_str(i))); i = i + 1; }
+        return r;
+    }
+    if (has_shape(k) == 0) { return r; }
+    if (k == K_PROXY) { return proxy_keys(ov, only_enum, syms); }
+    if (k == K_ARR || k == K_TYPED) {
+        let is i64 as i with mut = 0;
+        while (i < cast(*Arr, ov).len) { arr_push(r, intern(int_str(i))); i = i + 1; }
+    }
+    let is *Obj as o = cast(*Obj, ov);
+    let is i64 as n = o.shape.count;
+    let is *i64 as ks = cast(*i64, alloc((n + 1) * 8));
+    let is *i64 as fs = cast(*i64, alloc((n + 1) * 8));
+    let is *Shape as w with mut = o.shape;
+    while (cast(i64, w.parent) != 0) { ks[w.idx] = w.key; fs[w.idx] = w.flags; w = w.parent; }
+    let is i64 as pass with mut = 0;
+    while (pass < 2) {
+        let is i64 as i with mut = 0;
+        let is i64 as lastnum with mut = -1;
+        while (i < n) {
+            let is i64 as kk = ks[i];
+            let is i64 as issym = cast(i64, kind_of(kk) == K_SYM);
+            if (issym == syms && !(only_enum == 1 && (fs[i] & P_NONENUM) != 0)) {
+                let is i64 as idx with mut = -1;
+                if (issym == 0) { idx = str_index_of_key(kk); }
+                if (issym == 0 && cast(*Str, kk).len > 6 && cast(i64, cast(*Str, kk).bytes[0]) == 35 && cast(i64, cast(*Str, kk).bytes[1]) == 112 && cast(i64, cast(*Str, kk).bytes[5]) == 58) { idx = -2; }
+                if ((pass == 0 && idx >= 0) || (pass == 1 && idx == -1)) { arr_push(r, kk); }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    // Integer keys came in insertion order; a short insertion sort puts them right.
+    let is *Arr as ra = cast(*Arr, r);
+    let is i64 as a0 with mut = 1;
+    while (a0 < ra.len) {
+        let is i64 as x = ra.data[a0];
+        let is i64 as xi with mut = -1;
+        if (kind_of(x) == K_STR) { xi = str_index_of_key(x); }
+        if (xi >= 0) {
+            let is i64 as j with mut = a0 - 1;
+            while (j >= 0) {
+                let is i64 as y = ra.data[j];
+                if (kind_of(y) != K_STR) { break; }
+                let is i64 as yi = str_index_of_key(y);
+                if (yi < 0 || yi <= xi) { break; }
+                ra.data[j + 1] = y;
+                j = j - 1;
+            }
+            ra.data[j + 1] = x;
+        }
+        a0 = a0 + 1;
+    }
+    return r;
+}
+fn rt_forin_keys(ov as i64) as i64 {
+    let is i64 as r = arr_new(8);
+    let is i64 as w with mut = ov;
+    if (is_ptr(w) == 0) { return r; }
+    if (kind_of(w) == K_STR) { return own_keys(w, 1, 0); }
+    let is i64 as first with mut = 1;
+    while (is_obj(w) == 1) {
+        let is *Arr as ks = cast(*Arr, own_keys(w, 1, 0));
+        let is i64 as i with mut = 0;
+        while (i < ks.len) {
+            let is i64 as kk = ks.data[i];
+            let is i64 as dup with mut = 0;
+            if (first == 0) {
+                let is *Arr as ra = cast(*Arr, r);
+                let is i64 as j with mut = 0;
+                while (j < ra.len) { if (ra.data[j] == kk) { dup = 1; break; } j = j + 1; }
+            }
+            if (dup == 0) { arr_push(r, kk); }
+            i = i + 1;
+        }
+        w = cast(*Obj, w).proto;
+        first = 0;
+    }
+    return r;
+}
+fn rt_need_obj(v as i64) as void {
+    if (v == UNDEF || v == NULLV) { rt_error("TypeError", "Cannot destructure undefined or null"); }
+}
+fn rt_nullish(v as i64) as i32 { if (v == UNDEF || v == NULLV) { return 1; } return 0; }
+fn rt_obj_spread(r as i64, v as i64) as void {
+    if (v == UNDEF || v == NULLV) { return; }
+    let is *Arr as ks = cast(*Arr, own_keys(v, 1, 0));
+    let is i64 as i with mut = 0;
+    while (i < ks.len) { rt_seti(r, ks.data[i], get_slow(v, ks.data[i], NOIC())); i = i + 1; }
+    let is *Arr as sy = cast(*Arr, own_keys(v, 1, 1));
+    i = 0;
+    while (i < sy.len) { set_slow(r, sy.data[i], get_slow(v, sy.data[i], NOIC()), NOIC()); i = i + 1; }
+}
+fn rt_obj_rest(v as i64, seen as i64) as i64 {
+    let is i64 as r = obj_new();
+    let is *Arr as ks = cast(*Arr, own_keys(v, 1, 0));
+    let is *Arr as sn = cast(*Arr, seen);
+    let is i64 as i with mut = 0;
+    while (i < ks.len) {
+        let is i64 as kk = ks.data[i];
+        let is i64 as j with mut = 0;
+        let is i64 as skip with mut = 0;
+        while (j < sn.len) { if (sn.data[j] == kk) { skip = 1; break; } j = j + 1; }
+        if (skip == 0) { rt_seti(r, kk, get_slow(v, kk, NOIC())); }
+        i = i + 1;
+    }
+    return r;
+}
+fn rt_def_hidden(o as i64, kv as i64, v as i64) as void {
+    let is i64 as key = key_of(kv);
+    let is *Obj as ob = cast(*Obj, o);
+    let is i64 as i = shape_find(ob.shape, key);
+    if (i >= 0) { ob.slots[i] = v; return; }
+    obj_add_flags(ob, key, v, P_NONENUM);
+}
+fn rt_def_accessor(o as i64, kv as i64, g as i64, s as i64, enumerable as i64) as void {
+    let is i64 as key = key_of(kv);
+    let is *Obj as ob = cast(*Obj, o);
+    let is i64 as i = shape_find(ob.shape, key);
+    let is i64 as fl with mut = P_NONENUM;
+    if (enumerable == 1) { fl = 0; }
+    if (i >= 0) {
+        let is *Acc as old = acc_of(ob.slots[i]);
+        if (cast(i64, old) != 0) {
+            if (g != UNDEF) { old.getter = g; }
+            if (s != UNDEF) { old.setter = s; }
+            return;
+        }
+    }
+    let is *Acc as a = cast(*Acc, alloc(sizeof(Acc)));
+    a.kind = K_ACC; a.shape = 1; a.getter = g; a.setter = s;
+    if (i >= 0) {
+        ob.slots[i] = cast(i64, a);
+        // A new shape, so no inline cache hands the accessor out as a value.
+        shape_rebuild(ob, 0, key, fl, 0);
+        return;
+    }
+    obj_add_flags(ob, key, cast(i64, a), fl);
+}
+
+// ── Calls ──
+let is i64 as rt_argc with mut = 0;
+let is i64 as rt_callee with mut = 0;
+let is [4096]i64 as rt_x with mut;
+let is i64 as rt_jump with mut = 0;
+let is i64 as rt_jump_cont with mut = 0;
+let is i64 as stack_limit with mut = 0;
+let is i64 as rt_nt with mut = 10;
+let is i64 as rt_nt_this with mut = 0;
+fn not_fn() as i64 {
+    if (rt_call_key != 0 && is_ptr(rt_call_key) == 1 && kind_of(rt_call_key) == K_STR) { return rt_error_key("TypeError", "not a function: ", rt_call_key); }
+    if (cast(i64, rt_call_name) != 0) { return rt_error_key("TypeError", "not a function: ", lit(rt_call_name)); }
+    return rt_error("TypeError", "not a function");
+}
+fn too_deep() as i64 {
+    // The error is made by running JS, which needs some of the stack that just ran out.
+    let is i64 as saved = stack_limit;
+    stack_limit = saved - 12288;
+    let is i64 as ctor = rt_global_or_undef(lit("RangeError"));
+    rt_argc = 1;
+    let is i64 as err = rt_new(ctor, lit("Maximum call stack size exceeded"), UNDEF, UNDEF, UNDEF);
+    stack_limit = saved;
+    ex.throw(err);
+    return 0;
+}
+fn rt_call(f as i64, this_v as i64, a0 as i64, a1 as i64, a2 as i64, a3 as i64) as i64 {
+    let is i64 as here = 0;
+    if (cast(i64, &here) < stack_limit) { return too_deep(); }
+    if ((f & PTR_MASK) == 0) {
+        let is *Obj as o = cast(*Obj, f);
+        if (o.kind == K_FN) {
+            let is *u8 as c = o.code;
+            rt_callee = f;
+            return call(c, o.env, this_v, a0, a1, a2, a3);
+        }
+        if (o.kind == K_PROXY) { return proxy_call(f, this_v, a0, a1, a2, a3); }
+    }
+    return not_fn();
+}
+fn rt_fcall(f as i64, t as i64, n as i64, a0 as i64, a1 as i64, a2 as i64, a3 as i64) as i64 {
+    rt_argc = n;
+    return rt_call(f, t, a0, a1, a2, a3);
+}
+fn arr_at(a as *Arr, i as i64) as i64 { if (i < a.len) { return a.data[i]; } return UNDEF; }
+fn spread_args(av as i64) as void {
+    let is *Arr as a = cast(*Arr, av);
+    let is i64 as i with mut = 4;
+    if (a.len > 4100) { rt_error("RangeError", "too many arguments"); }
+    while (i < a.len) { rt_x[i - 4] = a.data[i]; i = i + 1; }
+    rt_argc = a.len;
+}
+fn rt_apply(f as i64, t as i64, av as i64) as i64 {
+    let is *Arr as a = cast(*Arr, av);
+    spread_args(av);
+    return rt_call(f, t, arr_at(a, 0), arr_at(a, 1), arr_at(a, 2), arr_at(a, 3));
+}
+fn rt_new(f as i64, a0 as i64, a1 as i64, a2 as i64, a3 as i64) as i64 {
+    if (is_ptr(f) == 1 && kind_of(f) == K_PROXY) { return proxy_new(f, a0, a1, a2, a3); }
+    if (is_ptr(f) == 0 || kind_of(f) != K_FN) { return rt_error("TypeError", "not a constructor"); }
+    let is i64 as n = rt_argc;
+    let is i64 as pr = get_slow(f, S_prototype, NOIC());
+    let is i64 as t = obj_with(pr, root_for(pr));
+    rt_nt = f;
+    rt_nt_this = t;
+    rt_argc = n;
+    let is i64 as r = rt_call(f, t, a0, a1, a2, a3);
+    if (is_obj(r) == 1) { return r; }
+    return t;
+}
+fn rt_new_apply(f as i64, av as i64) as i64 {
+    let is *Arr as a = cast(*Arr, av);
+    spread_args(av);
+    return rt_new(f, arr_at(a, 0), arr_at(a, 1), arr_at(a, 2), arr_at(a, 3));
+}
+fn rt_xget(k as i64, argc as i64) as i64 { if (k + 4 < argc) { return rt_x[k]; } return UNDEF; }
+fn arg_get(i as i64, argc as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64) as i64 {
+    if (i >= argc) { return UNDEF; }
+    if (i == 0) { return p0; }
+    if (i == 1) { return p1; }
+    if (i == 2) { return p2; }
+    if (i == 3) { return p3; }
+    return rt_x[i - 4];
+}
+fn rt_rest(from as i64, argc as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64) as i64 {
+    let is i64 as r = arr_new(argc);
+    let is i64 as i with mut = from;
+    while (i < argc) { arr_push(r, arg_get(i, argc, p0, p1, p2, p3)); i = i + 1; }
+    return r;
+}
+fn rt_arguments(argc as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64) as i64 { return rt_rest(0, argc, p0, p1, p2, p3); }
+fn rt_env(up as *i64, n as i64) as *i64 {
+    let is *i64 as s = cast(*i64, alloc((n + 1) * 8));
+    s[0] = cast(i64, up);
+    let is i64 as i with mut = 1;
+    while (i <= n) { s[i] = UNDEF; i = i + 1; }
+    return s;
+}
+fn rt_env_copy(s as *i64, n as i64) as *i64 {
+    let is *i64 as d = cast(*i64, alloc((n + 1) * 8));
+    let is i64 as i with mut = 0;
+    while (i <= n) { d[i] = s[i]; i = i + 1; }
+    return d;
+}
+fn rt_strs_init(out as *i64, n as i64, blob as *u8) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as p with mut = 0;
+    while (i < n) {
+        let is i64 as l with mut = 0;
+        while (cast(i64, blob[p]) != 58) { l = l * 10 + cast(i64, blob[p]) - 48; p = p + 1; }
+        p = p + 1;
+        out[i] = intern(str_raw(cast(i64, blob) + p, l));
+        p = p + l;
+        i = i + 1;
+    }
+}
+// Classes.
+fn n_default_ctor(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    let is i64 as n = rt_argc;
+    let is i64 as args = rt_rest(0, n, a, b, c, d);
+    if (e[0] != UNDEF) { rt_apply(e[0], t, args); }
+    rt_run_fields(e[1], t);
+    return UNDEF;
+}
+fn rt_default_ctor(parent as i64, fields as i64) as i64 {
+    let is *i64 as env = cast(*i64, alloc(16));
+    env[0] = parent; env[1] = fields;
+    return fn_new(fn_ptr(n_default_ctor), env);
+}
+fn rt_run_fields(f as i64, t as i64) as void { if (f != UNDEF) { rt_fcall(f, t, 0, UNDEF, UNDEF, UNDEF, UNDEF); } }
+fn rt_class_proto(f as i64, parent as i64) as i64 {
+    let is i64 as p = get_slow(f, S_prototype, NOIC());
+    if (parent == UNDEF) { return p; }
+    if (parent == NULLV) { rt_set_proto(p, NULLV); return p; }
+    rt_set_proto(p, get_slow(parent, S_prototype, NOIC()));
+    rt_set_proto(f, parent);
+    return p;
+}
+fn rt_super_base(parent as i64) as i64 {
+    if (parent == UNDEF || parent == NULLV) { return P_OBJECT; }
+    return get_slow(parent, S_prototype, NOIC());
+}
+
+// ── Conversions and operators ──
+fn to_prim(v as i64, want_str as i64) as i64 {
+    if (is_obj(v) == 0) { return v; }
+    let is i64 as ex0 = get_slow(v, SYM_toPrimitive, NOIC());
+    if (ex0 != UNDEF) {
+        let is i64 as hint with mut = lit("number");
+        if (want_str == 1) { hint = lit("string"); }
+        if (want_str == 2) { hint = lit("default"); }
+        return rt_fcall(ex0, v, 1, hint, UNDEF, UNDEF, UNDEF);
+    }
+    let is i64 as first with mut = S_valueOf;
+    let is i64 as second with mut = S_toString;
+    if (want_str == 1) { first = S_toString; second = S_valueOf; }
+    let is i64 as f = get_slow(v, first, NOIC());
+    if (is_ptr(f) == 1 && kind_of(f) == K_FN) {
+        let is i64 as r = rt_fcall(f, v, 0, UNDEF, UNDEF, UNDEF, UNDEF);
+        if (is_obj(r) == 0) { return r; }
+    }
+    let is i64 as g = get_slow(v, second, NOIC());
+    if (is_ptr(g) == 1 && kind_of(g) == K_FN) {
+        let is i64 as r = rt_fcall(g, v, 0, UNDEF, UNDEF, UNDEF, UNDEF);
+        if (is_obj(r) == 0) { return r; }
+    }
+    return rt_error("TypeError", "Cannot convert object to primitive value");
+}
+fn to_str(v as i64) as i64 {
+    if (is_int(v) == 1) { return int_str(int_of(v)); }
+    if (is_num(v) == 1) { return dbl_str(unbox_d(v)); }
+    if (v == UNDEF) { return lit("undefined"); }
+    if (v == NULLV) { return lit("null"); }
+    if (v == TRUEV) { return lit("true"); }
+    if (v == FALSEV) { return lit("false"); }
+    let is i64 as k = kind_of(v);
+    if (k == K_STR) { return v; }
+    if (k == K_SYM) { return rt_error("TypeError", "Cannot convert a Symbol to a string"); }
+    return to_str(to_prim(v, 1));
+}
+fn is_space(c as i64) as i32 { if (c == 32 || (c >= 9 && c <= 13)) { return 1; } return 0; }
+fn parse_num(s as *Str, strict as i64) as f64 {
+    let is i64 as i with mut = 0;
+    let is i64 as n with mut = s.len;
+    while (i < n && is_space(cast(i64, s.bytes[i])) == 1) { i = i + 1; }
+    if (strict == 1) { while (n > i && is_space(cast(i64, s.bytes[n - 1])) == 1) { n = n - 1; } }
+    if (i == n) { if (strict == 1) { return 0.0; } return math.nan(); }
+    let is f64 as sign with mut = 1.0;
+    let is i64 as c0 = cast(i64, s.bytes[i]);
+    if (c0 == 45) { sign = -1.0; i = i + 1; } else if (c0 == 43) { i = i + 1; }
+    if (i + 1 < n && cast(i64, s.bytes[i]) == 48 && strict == 1) {
+        let is i64 as x = cast(i64, s.bytes[i + 1]) | 32;
+        if (x == 120 || x == 98 || x == 111) {
+            let is f64 as base with mut = 16.0;
+            if (x == 98) { base = 2.0; }
+            if (x == 111) { base = 8.0; }
+            let is f64 as r with mut = 0.0;
+            i = i + 2;
+            while (i < n) {
+                let is i64 as c = cast(i64, s.bytes[i]);
+                let is f64 as dv with mut = -1.0;
+                if (c >= 48 && c <= 57) { dv = cast(f64, c - 48); }
+                if ((c | 32) >= 97 && (c | 32) <= 102) { dv = cast(f64, (c | 32) - 87); }
+                if (dv < 0.0 || dv >= base) { return math.nan(); }
+                r = r * base + dv;
+                i = i + 1;
+            }
+            return r;
+        }
+    }
+    let is i64 as inf_at = i;
+    if (n - i >= 8 && cast(i64, s.bytes[i]) == 73) { return sign * math.inf(); }
+    let is f64 as v with mut = 0.0;
+    let is i64 as seen with mut = 0;
+    let is i64 as ex0 with mut = 0;
+    while (i < n && cast(i64, s.bytes[i]) >= 48 && cast(i64, s.bytes[i]) <= 57) { v = v * 10.0 + cast(f64, cast(i64, s.bytes[i]) - 48); i = i + 1; seen = 1; }
+    if (i < n && cast(i64, s.bytes[i]) == 46) {
+        i = i + 1;
+        while (i < n && cast(i64, s.bytes[i]) >= 48 && cast(i64, s.bytes[i]) <= 57) { v = v * 10.0 + cast(f64, cast(i64, s.bytes[i]) - 48); ex0 = ex0 - 1; i = i + 1; seen = 1; }
+    }
+    if (seen == 0) { return math.nan(); }
+    if (i < n && (cast(i64, s.bytes[i]) | 32) == 101) {
+        let is i64 as j with mut = i + 1;
+        let is i64 as sg with mut = 1;
+        if (j < n && cast(i64, s.bytes[j]) == 45) { sg = -1; j = j + 1; } else if (j < n && cast(i64, s.bytes[j]) == 43) { j = j + 1; }
+        let is i64 as e2 with mut = 0;
+        let is i64 as eseen with mut = 0;
+        while (j < n && cast(i64, s.bytes[j]) >= 48 && cast(i64, s.bytes[j]) <= 57) { e2 = e2 * 10 + cast(i64, s.bytes[j]) - 48; j = j + 1; eseen = 1; }
+        if (eseen == 1) { ex0 = ex0 + sg * e2; i = j; }
+    }
+    if (strict == 1 && i != n) { return math.nan(); }
+    while (ex0 > 0) { v = v * 10.0; ex0 = ex0 - 1; }
+    let is f64 as dv with mut = 1.0;
+    while (ex0 < 0) { dv = dv * 10.0; ex0 = ex0 + 1; }
+    return sign * (v / dv);
+}
+fn to_num_f(v as i64) as f64 {
+    if (is_int(v) == 1) { return cast(f64, int_of(v)); }
+    if (is_num(v) == 1) { return unbox_d(v); }
+    if (v == TRUEV) { return 1.0; }
+    if (v == FALSEV || v == NULLV) { return 0.0; }
+    if (v == UNDEF) { return math.nan(); }
+    let is i64 as k = kind_of(v);
+    if (k == K_STR) { return parse_num(cast(*Str, v), 1); }
+    if (k == K_SYM) { rt_error("TypeError", "Cannot convert a Symbol to a number"); return 0.0; }
+    return to_num_f(to_prim(v, 0));
+}
+fn to_i32(v as i64) as i64 {
+    if ((v >> 49) == -1) { return int_of(v); }
+    let is f64 as d = to_num_f(v);
+    if (d != d) { return 0; }
+    if (d >= 9000000000000000000.0 || d <= -9000000000000000000.0) {
+        // Past an i64: the bits modulo 2^32 from the double's own form.
+        if (d > 1.7976931348623157e308 || d < -1.7976931348623157e308) { return 0; }
+        let is f64 as m = math.fmod(d, 4294967296.0);
+        return cast(i64, cast(i32, cast(i64, m)));
+    }
+    return cast(i64, cast(i32, cast(i64, d)));
+}
+fn rt_truthy(v as i64) as i32 {
+    if (v == TRUEV) { return 1; }
+    if (v == FALSEV || v == UNDEF || v == NULLV) { return 0; }
+    if ((v >> 49) == -1) { if (int_of(v) != 0) { return 1; } return 0; }
+    if ((v & NUM_TAG) != 0) {
+        let is f64 as d = unbox_d(v);
+        if (d != d || d == 0.0) { return 0; }
+        return 1;
+    }
+    if (kind_of(v) == K_STR) { if (cast(*Str, v).len > 0) { return 1; } return 0; }
+    return 1;
+}
+fn add_slow(a as i64, b as i64) as i64 {
+    if ((a & NUM_TAG) != 0 && (b & NUM_TAG) != 0) { return box_d(to_num_f(a) + to_num_f(b)); }
+    let is i64 as x = to_prim(a, 2);
+    let is i64 as y = to_prim(b, 2);
+    if ((is_ptr(x) == 1 && kind_of(x) == K_STR) || (is_ptr(y) == 1 && kind_of(y) == K_STR)) { return str_concat(to_str(x), to_str(y)); }
+    return box_d(to_num_f(x) + to_num_f(y));
+}
+fn rt_add(a as i64, b as i64) as i64 {
+    if (((a & b) >> 49) == -1) {
+        let is i64 as r = int_of(a) + int_of(b);
+        if (r == cast(i64, cast(i32, r))) { return box_i(r); }
+        return box_d(cast(f64, r));
+    }
+    return add_slow(a, b);
+}
+fn sub_slow(a as i64, b as i64) as i64 { return box_d(to_num_f(a) - to_num_f(b)); }
+fn rt_sub(a as i64, b as i64) as i64 {
+    if (((a & b) >> 49) == -1) {
+        let is i64 as r = int_of(a) - int_of(b);
+        if (r == cast(i64, cast(i32, r))) { return box_i(r); }
+        return box_d(cast(f64, r));
+    }
+    return sub_slow(a, b);
+}
+fn mul_slow(a as i64, b as i64) as i64 { return box_d(to_num_f(a) * to_num_f(b)); }
+fn rt_mul(a as i64, b as i64) as i64 {
+    if (((a & b) >> 49) == -1) {
+        let is i64 as x = int_of(a);
+        let is i64 as y = int_of(b);
+        let is i64 as r = x * y;
+        if (r == cast(i64, cast(i32, r)) && (r != 0 || (x >= 0 && y >= 0))) { return box_i(r); }
+        if (r != cast(i64, cast(i32, r))) { return box_d(cast(f64, x) * cast(f64, y)); }
+    }
+    return mul_slow(a, b);
+}
+fn rt_div(a as i64, b as i64) as i64 { return box_num(to_num_f(a) / to_num_f(b)); }
+fn rt_mod(a as i64, b as i64) as i64 {
+    if (((a & b) >> 49) == -1) {
+        let is i64 as x = int_of(a);
+        let is i64 as y = int_of(b);
+        if (x >= 0 && y > 0) { return box_i(x % y); }
+    }
+    let is f64 as fb = to_num_f(b);
+    let is f64 as fa = to_num_f(a);
+    if (fb == 0.0 || fa != fa || fb != fb || fa > 1.7976931348623157e308 || fa < -1.7976931348623157e308) { return box_d(math.nan()); }
+    if (fb > 1.7976931348623157e308 || fb < -1.7976931348623157e308) { return box_d(fa); }
+    return box_num(math.fmod(fa, fb));
+}
+fn rt_pow(a as i64, b as i64) as i64 { return box_num(pow_f(to_num_f(a), to_num_f(b))); }
+fn pow_f(x as f64, y as f64) as f64 { return math.pow(x, y); }
+fn rt_neg(a as i64) as i64 {
+    if ((a >> 49) == -1 && int_of(a) != 0) { return box_num(0.0 - cast(f64, int_of(a))); }
+    return box_d(-1.0 * to_num_f(a));
+}
+fn rt_pos(a as i64) as i64 { if ((a & NUM_TAG) != 0) { return a; } return box_num(to_num_f(a)); }
+fn rt_band(a as i64, b as i64) as i64 { return box_i(to_i32(a) & to_i32(b)); }
+fn rt_bor(a as i64, b as i64) as i64 { return box_i(to_i32(a) | to_i32(b)); }
+fn rt_bxor(a as i64, b as i64) as i64 { return box_i(to_i32(a) ^ to_i32(b)); }
+fn rt_bnot(a as i64) as i64 { return box_i(to_i32(a) ^ -1); }
+fn rt_shl(a as i64, b as i64) as i64 { return box_i(cast(i64, cast(i32, (to_i32(a) & 4294967295) << (to_i32(b) & 31)))); }
+fn rt_shr(a as i64, b as i64) as i64 { return box_i(to_i32(a) >> (to_i32(b) & 31)); }
+fn rt_ushr(a as i64, b as i64) as i64 {
+    let is i64 as r = (to_i32(a) & 4294967295) >> (to_i32(b) & 31);
+    if (r <= 2147483647) { return box_i(r); }
+    return box_d(cast(f64, r));
+}
+fn rt_seq(a as i64, b as i64) as i32 {
+    if (((a & b) >> 49) == -1) { if (a == b) { return 1; } return 0; }
+    if ((a & NUM_TAG) != 0 && (b & NUM_TAG) != 0) { if (to_num_f(a) == to_num_f(b)) { return 1; } return 0; }
+    if (a == b) { return 1; }
+    if (is_ptr(a) == 1 && is_ptr(b) == 1 && kind_of(a) == K_STR && kind_of(b) == K_STR) {
+        return bytes_eq(cast(*Str, a), cast(*Str, b));
+    }
+    return 0;
+}
+fn rt_leq(a as i64, b as i64) as i32 {
+    if ((a == UNDEF || a == NULLV) && (b == UNDEF || b == NULLV)) { return 1; }
+    if (a == UNDEF || a == NULLV || b == UNDEF || b == NULLV) { return 0; }
+    if (is_obj(a) == 1 && is_obj(b) == 1) { if (a == b) { return 1; } return 0; }
+    if (is_obj(a) == 1) { return rt_leq(to_prim(a, 2), b); }
+    if (is_obj(b) == 1) { return rt_leq(a, to_prim(b, 2)); }
+    if (is_ptr(a) == 1 && is_ptr(b) == 1) { return rt_seq(a, b); }
+    if ((a & NUM_TAG) != 0 && (b & NUM_TAG) != 0) { return rt_seq(a, b); }
+    if (is_ptr(a) == 1 && kind_of(a) == K_SYM) { return 0; }
+    if (is_ptr(b) == 1 && kind_of(b) == K_SYM) { return 0; }
+    if (to_num_f(a) == to_num_f(b)) { return 1; }
+    return 0;
+}
+fn str_cmp(av as i64, bv as i64) as i64 {
+    let is *Str as a = cast(*Str, av);
+    let is *Str as b = cast(*Str, bv);
+    let is i64 as i with mut = 0;
+    while (i < a.len && i < b.len) {
+        let is i64 as d = cast(i64, a.bytes[i]) - cast(i64, b.bytes[i]);
+        if (d != 0) { return d; }
+        i = i + 1;
+    }
+    return a.len - b.len;
+}
+fn both_str(a as i64, b as i64) as i32 {
+    if (is_ptr(a) == 1 && is_ptr(b) == 1 && kind_of(a) == K_STR && kind_of(b) == K_STR) { return 1; }
+    return 0;
+}
+fn lt_slow(a0 as i64, b0 as i64) as i32 {
+    let is i64 as a = to_prim(a0, 0);
+    let is i64 as b = to_prim(b0, 0);
+    if (both_str(a, b) == 1) { if (str_cmp(a, b) < 0) { return 1; } return 0; }
+    if (to_num_f(a) < to_num_f(b)) { return 1; } return 0;
+}
+fn le_slow(a0 as i64, b0 as i64) as i32 {
+    let is i64 as a = to_prim(a0, 0);
+    let is i64 as b = to_prim(b0, 0);
+    if (both_str(a, b) == 1) { if (str_cmp(a, b) <= 0) { return 1; } return 0; }
+    if (to_num_f(a) <= to_num_f(b)) { return 1; } return 0;
+}
+fn rt_lt(a as i64, b as i64) as i32 {
+    if (((a & b) >> 49) == -1) { if (int_of(a) < int_of(b)) { return 1; } return 0; }
+    return lt_slow(a, b);
+}
+fn rt_le(a as i64, b as i64) as i32 {
+    if (((a & b) >> 49) == -1) { if (int_of(a) <= int_of(b)) { return 1; } return 0; }
+    return le_slow(a, b);
+}
+fn rt_gt(a as i64, b as i64) as i32 { return rt_lt(b, a); }
+fn rt_ge(a as i64, b as i64) as i32 { return rt_le(b, a); }
+fn rt_typeof(v as i64) as i64 {
+    if (is_num(v) == 1) { return lit("number"); }
+    if (v == UNDEF) { return lit("undefined"); }
+    if (v == TRUEV || v == FALSEV) { return lit("boolean"); }
+    if (v == NULLV) { return lit("object"); }
+    let is i64 as k = kind_of(v);
+    if (k == K_STR) { return lit("string"); }
+    if (k == K_SYM) { return lit("symbol"); }
+    if (k == K_FN) { return lit("function"); }
+    if (k == K_PROXY && kind_of(cast(*Obj, v).env[0]) == K_FN) { return lit("function"); }
+    return lit("object");
+}
+
+// ── Errors ──
+let is i64 as G_global with mut = 10;
+fn rt_error(kind_name as *u8, msg as *u8) as i64 {
+    let is i64 as ctor = rt_global_or_undef(lit(kind_name));
+    let is i64 as text = str_new(cast(i64, msg), cstrlen(msg));
+    if (ctor != UNDEF) {
+        rt_argc = 1;
+        ex.throw(rt_new(ctor, text, UNDEF, UNDEF, UNDEF));
+    }
+    ex.throw(text);
+    return 0;
+}
+fn rt_error_key(kind_name as *u8, msg as *u8, key as i64) as i64 {
+    let is i64 as ctor = rt_global_or_undef(lit(kind_name));
+    let is i64 as text with mut = str_new(cast(i64, msg), cstrlen(msg));
+    if (kind_of(key) == K_STR) { text = str_concat(text, key); }
+    if (ctor != UNDEF) {
+        rt_argc = 1;
+        ex.throw(rt_new(ctor, text, UNDEF, UNDEF, UNDEF));
+    }
+    ex.throw(text);
+    return 0;
+}
+fn rt_global_or_undef(key as i64) as i64 {
+    if (is_ptr(G_global) == 0) { return UNDEF; }
+    let is *Obj as g = cast(*Obj, G_global);
+    let is i64 as i = shape_find(g.shape, key);
+    if (i >= 0) {
+        let is *Acc as ac = acc_of(g.slots[i]);
+        if (cast(i64, ac) != 0) { return get_slow(G_global, key, NOIC()); }
+        return g.slots[i];
+    }
+    return UNDEF;
+}
+fn rt_global(key as i64) as i64 {
+    let is *Obj as g = cast(*Obj, G_global);
+    if (shape_find(g.shape, key) >= 0) { return get_slow(G_global, key, NOIC()); }
+    let is i64 as text = str_concat(key, lit(" is not defined"));
+    let is i64 as ctor = rt_global_or_undef(lit("ReferenceError"));
+    if (ctor != UNDEF) { rt_argc = 1; ex.throw(rt_new(ctor, text, UNDEF, UNDEF, UNDEF)); }
+    ex.throw(text);
+    return 0;
+}
+fn rt_global_decl(key as i64) as void {
+    let is *Obj as g = cast(*Obj, G_global);
+    if (shape_find(g.shape, key) < 0) { set_slow(G_global, key, UNDEF, NOIC()); }
+}
+fn rt_global_set(key as i64, v as i64) as void { set_slow(G_global, key, v, NOIC()); }
+fn print_value(v as i64) as void {
+    if (is_num(v) == 1 && (v >> 49) != -1 && v == box_d(-1.0 * 0.0)) { out_c("-0"); return; }
+    let is ex.Frame as f;
+    let is i64 as code = ex.begin(&f);
+    if (code != 0) { out_c("[value that could not be printed]"); return; }
+    ex.enter(&f);
+    let is *Str as s = cast(*Str, to_str(v));
+    ex.leave(&f);
+    let is i64 as j with mut = 0;
+    while (j < s.len) { out_byte(cast(i64, s.bytes[j])); j = j + 1; }
+}
+// window.onerror first, as a page expects, unless it is the one that threw.
+let is i64 as in_onerror with mut = 0;
+fn report_uncaught(v as i64) as void {
+    if (in_onerror == 0 && is_ptr(G_global) == 1) {
+        let is i64 as h = rt_global_or_undef(lit("onerror"));
+        if (is_ptr(h) == 1 && kind_of(h) == K_FN) {
+            in_onerror = 1;
+            let is ex.Frame as f;
+            let is i64 as code = ex.begin(&f);
+            if (code == 0) {
+                ex.enter(&f);
+                let is i64 as msg with mut = v;
+                let is ex.Frame as g;
+                if (ex.begin(&g) == 0) { ex.enter(&g); msg = str_concat(lit("Uncaught "), to_str(v)); ex.leave(&g); }
+                rt_x[0] = v;
+                rt_argc = 5;
+                let is i64 as said = rt_call(h, G_global, msg, lit(""), box_i(0), box_i(0));
+                ex.leave(&f);
+                in_onerror = 0;
+                if (said == TRUEV) { return; }
+            }
+            in_onerror = 0;
+        }
+    }
+    flush();
+    out_c("Uncaught ");
+    print_value(v);
+    out_byte(10);
+    flush();
+}
+
+// ── Iteration ──
+fn rt_iter(v as i64) as i64 {
+    let is *Cursor as c = cast(*Cursor, alloc(sizeof(Cursor)));
+    c.kind = K_CURSOR; c.shape = 1; c.subject = v; c.idx = 0; c.mode = 0; c.next_fn = 0;
+    if (is_ptr(v) == 1) {
+        let is i64 as k = kind_of(v);
+        if (k == K_ARR || k == K_TYPED) {
+            // The plain case, unless someone replaced how arrays iterate.
+            return cast(i64, c);
+        }
+        if (k == K_STR) { c.mode = 1; return cast(i64, c); }
+    }
+    if (v == UNDEF || v == NULLV) { return rt_error("TypeError", "undefined or null is not iterable"); }
+    let is i64 as f = get_slow(v, SYM_iterator, NOIC());
+    if (is_ptr(f) == 0 || kind_of(f) != K_FN) { return rt_error("TypeError", "value is not iterable"); }
+    c.mode = 2;
+    c.subject = rt_fcall(f, v, 0, UNDEF, UNDEF, UNDEF, UNDEF);
+    c.next_fn = get_slow(c.subject, S_next, NOIC());
+    return cast(i64, c);
+}
+// The next value, or 0 at the end.
+fn rt_iter_next(cv as i64) as i64 {
+    let is *Cursor as c = cast(*Cursor, cv);
+    if (c.mode == 0) {
+        let is *Arr as a = cast(*Arr, c.subject);
+        if (c.idx >= a.len) { return 0; }
+        let is i64 as v = a.data[c.idx];
+        c.idx = c.idx + 1;
+        return v;
+    }
+    if (c.mode == 1) {
+        let is *Str as s = cast(*Str, c.subject);
+        if (c.idx >= s.len) { return 0; }
+        let is i64 as b0 = cast(i64, s.bytes[c.idx]);
+        let is i64 as n with mut = 1;
+        if (b0 >= 240) { n = 4; } else if (b0 >= 224) { n = 3; } else if (b0 >= 192) { n = 2; }
+        if (c.idx + n > s.len) { n = s.len - c.idx; }
+        let is i64 as r = str_raw(cast(i64, s.bytes) + c.idx, n);
+        c.idx = c.idx + n;
+        return r;
+    }
+    let is i64 as r = rt_fcall(c.next_fn, c.subject, 0, UNDEF, UNDEF, UNDEF, UNDEF);
+    if (rt_truthy(get_slow(r, S_done, NOIC())) == 1) { return 0; }
+    return get_slow(r, S_value, NOIC());
+}
+fn rt_iter_to_array(v as i64) as i64 {
+    if (is_ptr(v) == 1 && kind_of(v) == K_ARR) { return v; }
+    let is i64 as r = arr_new(8);
+    rt_arr_spread(r, v);
+    return r;
+}
+fn rt_arr_spread(r as i64, v as i64) as void {
+    let is i64 as it = rt_iter(v);
+    while (1 == 1) {
+        let is i64 as x = rt_iter_next(it);
+        if (x == 0) { return; }
+        arr_push(r, x);
+    }
+}
+fn rt_arr_from(av as i64, i0 as i64) as i64 {
+    let is *Arr as a = cast(*Arr, av);
+    let is i64 as r = arr_new(4);
+    let is i64 as i with mut = i0;
+    while (i < a.len) { arr_push(r, a.data[i]); i = i + 1; }
+    return r;
+}
+
+// ── Generators: each body on a stack of its own ──
+let is i64 as CO_STACK with imut = 262144;
+struct Co {
+    sp as i64;          // where to resume it
+    caller_sp as i64;   // where it resumes whoever asked
+    stack as i64;
+    code as *u8;
+    env as *i64;
+    this_v as i64;
+    args as i64;
+    state as i64;       // 0 fresh, 1 suspended, 2 running, 3 done
+    sent as i64;
+    sent_mode as i64;   // 0 next, 1 throw, 2 return
+    out as i64;         // what it handed back
+    threw as i64;
+    head as i64;
+    saved_limit as i64;
+    prev_co as *Co;
+    all_next as *Co;
+}
+let is *Co as co_list with mut = cast(*Co, 0);
+let is *Co as co_cur with mut = cast(*Co, 0);
+let is i64 as co_free with mut = 0;
+let is i64 as CO_RETURN with mut = 0;
+fn co_switch(save_to as *i64, to as i64) as void with naked {
+    asm("push rbx\npush rbp\npush r12\npush r13\npush r14\npush r15\nmov [rdi], rsp\nmov rsp, rsi\npop r15\npop r14\npop r13\npop r12\npop rbp\npop rbx\nret\n");
+}
+fn co_entry() as void {
+    let is *Co as c with mut = co_cur;
+    let is ex.Frame as f;
+    let is i64 as code = ex.begin(&f);
+    if (code != 0) {
+        // Past the top of the body: the asker gets it.
+        c = co_cur;
+        if (code == CO_RETURN) { c.out = c.sent; c.threw = 0; }
+        else { c.out = code; c.threw = 1; }
+    } else {
+        ex.enter(&f);
+        let is *Arr as a = cast(*Arr, c.args);
+        spread_args(c.args);
+        let is i64 as r = call(c.code, c.env, c.this_v, arr_at(a, 0), arr_at(a, 1), arr_at(a, 2), arr_at(a, 3));
+        ex.leave(&f);
+        c = co_cur;
+        c.out = r;
+        c.threw = 0;
+    }
+    c.state = 3;
+    co_switch(&c.sp, c.caller_sp);
+}
+fn co_resume(c as *Co, v as i64, mode as i64) as i64 {
+    if (c.state == 2) { return rt_error("TypeError", "Generator is already running"); }
+    if (c.state == 3) {
+        if (mode == 1) { ex.throw(v); }
+        if (mode == 2) { return iter_result(v, 1); }
+        return iter_result(UNDEF, 1);
+    }
+    if (c.state == 0 && mode != 0) {
+        c.state = 3;
+        if (mode == 1) { ex.throw(v); }
+        return iter_result(v, 1);
+    }
+    if (c.state == 0) {
+        let is i64 as st with mut = co_free;
+        if (st != 0) { co_free = *cast(*i64, st); }
+        else { st = os_map(CO_STACK); }
+        c.stack = st;
+        c.all_next = co_list;
+        co_list = c;
+        let is i64 as top = st + CO_STACK - 64;
+        let is *i64 as s = cast(*i64, top);
+        // Six registers popped, then a ret into the entry with the stack as a call leaves it.
+        s[0] = 0; s[1] = 0; s[2] = 0; s[3] = 0; s[4] = 0; s[5] = 0;
+        s[6] = cast(i64, fn_ptr(co_entry));
+        s[7] = 0;
+        c.sp = top;
+    }
+    c.sent = v;
+    c.sent_mode = mode;
+    c.state = 2;
+    let is *Co as prev = co_cur;
+    c.prev_co = prev;
+    let is i64 as head_saved = cast(i64, ex._head);
+    let is i64 as limit_saved = stack_limit;
+    co_cur = c;
+    ex._head = cast(*ex.Frame, c.head);
+    stack_limit = c.stack + 32768;
+    co_switch(&c.caller_sp, c.sp);
+    c.head = cast(i64, ex._head);
+    ex._head = cast(*ex.Frame, head_saved);
+    stack_limit = limit_saved;
+    co_cur = prev;
+    if (c.state == 3) {
+        *cast(*i64, c.stack) = co_free;
+        co_free = c.stack;
+        if (c.threw == 1) { ex.throw(c.out); }
+        return iter_result(c.out, 1);
+    }
+    c.state = 1;
+    return iter_result(c.out, 0);
+}
+fn iter_result(v as i64, done as i64) as i64 {
+    let is i64 as r = obj_new();
+    obj_add(cast(*Obj, r), S_value, v);
+    obj_add(cast(*Obj, r), S_done, box_b(cast(i32, done)));
+    return r;
+}
+fn rt_yield(v as i64) as i64 {
+    let is *Co as c with mut = co_cur;
+    if (cast(i64, c) == 0) { return rt_error("SyntaxError", "yield outside a generator"); }
+    c.out = v;
+    c.state = 1;
+    co_switch(&c.sp, c.caller_sp);
+    c = co_cur;
+    if (c.sent_mode == 1) { ex.throw(c.sent); }
+    if (c.sent_mode == 2) { ex.throw(CO_RETURN); }
+    return c.sent;
+}
+fn rt_yield_all(v as i64) as i64 {
+    let is i64 as it = rt_iter(v);
+    while (1 == 1) {
+        let is i64 as x = rt_iter_next(it);
+        if (x == 0) { return UNDEF; }
+        rt_yield(x);
+    }
+    return UNDEF;
+}
+fn co_of(t as i64) as *Co {
+    if (is_ptr(t) == 0 || kind_of(t) != K_OBJ || cast(i64, cast(*Obj, t).code) != 1) {
+        rt_error("TypeError", "not a generator");
+    }
+    return cast(*Co, cast(*Obj, t).env);
+}
+fn n_gen_next(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return co_resume(co_of(t), a, 0); }
+fn n_gen_throw(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return co_resume(co_of(t), a, 1); }
+fn n_gen_return(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return co_resume(co_of(t), a, 2); }
+fn n_self(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return t; }
+fn rt_coroutine(code as *u8, env as *i64, this_v as i64, p0 as i64, p1 as i64, p2 as i64, p3 as i64, is_async as i64) as i64 {
+    let is i64 as args = rt_rest(0, rt_argc, p0, p1, p2, p3);
+    let is *Co as c = cast(*Co, alloc(sizeof(Co)));
+    c.sp = 0; c.caller_sp = 0; c.stack = 0; c.code = code; c.env = env; c.this_v = this_v; c.args = args; c.state = 0;
+    c.sent = UNDEF; c.sent_mode = 0; c.out = UNDEF; c.threw = 0; c.head = 0; c.saved_limit = 0;
+    let is i64 as g = obj_with(P_GEN, root_for(P_GEN));
+    let is *Obj as o = cast(*Obj, g);
+    o.code = cast(*u8, 1);
+    o.env = cast(*i64, c);
+    if (is_async == 2) {
+        let is i64 as adriver = rt_global_or_undef(lit("__asyncGen"));
+        return rt_fcall(adriver, UNDEF, 1, g, UNDEF, UNDEF, UNDEF);
+    }
+    if (is_async == 1) {
+        let is i64 as driver = rt_global_or_undef(lit("__async"));
+        return rt_fcall(driver, UNDEF, 1, g, UNDEF, UNDEF, UNDEF);
+    }
+    return g;
+}

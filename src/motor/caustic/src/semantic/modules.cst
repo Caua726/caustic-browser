@@ -1,0 +1,253 @@
+use "../lexer/tokens.cst" as tok;
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "../../std/io.cst" as io;
+use "../ir/opt_mem.cst" as om;
+
+// === Global state ===
+let is *d.Module as module_list with mut;
+
+// Function pointer for parse callback (set by main before analyze)
+// Signature: fn(path_ptr as *u8, path_len as i32) as *u8
+let is *u8 as fn_load_module with mut;
+
+// Temp storage from last load_module call (for error reporting)
+let is *u8 as last_loaded_src with mut;
+let is i64 as last_loaded_src_len with mut;
+let is *u8 as last_loaded_tl with mut;
+let is *u8 as last_loaded_filename with mut;
+
+// === Dependency tracking (for --emit-deps / incremental builds) ===
+// Records the normalized canonical path of every module loaded during a
+// compile (the exact path get_mod_prefix uses), deduped. The maker reads this
+// list to compile each module separately with --module-only.
+let is [1024]i64 as _dep_paths;   // *u8 each
+let is [1024]i32 as _dep_lens;
+let is i32 as _dep_count with mut = 0;
+
+fn record_dep(path as *u8, len as i32) as void {
+    if (_dep_count >= 1024) { return; }
+    let is i32 as i with mut = 0;
+    while (i < _dep_count) {
+        if (d.str_eq(cast(*u8, _dep_paths[i]), _dep_lens[i], path, len) == 1) { return; }
+        i = i + 1;
+    }
+    _dep_paths[_dep_count] = cast(i64, d.str_dup(path, len));
+    _dep_lens[_dep_count] = len;
+    _dep_count = _dep_count + 1;
+}
+
+fn emit_deps(out_path as *u8) as void {
+    let is i64 as fd = io._open_write(out_path);
+    if (fd < 0) { return; }
+    let is i32 as i with mut = 0;
+    while (i < _dep_count) {
+        io._write_fd(fd, cast(*u8, _dep_paths[i]), cast(i64, _dep_lens[i]));
+        io._write_fd(fd, "\n", 1);
+        i = i + 1;
+    }
+    io._close_fd(fd);
+}
+
+fn dep_count() as i32 { return _dep_count; }
+fn dep_path(i as i32) as *u8 { return cast(*u8, _dep_paths[i]); }
+fn dep_len(i as i32) as i32 { return _dep_lens[i]; }
+
+fn modules_init() as void {
+    module_list = cast(*d.Module, 0);
+    _mod_ht_ready = 0;
+    fn_load_module = cast(*u8, 0);
+    last_loaded_src = cast(*u8, 0);
+    last_loaded_src_len = 0;
+    last_loaded_tl = cast(*u8, 0);
+    last_loaded_filename = cast(*u8, 0);
+    _dep_count = 0;
+}
+
+// Free every imported module's token array after semantic analysis. The tokens
+// are only needed during parse + semantic; IR-gen never reads them (g.ir_tl is 0
+// throughout gen_ir — confirmed) and the root module's own tokens live in a
+// separate stack local, not in module_list. Each Module.token_list points at a
+// TokenList whose .data (the big tok_alloc'd array, on opt_alloc's mmap path) is
+// at offset 0; freeing it munmaps real resident pages. A cached re-import makes
+// two Module records share one TokenList, so we null .data after freeing to make
+// the second sweep a no-op (avoids a double-munmap). "Allocate only what we use":
+// stop carrying ~50 modules' token arrays resident through codegen.
+fn free_module_tokens() as void {
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (cast(i64, m.token_list) != 0) {
+            let is *i64 as datap = cast(*i64, m.token_list);  // TokenList.data @ offset 0
+            if (*datap != 0) {
+                om.opt_free(cast(*u8, *datap));
+                *datap = 0;
+            }
+        }
+        m = m.next;
+    }
+}
+
+// One module's tokens, once its last body has been parsed.
+fn free_tokens_of(m as *d.Module) as void {
+    if (cast(i64, m.token_list) == 0) { return; }
+    let is *i64 as datap = cast(*i64, m.token_list);
+    if (*datap != 0) {
+        om.opt_free(cast(*u8, *datap));
+        *datap = 0;
+    }
+}
+
+// What the imported modules' token arrays still hold (--stats).
+fn live_token_bytes() as i64 {
+    let is i64 as total with mut = 0;
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (cast(i64, m.token_list) != 0) {
+            let is *i64 as datap = cast(*i64, m.token_list);        // TokenList.data @ 0
+            let is *i32 as countp = cast(*i32, cast(i64, m.token_list) + 8);
+            if (*datap != 0) { total = total + cast(i64, *countp) * sizeof(tok.Token); }
+        }
+        m = m.next;
+    }
+    return total;
+}
+
+fn set_load_module(fp as *u8) as void {
+    fn_load_module = fp;
+}
+
+// --- Module-prefix iteration (for --module-objects batch codegen) ---
+fn mo_count() as i32 {
+    let is i32 as n with mut = 0;
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) { n = n + 1; m = m.next; }
+    return n;
+}
+fn mo_prefix_ptr(idx as i32) as *u8 {
+    let is i32 as i with mut = 0;
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (i == idx) { return m.prefix_ptr; }
+        i = i + 1; m = m.next;
+    }
+    return cast(*u8, 0);
+}
+fn mo_prefix_len(idx as i32) as i32 {
+    let is i32 as i with mut = 0;
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (i == idx) { return m.prefix_len; }
+        i = i + 1; m = m.next;
+    }
+    return 0;
+}
+
+// === Module cache with hash table ===
+let is [64]i64 as _mod_ht;
+let is i32 as _mod_ht_ready with mut = 0;
+
+fn _mod_hash(ptr as *u8, len as i32) as i32 {
+    let is i32 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < len) { h = h * 33 + cast(i32, ptr[i]); i = i + 1; }
+    return (h & 63);
+}
+
+fn _mod_ht_insert(m as *d.Module) as void {
+    if (_mod_ht_ready == 0) {
+        let is i32 as i with mut = 0;
+        while (i < 64) { _mod_ht[i] = 0; i = i + 1; }
+        _mod_ht_ready = 1;
+    }
+    let is i32 as h = _mod_hash(m.prefix_ptr, m.prefix_len);
+    m.ht_next = cast(*d.Module, _mod_ht[h]);
+    _mod_ht[h] = cast(i64, m);
+}
+
+fn find_module(prefix_ptr as *u8, prefix_len as i32) as *d.Module {
+    if (_mod_ht_ready == 0) { return cast(*d.Module, 0); }
+    let is i32 as h = _mod_hash(prefix_ptr, prefix_len);
+    let is *d.Module as m with mut = cast(*d.Module, _mod_ht[h]);
+    while (cast(i64, m) != 0) {
+        if (d.str_eq(m.prefix_ptr, m.prefix_len, prefix_ptr, prefix_len) == 1) {
+            return m;
+        }
+        m = m.ht_next;
+    }
+    return cast(*d.Module, 0);
+}
+
+// Two `only` lists are the same filter. Order-sensitive: `only a, b` and
+// `only b, a` compare unequal and get separate records, which duplicates a
+// record but never narrows one — the failure mode we are avoiding here.
+fn only_list_eq(a_names as *u8, a_count as i32, b_names as *u8, b_count as i32) as i32 {
+    if (a_count != b_count) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < a_count) {
+        let is *i64 as ap = cast(*i64, cast(i64, a_names) + cast(i64, i) * 12);
+        let is *i32 as al = cast(*i32, cast(i64, a_names) + cast(i64, i) * 12 + 8);
+        let is *i64 as bp = cast(*i64, cast(i64, b_names) + cast(i64, i) * 12);
+        let is *i32 as bl = cast(*i32, cast(i64, b_names) + cast(i64, i) * 12 + 8);
+        if (d.str_eq(cast(*u8, *ap), *al, cast(*u8, *bp), *bl) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The record for an `only` import site: keyed by (prefix, only list), NOT by
+// alias name. Two files importing the same module under the same alias with
+// DIFFERENT `only` lists are different bindings and must not share a record —
+// keying by name alone let whichever was processed first decide what the other
+// could see. Alias records live in module_list only; they are deliberately kept
+// out of the prefix hash table so they can never shadow the complete record.
+fn find_alias_module(prefix_ptr as *u8, prefix_len as i32, only_names as *u8, only_count as i32) as *d.Module {
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (m.only_count > 0 && d.str_eq(m.prefix_ptr, m.prefix_len, prefix_ptr, prefix_len) == 1) {
+            if (only_list_eq(m.only_names, m.only_count, only_names, only_count) == 1) {
+                return m;
+            }
+        }
+        m = m.next;
+    }
+    return cast(*d.Module, 0);
+}
+
+fn find_module_by_name(name_ptr as *u8, name_len as i32) as *d.Module {
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (d.str_eq(m.name_ptr, m.name_len, name_ptr, name_len) == 1) {
+            return m;
+        }
+        m = m.next;
+    }
+    return cast(*d.Module, 0);
+}
+
+// === File reading ===
+
+fn read_file(path as *u8, out_size as *i64) as *u8 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (size <= 0) { io._close_fd(fd); return cast(*u8, 0); }
+    let is *u8 as buf = d.sem_alloc(size + 1);
+    io._read_fd(fd, buf, size);
+    buf[size] = cast(u8, 0);
+    io._close_fd(fd);
+    *out_size = size;
+    return buf;
+}
+
+// === Resolve relative path ===
+
+fn strip_quotes(ptr as *u8, len as i32, out_len as *i32) as *u8 {
+    // Skip leading/trailing quote
+    if (len >= 2 && ptr[0] == 34) {
+        *out_len = len - 2;
+        return cast(*u8, cast(i64, ptr) + 1);
+    }
+    *out_len = len;
+    return ptr;
+}

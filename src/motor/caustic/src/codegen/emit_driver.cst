@@ -1,0 +1,3017 @@
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../ir/defs.cst" as d;
+use "../ir/opt.cst" as opt;
+use "../ir/opt_ifconv.cst" as ifc;
+use "../ir/opt_unroll.cst" as unroll;
+use "../ir/opt_rotate.cst" as rot;
+use "../ir/opt_uj.cst" as uj;
+use "../ir/opt_slp.cst" as slp;
+use "../ir/opt_widen.cst" as widen;
+use "../ir/vec/vec_driver.cst" as vec2;
+use "../ir/gen_program.cst" as irp;
+use "alloc_core.cst" as al;
+use "alloc_gc.cst" as gc;
+use "emit_output.cst" as eo;
+use "emit.cst" as e;
+use "emit_inst.cst" as ei;
+use "target.cst" as tgt;
+use "dynsyms.cst" as dyns;
+use "shrinkwrap.cst" as sw;
+use "fsplit.cst" as fs;
+use "nowrap.cst" as nw;
+
+// Dynamic-stdlib mode (-lcaustic on an ELF/PE target): functions whose mangled
+// name starts with "_std_" are provided by libcaustic.so at runtime, so we
+// DON'T emit their bodies — the call sites become undefined externals that the
+// linker resolves dynamically (NEEDED libcaustic.so). User code is emitted
+// normally.
+//
+// The prefix is a FALLBACK for the platforms whose libraries we cannot read: an
+// .so's exports are the system loader's business. Where a .csl was actually
+// read (the CausticOS target), dynsyms answers instead and this prefix is never
+// consulted — see _is_dyn_extern.
+let is i32 as g_dyn_stdlib with mut = 0;
+fn set_dyn_stdlib(v as i32) as void { g_dyn_stdlib = v; }
+
+// --module-only (separate compilation): a function belongs to the target
+// module iff its mangled name is `<module_prefix>_<name>`. Everything else is
+// defined in another object and must not be emitted here.
+fn _belongs_to_target_module(f as *d.IRFunction) as i32 {
+    let is *u8 as p = tgt.module_prefix_ptr_get();
+    let is i32 as plen = tgt.module_prefix_len_get();
+    if (plen == 0) { return 0; }
+    if (f.asm_name_len < plen + 1) { return 0; }
+    let is *u8 as n = f.asm_name_ptr;
+    let is i32 as i with mut = 0;
+    while (i < plen) {
+        if (n[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    if (n[plen] != 95) { return 0; } // boundary: '_' separator
+    return 1;
+}
+
+// Whether a global should be DEFINED in this object. Outside --module-only,
+// always yes (whole-program). In --module-only, only the target module's own
+// globals — others are external (defined in their module's object).
+fn _global_belongs(g as *d.IRGlobal) as i32 {
+    // A library's variable is that library's: an image linked to it shares it, not a copy.
+    if (dyns.dynsyms_count() > 0 && dyns.dynsyms_lookup(g.name_ptr, cast(i64, g.name_len)) >= 0) { return 0; }
+    if (tgt.module_only_get() == 0) { return 1; }
+    let is *u8 as p = tgt.module_prefix_ptr_get();
+    let is i32 as plen = tgt.module_prefix_len_get();
+    if (plen == 0) { return 0; }
+    if (g.name_len < plen + 1) { return 0; }
+    let is *u8 as n = g.name_ptr;
+    let is i32 as i with mut = 0;
+    while (i < plen) { if (n[i] != p[i]) { return 0; } i = i + 1; }
+    if (n[plen] != 95) { return 0; } // boundary: '_' separator
+    return 1;
+}
+
+fn _is_dyn_extern(f as *d.IRFunction) as i32 {
+    // module-only: functions outside the target module are external (defined
+    // in another .o), so don't emit their bodies — call sites stay undefined
+    // and the linker resolves them.
+    if (tgt.module_only_get() == 1 && _belongs_to_target_module(f) == 0) { return 1; }
+    return _is_dyn_library(f);
+}
+
+fn _is_dyn_library(f as *d.IRFunction) as i32 {
+    // A library we READ answers for itself, and it is the only authority worth
+    // having: it says which symbols it exports, so a symbol it does not export
+    // gets its body emitted here even if the name looks like somebody else's.
+    // This is also the ONLY rule that works with more than one library — the
+    // prefix below cannot say WHICH of them a symbol came from.
+    //
+    // Note the exclusivity: once any .csl is registered, the prefix rule is
+    // skipped entirely. Applying both would externalize a _std_* symbol that no
+    // registered library actually exports, and the failure would surface as an
+    // unresolvable import at load time rather than as a missing body here.
+    if (dyns.dynsyms_count() > 0) {
+        if (dyns.dynsyms_lookup(f.asm_name_ptr, cast(i64, f.asm_name_len)) >= 0) { return 1; }
+        return 0;
+    }
+
+    if (g_dyn_stdlib == 0) { return 0; }
+    if (f.asm_name_len < 5) { return 0; }
+    let is *u8 as n = f.asm_name_ptr;
+    // "_std_" = 95 115 116 100 95
+    if (n[0] == 95 && n[1] == 115 && n[2] == 116 && n[3] == 100 && n[4] == 95) { return 1; }
+    return 0;
+}
+
+// Does any live instruction address the locals area ([rbp - off])? Only three
+// IR forms do: a LOAD or STORE whose address is a stack offset instead of a
+// vreg, and IR_ADDR (&local). Hand-written asm may name [rbp - off] itself, so
+// a function with live asm keeps its locals. Spill slots, the alloca area and
+// the variadic save area are addressed past arg_spill_base and move with it.
+fn _frame_locals_used(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_ADDR || op == d.IR_ASM) { return 1; }
+            if (op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) { return 1; }
+            if (op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) { return 1; }
+        }
+        inst = inst.next;
+    }
+    return 0;
+}
+
+// === Global addresses folded into the access (x86, -O1 and up) ===
+//
+//     ADDR_GLOBAL a = g ; LOAD t = [a]     → mov t, [rip+g]
+//     ADDR_GLOBAL a = g ; STORE [a] = v    → mov [rip+g], v
+//
+// The access names the global itself, so the address needs neither a lea nor a
+// register; the ADDR_GLOBAL stays only for readers that are not accesses (an
+// index added to it, a pointer passed on). Only a global this object defines:
+// a 64-bit `mov r64, [rip+g]` on an undefined g is the assembler's GOT load
+// of an `extern let`, and a string literal's ADDR_GLOBAL is what marks it used.
+fn _gsym_foldable(g as *d.IRInst) as i32 {
+    if (g.is_extern_global != 0) { return 0; }
+    let is i32 as n = cast(i32, g.global_name_len);
+    if (n <= 0 || n > e.GSYM_MAX) { return 0; }
+    let is *u8 as p = g.global_name_ptr;
+    if (n > 3 && p[0] == 46 && p[1] == 76 && p[2] == 67) { return 0; }   // .LC<sid>
+    if (tgt.module_only_get() == 1) {
+        let is *u8 as mp = tgt.module_prefix_ptr_get();
+        let is i32 as ml = tgt.module_prefix_len_get();
+        if (ml == 0 || n < ml + 1) { return 0; }
+        let is i32 as i with mut = 0;
+        while (i < ml) { if (p[i] != mp[i]) { return 0; } i = i + 1; }
+        if (p[ml] != 95) { return 0; }
+    }
+    return 1;
+}
+
+// === f64 constants as memory operands (x86, -O1 and up) ===
+//
+//     IMM c = bits ; FADD t = a, c    → addsd t, [rip+.LCFk]
+//
+// An f64 add, subtract, multiply or divide reads a constant operand from the
+// pool instead of from a register filled by movabs + movq. A constant first
+// operand of an add or multiply is swapped into the second place; of a
+// subtract or divide it is loaded straight into the accumulator. An f64
+// compare reads it the same way (ucomisd a, [rip+.LCFk]); a constant first
+// operand trades places with the other one and the compare turns around
+// (a < b is b > a, and both are false on a NaN). An IMM left with no reader
+// goes.
+fn _fc_is_cmp(op as i32) as i32 {
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { return 1; }
+    return 0;
+}
+
+// The compare that reads its operands the other way round.
+fn _fc_swap_cmp(op as i32) as i32 {
+    if (op == d.IR_LT) { return d.IR_GT; }
+    if (op == d.IR_GT) { return d.IR_LT; }
+    if (op == d.IR_LE) { return d.IR_GE; }
+    if (op == d.IR_GE) { return d.IR_LE; }
+    return op;
+}
+
+fn fconst_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i64 as idef = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { idef[i] = 0; i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+            && inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+            let is i32 as v = inst.dest.vreg;
+            if (inst.op == d.IR_IMM && idef[v] == 0) { idef[v] = cast(i64, inst); any = 1; }
+            else { idef[v] = 0 - 1; }
+        }
+        inst = inst.next;
+    }
+    if (any == 0) { d.opt_free(cast(*u8, idef)); return; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        let is i32 as op = inst.op;
+        if (inst.is_dead == 0 && (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV)
+            && e.get_type_size(inst.cast_to) == 8
+            && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG) {
+            let is i32 as c1 = inst.src1.vreg >= 0 && inst.src1.vreg < vc && idef[inst.src1.vreg] > 0;
+            let is i32 as c2 = inst.src2.vreg >= 0 && inst.src2.vreg < vc && idef[inst.src2.vreg] > 0;
+            if (c1 == 1 && c2 == 0 && (op == d.IR_FADD || op == d.IR_FMUL)) {
+                let is i32 as tv = inst.src1.vreg;
+                inst.src1.vreg = inst.src2.vreg;
+                inst.src2.vreg = tv;
+            }
+            if (inst.src2.vreg >= 0 && inst.src2.vreg < vc && idef[inst.src2.vreg] > 0) {
+                let is *d.IRInst as g2 = cast(*d.IRInst, idef[inst.src2.vreg]);
+                let is i32 as k2 = eo.fc_index(g2.src1.imm);
+                if (k2 >= 0) { inst.src2.op_type = cast(i8, d.OP_FCONST); inst.src2.imm = cast(i64, k2); }
+            }
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc && idef[inst.src1.vreg] > 0) {
+                let is *d.IRInst as g1 = cast(*d.IRInst, idef[inst.src1.vreg]);
+                let is i32 as k1 = eo.fc_index(g1.src1.imm);
+                if (k1 >= 0) { inst.src1.op_type = cast(i8, d.OP_FCONST); inst.src1.imm = cast(i64, k1); }
+            }
+        }
+        if (inst.is_dead == 0 && _fc_is_cmp(op) == 1 && e.is_float_type(inst.cast_to) == 1
+            && e.get_type_size(inst.cast_to) == 8
+            && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG
+            && inst.src1.vreg >= 0 && inst.src1.vreg < vc && inst.src2.vreg >= 0 && inst.src2.vreg < vc) {
+            if (idef[inst.src1.vreg] > 0 && idef[inst.src2.vreg] <= 0) {
+                let is i32 as tw = inst.src1.vreg;
+                inst.src1.vreg = inst.src2.vreg;
+                inst.src2.vreg = tw;
+                inst.op = cast(i8, _fc_swap_cmp(op));
+            }
+            if (idef[inst.src2.vreg] > 0 && idef[inst.src1.vreg] <= 0) {
+                let is *d.IRInst as gc = cast(*d.IRInst, idef[inst.src2.vreg]);
+                let is i32 as kc = eo.fc_index(gc.src1.imm);
+                if (kc >= 0) { inst.src2.op_type = cast(i8, d.OP_FCONST); inst.src2.imm = cast(i64, kc); }
+            }
+        }
+        inst = inst.next;
+    }
+    // An IMM nothing reads any more goes.
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc && idef[inst.src1.vreg] > 0) { idef[inst.src1.vreg] = 0 - 1; }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc && idef[inst.src2.vreg] > 0) { idef[inst.src2.vreg] = 0 - 1; }
+            if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc && idef[inst.dest.vreg] > 0
+                && cast(i64, inst) != idef[inst.dest.vreg]) { idef[inst.dest.vreg] = 0 - 1; }
+        }
+        inst = inst.next;
+    }
+    i = 0;
+    while (i < vc) {
+        if (idef[i] > 0) { let is *d.IRInst as g = cast(*d.IRInst, idef[i]); g.is_dead = 1; }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, idef));
+}
+
+// -O2: `(x << k) | (x >> (W - k))` on an unsigned W-bit value is one
+// `rol x, k`. A u32 shift works on the u32 value (the emitter extends an
+// operand left unextended), maybe through an explicit CAST to u32; the left
+// shift's upper bits are past the value anyway. The shifts and the cast go when the OR was their
+// only reader, and x must not be written between them and the OR.
+fn _uw(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    if (k == 7 && sz == 4) { return 32; }
+    if (k == 8 && sz == 8) { return 64; }
+    return 0;
+}
+
+fn _rol_def(def as *i64, vc as i32, v as i32) as *d.IRInst {
+    if (v < 0 || v >= vc || def[v] <= 0) { return cast(*d.IRInst, 0); }
+    return cast(*d.IRInst, def[v]);
+}
+
+fn rol_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i64 as def = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { def[i] = 0; uses[i] = 0; i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc) { uses[inst.src1.vreg] = uses[inst.src1.vreg] + 1; }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc) { uses[inst.src2.vreg] = uses[inst.src2.vreg] + 1; }
+            if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc) {
+                let is i32 as v = inst.dest.vreg;
+                if (inst.op == d.IR_STORE || inst.op == d.IR_COPY || inst.op == d.IR_CMOV) { uses[v] = uses[v] + 1; }
+                if (inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+                    if (def[v] == 0) { def[v] = cast(i64, inst); } else { def[v] = 0 - 1; }
+                }
+            }
+            if (inst.op == d.IR_OR) { any = 1; }
+        }
+        inst = inst.next;
+    }
+    if (any == 1) {
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.op == d.IR_OR && inst.dest.op_type == d.OP_VREG
+                && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG) {
+                _rol_one(inst, def, uses, vc);
+            }
+            inst = inst.next;
+        }
+    }
+    d.opt_free(cast(*u8, def));
+    d.opt_free(cast(*u8, uses));
+}
+
+fn _rol_one(o as *d.IRInst, def as *i64, uses as *i32, vc as i32) as void {
+    let is i32 as w = _uw(o.cast_to);
+    if (w == 0) { return; }
+    let is *d.IRInst as l with mut = _rol_def(def, vc, o.src1.vreg);
+    let is *d.IRInst as r with mut = _rol_def(def, vc, o.src2.vreg);
+    if (cast(i64, l) == 0 || cast(i64, r) == 0) { return; }
+    if (l.op == d.IR_SHR && r.op == d.IR_SHL) { let is *d.IRInst as t = l; l = r; r = t; }
+    if (l.op != d.IR_SHL || r.op != d.IR_SHR) { return; }
+    if (l.src1.op_type != d.OP_VREG || r.src1.op_type != d.OP_VREG) { return; }
+    if (l.src2.op_type != d.OP_IMM || r.src2.op_type != d.OP_IMM) { return; }
+    let is i64 as k = l.src2.imm;
+    if (k <= 0 || k >= cast(i64, w) || r.src2.imm != cast(i64, w) - k) { return; }
+    if (_uw(l.cast_to) != w || _uw(r.cast_to) != w) { return; }
+    if (uses[l.dest.vreg] != 1 || uses[r.dest.vreg] != 1) { return; }
+    let is i32 as x = l.src1.vreg;
+    let is *d.IRInst as zx with mut = cast(*d.IRInst, 0);
+    if (r.src1.vreg != x) {
+        // a u32 rotate: the two shifts may read x through casts that keep
+        // its low 32 bits (each its own cast of one value)
+        if (w != 32 || _low32_root(def, vc, x) != _low32_root(def, vc, r.src1.vreg)) { return; }
+        zx = _rol_def(def, vc, r.src1.vreg);
+        if (cast(i64, zx) != 0 && zx.op != d.IR_CAST) { zx = cast(*d.IRInst, 0); }
+    }
+    // l, r (and zx) above o in one straight run, x not written in between
+    let is i32 as seen with mut = 0;
+    let is i32 as need with mut = 2;
+    if (cast(i64, zx) != 0) { need = 3; }
+    let is *d.IRInst as w0 with mut = o;
+    // walk back: find the earliest of them by scanning from each candidate down to o
+    let is *d.IRInst as first with mut = l;
+    if (_before(r, first) == 1) { first = r; }
+    if (cast(i64, zx) != 0 && _before(zx, first) == 1) { first = zx; }
+    w0 = first;
+    while (cast(i64, w0) != cast(i64, o)) {
+        if (cast(i64, w0) == 0) { return; }
+        if (w0.op == d.IR_LABEL || w0.op == d.IR_JMP || w0.op == d.IR_JZ || w0.op == d.IR_JNZ) { return; }
+        if (w0.is_dead == 0 && cast(i64, w0) != cast(i64, first) && w0.dest.op_type == d.OP_VREG && w0.dest.vreg == x
+            && w0.op != d.IR_STORE && w0.op != d.IR_COPY) { return; }
+        if (cast(i64, w0) == cast(i64, l) || cast(i64, w0) == cast(i64, r) || cast(i64, w0) == cast(i64, zx)) { seen = seen + 1; }
+        w0 = w0.next;
+    }
+    if (seen != need) { return; }
+    o.op = d.IR_ROL;
+    o.src1 = d.op_vreg(x);
+    o.src2 = d.op_imm(k);
+    l.is_dead = 1;
+    r.is_dead = 1;
+    if (cast(i64, zx) != 0 && uses[zx.dest.vreg] == 1) { zx.is_dead = 1; }
+}
+
+// v through the integer casts between types of 4 bytes or more: they all
+// keep the low 32 bits.
+fn _low32_root(def as *i64, vc as i32, v0 as i32) as i32 {
+    let is i32 as v with mut = v0;
+    let is i32 as hops with mut = 0;
+    while (hops < 4) {
+        let is *d.IRInst as c = _rol_def(def, vc, v);
+        if (cast(i64, c) == 0 || c.op != d.IR_CAST || c.src1.op_type != d.OP_VREG) { return v; }
+        if (cast(i64, c.cast_to) == 0 || cast(i64, c.cast_from) == 0) { return v; }
+        let is i32 as kt = *cast(*i32, c.cast_to);
+        let is i32 as kf = *cast(*i32, c.cast_from);
+        if (kt < 1 || kt > 8 || kf < 1 || kf > 8) { return v; }
+        if (*cast(*i32, cast(i64, c.cast_to) + 28) < 4 || *cast(*i32, cast(i64, c.cast_from) + 28) < 4) { return v; }
+        v = c.src1.vreg;
+        hops = hops + 1;
+    }
+    return v;
+}
+
+// Does a come before b in the list (b reachable from a)?
+fn _before(a as *d.IRInst, b as *d.IRInst) as i32 {
+    let is *d.IRInst as w with mut = a.next;
+    let is i32 as n with mut = 0;
+    while (cast(i64, w) != 0 && n < 64) {
+        if (cast(i64, w) == cast(i64, b)) { return 1; }
+        w = w.next;
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn rip_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    // gdef[v]: the one ADDR_GLOBAL writing v, -1 once anything else writes it.
+    let is *i64 as gdef = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { gdef[i] = 0; i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+            && inst.op != d.IR_STORE) {
+            let is i32 as v = inst.dest.vreg;
+            if (inst.op == d.IR_ADDR_GLOBAL && gdef[v] == 0 && _gsym_foldable(inst) == 1) {
+                gdef[v] = cast(i64, inst);
+                any = 1;
+            } else {
+                gdef[v] = 0 - 1;
+            }
+        }
+        inst = inst.next;
+    }
+    if (any == 0) { d.opt_free(cast(*u8, gdef)); return; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc
+                && gdef[inst.src1.vreg] > 0) {
+                inst.src1.op_type = cast(i8, d.OP_GSYM);
+                inst.src1.imm = gdef[inst.src1.vreg];
+            }
+            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+                && gdef[inst.dest.vreg] > 0
+                && (inst.src1.op_type != d.OP_VREG || inst.src1.vreg != inst.dest.vreg)) {
+                inst.dest.op_type = cast(i8, d.OP_GSYM);
+                inst.dest.imm = gdef[inst.dest.vreg];
+            }
+        }
+        inst = inst.next;
+    }
+    // An ADDR_GLOBAL nothing reads any more goes.
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc && gdef[inst.src1.vreg] > 0) { gdef[inst.src1.vreg] = 0 - 1; }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc && gdef[inst.src2.vreg] > 0) { gdef[inst.src2.vreg] = 0 - 1; }
+            if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc && gdef[inst.dest.vreg] > 0
+                && cast(i64, inst) != gdef[inst.dest.vreg]) { gdef[inst.dest.vreg] = 0 - 1; }
+        }
+        inst = inst.next;
+    }
+    i = 0;
+    while (i < vc) {
+        if (gdef[i] > 0) { let is *d.IRInst as g = cast(*d.IRInst, gdef[i]); g.is_dead = 1; }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, gdef));
+}
+
+// Does the function call out (and so need rsp 16-byte aligned at the call)?
+fn _frame_makes_calls(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_ASM) { return 1; }
+        }
+        inst = inst.next;
+    }
+    return 0;
+}
+
+// CFI for a push in a function without a frame pointer: the k-th push leaves
+// rsp at CFA - 8 - 8k (the CFA is the caller's rsp, past the return address).
+fn _cfi_push(reg as *u8, k as i32) as void {
+    eo.out_str(".cfi_def_cfa_offset ", 20); eo.out_int(cast(i64, 8 + 8 * k)); eo.out_char(10);
+    eo.out_str(".cfi_offset ", 12); eo.out_cstr(reg); eo.out_str(", -", 3); eo.out_int(cast(i64, 8 + 8 * k)); eo.out_char(10);
+}
+
+// The CFA inside the framed part / at a frameless block (shrink-wrapping).
+fn _cfa_framed(push_count as i32) as void {
+    if (eo.fp_omit == 1) {
+        eo.out_str(".cfi_def_cfa_offset ", 20);
+        eo.out_int(8 + eo.fp_bias);
+        eo.out_char(10);
+        return;
+    }
+    eo.out_line(".cfi_def_cfa_register rbp");
+    eo.out_line(".cfi_def_cfa_offset 16");
+}
+
+fn _cfa_frameless() as void {
+    if (eo.fp_omit == 0) { eo.out_line(".cfi_def_cfa_register rsp"); }
+    eo.out_line(".cfi_def_cfa_offset 8");
+}
+
+// -O2: can this function run without rbp as a frame pointer? Its frame is then
+// addressed from rsp (eo.out_fp), which needs rsp fixed in the body after the
+// prologue. Kept: hand-written asm (it may name rbp or move rsp; the compiler
+// also pads calls with stack arguments through asm), variadics (their save
+// area and overflow pointer are rbp-based), stack-passed parameters, FFI calls
+// (they move rsp around the call). std/exceptions.cst's backtrace unwinds
+// through such a frame with the CFI emitted here (.eh_frame). rbp is never
+// written in it, so the frame-pointer chain stays valid too, pointing at the
+// nearest caller that kept rbp. A program that becomes a dynamic executable
+// through an `extern "lib.so"` call gets no .eh_frame from caustic-ld (only the
+// static writer builds it), so its backtrace falls back to that chain and
+// lists only the frames that kept rbp.
+fn _frame_can_omit_fp(func as *d.IRFunction) as i32 {
+    if (al.al_opt_level < 2 || func.is_naked == 1 || func.is_variadic == 1 || func.num_args > 6) { return 0; }
+    // Only where the image carries unwind tables: std/exceptions.cst's
+    // backtrace walks them, and the frame-pointer chain where they are absent.
+    if (tgt.unwind_tables() == 0) { return 0; }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_ASM || op == d.IR_FFI_CALL || op == d.IR_VA_START) { return 0; }
+            if (op == d.IR_SET_ARG && e.arg_place(inst, inst.dest.imm) >= 6 && e.arg_place(inst, inst.dest.imm) < 100) { return 0; }
+            if (op == d.IR_GET_ARG && e.arg_place(inst, inst.src1.imm) >= 6 && e.arg_place(inst, inst.src1.imm) < 100) { return 0; }
+        }
+        inst = inst.next;
+    }
+    return 1;
+}
+
+// Labels some later jump goes back to: the heads of loops.
+// -O2: the labels to align on 16: the first of a run of labels that a forward
+// branch jumps into, when what follows is a few instructions and a
+// branch back. An iteration that jumps over the rest of its body runs that
+// little block every time, and split across a 32-byte fetch window it costs a
+// cycle more per iteration. Only where the pad is run rarely or never: right
+// after a jump or a return, or at the way out of an inner loop. An arm that
+// falls in from above could be half of the iterations.
+fn _latch_blocks(func as *d.IRFunction, heads as *u8, ctx as *al.AllocCtx) as *u8 {
+    let is i32 as nl = func.label_count;
+    if (nl <= 0) { return cast(*u8, 0); }
+    let is *u8 as mark = d.opt_alloc(cast(i64, nl));
+    let is *u8 as refd = d.opt_alloc(cast(i64, nl));
+    let is *u8 as placed = d.opt_alloc(cast(i64, nl));
+    let is i32 as k with mut = 0;
+    while (k < nl) { mark[k] = cast(u8, 0); refd[k] = cast(u8, 0); placed[k] = cast(u8, 0); k = k + 1; }
+    let is i32 as first with mut = 0 - 1;     // first label of the current run
+    let is i32 as fwd with mut = 0;           // a forward branch jumps into it
+    let is i32 as nohead with mut = 1;
+    let is i32 as since with mut = 0;
+    let is i32 as in_run with mut = 0;
+    let is i32 as pad_free with mut = 1;      // what comes before rarely falls through
+    let is i32 as jmp_to with mut = 0 - 1;    // the label the jump just before jumps to
+    let is *d.IRInst as jmp_inst with mut = cast(*d.IRInst, 0);
+    let is i32 as pad_before with mut = 1;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_LABEL && it.dest.label >= 0 && it.dest.label < nl) {
+                let is i32 as lb = it.dest.label;
+                if (in_run == 0) { first = lb; fwd = 0; nohead = pad_free; since = 0; in_run = 1; }
+                // a jump to here is no jump (a pad between them would keep the
+                // peephole from dropping it): what counts is what comes before it
+                if (lb == jmp_to) {
+                    jmp_inst.is_dead = cast(i8, 1);
+                    if (pad_before == 0) { nohead = 0; }
+                }
+                if (refd[lb] == cast(u8, 1)) { fwd = 1; }
+                if (cast(i64, heads) != 0 && heads[lb] == cast(u8, 1)) { nohead = 0; }
+                placed[lb] = cast(u8, 1);
+            } else if (op == d.IR_MOV && it.src1.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
+                       && al.get_loc(it.src1.vreg, ctx) == al.get_loc(it.dest.vreg, ctx)) {
+                // a copy the allocation made nothing of
+            } else {
+                in_run = 0;
+                jmp_to = 0 - 1;
+                if (op == d.IR_JMP && it.dest.op_type == d.OP_LABEL) {
+                    jmp_to = it.dest.label;
+                    jmp_inst = it;
+                    pad_before = pad_free;
+                }
+                pad_free = cast(i32, op == d.IR_JMP || op == d.IR_RET
+                    || ((op == d.IR_JZ || op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+                        && it.dest.label >= 0 && it.dest.label < nl && placed[it.dest.label] == cast(u8, 1)));
+                if ((op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+                    && it.dest.label >= 0 && it.dest.label < nl) {
+                    let is i32 as t = it.dest.label;
+                    if (placed[t] == cast(u8, 1)) {
+                        if (first >= 0 && fwd == 1 && nohead == 1 && since <= 6) { mark[first] = cast(u8, 1); }
+                    } else { refd[t] = cast(u8, 1); }
+                    first = 0 - 1;
+                } else if (op == d.IR_RET || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL) {
+                    first = 0 - 1;
+                } else { since = since + 1; }
+            }
+        }
+        it = it.next;
+    }
+    d.opt_free(refd);
+    d.opt_free(placed);
+    return mark;
+}
+
+fn _loop_heads(func as *d.IRFunction) as *u8 {
+    let is i32 as lc = func.label_count;
+    let is *u8 as seen = d.opt_alloc(cast(i64, lc));
+    let is *u8 as head = d.opt_alloc(cast(i64, lc));
+    let is i32 as k with mut = 0;
+    while (k < lc) { seen[k] = cast(u8, 0); head[k] = cast(u8, 0); k = k + 1; }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_LABEL && inst.dest.label >= 0 && inst.dest.label < lc) { seen[inst.dest.label] = cast(u8, 1); }
+            if ((op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) && inst.dest.op_type == d.OP_LABEL
+                && inst.dest.label >= 0 && inst.dest.label < lc && seen[inst.dest.label] == cast(u8, 1)) {
+                head[inst.dest.label] = cast(u8, 1);
+            }
+        }
+        inst = inst.next;
+    }
+    d.opt_free(seen);
+    return head;
+}
+
+// The prologue: CausticOS stack probe, push rbp / mov rbp, rsp, the
+// callee-saved pushes, the frame body and the variadic save area. At the entry,
+// or at the shrink-wrap point (shrinkwrap.cst).
+fn _emit_prologue(func as *d.IRFunction, ctx as *al.AllocCtx, push_count as i32, total as i32,
+                  local_size as i32, spill_size as i32, alloc_size as i32) as void {
+    let is i32 as mask = ctx.used_callee_mask;
+    // Dynamic-stack probe (recursion/indirect programs). Before this frame
+    // descends — pushes AND sub rsp — make sure the committed stack reaches the
+    // lowest address it (plus the grow helper) will touch; if not,
+    // __caustic_stkgrow commits more via SYS_COMMIT. Emitted ABOVE the pushes so
+    // it guards them too. rax is caller-saved scratch at entry (never an arg),
+    // so clobbering it here is free; the helper preserves everything else. Every
+    // function probes because recursion can place any of them at unbounded
+    // depth. The helper itself is hand-emitted (not via gen_func) so it never
+    // probes itself.
+    //
+    // How far the stack is committed is the RUNNING THREAD's: fs:[0], the
+    // first word of its thread block (CausticOS abi.THREAD_BLOCK_*). It was a
+    // single global, the first thread's — so the first call any other thread
+    // made compared its own stack against the first one's and ended the
+    // process trying to commit the space in between.
+    if (tgt.target_get().object_format == 3 && tgt.cse_stack_dynamic_get() == 1 && func.is_naked == 0) {
+        let is i32 as descent with mut = (1 + push_count) * 8 + total;
+        if (eo.fp_omit == 1) { descent = push_count * 8 + total; }
+        let is i64 as pid2 = cast(i64, sa_probe_counter);
+        sa_probe_counter = sa_probe_counter + 1;
+        eo.out_cstr("  lea rax, [rsp-");
+        eo.out_int(cast(i64, descent) + cast(i64, SA_PROBE_MARGIN));
+        eo.out_cstr("]\n");
+        eo.out_cstr("  cmp rax, QWORD PTR fs:[0]\n");
+        eo.out_cstr("  jae .Lsk");
+        eo.out_int(pid2);
+        eo.out_cstr("\n");
+        eo.out_cstr("  call __caustic_stkgrow\n");
+        eo.out_cstr(".Lsk");
+        eo.out_int(pid2);
+        eo.out_cstr(":\n");
+    }
+
+    // Prologue — skipped entirely for `with naked` functions (asm-only body
+    // takes full control of the stack; e.g. clone trampolines / ABI shims).
+    if (func.is_naked == 0 && eo.fp_omit == 1) {
+        // No frame pointer: the CFA stays rsp-based and moves with each push.
+        let is i32 as k with mut = 0;
+        if (mask & 1) { k = k + 1; eo.out_line("push rbx"); _cfi_push("rbx", k); }
+        if (mask & 2) { k = k + 1; eo.out_line("push r12"); _cfi_push("r12", k); }
+        if (mask & 4) { k = k + 1; eo.out_line("push r13"); _cfi_push("r13", k); }
+        if (mask & 8) { k = k + 1; eo.out_line("push r14"); _cfi_push("r14", k); }
+        if (mask & 16) { k = k + 1; eo.out_line("push r15"); _cfi_push("r15", k); }
+    }
+    if (func.is_naked == 0) {
+    if (eo.fp_omit == 0) {
+    eo.out_line("push rbp");
+    eo.out_line(".cfi_def_cfa_offset 16");
+    eo.out_line(".cfi_offset rbp, -16");
+    eo.out_line("mov rbp, rsp");
+    eo.out_line(".cfi_def_cfa_register rbp");
+    if (mask & 1) { eo.out_line("push rbx"); eo.out_line(".cfi_offset rbx, -24"); }
+    if (mask & 2) { eo.out_line("push r12"); eo.out_line(".cfi_offset r12, -32"); }
+    if (mask & 4) { eo.out_line("push r13"); eo.out_line(".cfi_offset r13, -40"); }
+    if (mask & 8) { eo.out_line("push r14"); eo.out_line(".cfi_offset r14, -48"); }
+    if (mask & 16) { eo.out_line("push r15"); eo.out_line(".cfi_offset r15, -56"); }
+    }
+    if (ctx.aligned_stack_size > 0) {
+        // Windows: frames ≥ 4 KiB must probe guard pages before allocating,
+        // or the kernel refuses to commit the stack and raises a fault on
+        // the first store past the current commit limit. We call into
+        // __caustic_chkstk (emitted once by the PE linker) which touches
+        // each 4 KiB page descending from rsp, then we do the actual
+        // `sub rsp, rax`. Linux and small Windows frames keep the simple
+        // single-instruction prologue.
+        if (tgt.target_get().object_format == 2 && ctx.aligned_stack_size >= 4096) {
+            eo.out_str("  mov rax, ", 11);
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
+            eo.out_line("call __caustic_chkstk");
+            eo.out_line("sub rsp, rax");
+        } else {
+            eo.out_str("  sub rsp, ", 11);
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
+        }
+        if (eo.fp_omit == 1) { _cfa_framed(push_count); }
+    }
+
+    // Variadic prologue: save 6 arg registers to register save area
+    if (func.is_variadic == 1) {
+        // va_save_offset = total offset from rbp to start of 48-byte save area
+        // Layout: [rbp - va_save_offset] = rdi (first), ..., [rbp - va_save_offset + 40] = r9 (last)
+        let is i32 as vso = local_size + spill_size + alloc_size + 48;
+        ctx.va_save_offset = vso;
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso)); eo.out_str("], rdi\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 8)); eo.out_str("], rsi\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 16)); eo.out_str("], rdx\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 24)); eo.out_str("], rcx\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 32)); eo.out_str("], r8\n", 6);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 40)); eo.out_str("], r9\n", 6);
+    }
+    }
+
+}
+
+// -O2: an address `a = b + c` (c a vreg or a constant) read by a single load
+// or store further down its block moves to just before that access, where
+// try_addr_add folds it into the access's addressing ([b + c], [b + 16])
+// instead of computing it into a register of its own. It does not move past
+// a label, a branch, a call or argument set-up, a write of b or c, or more
+// than 32 instructions. A store of a constant keeps its IMM right before it.
+fn _as_barrier(op as i32) as i32 {
+    if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET
+        || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+        || op == d.IR_SET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_ASM || op == d.IR_VA_START
+        || op == d.IR_SET_CTX || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE
+        || op == d.IR_CMOV || op == d.IR_PHI) { return 1; }
+    return 0;
+}
+
+fn _as_reads_dest(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_CMOV || op == d.IR_ATOMIC_STORE
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) { return 1; }
+    return 0;
+}
+
+// The accesses addr_sink found for one address: each one, and the two
+// instructions the copy of the ADD goes between.
+let is [32]i64 as as_acc;
+let is [32]i64 as as_p;
+let is [32]i64 as as_q;
+
+// -O2: a cast of an integer to its own type (`CAST t = i (i32->i32)`, how a
+// narrow variable is read) is the value itself. When t is defined once and
+// read only further down its own block, before i is written again, its
+// readers read i: the allocator then never has a copy of i to coalesce (it
+// may not), and `t + 1` assigned back to i becomes one add.
+fn _idc_same(inst as *d.IRInst) as i32 {
+    if (inst.op != d.IR_CAST || inst.dest.op_type != d.OP_VREG || inst.src1.op_type != d.OP_VREG) { return 0; }
+    if (cast(i64, inst.cast_to) == 0 || cast(i64, inst.cast_from) == 0) { return 0; }
+    if (e.is_float_type(inst.cast_to) == 1 || e.is_float_type(inst.cast_from) == 1) { return 0; }
+    if (e.get_type_size(inst.cast_to) != e.get_type_size(inst.cast_from)) { return 0; }
+    if (e.is_signed_type(inst.cast_to) != e.is_signed_type(inst.cast_from)) { return 0; }
+    return 1;
+}
+
+// Does q read its operand `which` (1 src1, 2 src2) through the low 4 bytes
+// only? Such a reader leaves a narrow value free to stay unextended
+// (e.lz_init) whether it reads the cast or the variable; any other reader of
+// the cast is where the variable is extended once, which folding the cast
+// away would move to every write of the variable.
+fn _idc_low_reader(q as *d.IRInst, which as i32) as i32 {
+    let is i32 as op = q.op;
+    if (cast(i64, q.cast_to) == 0 || e.is_float_type(q.cast_to) == 1) { return 0; }
+    let is i32 as tsz = e.get_type_size(q.cast_to);
+    if (op == d.IR_CAST) {
+        if (which != 1 || cast(i64, q.cast_from) == 0 || e.is_float_type(q.cast_from) == 1) { return 0; }
+        let is i32 as fsz = e.get_type_size(q.cast_from);
+        return cast(i32, fsz >= 1 && fsz <= 4);
+    }
+    if (tsz < 1 || tsz > 4) { return 0; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { return 1; }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_NEG || op == d.IR_AND
+        || op == d.IR_OR || op == d.IR_XOR) { return 1; }
+    if (op == d.IR_SHL && which == 1) { return 1; }
+    if (op == d.IR_STORE && which == 1) { return 1; }
+    return 0;
+}
+
+fn id_cast_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as defs = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    // full[v]: something reads v whole (not through its low 4 bytes, nor
+    // through a copy), so v is extended at its writes in any case.
+    let is *u8 as full = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as i with mut = 0;
+    while (i < vc) { uses[i] = 0; defs[i] = 0; full[i] = cast(u8, 0); i = i + 1; }
+    // Loop depth of each instruction, from the backward jumps (a loop is the
+    // stretch from a label to a jump back to it), and ddep[v] the deepest of
+    // v's writes: a variable written in a loop and read whole only after it
+    // is better left unextended there and extended once by the cast.
+    let is i32 as nl = func.label_count + 1;
+    let is *i32 as lpos = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    i = 0;
+    while (i < nl) { lpos[i] = 0 - 1; i = i + 1; }
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_LABEL && it.dest.label >= 0 && it.dest.label < nl) { lpos[it.dest.label] = n; }
+        n = n + 1;
+        it = it.next;
+    }
+    let is *i32 as dep = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    i = 0;
+    while (i <= n) { dep[i] = 0; i = i + 1; }
+    let is i32 as k with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_JMP || it.op == d.IR_JZ || it.op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+            && it.dest.label >= 0 && it.dest.label < nl && lpos[it.dest.label] >= 0 && lpos[it.dest.label] <= k) {
+            dep[lpos[it.dest.label]] = dep[lpos[it.dest.label]] + 1;
+            dep[k + 1] = dep[k + 1] - 1;
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    k = 1;
+    while (k <= n) { dep[k] = dep[k] + dep[k - 1]; k = k + 1; }
+    let is *i32 as ddep = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    i = 0;
+    while (i < vc) { ddep[i] = 0; i = i + 1; }
+    k = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if ((it.op == d.IR_ASM && d.is_stack_adjust(it) == 0) || it.op == d.IR_PHI) {
+                d.opt_free(cast(*u8, uses)); d.opt_free(cast(*u8, defs)); d.opt_free(full);
+                d.opt_free(cast(*u8, lpos)); d.opt_free(cast(*u8, dep)); d.opt_free(cast(*u8, ddep));
+                return;
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc && _as_reads_dest(it.op) == 0
+                && dep[k] > ddep[it.dest.vreg]) { ddep[it.dest.vreg] = dep[k]; }
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc) {
+                uses[it.src1.vreg] = uses[it.src1.vreg] + 1;
+                if (it.op != d.IR_MOV && _idc_low_reader(it, 1) == 0) { full[it.src1.vreg] = cast(u8, 1); }
+            }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) {
+                uses[it.src2.vreg] = uses[it.src2.vreg] + 1;
+                if (_idc_low_reader(it, 2) == 0) { full[it.src2.vreg] = cast(u8, 1); }
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc) {
+                if (_as_reads_dest(it.op) == 1) { uses[it.dest.vreg] = uses[it.dest.vreg] + 1; full[it.dest.vreg] = cast(u8, 1); }
+                if (it.op != d.IR_STORE && it.op != d.IR_COPY) { defs[it.dest.vreg] = defs[it.dest.vreg] + 1; }
+            }
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    // raw[v]: v may hold a value from outside -- a parameter, what a C
+    // function, a call through a pointer or an atomic returns -- whose upper
+    // half nobody extended (e.sx32_init). Only the cast extends it, so a
+    // compare, or a reader that reads it whole, must keep reading the cast.
+    let is *u8 as raw = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { raw[i] = cast(u8, 0); i = i + 1; }
+    let is i32 as rchg with mut = 1;
+    while (rchg == 1) {
+        rchg = 0;
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                && raw[it.dest.vreg] == cast(u8, 0)) {
+                let is i32 as op = it.op;
+                let is i32 as r with mut = 0;
+                if ((op == d.IR_GET_ARG && e.param_canon(it) == 0) || op == d.IR_FFI_CALL
+                    || op == d.IR_CALL_INDIRECT || op == d.IR_SYSCALL
+                    || (op == d.IR_CALL && it.is_extern_call != cast(i8, 0))
+                    || (op >= d.IR_ATOMIC_LOAD && op <= d.IR_ATOMIC_CAS && op != d.IR_ATOMIC_STORE)) { r = 1; }
+                if ((op == d.IR_MOV || op == d.IR_CMOV) && it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0
+                    && it.src1.vreg < vc && raw[it.src1.vreg] == cast(u8, 1)) { r = 1; }
+                if (r == 1) { raw[it.dest.vreg] = cast(u8, 1); rchg = 1; }
+            }
+            it = it.next;
+        }
+    }
+    // argx[v]: v is a parameter in a register read only through casts to
+    // i32, which e.sx32_init extends once on entry and its casts then copy;
+    // folding one of them would leave every other one a movsxd.
+    let is *u8 as argx = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { argx[i] = cast(u8, 0); i = i + 1; }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.op == d.IR_GET_ARG && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0
+            && it.dest.vreg < vc && e.arg_place(it, it.src1.imm) < 6 && e.param_canon(it) == 0) { argx[it.dest.vreg] = cast(u8, 1); }
+        it = it.next;
+    }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc && e._is_cast_to_i32s(it) == 0) {
+                argx[it.src1.vreg] = cast(u8, 0);
+            }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) { argx[it.src2.vreg] = cast(u8, 0); }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc && it.op != d.IR_GET_ARG) {
+                argx[it.dest.vreg] = cast(u8, 0);
+            }
+        }
+        it = it.next;
+    }
+    k = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && _idc_same(it) == 1) {
+            let is i32 as t = it.dest.vreg;
+            let is i32 as src = it.src1.vreg;
+            if (t >= 0 && t < vc && src >= 0 && src < vc && t != src && defs[t] == 1 && uses[t] > 0) {
+                // every read of t ahead in the block, with src unchanged
+                let is i32 as seen with mut = 0;
+                let is i32 as ok with mut = 1;
+                let is i32 as tfull with mut = 0;
+                let is i32 as tcmp with mut = 0;
+                let is *d.IRInst as q with mut = it.next;
+                while (cast(i64, q) != 0 && seen < uses[t] && ok == 1) {
+                    if (q.is_dead == 0) {
+                        if (q.op == d.IR_LABEL) { ok = 0; }
+                        else {
+                            if (q.op >= d.IR_EQ && q.op <= d.IR_GE && ((q.src1.op_type == d.OP_VREG && q.src1.vreg == t)
+                                || (q.src2.op_type == d.OP_VREG && q.src2.vreg == t))) { tcmp = 1; }
+                            if (q.src1.op_type == d.OP_VREG && q.src1.vreg == t) {
+                                seen = seen + 1;
+                                if (q.op == d.IR_MOV || _idc_low_reader(q, 1) == 0) { tfull = 1; }
+                            }
+                            if (q.src2.op_type == d.OP_VREG && q.src2.vreg == t) {
+                                seen = seen + 1;
+                                if (_idc_low_reader(q, 2) == 0) { tfull = 1; }
+                            }
+                            if (q.dest.op_type == d.OP_VREG && q.dest.vreg == t && _as_reads_dest(q.op) == 1) { seen = seen + 1; tfull = 1; }
+                            if (seen < uses[t]) {
+                                if (q.dest.op_type == d.OP_VREG && q.dest.vreg == src && q.op != d.IR_STORE && q.op != d.IR_COPY) { ok = 0; }
+                                if (q.op == d.IR_JMP || q.op == d.IR_JZ || q.op == d.IR_JNZ || q.op == d.IR_RET) { ok = 0; }
+                            }
+                        }
+                    }
+                    q = q.next;
+                }
+                if (tfull == 1 && full[src] == cast(u8, 0) && dep[k] < ddep[src]) { ok = 0; }
+                if (raw[src] == cast(u8, 1) && (tfull == 1 || tcmp == 1)) { ok = 0; }
+                if (argx[src] == cast(u8, 1)) { ok = 0; }
+                if (ok == 1 && seen == uses[t]) {
+                    if (tfull == 1) { full[src] = cast(u8, 1); }
+                    let is *d.IRInst as r with mut = it.next;
+                    let is i32 as done with mut = 0;
+                    while (cast(i64, r) != 0 && done < seen) {
+                        if (r.is_dead == 0) {
+                            if (r.src1.op_type == d.OP_VREG && r.src1.vreg == t) {
+                                r.src1.vreg = src; done = done + 1;
+                                // A copy keeps the cast's types: its dest still
+                                // reads as a value of the narrow type (e._lz_def_mask).
+                                if (r.op == d.IR_MOV && r.is_extern_call == cast(i8, 0) && r.dest.op_type == d.OP_VREG
+                                    && cast(i64, r.cast_to) == 0 && cast(i64, r.cast_from) == 0) {
+                                    r.cast_to = it.cast_to; r.cast_from = it.cast_from;
+                                }
+                            }
+                            if (r.src2.op_type == d.OP_VREG && r.src2.vreg == t) { r.src2.vreg = src; done = done + 1; }
+                            if (r.dest.op_type == d.OP_VREG && r.dest.vreg == t && _as_reads_dest(r.op) == 1) { r.dest.vreg = src; done = done + 1; }
+                        }
+                        r = r.next;
+                    }
+                    uses[src] = uses[src] + seen - 1;
+                    uses[t] = 0;
+                    defs[t] = 0;
+                    it.is_dead = 1;
+                }
+            }
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    d.opt_free(cast(*u8, uses));
+    d.opt_free(cast(*u8, defs));
+    d.opt_free(full);
+    d.opt_free(cast(*u8, lpos));
+    d.opt_free(cast(*u8, dep));
+    d.opt_free(cast(*u8, ddep));
+    d.opt_free(raw);
+    d.opt_free(argx);
+}
+
+// -O2: SET_CTX puts a call's context in r10 (0, or where a struct result
+// goes) for the callee to read on entry (std/string.cst getbeforevalue). In a
+// function left with no call and no inline asm, nothing reads it: the ones
+// before calls that were inlined are dropped, and with them the r10 clobber
+// the allocator keeps values away from.
+fn drop_set_ctx(func as *d.IRFunction) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    let is i32 as nctx with mut = 0;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL || op == d.IR_ASM) { return; }
+            if (op == d.IR_SET_CTX) { nctx = nctx + 1; }
+        }
+        it = it.next;
+    }
+    if (nctx == 0) { return; }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.op == d.IR_SET_CTX) { it.is_dead = 1; }
+        it = it.next;
+    }
+}
+
+// === The constant of an index, in the address ===
+//
+// -O2, right before registers are allocated. In
+//
+//     k = x + c ; a = LEA8 b, k           ->     a = LEA8 b, x, c * 8
+//
+// k read only by the LEA, x not written from k to the LEA, nothing joining in
+// between: the access reads [b + x * 8 + c * 8], and k needs no register and
+// no instruction. An i32 k only when it cannot wrap (nowrap.cst): its sign
+// extension is then the 64-bit sum. The displacement rides in the imm of the
+// LEA's second operand; nothing after this reads a LEA as a pass would.
+fn lea_disp_fold(func as *d.IRFunction) as i32 {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return 0; }
+    let is *i64 as last = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { *cast(*i64, cast(i64, last) + cast(i64, i) * 8) = 0; i = i + 1; }
+    let is i32 as changed with mut = 0;
+    let is *d.IRInst as run with mut = func.instructions;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { run = it; }
+            let is i32 as sc with mut = 0;
+            if (op == d.IR_LEA2) { sc = 2; } else if (op == d.IR_LEA4) { sc = 4; } else if (op == d.IR_LEA8) { sc = 8; }
+            // (whatever an operand's imm held before it became a vreg)
+            if (sc != 0 && it.src2.op_type == d.OP_VREG) { it.src2.imm = 0; }
+            if (sc != 0 && it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc
+                && it.src1.op_type == d.OP_VREG && e.isel_get_uses(it.src2.vreg) == 1) {
+                let is *d.IRInst as k with mut = cast(*d.IRInst, *cast(*i64, cast(i64, last) + cast(i64, it.src2.vreg) * 8));
+                let is *d.IRInst as cst with mut = cast(*d.IRInst, 0);
+                if (cast(i64, k) != 0 && k.op == d.IR_CAST && k.src1.op_type == d.OP_VREG
+                    && k.src1.vreg >= 0 && k.src1.vreg < vc && e.isel_get_uses(k.src1.vreg) == 1
+                    && cast(i64, k.cast_to) != 0 && e.get_type_size(k.cast_to) == 8
+                    && cast(i64, k.cast_from) != 0 && e.get_type_size(k.cast_from) >= 4
+                    && e.is_float_type(k.cast_from) == 0) {
+                    cst = k;
+                    k = cast(*d.IRInst, *cast(*i64, cast(i64, last) + cast(i64, k.src1.vreg) * 8));
+                    // the cast reads it as the width it was computed in
+                    if (cast(i64, k) != 0 && cast(i64, k.cast_to) != 0
+                        && e.get_type_size(k.cast_to) != e.get_type_size(cst.cast_from)) { k = cast(*d.IRInst, 0); }
+                }
+                if (cast(i64, k) != 0 && (k.op == d.IR_ADD || k.op == d.IR_SUB)
+                    && k.src1.op_type == d.OP_VREG && k.src2.op_type == d.OP_IMM
+                    && k.src1.vreg >= 0 && k.src1.vreg < vc) {
+                    let is i32 as sz with mut = 8;
+                    if (cast(i64, k.cast_to) != 0) { sz = e.get_type_size(k.cast_to); }
+                    if (sz == 8 || (sz == 4 && nw.nw_has(k) == 1)) {
+                        let is i64 as c with mut = k.src2.imm;
+                        if (k.op == d.IR_SUB) { c = 0 - c; }
+                        let is i64 as dp = it.src2.imm + c * cast(i64, sc);
+                        // x as it was at k, and k in this run of code
+                        let is i32 as x = k.src1.vreg;
+                        let is i32 as ok with mut = 0;
+                        let is i32 as passed with mut = 0;
+                        let is *d.IRInst as w with mut = run;
+                        while (cast(i64, w) != cast(i64, it)) {
+                            if (cast(i64, w) == cast(i64, k)) { ok = 1; passed = 1; }
+                            else if (passed == 1 && w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg == x
+                                     && w.op != d.IR_STORE && w.op != d.IR_COPY) { ok = 0; }
+                            w = w.next;
+                        }
+                        if (ok == 1 && dp <= 268435455 && dp >= 0 - 268435455) {
+                            it.src2 = d.op_vreg(x);
+                            it.src2.imm = dp;
+                            k.is_dead = 1;
+                            if (cast(i64, cst) != 0) { cst.is_dead = 1; }
+                            changed = 1;
+                        }
+                    }
+                }
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                && op != d.IR_STORE && op != d.IR_COPY) {
+                *cast(*i64, cast(i64, last) + cast(i64, it.dest.vreg) * 8) = cast(i64, it);
+            }
+        }
+        it = it.next;
+    }
+    d.opt_free(cast(*u8, last));
+    return changed;
+}
+
+fn addr_sink(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as defs = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { uses[i] = 0; defs[i] = 0; i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc) { uses[it.src1.vreg] = uses[it.src1.vreg] + 1; }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) { uses[it.src2.vreg] = uses[it.src2.vreg] + 1; }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc) {
+                if (_as_reads_dest(it.op) == 1) { uses[it.dest.vreg] = uses[it.dest.vreg] + 1; }
+                if (it.op != d.IR_STORE && it.op != d.IR_COPY) { defs[it.dest.vreg] = defs[it.dest.vreg] + 1; }
+            }
+            if (it.op == d.IR_PHI || (it.op == d.IR_ASM && d.is_stack_adjust(it) == 0)) {
+                d.opt_free(cast(*u8, uses)); d.opt_free(cast(*u8, defs));
+                return;
+            }
+        }
+        it = it.next;
+    }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as moved with mut = 0;
+        let is i32 as cdisp = cast(i32, it.src2.op_type == d.OP_IMM);
+        // (a scaled LEA goes the same way: [b + i * scale] in the access)
+        let is i32 as is_lea = cast(i32, it.op == d.IR_LEA2 || it.op == d.IR_LEA4 || it.op == d.IR_LEA8);
+        if (it.is_dead == 0 && (it.op == d.IR_ADD || is_lea == 1) && it.dest.op_type == d.OP_VREG && it.src1.op_type == d.OP_VREG
+            && (it.src2.op_type == d.OP_VREG
+                || (cdisp == 1 && it.src2.imm <= 2147483647 && it.src2.imm >= 0 - 2147483647))
+            && it.dest.vreg >= 0 && it.dest.vreg < vc && defs[it.dest.vreg] == 1
+            && (uses[it.dest.vreg] == 1 || (cdisp == 1 && uses[it.dest.vreg] <= 32))) {
+            let is i32 as a = it.dest.vreg;
+            let is i32 as b = it.src1.vreg;
+            let is i32 as c with mut = 0 - 1;
+            if (it.src2.op_type == d.OP_VREG) { c = it.src2.vreg; }
+            let is i32 as want = uses[a];
+            // walk to the accesses; lp = the list predecessor of w, pl / ppl
+            // the last live instruction before w and its list predecessor
+            let is *d.IRInst as w with mut = it.next;
+            let is *d.IRInst as lp with mut = it;
+            let is *d.IRInst as pl with mut = it;
+            let is *d.IRInst as ppl with mut = prev;
+            let is i32 as nf with mut = 0;
+            let is i32 as steps with mut = 0;
+            let is i32 as stop with mut = 0;
+            let is i32 as lim with mut = 32;
+            if (want > 1) { lim = 256; }
+            while (stop == 0 && nf < want && cast(i64, w) != 0 && steps < lim) {
+                let is i32 as is_acc with mut = 0;
+                if (w.is_dead == 0) {
+                    if ((w.op == d.IR_LOAD && w.src1.op_type == d.OP_VREG && w.src1.vreg == a)
+                        || (w.op == d.IR_STORE && w.dest.op_type == d.OP_VREG && w.dest.vreg == a
+                            && (w.src1.op_type != d.OP_VREG || w.src1.vreg != a))) {
+                        is_acc = 1;
+                        let is *d.IRInst as qq with mut = w;
+                        let is *d.IRInst as pp with mut = lp;
+                        // a store of a constant keeps its IMM right before it
+                        if (w.op == d.IR_STORE && pl.op == d.IR_IMM && pl.dest.op_type == d.OP_VREG
+                            && w.src1.op_type == d.OP_VREG && w.src1.vreg == pl.dest.vreg
+                            && cast(i64, pl) != cast(i64, it)) {
+                            qq = pl; pp = ppl;
+                        }
+                        as_acc[nf] = cast(i64, w);
+                        as_p[nf] = cast(i64, pp);
+                        as_q[nf] = cast(i64, qq);
+                        nf = nf + 1;
+                    } else if (_as_barrier(w.op) == 1) {
+                        stop = 1;
+                    } else if ((w.src1.op_type == d.OP_VREG && w.src1.vreg == a)
+                               || (w.src2.op_type == d.OP_VREG && w.src2.vreg == a)
+                               || (w.dest.op_type == d.OP_VREG && w.dest.vreg == a)) {
+                        stop = 1;
+                    } else if (w.dest.op_type == d.OP_VREG && _as_reads_dest(w.op) == 0
+                               && (w.dest.vreg == b || w.dest.vreg == c)) {
+                        stop = 1;
+                    }
+                    if (stop == 0) { ppl = lp; pl = w; steps = steps + 1; }
+                }
+                if (stop == 0) { lp = w; w = w.next; }
+            }
+            if (nf == want && want == 1) {
+                let is *d.IRInst as ins_p = cast(*d.IRInst, as_p[0]);
+                let is *d.IRInst as ins_q = cast(*d.IRInst, as_q[0]);
+                if (cast(i64, ins_p) != cast(i64, it) && cast(i64, ins_q) != cast(i64, it)) {
+                    if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+                    ins_p.next = it;
+                    it.next = ins_q;
+                    moved = 1;
+                }
+            } else if (nf == want && want > 1) {
+                // one copy of the ADD in front of each access
+                let is i32 as k with mut = 0;
+                while (k < nf) {
+                    let is *d.IRInst as acc = cast(*d.IRInst, as_acc[k]);
+                    let is *d.IRInst as ins_p = cast(*d.IRInst, as_p[k]);
+                    let is *d.IRInst as ins_q = cast(*d.IRInst, as_q[k]);
+                    let is i32 as nv = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as cp = d.new_inst(d.IR_ADD);
+                    cp.dest = d.op_vreg(nv);
+                    cp.src1 = it.src1;
+                    cp.src2 = it.src2;
+                    cp.line = acc.line;
+                    cp.cast_to = it.cast_to; cp.cast_from = it.cast_from;
+                    if (acc.op == d.IR_LOAD) { acc.src1.vreg = nv; } else { acc.dest.vreg = nv; }
+                    ins_p.next = cp;
+                    cp.next = ins_q;
+                    k = k + 1;
+                }
+                it.is_dead = 1;
+            }
+        }
+        if (moved == 0) { prev = it; }
+        it = nx;
+    }
+    d.opt_free(cast(*u8, uses)); d.opt_free(cast(*u8, defs));
+}
+
+fn gen_func(func as *d.IRFunction) as void {
+    d.params_canonical = 0;
+    if (d.params_canon_prog == 1 && func.addr_taken == 0 && func.is_naked == 0) { d.params_canonical = 1; }
+    // -O2 loop unrolling: runs HERE (post-optimize, pre-regalloc) — never inside
+    // optimize_func — because it reuses vregs across unrolled copies, which would
+    // make value-numbering passes (cse_local etc.) wrongly CSE identical-looking
+    // ops with different per-copy values. At codegen the register allocator is
+    // liveness-based, so reused vregs in straight-line code are handled correctly.
+    if (al.al_opt_level >= 2) {
+        // The LLVM-class vectorizer (Legal->Plan->Execute, src/ir/vec/): one transform
+        // per call, re-invoked to a fixpoint. Runs before unroll claims counted loops.
+        // an outer loop whose inner loop sums floats: four of its iterations
+        // share one inner loop (opt_uj.cst)
+        let is i32 as jcount with mut = 0;
+        while (jcount < 4 && uj.pass_unroll_jam(func) == 1) { jcount = jcount + 1; }
+        let is i32 as vcount with mut = 0;
+        while (vcount < 16 && vec2.pass_vectorize2(func) == 1) { vcount = vcount + 1; }
+        vec2.resolve_isa(func);
+        let is i32 as ucount with mut = 0;
+        while (ucount < 16 && unroll.pass_unroll(func) == 1) { ucount = ucount + 1; }
+        // two f64 stores side by side computed as one pair (opt_slp.cst)
+        let is i32 as scount with mut = 0;
+        while (scount < 64 && slp.pass_slp(func) == 1) { scount = scount + 1; }
+    }
+    // -O2, on what the vectorizer left scalar: an i32 index that provably
+    // never wraps addresses through a pointer that steps with it; a load of an
+    // address already loaded, with no store between, is a copy; values nobody
+    // reads are dropped (ir/opt_widen.cst).
+    if (al.al_opt_level >= 2) {
+        widen.pass_widen(func);
+        widen.pass_load_cse(func);
+        widen.pass_add_zero(func);
+        widen.pass_drop_unread(func);
+    }
+    // If-conversion: rewrite tiny if/else value-selects into branchless cmov.
+    // Runs here (post-optimize, pre-regalloc) so IR_CMOV is codegen-only and the
+    // interval-overlap allocator handles its tied dest automatically.
+    if (al.al_opt_level >= 2) { drop_set_ctx(func); }
+    if (al.al_opt_level >= 1) { ifc.pass_ifconv(func); }
+    if (al.al_opt_level >= 2 && ifc.ic_bool_hit == 1) { widen.pass_drop_unread(func); }
+    if (al.al_opt_level >= 2) { ifc.pass_cold_sink(func); }
+    // -O2 loop rotation: the test moves to the bottom, one branch per iteration.
+    // After the passes above, which match loops in their original shape.
+    if (al.al_opt_level >= 2) {
+        rot.pass_rotate(func);
+        rot.pass_loop_fwd(func);
+        if (rot.fwd_next_hit == 1) { widen.pass_drop_unread(func); }
+    }
+    if (al.al_opt_level >= 1) { rip_fold(func); fconst_fold(func); }
+    if (al.al_opt_level >= 2) { rol_fold(func); addr_sink(func); id_cast_fold(func); }
+    // -O2 shrink-wrapping: plan where the prologue goes (shrinkwrap.cst). The
+    // split copies it inserts must exist before the use counts below.
+    sw.sw_reset();
+    if (al.al_opt_level >= 2) {
+        sw.sw_drop_unreachable(func);
+        sw.sw_dup_exit(func);
+        sw.sw_hoist_call_use(func);
+        sw.sw_flip_branches(func);
+        fs.fs_split(func);
+        // No region: a preheader and a copied return may make one.
+        if (sw.sw_plan(func) == 0 && sw.sw_prepare(func) == 1) { sw.sw_flip_branches(func); sw.sw_plan(func); }
+    }
+    // Allocation runs at most twice: a shrink-wrap plan the allocation rejects
+    // is undone and the function allocated again without it.
+    let is *al.AllocCtx as ctx with mut = cast(*al.AllocCtx, 0);
+    let is i32 as attempt with mut = 0;
+    while (attempt < 2) {
+    // Init register cache, instruction selection use counts, and def table
+    eo.rc_init();
+    eo.peep_reset();
+    ei.cmov_left = 0;
+    if (al.al_opt_level >= 1) {
+        if (attempt == 1) { d.opt_free(cast(*u8, e.isel_uses)); d.opt_free(cast(*u8, e.isel_defs)); e.moves_to_casts(); }
+        e.isel_init(func);
+        e.isel_init_defs(func);
+        e.sx32_init(func);
+    }
+    ei.rdx_free = 0;
+    if (al.al_opt_level >= 2) { ei.rdx_free_scan(func); }
+    nw.nw_reset();
+    if (al.al_opt_level >= 2) { nw.nw_init(func); }
+    if (al.al_opt_level >= 2 && attempt == 0 && lea_disp_fold(func) == 1) {
+        d.opt_free(cast(*u8, e.isel_uses));
+        d.opt_free(cast(*u8, e.isel_defs));
+        e.isel_init(func);
+        e.isel_init_defs(func);
+        e.sx32_init(func);
+        ei.rdx_free_scan(func);
+        nw.nw_reset();
+        nw.nw_init(func);
+    }
+
+    // Build intervals and allocate registers
+    ctx = al.new_alloc_ctx();
+    ctx.func = cast(*u8, func);
+    ctx.next_spill = 1;
+
+    if (attempt == 1 && cast(i64, func.vreg_class) != 0) { d.opt_free(cast(*u8, func.vreg_class)); func.vreg_class = cast(*i32, 0); }
+    d.infer_vreg_classes(func);
+    if (al.al_opt_level >= 2) { e.casts_to_moves(func); }
+    e.f32s_init(func);
+    al.build_intervals(func, ctx);
+    if (al.al_opt_level >= 1) {
+        gc.graph_coloring_alloc_v2(func, ctx);
+    } else {
+        al.linear_scan_alloc(func, ctx);
+    }
+    if (eo.cg_quiet == 0) {
+        io.write_str(io.STDERR, "    alloc ok, vregs=");
+        io.write_int(io.STDERR, cast(i64, func.vreg_count));
+        io.write_str(io.STDERR, " spills=");
+        io.write_int(io.STDERR, cast(i64, ctx.stack_slots));
+        io.write_str(io.STDERR, "\n");
+    }
+    // The frameless part must have come out of allocation using no
+    // callee-saved register and no spill slot; otherwise undo the split and
+    // allocate again with the prologue at the entry.
+    sw.sw_check(func, ctx);
+    if (sw.sw_planned == 1 && sw.sw_active == 0) {
+        sw.sw_undo(func);
+        al.free_alloc_ctx(ctx);
+        attempt = attempt + 1;
+    } else {
+        attempt = 2;
+    }
+    }
+
+    // Count callee-saved pushes from mask bits
+    let is i32 as mask = ctx.used_callee_mask;
+    let is i32 as push_count with mut = 0;
+    if (mask & 1) { push_count = push_count + 1; }
+    if (mask & 2) { push_count = push_count + 1; }
+    if (mask & 4) { push_count = push_count + 1; }
+    if (mask & 8) { push_count = push_count + 1; }
+    if (mask & 16) { push_count = push_count + 1; }
+
+    // Frame layout, as offsets below rbp: the callee-saved pushes sit at
+    // [rbp-8 .. rbp-push_count*8], inside the 48 bytes semantic reserves at the
+    // top of every locals area (walk.cst: stack_offset starts at 48); locals
+    // follow, then spill slots (from arg_spill_base), then alloca, then the
+    // variadic save area.
+    //
+    // The locals area is only real if something live still addresses it. After
+    // mem2reg most scalar locals live in vregs and their stack STOREs are dead,
+    // yet func.stack_size still counts their slots — every function paid a
+    // `sub rsp` for memory nothing touched. When no live instruction reaches
+    // the area, it shrinks to the pushes alone and spill slots start right
+    // below them. The pushes already moved rsp past their own bytes, so only
+    // what lies beneath them is subtracted.
+    let is i32 as local_size with mut = func.stack_size;
+    let is i32 as pushed_bytes with mut = 0;
+    if (al.al_opt_level >= 1 && _frame_locals_used(func) == 0) {
+        local_size = push_count * 8;
+        pushed_bytes = local_size;
+    }
+
+    // Set arg_spill_base so spill slots don't overlap with local vars
+    ctx.arg_spill_base = local_size;
+
+    // Compute total stack size needed
+    let is i32 as spill_size = ctx.stack_slots * 8;
+    let is i32 as alloc_size = func.alloc_stack_size;
+    let is i32 as va_size with mut = 0;
+    if (func.is_variadic == 1) { va_size = 48; }
+    let is i32 as total with mut = local_size - pushed_bytes + spill_size + alloc_size + va_size;
+    // Align total to 16-byte boundary considering call(8) + push rbp(8) + pushes.
+    // The alignment only matters to a callee: a function that calls nothing and
+    // has nothing on the stack keeps rsp where the pushes left it.
+    eo.fp_omit = _frame_can_omit_fp(func);
+    let is i32 as frame_fixed with mut = 16 + push_count * 8;
+    if (eo.fp_omit == 1) { frame_fixed = 8 + push_count * 8; }
+    let is i32 as needs_frame with mut = 1;
+    if (al.al_opt_level >= 1 && total == 0 && _frame_makes_calls(func) == 0) { needs_frame = 0; }
+    if (needs_frame == 1) {
+        if (total < 8 && eo.fp_omit == 0) { total = 8; }
+        let is i32 as rem = (frame_fixed + total) % 16;
+        if (rem != 0) {
+            total = total + 16 - rem;
+        }
+    }
+    ctx.aligned_stack_size = total;
+    eo.fp_bias = cast(i64, push_count * 8 + total);
+
+    // Record this frame for the CSE stack-usage analysis while the instruction
+    // list is still live (it is freed right after gen_func). frame = return addr
+    // (8) + push rbp (8) + callee-saved pushes + the aligned sub-rsp body.
+    if (tgt.target_get().object_format == 3) {
+        if (eo.fp_omit == 1) { sa_record(func, 8 + push_count * 8 + total); }
+        else { sa_record(func, 16 + push_count * 8 + total); }
+    }
+
+    // -O2: functions start on a 16-byte boundary (the linker keeps it,
+    // g_align_funcs) and so do loop heads below, as gcc does: where a hot loop
+    // lands relative to the fetch blocks moves its speed by tens of percent.
+    let is *u8 as loop_head with mut = cast(*u8, 0);
+    let is *u8 as latch_block with mut = cast(*u8, 0);
+    if (al.al_opt_level >= 2 && func.label_count > 0) {
+        eo.out_str(".p2align 4\n", 11);
+        loop_head = _loop_heads(func);
+        if (d.ir_cpu == d.CPU_ZNVER3) { latch_block = _latch_blocks(func, loop_head, ctx); }
+    }
+
+    // Function label
+    eo.out_str(func.asm_name_ptr, func.asm_name_len);
+    eo.out_str(":\n", 2);
+    // Call Frame Information (SysV .eh_frame). Naked functions take over the
+    // stack, so they get no CFI at all. The function name follows so the
+    // assembler can key the record by symbol — DCE repacks .text, so object
+    // offsets would be stale by link time.
+    if (func.is_naked == 0) {
+        eo.out_str(".cfi_startproc ", 16);
+        eo.out_str(func.asm_name_ptr, func.asm_name_len);
+        eo.out_char(10);
+    }
+
+    let is i32 as cfa_framed with mut = 0;
+    if (sw.sw_active == 0) {
+        _emit_prologue(func, ctx, push_count, total, local_size, spill_size, alloc_size);
+        cfa_framed = 1;
+    }
+
+    // Instructions
+    let is *d.IRInst as inst with mut = func.instructions;
+    let is i32 as last_line with mut = 0;
+    let is i32 as first_line with mut = 0;
+    let is i32 as pend_done with mut = 0;
+    while (cast(i64, inst) != 0) {
+        if (inst.line > 0 && inst.line < 100000 && inst.line != last_line) {
+            // The first line is the function's declaration line (the parameter
+            // spills carry it); the first DIFFERENT line is the body, i.e. the
+            // point past which the parameters live in their stack slots. Flag it
+            // so a debugger's breakpoint on the function lands there, not in the
+            // middle of the spills.
+            if (first_line == 0) { first_line = inst.line; }
+            else if (pend_done == 0 && inst.line != first_line) {
+                eo.out_str(".dbg_prologue_end\n", 18);
+                pend_done = 1;
+            }
+            eo.out_str(".loc 1 ", 7);
+            eo.out_int(cast(i64, inst.line));
+            eo.out_str(" 0\n", 3);
+            last_line = inst.line;
+        }
+        if (sw.sw_active == 1) {
+            // Shrink-wrapped: returns outside the region are frameless, and the
+            // CFA follows the textual switches between the two kinds of block.
+            let is i32 as inr = sw.sw_step(inst);
+            ctx.sw_frameless = 1 - inr;
+            if (cast(i64, inst) == cast(i64, sw.sw_p)) {
+                // a held-back load goes out before the frame changes
+                if (cast(i64, ei.il_pending) != 0) {
+                    let is *d.IRInst as swl = ei.il_pending;
+                    ei.il_pending = cast(*d.IRInst, 0);
+                    ei.il_off = 1; gen_inst(swl, ctx); ei.il_off = 0;
+                }
+                if (inst.op == d.IR_LABEL) { eo.out_str(".p2align 4,,10\n", 15); gen_inst(inst, ctx); }
+                if (cfa_framed == 1) { _cfa_frameless(); }
+                _emit_prologue(func, ctx, push_count, total, local_size, spill_size, alloc_size);
+                cfa_framed = 1;
+                if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
+                if (inst.op != d.IR_LABEL && inst.is_dead != 1) { gen_inst(inst, ctx); }
+                inst = inst.next;
+                continue;
+            }
+            if (inr == 1 && cfa_framed == 0) {
+                _cfa_framed(push_count);
+                cfa_framed = 1;
+            } else if (inr == 0 && cfa_framed == 1) {
+                _cfa_frameless();
+                cfa_framed = 0;
+            }
+        }
+        if (inst.is_dead != 1) {
+            // A loop head. --cpu=znver3: the assembler pads it so the loop spans
+            // as few 64-byte lines as it can, once it knows the loop's length.
+            // Otherwise the plain alignment, which favours no CPU.
+            if (cast(i64, loop_head) != 0 && inst.op == d.IR_LABEL && inst.dest.label >= 0
+                && inst.dest.label < func.label_count && loop_head[inst.dest.label] == cast(u8, 1)) {
+                if (d.ir_cpu == d.CPU_ZNVER3) { eo.out_str(".loopalign\n", 11); }
+                else { eo.out_str(".p2align 4,,10\n.p2align 3\n", 26); }
+            }
+            if (cast(i64, latch_block) != 0 && inst.op == d.IR_LABEL && inst.dest.label >= 0
+                && inst.dest.label < func.label_count && latch_block[inst.dest.label] == cast(u8, 1)) {
+                eo.out_str(".p2align 4,,10\n", 15);
+            }
+            gen_inst(inst, ctx);
+        }
+        inst = inst.next;
+    }
+    if (cast(i64, loop_head) != 0) { d.opt_free(loop_head); }
+    if (cast(i64, latch_block) != 0) { d.opt_free(latch_block); }
+    ctx.sw_frameless = 0;
+    eo.fp_omit = 0;
+
+    // The function is fully emitted; its register-allocation context is now
+    // dead. Free it so codegen doesn't accumulate one ctx per function.
+    if (func.is_naked == 0) { eo.out_line(".cfi_endproc"); }
+    al.free_alloc_ctx(ctx);
+}
+
+// === Data sections ===
+
+// One string, with the immutable string globals that alias its bytes.
+fn _emit_string(s as *d.StringEntry, heads as *i64, links as *i64) as void {
+    let is i64 as ak with mut = heads[cast(i64, s.id) * 2];
+    while (ak != 0) {
+        eo.stats_add(eo.STAT_RODATA_VISITS, 1);
+        let is *d.IRGlobal as sg = cast(*d.IRGlobal, links[(ak - 1) * 2]);
+        if (sg.is_string_const == 1) {
+            eo.out_str(".globl ", 7);
+            eo.out_str(sg.name_ptr, sg.name_len);
+            eo.out_char(10);
+            eo.out_str(sg.name_ptr, sg.name_len);
+            eo.out_str(":\n", 2);
+        }
+        ak = links[(ak - 1) * 2 + 1];
+    }
+        eo.out_str(".LC", 3);
+        eo.out_int(cast(i64, s.id));
+        eo.out_str(":\n  .string \"", 13);
+        // Output string with escaping
+        let is i32 as i with mut = 0;
+        while (i < s.len) {
+            let is u8 as c = s.ptr[i];
+            if (c == 10) { eo.out_str("\\n", 2); }
+            else if (c == 9) { eo.out_str("\\t", 2); }
+            else if (c == 13) { eo.out_str("\\r", 2); }
+            else if (c == 34) { eo.out_str("\\\"", 2); }
+            else if (c == 92) { eo.out_str("\\\\", 2); }
+            else if (c < 32 || c > 126) {
+                // 3-digit octal \NNN — never \0/\NN: the assembler reads octal greedily
+                // (up to 3 digits), so a short escape would fuse with a following octal
+                // digit byte (e.g. \0 + '5' -> \05) and silently drop a byte.
+                let is i32 as cv = cast(i32, c);
+                eo.out_char(92);
+                eo.out_char(cast(u8, 48 + ((cv >> 6) & 7)));
+                eo.out_char(cast(u8, 48 + ((cv >> 3) & 7)));
+                eo.out_char(cast(u8, 48 + (cv & 7)));
+            }
+            else { eo.out_char(c); }
+            i = i + 1;
+        }
+        eo.out_str("\"\n", 2);
+}
+
+fn emit_rodata(prog as *d.IRProgram) as void {
+    if (cast(i64, prog.strings) == 0) { return; }
+    eo.out_str(".section .rodata\n", 17);
+
+    // The globals this object defines that name a string, listed per string id. It
+    // used to walk every global of the program for every string, once per module,
+    // which on a program of a few hundred modules was most of the build.
+    let is i32 as max_id with mut = 0;
+    let is *d.StringEntry as ms with mut = prog.strings;
+    while (cast(i64, ms) != 0) {
+        if (ms.id > max_id) { max_id = ms.id; }
+        ms = ms.next;
+    }
+    let is i64 as heads_size = (cast(i64, max_id) + 1) * 16;
+    let is *i64 as heads = cast(*i64, d.opt_alloc(heads_size));
+    mem.memset(cast(*u8, heads), 0, heads_size);   // [id*2] first, [id*2+1] last
+    let is i32 as nsg with mut = 0;
+    let is *d.IRGlobal as cg with mut = prog.globals;
+    while (cast(i64, cg) != 0) {
+        eo.stats_add(eo.STAT_RODATA_VISITS, 1);
+        if ((cg.is_string_init == 1 || cg.is_string_const == 1) && cg.is_reachable == 1 && _global_belongs(cg) == 1) { nsg = nsg + 1; }
+        cg = cg.next;
+    }
+    let is *i64 as links = cast(*i64, d.opt_alloc((cast(i64, nsg) + 1) * 16));   // [k*2] global, [k*2+1] next+1
+    let is i32 as ki with mut = 0;
+    cg = prog.globals;
+    while (cast(i64, cg) != 0) {
+        eo.stats_add(eo.STAT_RODATA_VISITS, 1);
+        if ((cg.is_string_init == 1 || cg.is_string_const == 1) && cg.is_reachable == 1 && _global_belongs(cg) == 1) {
+            links[ki * 2] = cast(i64, cg);
+            links[ki * 2 + 1] = 0;
+            let is i64 as sid = cg.init_value;
+            if (sid >= 0 && sid <= cast(i64, max_id)) {
+                if (heads[sid * 2] == 0) { heads[sid * 2] = cast(i64, ki) + 1; }
+                else { links[(heads[sid * 2 + 1] - 1) * 2 + 1] = cast(i64, ki) + 1; }
+                heads[sid * 2 + 1] = cast(i64, ki) + 1;
+            }
+            ki = ki + 1;
+        }
+        cg = cg.next;
+    }
+
+    if (eo.str_filter_active() == 1) {
+        // What this module's functions used, in that order, then what its globals name.
+        let is i32 as uo with mut = 0;
+        while (uo < eo.str_order_count()) {
+            let is *d.StringEntry as us = d.str_entry(eo.str_order_at(uo));
+            if (cast(i64, us) != 0) { _emit_string(us, heads, links); }
+            uo = uo + 1;
+        }
+        let is i32 as gk with mut = 0;
+        while (gk < ki) {
+            let is *d.IRGlobal as gl = cast(*d.IRGlobal, links[gk * 2]);
+            let is *d.StringEntry as gs = d.str_entry(cast(i32, gl.init_value));
+            if (gl.is_string_init == 1 && cast(i64, gs) != 0 && eo.str_is_used(gs.id) == 0) {
+                eo.str_mark(gs.id);
+                _emit_string(gs, heads, links);
+            }
+            gk = gk + 1;
+        }
+    } else {
+        let is *d.StringEntry as s with mut = prog.strings;
+        while (cast(i64, s) != 0) {
+            _emit_string(s, heads, links);
+            s = s.next;
+        }
+    }
+    d.opt_free(cast(*u8, links));
+    d.opt_free(cast(*u8, heads));
+}
+
+// Find a literal entry for the given struct field name. Returns null if
+// the caller omitted this field (it will be zero-filled).
+fn _find_lit_entry(lit as *ast.Node, name as *u8, name_len as i32) as *ast.Node {
+    let is *ast.Node as e with mut = lit.args;
+    while (cast(i64, e) != 0) {
+        if (e.name_len == name_len && d.str_eq(e.name_ptr, e.name_len, name, name_len) == 1) {
+            return e;
+        }
+        e = e.next;
+    }
+    return cast(*ast.Node, 0);
+}
+
+fn _emit_sized_int(size as i32, val as i64) as void {
+    if (size == 8) { eo.out_str("  .quad ", 8); }
+    else if (size == 4) { eo.out_str("  .long ", 8); }
+    else if (size == 2) { eo.out_str("  .short ", 9); }
+    else { eo.out_str("  .byte ", 8); }
+    eo.out_int(val);
+    eo.out_char(10);
+}
+
+// Emit a struct literal value field-by-field. Assumes the preceding
+// ".globl X\nX:\n" header was already written.
+fn _emit_struct_lit(g as *d.IRGlobal) as void {
+    let is *ast.Node as lit = cast(*ast.Node, g.struct_lit_ast);
+    let is *ast.Type as st = lit.ty;
+    if (cast(i64, st) == 0) { return; }
+    let is i32 as cur_off with mut = 0;
+    let is *ast.Node as f with mut = cast(*ast.Node, st.fields);
+    while (cast(i64, f) != 0) {
+        // Padding before this field (alignment or skipped fields).
+        if (f.var_offset > cur_off) {
+            eo.out_str("  .zero ", 8);
+            eo.out_int(cast(i64, f.var_offset - cur_off));
+            eo.out_char(10);
+            cur_off = f.var_offset;
+        }
+        let is *ast.Node as entry = _find_lit_entry(lit, f.name_ptr, f.name_len);
+        let is i32 as fsize = f.ty.size;
+        if (cast(i64, entry) == 0) {
+            // Omitted field — zero-fill.
+            eo.out_str("  .zero ", 8);
+            eo.out_int(cast(i64, fsize));
+            eo.out_char(10);
+        } else if (cast(i64, entry.expr) != 0 && entry.expr.kind == ast.NK_FN_PTR) {
+            eo.out_str("  .quad ", 8);
+            eo.out_str(entry.expr.name_ptr, entry.expr.name_len);
+            eo.out_char(10);
+        } else if (cast(i64, entry.expr) != 0 && entry.expr.kind == ast.NK_NUM) {
+            _emit_sized_int(fsize, entry.expr.val);
+        } else {
+            // Unsupported expression kind in struct literal init — emit zeros
+            // so alignment is preserved; semantic walk should have flagged this.
+            eo.out_str("  .zero ", 8);
+            eo.out_int(cast(i64, fsize));
+            eo.out_char(10);
+        }
+        cur_off = cur_off + fsize;
+        f = f.next;
+    }
+    if (cur_off < st.size) {
+        eo.out_str("  .zero ", 8);
+        eo.out_int(cast(i64, st.size - cur_off));
+        eo.out_char(10);
+    }
+}
+
+// Every global is padded to a multiple of 8 bytes, so the NEXT one starts at an
+// 8-byte boundary. caustic-as lays globals out back to back with no per-symbol
+// alignment (there is no .align directive), so one 4-byte global left every
+// global after it 4-byte aligned — and an i64, an f64 or a pointer in one of
+// those is then misaligned: two cpus touching it can tear the value across a
+// cache line, which is exactly what the scheduler's per-cpu arrays did
+// (`cpu_heartbeat_ns` sat at ...9c). 8 is the widest scalar the language has,
+// so this covers all of them; the cost is at most 7 bytes per global. The
+// padding is emitted AFTER the value, so a 4-byte initializer still occupies 4
+// bytes — only what follows moves.
+fn _emit_align8(size as i32) as void {
+    let is i32 as rem = size % 8;
+    if (rem != 0) {
+        eo.out_str("  .zero ", 8);
+        eo.out_int(cast(i64, 8 - rem));
+        eo.out_char(10);
+    }
+    return;
+}
+
+fn _emit_global_value(g as *d.IRGlobal) as void {
+    eo.out_str(".globl ", 7);
+    eo.out_str(g.name_ptr, g.name_len);
+    eo.out_char(10);
+    eo.out_str(g.name_ptr, g.name_len);
+    eo.out_str(":\n", 2);
+    if (g.is_string_init == 1) {
+        eo.out_str("  .quad .LC", 11);
+        eo.out_int(g.init_value);
+        eo.out_char(10);
+    } else if (g.is_fn_ptr_init == 1) {
+        eo.out_str("  .quad ", 8);
+        eo.out_str(g.init_fn_name_ptr, g.init_fn_name_len);
+        eo.out_char(10);
+    } else if (g.is_struct_lit_init == 1) {
+        _emit_struct_lit(g);
+    } else if (g.size == 8) {
+        eo.out_str("  .quad ", 8);
+        eo.out_int(g.init_value);
+        eo.out_char(10);
+    } else if (g.size == 4) {
+        eo.out_str("  .long ", 8);
+        eo.out_int(g.init_value);
+        eo.out_char(10);
+    } else if (g.size == 2) {
+        eo.out_str("  .short ", 9);
+        eo.out_int(g.init_value);
+        eo.out_char(10);
+    } else if (g.size == 1) {
+        eo.out_str("  .byte ", 8);
+        eo.out_int(g.init_value);
+        eo.out_char(10);
+    } else {
+        eo.out_str("  .zero ", 8);
+        eo.out_int(cast(i64, g.size));
+        eo.out_char(10);
+    }
+    _emit_align8(g.size);
+}
+
+fn emit_data(prog as *d.IRProgram) as void {
+    let is i32 as has_data with mut = 0;
+    let is i32 as has_bss with mut = 0;
+
+    // Custom sections first (globals with section attribute)
+    let is *d.IRGlobal as sg with mut = prog.globals;
+    while (cast(i64, sg) != 0) {
+        if (sg.is_reachable == 1 && sg.section_len > 0 && _global_belongs(sg) == 1) {
+            eo.out_str(".section ", 9);
+            eo.out_str(sg.section_ptr, sg.section_len);
+            eo.out_str(", \"aw\", @progbits\n", 18);
+            _emit_global_value(sg);
+        }
+        sg = sg.next;
+    }
+
+    // .data section (initialized, no custom section)
+    let is *d.IRGlobal as g with mut = prog.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_reachable == 1 && g.is_initialized == 1 && g.is_string_const == 0 && g.section_len == 0 && _global_belongs(g) == 1) {
+            if (has_data == 0) {
+                eo.out_str(".data\n", 6);
+                has_data = 1;
+            }
+            _emit_global_value(g);
+        }
+        g = g.next;
+    }
+    // .bss section (uninitialized, no custom section)
+    g = prog.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_reachable == 1 && g.is_initialized == 0 && g.section_len == 0 && _global_belongs(g) == 1) {
+            if (has_bss == 0) {
+                eo.out_str(".bss\n", 5);
+                has_bss = 1;
+            }
+            eo.out_str(".globl ", 7);
+            eo.out_str(g.name_ptr, g.name_len);
+            eo.out_char(10);
+            eo.out_str(g.name_ptr, g.name_len);
+            eo.out_str(":\n", 2);
+            eo.out_str("  .zero ", 8);
+            eo.out_int(cast(i64, g.size));
+            eo.out_char(10);
+            _emit_align8(g.size);
+        }
+        g = g.next;
+    }
+}
+
+// === codegen entry ===
+
+fn set_opt_level(level as i32) as void {
+    al.al_opt_level = level;
+    // Online peephole dedups consecutive identical `mov`s — only kicks in at
+    // -O1 because -O0 needs deterministic 1:1 IR-to-asm for debugging.
+    if (level >= 1) { eo.peep_set_enabled(1); }
+    else { eo.peep_set_enabled(0); }
+}
+
+// ============================================================
+// Worst-case stack-usage analysis (declares the CSE stack — no OS default, no
+// toolchain default). gen_func records each function's exact frame; here we walk
+// the call graph from main and take the deepest weighted path. A non-recursive
+// program gets an EXACT computed stack, derived from its own code. Recursion (a
+// cycle) or an indirect call (callee unknowable statically) is the irreducible
+// case only the author can bound — there we require --stack-size and error
+// otherwise. CSE target only.
+// ============================================================
+
+// System V entry overhead below the deepest call chain: the argv/envp/auxv block
+// the loader lays in the top page (kernel bounds it to <=1 page), the _start stub
+// frame, the SysV red zone, and 16-byte alignment slack. Traceable ABI cost.
+let is i32 as SA_ENTRY_OVERHEAD with imut = 8192;
+
+// Default reserve ceiling for a dynamic-stack program (no --stack-size given):
+// 8 MiB, the Linux RLIMIT_STACK default. The program commits up to here on
+// demand; recursing past it is a clean stack-overflow exit. --stack-size raises
+// or lowers it. MUST match the kernel's elf.STACK_DYN_CEILING.
+let is i32 as STACK_DYN_CEILING_DEFAULT with imut = 8388608;
+
+let is i32 as sa_recursion_seen with mut = 0;
+let is i32 as sa_indirect_seen with mut = 0;
+
+// Unique-label counter for dynamic-stack prologue probes. Monotonic per
+// compile (one compile per process) → deterministic labels → byte-identical
+// self-host output.
+let is i32 as sa_probe_counter with mut = 0;
+
+// Stack-probe margin (bytes): committed headroom the probe reserves below the
+// frame for __caustic_stkgrow's own call frame + register saves, so the helper
+// always runs in committed memory. Comfortably covers its 8 pushes + the
+// syscall path; the growth invariant (every caller enters >= MARGIN above the
+// committed bottom) holds by induction from _start's 128 KiB initial window.
+let is i32 as SA_PROBE_MARGIN with imut = 512;
+
+// Record frame + direct-call edges + indirect-call flag while instructions live.
+fn sa_record(func as *d.IRFunction, frame_bytes as i32) as void {
+    func.sa_frame = frame_bytes;
+    func.sa_state = 0;
+    func.sa_longest = 0;
+    func.sa_indirect = 0;
+    let is i32 as count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) { count = count + 1; }
+        if (inst.op == d.IR_CALL_INDIRECT) { func.sa_indirect = 1; }
+        inst = inst.next;
+    }
+    func.sa_edge_count = count;
+    if (count == 0) { func.sa_edges = cast(*u8, 0); return; }
+    let is *u8 as buf = d.opt_alloc(cast(i64, count) * 12);
+    let is i32 as idx with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) {
+            let is *i64 as pp = cast(*i64, cast(i64, buf) + cast(i64, idx) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, buf) + cast(i64, idx) * 12 + 8);
+            *pp = cast(i64, inst.call_name_ptr);
+            *pl = inst.call_name_len;
+            idx = idx + 1;
+        }
+        inst = inst.next;
+    }
+    func.sa_edges = buf;
+}
+
+// Resolve a callee name → IRFunction (by source or asm name). 0 if not a known
+// caustic function (builtin/inlined/extern) — a leaf that adds no caustic frame.
+fn sa_resolve(p as *d.IRProgram, name as *u8, nlen as i32) as *d.IRFunction {
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (d.str_eq(f.name_ptr, f.name_len, name, nlen) == 1) { return f; }
+        if (f.asm_name_len > 0 && d.str_eq(f.asm_name_ptr, f.asm_name_len, name, nlen) == 1) { return f; }
+        f = f.next;
+    }
+    return cast(*d.IRFunction, 0);
+}
+
+// Deepest stack from f down (longest weighted path). A back edge (state 1 on
+// re-entry) is recursion; an indirect call is unbounded — both set a *_seen flag
+// and short-circuit (the exact number is then irrelevant; the author declares).
+fn sa_longest(p as *d.IRProgram, f as *d.IRFunction) as i32 {
+    if (sa_recursion_seen == 1 || sa_indirect_seen == 1) { return 0; }
+    if (f.sa_state == 2) { return f.sa_longest; }
+    if (f.sa_state == 1) { sa_recursion_seen = 1; return 0; }
+    if (f.sa_indirect == 1) { sa_indirect_seen = 1; return 0; }
+    f.sa_state = 1;
+    let is i32 as max_child with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < f.sa_edge_count) {
+        let is *i64 as pp = cast(*i64, cast(i64, f.sa_edges) + cast(i64, i) * 12);
+        let is *i32 as pl = cast(*i32, cast(i64, f.sa_edges) + cast(i64, i) * 12 + 8);
+        let is *d.IRFunction as callee = sa_resolve(p, cast(*u8, *pp), *pl);
+        if (cast(i64, callee) != 0) {
+            let is i32 as c = sa_longest(p, callee);
+            if (c > max_child) { max_child = c; }
+        }
+        i = i + 1;
+    }
+    f.sa_longest = f.sa_frame + max_child;
+    f.sa_state = 2;
+    return f.sa_longest;
+}
+
+// The stack facts of the program: how deep main's stack goes, and whether
+// anything recurses or calls indirectly. Every emitted function is a root of
+// the second question, not main alone: one whose address is taken can run
+// with nothing in the program calling it — a thread's entry function, started
+// by the kernel — and recursion there needs a growing stack as much as
+// recursion under main does. Walked from main alone, a program whose only
+// recursion sat behind a thread entry got a fixed stack and no probes, and its
+// thread ran off the end of what was committed.
+fn sa_walk(p as *d.IRProgram) as i32 {
+    sa_recursion_seen = 0;
+    sa_indirect_seen = 0;
+    let is i32 as deepest = sa_longest(p, p.main_func);
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0 && sa_recursion_seen == 0 && sa_indirect_seen == 0) {
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) { sa_longest(p, f); }
+        f = f.next;
+    }
+    return deepest;
+}
+
+// After codegen (CSE only): set the declared stack to the computed value, honor
+// --stack-size override, or error when uncomputable and no flag was given.
+fn sa_compute(p as *d.IRProgram) as void {
+    if (cast(i64, p.main_func) == 0) { return; }   // no entry (lib / -c)
+    let is i32 as deepest = sa_walk(p);
+    let is i32 as flag = tgt.cse_stack_size_get();
+    if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
+        // Undecidable statically (recursion depth / indirect target are runtime
+        // facts). Don't refuse and don't over-commit — mark the program DYNAMIC:
+        // codegen emits prologue stack probes that grow the committed stack on
+        // demand via SYS_COMMIT (see emit_dynamic_stack_runtime + the probe in
+        // gen_func). The header stacksize becomes the reserve CEILING.
+        tgt.cse_stack_dynamic_set(1);
+        if (flag <= 0) { tgt.cse_stack_size_set(STACK_DYN_CEILING_DEFAULT); }
+        return;
+    }
+    if (flag > 0) { return; }   // explicit override wins even when computable
+    tgt.cse_stack_size_set(deepest + SA_ENTRY_OVERHEAD);
+}
+
+// Decide dynamic-ness BEFORE the codegen loop, so gen_func knows whether to
+// emit prologue probes. sa_compute (after the loop) sizes the stack, but the
+// PROBE has to be emitted during gen_func — hence this early pass. Runs after
+// the -O1 inline phase so it sees the same call graph gen_func will emit:
+// materialize each reachable function's IR (regen if freed), build its call
+// edges (sa_record), then walk every function for a cycle (recursion) or an
+// indirect call (sa_walk). Either → the program grows its stack dynamically.
+// CSE target only.
+fn sa_predetect(p as *d.IRProgram) as void {
+    if (tgt.target_get().object_format != 3) { return; }
+    if (cast(i64, p.main_func) == 0) { return; }
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
+            if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+                irp.regen_func_ir(f);
+            }
+            sa_record(f, 0);   // edges + sa_indirect; gen_func sets the real frame later
+        }
+        f = f.next;
+    }
+    sa_walk(p);
+    if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
+        tgt.cse_stack_dynamic_set(1);
+        let is i32 as flag = tgt.cse_stack_size_get();
+        if (flag <= 0) { tgt.cse_stack_size_set(STACK_DYN_CEILING_DEFAULT); }
+    }
+}
+
+// Emit the dynamic-stack runtime (CSE dynamic programs only): the grow helper.
+// Called once after all functions.
+//
+// Each thread's stack is described by its thread block, at its fs base
+// (CausticOS kernel/abi.cst, THREAD_BLOCK_*): fs:[0] is the lowest committed
+// byte, fs:[16] the bottom of the reservation. The loader writes the first
+// thread's; whoever starts another writes that one's (std thread_start). So
+// the runtime keeps no copy of the kernel's stack constants, and every thread
+// grows its own stack.
+//
+// __caustic_stkgrow(rax = lowest address the caller needs): commit from
+// page_down(rax) - 64 KiB — or the reservation's bottom, if that comes first —
+// up to the committed bottom, via SYS_COMMIT(27), and record the new bottom.
+// Leaf, preserves every GP register (it runs mid-prologue, before the caller
+// has saved its args). Needing more than the reservation holds is a stack
+// overflow: exit(134), as is a SYS_COMMIT that fails.
+//
+// The new bottom crosses the syscall in rbx. It used to cross in rdi, which
+// the kernel did not give back: the first growth recorded the bottom as
+// whatever the kernel left in rdi (12, in the run that found it), every probe
+// after that believed the whole stack committed, and the next frame past the
+// first 64 KiB of growth faulted.
+fn emit_dynamic_stack_runtime() as void {
+    if (tgt.target_get().object_format != 3) { return; }
+    if (tgt.cse_stack_dynamic_get() != 1) { return; }
+
+    eo.out_cstr(".section .text\n");
+    eo.out_cstr("__caustic_stkgrow:\n");
+    eo.out_line("push rdi");
+    eo.out_line("push rsi");
+    eo.out_line("push rdx");
+    eo.out_line("push rcx");
+    eo.out_line("push r8");
+    eo.out_line("push r9");
+    eo.out_line("push r10");
+    eo.out_line("push r11");
+    eo.out_line("push rbx");                         // holds the new bottom across the syscall
+    eo.out_line("shr rax, 12");                     // page-align the needed address down
+    eo.out_line("shl rax, 12");                     // (avoids AND with a negative immediate)
+    eo.out_cstr("  mov rcx, QWORD PTR fs:[16]\n"); // the reservation's bottom
+    eo.out_line("cmp rax, rcx");
+    eo.out_cstr("  jb .Lsg_fail\n");               // more than it holds: overflow
+    eo.out_line("sub rax, 65536");                  // grow 64 KiB ahead to amortize,
+    eo.out_line("cmp rax, rcx");
+    eo.out_cstr("  jae .Lsg_ahead\n");
+    eo.out_line("mov rax, rcx");                     // but not past the bottom
+    eo.out_cstr(".Lsg_ahead:\n");
+    eo.out_cstr("  mov rcx, QWORD PTR fs:[0]\n");  // committed so far
+    eo.out_line("cmp rax, rcx");                     // already covered? (defensive)
+    eo.out_cstr("  jae .Lsg_done\n");
+    eo.out_line("mov rbx, rax");                     // the new bottom, in a register the
+    eo.out_line("mov rdi, rax");                     // syscall ABI always preserved; rdi
+    eo.out_line("mov rsi, rcx");                     // came back as dispatch left it on
+    eo.out_line("sub rsi, rax");                     // kernels before 2026-10
+    eo.out_line("mov rdx, 3");                       // PROT_READ | PROT_WRITE
+    eo.out_line("mov rax, 27");                      // SYS_COMMIT(new bottom, old - new)
+    eo.out_line("syscall");
+    eo.out_line("test rax, rax");
+    eo.out_cstr("  jnz .Lsg_fail\n");
+    eo.out_cstr("  mov QWORD PTR fs:[0], rbx\n");
+    eo.out_cstr(".Lsg_done:\n");
+    eo.out_line("pop rbx");
+    eo.out_line("pop r11");
+    eo.out_line("pop r10");
+    eo.out_line("pop r9");
+    eo.out_line("pop r8");
+    eo.out_line("pop rcx");
+    eo.out_line("pop rdx");
+    eo.out_line("pop rsi");
+    eo.out_line("pop rdi");
+    eo.out_line("ret");
+    eo.out_cstr(".Lsg_fail:\n");
+    eo.out_line("mov rdi, 134");                     // stack-overflow exit code
+    eo.out_line("mov rax, 3");                       // SYS_PROC_EXIT
+    eo.out_line("syscall");
+}
+
+// Reserved gate for a "Phase-2 inline already done elsewhere, skip it" mode.
+// Currently always 0 (the parallel-exe driver uses g_snapshot_inline instead,
+// which inlines per-worker rather than skipping); kept as the off-switch the
+// non-snapshot whole-program path checks.
+let is i32 as g_preinlined with mut = 0;
+
+// When 1, codegen() inlines THIS module's functions per-worker from a frozen
+// snapshot: it clones each reachable module function's pristine post-frontend IR
+// (clone_insts) and inlines into the clone, reading cross-module callees from the
+// COW-shared pristine bodies. Inlining is allowed across modules (no same-module
+// restriction) yet the per-module .o stays byte-identical across -j, because a
+// module is emitted by exactly one worker and the only mutable state it touches
+// is its own functions' clones — every callee it reads is either pristine
+// (cross-module / not-yet-processed) or its own already-inlined form in fixed
+// list order. This moves the inline pass (the largest serial cost) into the
+// parallel workers while preserving cross-module inlining. Set by run_parallel_exe.
+let is i32 as g_snapshot_inline with mut = 0;
+fn set_snapshot_inline(v as i32) as void { g_snapshot_inline = v; }
+
+fn _mark_addr_taken(p as *d.IRProgram, name as *u8, len as i32) as void {
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (d.str_eq(f.asm_name_ptr, f.asm_name_len, name, len) == 1 || d.str_eq(f.name_ptr, f.name_len, name, len) == 1) {
+            f.addr_taken = 1;
+        }
+        f = f.next;
+    }
+}
+
+fn _opened_for_scan(f as *d.IRFunction) as *d.IRInst {
+    if (cast(i64, f.instructions) == 0 && f.ir_blob_count > 0) { return d.func_unpack(f); }
+    return cast(*d.IRInst, 0);
+}
+
+// Could anything but this program's own code call one of its functions? A C
+// function called from it could call back; inline asm that calls is its own
+// caller, with its own idea of a register's upper half.
+fn _outside_callers(p as *d.IRProgram) as i32 {
+    eo.stats_add(eo.STAT_OUTSIDE_CALLS, 1);
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable != 0) {
+            let is *d.IRInst as packed = _opened_for_scan(f);
+            let is *d.IRInst as i with mut = f.instructions;
+            if (cast(i64, packed) != 0) { i = packed; }
+            while (cast(i64, i) != 0) {
+                if (i.is_dead == 0) {
+                    if (i.op == d.IR_FFI_CALL || (i.op == d.IR_CALL && i.is_extern_call != cast(i8, 0))) {
+                        if (cast(i64, packed) != 0) { d.free_inst_list(packed); }
+                        return 1;
+                    }
+                    if (i.op == d.IR_FN_ADDR) { _mark_addr_taken(p, i.global_name_ptr, cast(i32, i.global_name_len)); }
+                    if (i.op == d.IR_ASM) {
+                        let is i32 as k with mut = 0;
+                        while (k + 4 <= i.asm_str_len) {
+                            if (d.str_eq(i.asm_str_ptr + cast(i64, k), 4, "call", 4) == 1) {
+                                if (cast(i64, packed) != 0) { d.free_inst_list(packed); }
+                                return 1;
+                            }
+                            k = k + 1;
+                        }
+                    }
+                }
+                i = i.next;
+            }
+            if (cast(i64, packed) != 0) { d.free_inst_list(packed); }
+        }
+        f = f.next;
+    }
+    let is *d.IRGlobal as g with mut = p.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_struct_lit_init != 0) { return 1; }
+        if (g.is_fn_ptr_init != 0) { _mark_addr_taken(p, g.init_fn_name_ptr, g.init_fn_name_len); }
+        g = g.next;
+    }
+    return 0;
+}
+
+// Whole-program facts every module's code depends on. Once per program, and in the
+// parent when emission forks: it walks all the IR, and it used to do so again for each
+// module in each worker, only to reach the same answer.
+let is *d.IRProgram as g_prepared with mut = cast(*d.IRProgram, 0);
+
+// === What a module's object depends on ===
+// An object is a function of the module's own IR and of what the inliner reads of other
+// functions: their bodies, to a bounded depth, and a few facts about them. Each function
+// gets a key folding its IR with its callees' keys, KEY_ROUNDS times, which is deeper
+// than the inliner can reach (INL_MAX_DEPTH copies, then one look at what was copied).
+// A key that misses a real dependency would reuse a stale object, so tests compare warm
+// builds with clean ones.
+let is i32 as KEY_ROUNDS with imut = 6;
+
+fn prepare_module_keys(p as *d.IRProgram) as void {
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            let is i64 as a with mut = f.ir_hash;
+            if (al.al_opt_level >= 1) {
+                a = d.hash_mix(a, opt.inline_refs_of(f));
+                a = d.hash_mix(a, opt.inline_noreturn_of(f));
+            }
+            if (d.params_canon_prog == 1) { a = d.hash_mix(a, cast(i64, f.addr_taken)); }
+            f.key_a = a;
+            f.ir_hash = a;
+        }
+        f = f.next;
+    }
+    if (al.al_opt_level == 0) { return; }     // no inlining: only its own IR counts
+    let is i32 as round with mut = 0;
+    while (round < KEY_ROUNDS) {
+        f = p.functions;
+        while (cast(i64, f) != 0) {
+            if (f.is_reachable == 1) {
+                // In any order of calls, each counted, so a key stays the same whatever
+                // the list's order; a callee's key is what it says it is.
+                let is i64 as sum with mut = 0;
+                let is i32 as k with mut = 0;
+                while (k < f.call_target_count) {
+                    let is *i64 as pp = cast(*i64, cast(i64, f.call_targets) + cast(i64, k) * 12);
+                    let is *i32 as pl = cast(*i32, cast(i64, f.call_targets) + cast(i64, k) * 12 + 8);
+                    let is *d.IRFunction as t = opt.inline_lookup(cast(*u8, *pp), *pl);
+                    if (cast(i64, t) != 0 && cast(i64, t) != cast(i64, f)) {
+                        // A body the inliner refuses is seen only by those facts.
+                        if (t.is_noinline == 0 && t.is_variadic == 0 && t.is_naked == 0 && t.is_recursive == 0
+                            && t.live_inst_count > 0 && t.live_inst_count <= 1200) {
+                            sum = sum + d.hash_mix(77, t.key_a);
+                        } else {
+                            sum = sum + d.hash_mix(78, d.hash_mix(opt.inline_refs_of(t), opt.inline_noreturn_of(t)));
+                        }
+                    }
+                    k = k + 1;
+                }
+                f.key_b = d.hash_mix(f.ir_hash, sum);
+            }
+            f = f.next;
+        }
+        f = p.functions;
+        while (cast(i64, f) != 0) { f.key_a = f.key_b; f = f.next; }
+        round = round + 1;
+    }
+}
+
+// 0 when this module's object cannot be cached.
+fn module_key(p as *d.IRProgram, prefix as *u8, plen as i32) as i64 {
+    tgt.module_prefix_set(prefix, plen);
+    let is i64 as h with mut = d.hash_bytes(prefix, cast(i64, plen));
+    h = d.hash_mix(h, cast(i64, d.params_canon_prog));
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) { h = d.hash_mix(h, f.key_a); }
+        f = f.next;
+    }
+    let is *d.IRGlobal as g with mut = p.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_reachable == 1 && _global_belongs(g) == 1) {
+            if (g.is_struct_lit_init != 0) { return 0; }
+            h = d.hash_mix(h, d.hash_bytes(g.name_ptr, cast(i64, g.name_len)));
+            h = d.hash_mix(h, cast(i64, g.size));
+            h = d.hash_mix(h, cast(i64, g.is_initialized) + cast(i64, g.is_string_init) * 2
+                              + cast(i64, g.is_string_const) * 4 + cast(i64, g.is_fn_ptr_init) * 8);
+            if (g.is_string_init == 1) {
+                let is *d.StringEntry as e = d.str_entry(cast(i32, g.init_value));
+                if (cast(i64, e) != 0) { h = d.hash_mix(h, d.hash_bytes(e.ptr, cast(i64, e.len))); }
+            } else {
+                h = d.hash_mix(h, g.init_value);
+            }
+            if (g.is_fn_ptr_init != 0) { h = d.hash_mix(h, d.hash_bytes(g.init_fn_name_ptr, cast(i64, g.init_fn_name_len))); }
+            if (g.section_len > 0) { h = d.hash_mix(h, d.hash_bytes(g.section_ptr, cast(i64, g.section_len))); }
+        }
+        g = g.next;
+    }
+    if (h == 0) { return 1; }
+    return h;
+}
+
+fn prepare_program(p as *d.IRProgram) as void {
+    if (cast(i64, g_prepared) == cast(i64, p)) { return; }
+    g_prepared = p;
+    if (g_snapshot_inline == 1 && al.al_opt_level >= 1) { opt.prepare_inline(cast(*u8, p)); }
+    d.params_canon_prog = 0;
+    if (d.params_canon_ok == 1 && al.al_opt_level >= 2 && _outside_callers(p) == 0) { d.params_canon_prog = 1; }
+}
+
+fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    eo.stats_add(eo.STAT_MODULES, 1);
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: init\n"); }
+    prepare_program(p);
+    // In module-only/batch mode, restrict inlining to the target module's own
+    // callees (cross-module callees are external here, exactly as in the warm
+    // --module-only path). This makes per-module .o emission order-independent
+    // (deterministic across -jN) and convergent with the warm per-module build.
+    if (g_snapshot_inline == 1) {
+        // Snapshot mode reads callees from frozen/pristine bodies, so cross-module
+        // inlining is safe and deterministic — no same-module restriction.
+        d.set_inline_module(cast(*u8, 0), 0);
+    } else if (tgt.module_only_get() == 1) {
+        d.set_inline_module(tgt.module_prefix_ptr_get(), tgt.module_prefix_len_get());
+    } else {
+        d.set_inline_module(cast(*u8, 0), 0);
+    }
+    // Reset the local-label base per codegen call. Whole-program calls this once
+    // (no change); module-objects calls it per module, so each module's `.L`
+    // labels start at 0 — deterministic across -jN/worker assignment and
+    // convergent with the warm --module-only output. `.L` labels are object-local.
+    ei.label_base = 0;
+    ei.isa_cache_used = 0;
+    ei.isa_label_n = 0;
+    eo.fc_reset();
+    d.opt_bins_init();
+    eo.out_init(fd);
+    // Reset per-module string filtering (active only in module-only/batch mode).
+    eo.str_filter_reset(tgt.module_only_get());
+    eo.cg_filename = filename_ptr;
+    eo.cg_filename_len = filename_len;
+
+    eo.out_str(".intel_syntax noprefix\n", 23);
+
+    // data + bss
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: data\n"); }
+    emit_data(p);
+
+    // .text
+    eo.out_str(".text\n", 6);
+    // Debug info: .file directive
+    eo.out_str(".file 1 \"", 9);
+    eo.out_str(eo.cg_filename, eo.cg_filename_len);
+    eo.out_str("\"\n", 2);
+
+    // Emit .globl for all reachable functions
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: globl\n"); }
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        // Inlining a shared-runtime body would bind its globals to a private
+        // copy in this image instead of the library's state.
+        f.is_dyn_import = _is_dyn_library(f);
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
+            eo.out_str(".globl ", 7);
+            eo.out_str(f.asm_name_ptr, f.asm_name_len);
+            eo.out_char(10);
+        }
+        f = f.next;
+    }
+
+    // Phase 2+3 per-function: inline → re-optimize (only with -O1). This is the
+    // whole-program path: regen any function freed in Phase 1, then inline every
+    // reachable function in place. Snapshot mode (g_snapshot_inline, the
+    // parallel-exe workers) instead inlines per-module inside the codegen loop
+    // below, function-by-function with save/restore, so the shared IR each callee
+    // read sees stays pristine regardless of worker/module emission order —
+    // nothing to do here for it. (g_preinlined is the reserved "already inlined,
+    // skip" off-switch, currently always 0.)
+    if (al.al_opt_level >= 1 && g_preinlined == 0 && g_snapshot_inline == 0) {
+        f = p.functions;
+        while (cast(i64, f) != 0) {
+            if (f.is_reachable == 1 && _is_dyn_extern(f) == 0 && cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+                irp.regen_func_ir(f);
+                opt.optimize_func(f);
+            }
+            f = f.next;
+        }
+        if (al.al_opt_level >= 2) {
+            // -O2 visits callees before their callers, so what gets copied
+            // into a caller already has its own calls inlined.
+            let is i32 as on with mut = 0;
+            let is **d.IRFunction as order = opt.inline_order(prog, &on);
+            let is i32 as oi with mut = 0;
+            while (oi < on) {
+                let is *d.IRFunction as of = order[oi];
+                if (_is_dyn_extern(of) == 0) { opt.optimize_inline_func(of, prog); }
+                oi = oi + 1;
+            }
+            oi = 0;
+            while (oi < on) {
+                let is *d.IRFunction as lf = order[oi];
+                if (_is_dyn_extern(lf) == 0) { opt.late_inline_func(lf, prog); }
+                oi = oi + 1;
+            }
+            d.opt_free(cast(*u8, order));
+        } else {
+            f = p.functions;
+            while (cast(i64, f) != 0) {
+                if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
+                    opt.optimize_inline_func(f, prog);
+                }
+                f = f.next;
+            }
+        }
+    }
+
+    // Decide dynamic-stack-ness before emitting any prologue (the probe lives
+    // in gen_func and needs cse_stack_dynamic set). Post-inline so the call
+    // graph matches what we're about to emit.
+    sa_predetect(p);
+
+    // Codegen per-function: regen freed functions, then codegen + free
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: funcs\n"); }
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
+            d.func_trim_opened();
+            d.func_open(f);
+            // Snapshot mode: inline THIS function now, off a clone of its pristine
+            // post-frontend IR, then restore its IRFunction fields afterwards.
+            // pass_inline reads callee bodies + sizing fields straight off the
+            // shared IRFunction records, so leaving every function pristine except
+            // the one being emitted makes the per-module .o byte-identical
+            // regardless of how many modules this process emits or in what order
+            // (cross-module inlining preserved; deterministic across -j and vs -j1).
+            let is *d.IRInst as snap_insts with mut = cast(*d.IRInst, 0);
+            let is i32 as snap_vreg with mut = 0;
+            let is i32 as snap_label with mut = 0;
+            let is i32 as snap_live with mut = 0;
+            let is i32 as snap_rec with mut = 0;
+            let is i32 as snap_stk with mut = 0;
+            let is i32 as snap_frame with mut = 0;
+            let is i32 as snap_alloca with mut = 0;
+            let is i32 as snap_asm with mut = 0;
+            let is i32 as did_snap with mut = 0;
+            if (al.al_opt_level >= 1 && g_snapshot_inline == 1 && cast(i64, f.instructions) != 0) {
+                snap_insts = f.instructions;
+                snap_vreg = f.vreg_count;
+                snap_label = f.label_count;
+                snap_live = f.live_inst_count;
+                snap_rec = f.is_recursive;
+                snap_stk = f.has_stack_ops;
+                snap_frame = f.stack_size;
+                snap_alloca = f.alloc_stack_size;
+                snap_asm = f.has_asm;
+                did_snap = 1;
+                f.instructions = d.clone_insts(snap_insts);
+                opt.optimize_inline_func(f, prog);
+                opt.late_inline_func(f, prog);
+            }
+            // Regen IR + re-optimize for functions freed after Phase 1
+            if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+                irp.regen_func_ir(f);
+                if (al.al_opt_level >= 1) {
+                    opt.optimize_func(f);
+                }
+            }
+            if (eo.cg_quiet == 0) {
+                io.write_str(io.STDERR, "  gen: ");
+                io.write_bytes(io.STDERR, f.asm_name_ptr, cast(i64, f.asm_name_len));
+                io.write_str(io.STDERR, "\n");
+            }
+            // `with section(".name")` on a function: emit the body into that
+            // section ("ax" = alloc+exec, unlike the "aw" globals get) and drop
+            // back to .text afterwards. The assembler routes the encoded bytes
+            // by line.section and the linker maps a code-bearing custom section
+            // into the executable segment.
+            if (f.fn_section_len > 0) {
+                eo.out_str(".section ", 9);
+                eo.out_str(f.fn_section_ptr, f.fn_section_len);
+                eo.out_str(", \"ax\", @progbits\n", 18);
+            }
+            if (eo.cg_prof_enabled == 1) {
+                let is i64 as t0 = eo.cg_prof_get_time_us();
+                gen_func(f);
+                eo.cg_prof_record(f.asm_name_ptr, f.asm_name_len, f.vreg_count, eo.cg_prof_get_time_us() - t0);
+            } else {
+                gen_func(f);
+            }
+            if (f.fn_section_len > 0) { eo.out_str(".text\n", 6); }
+            eo.stats_add(eo.STAT_FUNCS_EMITTED, 1);
+            if (d.ir_pack == 1) {
+                f.instructions = cast(*d.IRInst, 0);
+                d.inst_pool_reset();
+            } else {
+                d.free_func_insts(f);
+            }
+            ei.label_base = ei.label_base + f.label_count + 1;
+            // Restore the pristine record so later-emitted modules in this same
+            // process inline `f` from its un-inlined body (free_func_insts only
+            // freed the clone; snap_insts still points at the shared original).
+            if (did_snap == 1) {
+                f.instructions = snap_insts;
+                f.vreg_count = snap_vreg;
+                f.label_count = snap_label;
+                f.live_inst_count = snap_live;
+                f.is_recursive = snap_rec;
+                f.has_stack_ops = snap_stk;
+                f.stack_size = snap_frame;
+                f.alloc_stack_size = snap_alloca;
+                f.has_asm = snap_asm;
+            }
+        }
+        f = f.next;
+    }
+
+    d.func_close_opened();
+
+    // Declare the program's stack from its now-known frames (CSE target only).
+    if (tgt.target_get().object_format == 3) { sa_compute(p); }
+
+    // Dynamic-stack runtime: the committed-bottom global + grow helper the
+    // prologue probes reference (no-op unless the program was marked dynamic).
+    emit_dynamic_stack_runtime();
+
+    // The vectorizer's AVX2 test caches its answer here (IR_HASAVX2).
+    ei.emit_isa_cache();
+    eo.fc_emit_pool();
+
+    // rodata (after codegen loop so regen'd strings are included)
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: rodata\n"); }
+    p.strings = cast(*d.StringEntry, cast(i64, irp.get_string_head()));
+    emit_rodata(p);
+
+    // .cststructs + .cstsigs + .cstlocals — function signature + struct +
+    // local-variable info for PDB type info. Struct table must be populated
+    // BEFORE .cstsigs so index assignment is stable (cstsigs encodes
+    // (300, struct_idx) pairs). .cstlocals consults the same table.
+    if (tgt.target_get().object_format == 2 || tgt.debug_get() == 1) {
+        _struct_table_init();
+        _enum_table_init();
+        emit_cstsigs(p);
+        emit_cstlocals(p);
+        emit_cststructs();
+        emit_cstenums();
+    }
+
+    eo.out_flush();
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: done\n"); }
+}
+
+// === Struct collection (for .cststructs) ===
+//
+// Codegen walks all reachable function signatures, collects every struct
+// type that appears, and assigns each a 0-based index. The .cststructs
+// section emits the definition (name + fields). .cstsigs encodes struct
+// types as (kind=300, extra=struct_index) so the linker can resolve them
+// to TPI LF_STRUCTURE records.
+
+let is i32 as MAX_STRUCTS with imut = 256;
+let is *u8 as g_struct_types with mut;        // *ast.Type[MAX_STRUCTS], lazy
+let is i32 as g_struct_count with mut = 0;
+
+// Lazy: first _struct_index_of call allocates the table. _struct_table_init
+// stays callable to RESET state for a second codegen pass.
+fn _struct_table_init() as void {
+    g_struct_types = cast(*u8, 0);
+    g_struct_count = 0;
+}
+
+// Return existing index, or add and return new index.
+fn _struct_index_of(t as *ast.Type) as i32 {
+    if (cast(i64, g_struct_types) == 0) {
+        g_struct_types = d.opt_alloc(cast(i64, MAX_STRUCTS) * 8);
+    }
+    let is *i64 as arr = cast(*i64, g_struct_types);
+    let is i32 as i with mut = 0;
+    while (i < g_struct_count) {
+        let is *ast.Type as e = cast(*ast.Type, arr[i]);
+        if (e.name_len == t.name_len && cast(i64, e.fields) == cast(i64, t.fields)) {
+            let is i32 as k with mut = 0;
+            let is i32 as eq with mut = 1;
+            while (k < t.name_len) {
+                if (e.name_ptr[k] != t.name_ptr[k]) { eq = 0; k = t.name_len; }
+                k = k + 1;
+            }
+            if (eq == 1) { return i; }
+        }
+        i = i + 1;
+    }
+    if (g_struct_count >= MAX_STRUCTS) { return 0; }
+    arr[g_struct_count] = cast(i64, t);
+    let is i32 as idx = g_struct_count;
+    g_struct_count = g_struct_count + 1;
+    return idx;
+}
+
+// === Enum collection (for .cstenums) ===
+//
+// Same idea as the struct table: every enum type that appears in a signature,
+// a local or a struct field is collected by name and resolved field identity
+// and gets a 0-based index. Homonymous module types must remain distinct.
+// .cstsigs encodes an enum type as (kind=600, extra=enum_index) so the linker
+// can resolve it to a DW_TAG_enumeration_type / LF_ENUM.
+
+let is i32 as MAX_ENUMS with imut = 256;
+let is *u8 as g_enum_types with mut;         // *ast.Type[MAX_ENUMS], lazy
+let is i32 as g_enum_count with mut = 0;
+
+fn _enum_table_init() as void {
+    g_enum_types = cast(*u8, 0);
+    g_enum_count = 0;
+}
+
+fn _enum_index_of(t as *ast.Type) as i32 {
+    if (cast(i64, g_enum_types) == 0) {
+        g_enum_types = d.opt_alloc(cast(i64, MAX_ENUMS) * 8);
+    }
+    let is *i64 as arr = cast(*i64, g_enum_types);
+    let is i32 as i with mut = 0;
+    while (i < g_enum_count) {
+        let is *ast.Type as e = cast(*ast.Type, arr[i]);
+        if (e.name_len == t.name_len && cast(i64, e.fields) == cast(i64, t.fields)) {
+            let is i32 as k with mut = 0;
+            let is i32 as eq with mut = 1;
+            while (k < t.name_len) {
+                if (e.name_ptr[k] != t.name_ptr[k]) { eq = 0; k = t.name_len; }
+                k = k + 1;
+            }
+            if (eq == 1) { return i; }
+        }
+        i = i + 1;
+    }
+    if (g_enum_count >= MAX_ENUMS) { return 0; }
+    arr[g_enum_count] = cast(i64, t);
+    let is i32 as idx = g_enum_count;
+    g_enum_count = g_enum_count + 1;
+    return idx;
+}
+
+// === Type encoding for .cstsigs ===
+//
+// Each type is encoded as a (kind, extra) u32 pair. Kind values:
+//   0..16  primitive type — directly mirrors ast.TY_*
+//   100+P  pointer to primitive P (P in 0..16)
+//   200+P  array of primitive P (extra = element count)
+//   300    struct (extra = struct_index in .cststructs)
+//   400    function pointer (extra = 0)
+//   999    fallback / unknown
+//
+// Non-primitive bases (pointer-to-pointer, pointer-to-struct, array-of-struct)
+// collapse to 999 in this single-pair encoding. A future encoding can switch
+// to a per-function local type table for full recursion.
+fn _type_pair_kind(ty as *u8) as i32 {
+    if (cast(i64, ty) == 0) { return 0; }                       // void
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind >= 0 && t.kind <= 13) { return t.kind; }         // primitive 0..13
+    if (t.kind == ast.TY_PTR) {
+        let is *ast.Type as b = t.base;
+        if (cast(i64, b) != 0 && b.kind >= 0 && b.kind <= 13) {
+            return 100 + b.kind;
+        }
+        if (cast(i64, b) != 0 && b.kind == ast.TY_STRUCT) {
+            return 500;                                          // pointer-to-struct
+        }
+        return 999;
+    }
+    if (t.kind == ast.TY_ARRAY) {
+        let is *ast.Type as b = t.base;
+        if (cast(i64, b) != 0 && b.kind >= 0 && b.kind <= 13) {
+            return 200 + b.kind;
+        }
+        return 999;
+    }
+    if (t.kind == ast.TY_STRUCT) { return 300; }
+    if (t.kind == ast.TY_FN)     { return 400; }
+    if (t.kind == ast.TY_ENUM)   { return 600; }
+    return 999;
+}
+
+fn _type_pair_extra(ty as *u8) as i32 {
+    if (cast(i64, ty) == 0) { return 0; }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_ARRAY) { return t.array_len; }
+    if (t.kind == ast.TY_STRUCT) { return _struct_index_of(t); }
+    if (t.kind == ast.TY_ENUM) { return _enum_index_of(t); }
+    if (t.kind == ast.TY_PTR) {
+        let is *ast.Type as b = t.base;
+        if (cast(i64, b) != 0 && b.kind == ast.TY_STRUCT) {
+            return _struct_index_of(b);
+        }
+    }
+    return 0;
+}
+
+fn _emit_type_pair(ty as *u8) as void {
+    eo.out_str("  .long ", 8);
+    eo.out_int(cast(i64, _type_pair_kind(ty)));
+    eo.out_char(10);
+    eo.out_str("  .long ", 8);
+    eo.out_int(cast(i64, _type_pair_extra(ty)));
+    eo.out_char(10);
+}
+
+// Recursively walk an AST subtree, emitting one entry per NK_LET node.
+// Single-pass: writes asm directives directly to the output stream and
+// returns the count. The caller (emit_cstlocals) writes the count first
+// into a separate buffered pass, then re-walks to emit; the two passes
+// follow identical rules so the count and the emit always agree.
+//
+// Recursion is restricted to STATEMENT-BEARING fields (body, stmts,
+// then_b, else_b, cases, for_init, payload_args, args, next) plus
+// init_expr (block-expressions used as rvalues can contain nested lets).
+// Pure-expression fields (cond, expr, for_step, lhs, rhs) are skipped.
+// For NK_LET nodes themselves we don't recurse into init_expr a second
+// time — that would re-visit nested lets reached via the let's own
+// initializer block from the parent scope's walk.
+fn _walk_locals(n as *u8, emit as i32, out_count as *i32) as void {
+    if (cast(i64, n) == 0) { return; }
+    let is *ast.Node as nd = cast(*ast.Node, n);
+    let is i32 as is_let with mut = 0;
+    if (nd.kind == ast.NK_LET && nd.is_extern == 0 && nd.is_global == 0
+        && nd.name_len > 0 && cast(i64, nd.ty) != 0) { is_let = 1; }
+    if (is_let == 1) {
+        if (emit == 1) {
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, nd.name_len));
+            eo.out_char(10);
+            eo.out_str("  .ascii \"", 10);
+            eo.out_str(nd.name_ptr, nd.name_len);
+            eo.out_str("\"\n", 2);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, nd.var_offset));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_kind(cast(*u8, nd.ty))));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_extra(cast(*u8, nd.ty))));
+            eo.out_char(10);
+        }
+        *out_count = *out_count + 1;
+    }
+    _walk_locals(cast(*u8, nd.body), emit, out_count);
+    _walk_locals(cast(*u8, nd.stmts), emit, out_count);
+    _walk_locals(cast(*u8, nd.then_b), emit, out_count);
+    _walk_locals(cast(*u8, nd.else_b), emit, out_count);
+    _walk_locals(cast(*u8, nd.cases), emit, out_count);
+    _walk_locals(cast(*u8, nd.for_init), emit, out_count);
+    _walk_locals(cast(*u8, nd.payload_args), emit, out_count);
+    _walk_locals(cast(*u8, nd.args), emit, out_count);
+    if (is_let == 0) {
+        _walk_locals(cast(*u8, nd.init_expr), emit, out_count);
+    }
+    _walk_locals(cast(*u8, nd.next), emit, out_count);
+}
+
+// Emit .cstlocals section. Per reachable function:
+//   u32 name_len, byte[name_len] name, u32 num_locals,
+//   per local: u32 name_len, byte[name_len] name, u32 var_offset,
+//              u32 type_kind, u32 type_extra
+//
+// Locals include function parameters AND every NK_LET in the function
+// body (recursively walked). var_offset is positive; locals are accessed
+// via [rbp - var_offset] in the emitted code, so the linker emits
+// S_DEFRANGE_FRAMEPOINTER_REL with -var_offset as OffsetFP.
+fn emit_cstlocals(prog as *d.IRProgram) as void {
+    eo.out_str(".section .cstlocals\n", 20);
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            let is *ast.Node as fnd = cast(*ast.Node, f.ast_node);
+            if (cast(i64, fnd) != 0) {
+                // Count: num_params + num_lets-in-body (count-only pass).
+                let is i32 as num_params with mut = 0;
+                let is *ast.Node as pc with mut = fnd.params;
+                while (cast(i64, pc) != 0) { num_params = num_params + 1; pc = pc.next; }
+                let is i32 as num_lets with mut = 0;
+                _walk_locals(cast(*u8, fnd.body), 0, &num_lets);
+                let is i32 as total = num_params + num_lets;
+
+                eo.out_str("  .long ", 8);
+                eo.out_int(cast(i64, f.asm_name_len));
+                eo.out_char(10);
+                eo.out_str("  .ascii \"", 10);
+                eo.out_str(f.asm_name_ptr, f.asm_name_len);
+                eo.out_str("\"\n", 2);
+                eo.out_str("  .long ", 8);
+                eo.out_int(cast(i64, total));
+                eo.out_char(10);
+
+                // Params first
+                let is *ast.Node as p with mut = fnd.params;
+                while (cast(i64, p) != 0) {
+                    eo.out_str("  .long ", 8);
+                    eo.out_int(cast(i64, p.name_len));
+                    eo.out_char(10);
+                    eo.out_str("  .ascii \"", 10);
+                    eo.out_str(p.name_ptr, p.name_len);
+                    eo.out_str("\"\n", 2);
+                    eo.out_str("  .long ", 8);
+                    eo.out_int(cast(i64, p.var_offset));
+                    eo.out_char(10);
+                    eo.out_str("  .long ", 8);
+                    eo.out_int(cast(i64, _type_pair_kind(cast(*u8, p.ty))));
+                    eo.out_char(10);
+                    eo.out_str("  .long ", 8);
+                    eo.out_int(cast(i64, _type_pair_extra(cast(*u8, p.ty))));
+                    eo.out_char(10);
+                    p = p.next;
+                }
+
+                // Then lets in body (emit pass).
+                let is i32 as let_emitted with mut = 0;
+                _walk_locals(cast(*u8, fnd.body), 1, &let_emitted);
+            } else {
+                // Synthesized function (no AST node) — emit 0 locals.
+                eo.out_str("  .long ", 8);
+                eo.out_int(cast(i64, f.asm_name_len));
+                eo.out_char(10);
+                eo.out_str("  .ascii \"", 10);
+                eo.out_str(f.asm_name_ptr, f.asm_name_len);
+                eo.out_str("\"\n", 2);
+                eo.out_str("  .long 0\n", 10);
+            }
+        }
+        f = f.next;
+    }
+}
+
+// Emit .cststructs section. Each entry, in collection order:
+//   u32 name_len, byte[name_len] name,
+//   u32 size_bytes,
+//   u32 num_fields,
+//   per field: u32 name_len, byte[name_len] name, u32 offset,
+//              u32 type_kind, u32 type_extra
+fn emit_cststructs() as void {
+    if (g_struct_count == 0) { return; }
+    eo.out_str(".section .cststructs\n", 21);
+    let is *i64 as arr = cast(*i64, g_struct_types);
+    let is i32 as i with mut = 0;
+    while (i < g_struct_count) {
+        let is *ast.Type as t = cast(*ast.Type, arr[i]);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.name_len));
+        eo.out_char(10);
+        eo.out_str("  .ascii \"", 10);
+        eo.out_str(t.name_ptr, t.name_len);
+        eo.out_str("\"\n", 2);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.size));
+        eo.out_char(10);
+        // field_count on ast.Type isn't reliably populated; count the
+        // linked list ourselves.
+        let is i32 as fc with mut = 0;
+        let is *ast.Node as fcw with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, fcw) != 0) { fc = fc + 1; fcw = fcw.next; }
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, fc));
+        eo.out_char(10);
+        // fields linked list
+        let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, f) != 0) {
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, f.name_len));
+            eo.out_char(10);
+            eo.out_str("  .ascii \"", 10);
+            eo.out_str(f.name_ptr, f.name_len);
+            eo.out_str("\"\n", 2);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, f.var_offset));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_kind(cast(*u8, f.ty))));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_extra(cast(*u8, f.ty))));
+            eo.out_char(10);
+            f = f.next;
+        }
+        i = i + 1;
+    }
+}
+
+// Emit .cstenums section. Each entry, in collection order:
+//   u32 name_len, byte[name_len] name,
+//   u32 size_bytes,
+//   u32 payload_offset,          (0 = plain enum, 8 = tagged union)
+//   u32 num_variants,
+//   per variant: u32 name_len, byte[name_len] name, u32 discriminant,
+//                u32 payload_kind, u32 payload_extra
+//
+// A variant's payload is 0/0 when the variant carries no data (`Red;`).
+fn emit_cstenums() as void {
+    if (g_enum_count == 0) { return; }
+    eo.out_str(".section .cstenums\n", 20);
+    let is *i64 as arr = cast(*i64, g_enum_types);
+    let is i32 as i with mut = 0;
+    while (i < g_enum_count) {
+        let is *ast.Type as t = cast(*ast.Type, arr[i]);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.name_len));
+        eo.out_char(10);
+        eo.out_str("  .ascii \"", 10);
+        eo.out_str(t.name_ptr, t.name_len);
+        eo.out_str("\"\n", 2);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.size));
+        eo.out_char(10);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.payload_offset));
+        eo.out_char(10);
+        let is i32 as vc with mut = 0;
+        let is *ast.Node as vcw with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, vcw) != 0) { vc = vc + 1; vcw = vcw.next; }
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, vc));
+        eo.out_char(10);
+        let is *ast.Node as v with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, v) != 0) {
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, v.name_len));
+            eo.out_char(10);
+            eo.out_str("  .ascii \"", 10);
+            eo.out_str(v.name_ptr, v.name_len);
+            eo.out_str("\"\n", 2);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, v.discriminant));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_kind(cast(*u8, v.ty))));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_extra(cast(*u8, v.ty))));
+            eo.out_char(10);
+            v = v.next;
+        }
+        i = i + 1;
+    }
+}
+
+// Emit .cstsigs section. Per reachable function:
+//   u32 name_len, byte[name_len] name, u32 num_args,
+//   (u32 kind, u32 extra)[1 + num_args]   ; ret type first, then args
+//
+// Records are not padded — the linker reads byte-aligned u32s.
+fn emit_cstsigs(prog as *d.IRProgram) as void {
+    eo.out_str(".section .cstsigs\n", 18);
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, f.asm_name_len));
+            eo.out_char(10);
+            eo.out_str("  .ascii \"", 10);
+            eo.out_str(f.asm_name_ptr, f.asm_name_len);
+            eo.out_str("\"\n", 2);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, f.num_args));
+            eo.out_char(10);
+
+            // Return type then arg types — pulled from the AST FnDef node
+            // attached to this IRFunction. Missing nodes (synthesized
+            // functions) fall back to void/empty args.
+            let is *ast.Node as fnd = cast(*ast.Node, f.ast_node);
+            if (cast(i64, fnd) != 0) {
+                _emit_type_pair(cast(*u8, fnd.return_type));
+                let is *ast.Node as p with mut = fnd.params;
+                while (cast(i64, p) != 0) {
+                    _emit_type_pair(cast(*u8, p.ty));
+                    p = p.next;
+                }
+            } else {
+                _emit_type_pair(cast(*u8, 0));    // void return
+                let is i32 as ai with mut = 0;
+                while (ai < f.num_args) {
+                    _emit_type_pair(cast(*u8, 0));
+                    ai = ai + 1;
+                }
+            }
+        }
+        f = f.next;
+    }
+}
+
+fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as op = inst.op;
+    // a load held back for this instruction (ei.il_try_defer): its memory
+    // operand, or emitted here, where it would have been
+    if (cast(i64, ei.il_pending) != 0) {
+        let is *d.IRInst as ild = ei.il_pending;
+        ei.il_pending = cast(*d.IRInst, 0);
+        if (al.al_opt_level >= 1 && inst.dest.op_type == d.OP_VREG) {
+            let is i32 as idl = al.get_loc(inst.dest.vreg, ctx);
+            if (idl >= 0) { eo.rc_invalidate_reg(idl); }
+            eo.rc_invalidate_vreg(inst.dest.vreg);
+        }
+        if (ei.il_fold(inst, ild, ctx, e.lz_lazy_inst(inst)) == 1) { return; }
+        ei.il_off = 1;
+        gen_inst(ild, ctx);
+        ei.il_off = 0;
+    }
+
+    if (al.al_opt_level >= 1) {
+        // Invalidate dest register — it will be overwritten by this instruction
+        if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
+            let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
+            if (dest_loc >= 0) {
+                eo.rc_invalidate_reg(dest_loc);
+            }
+            // Also invalidate any cached entry for this vreg (it's being redefined)
+            eo.rc_invalidate_vreg(inst.dest.vreg);
+        }
+
+        // Full invalidation on calls (all caller-saved regs clobbered) and on
+        // atomics (they clobber rax/rcx/rdx and are full memory barriers).
+        if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+            || op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
+            || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) { eo.ph_invalidate(); }
+
+        // Instruction selection: try fused patterns before standard emission
+        if (op == d.IR_IMM) {
+            if (e.try_fuse_imm_store(inst, ctx) == 1) { return; }
+            if (e.try_fuse_imm_store_stack(inst, ctx) == 1) { return; }
+        }
+        if (op == d.IR_LOAD) {
+            e.try_fuse_inc_stack(inst, ctx);
+            // Note: try_fuse_inc_stack returns 0 always — load still emitted normally
+        }
+    }
+
+    if (op == d.IR_IMM || op == d.IR_MOV || op == d.IR_BITS) { ei.gen_inst_imm_mov(inst, ctx); return; }
+    if (op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { ei.gen_inst_lea(inst, ctx); return; }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV || op == d.IR_MOD || op == d.IR_NEG
+        || op == d.IR_MULHI_U64) {
+        if (e.lz_lazy_inst(inst) == 1) { e.lz_skip_narrow = 1; }
+        else if (nw.nw_has(inst) == 1) { e.nw_skip_narrow = 1; }
+        ei.gen_inst_arith(inst, ctx);
+        e.lz_skip_narrow = 0;
+        e.nw_skip_narrow = 0;
+        return;
+    }
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT) { ei.gen_inst_float(inst, ctx); return; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { ei.gen_inst_compare(inst, ctx); return; }
+    if (op == d.IR_SHL || op == d.IR_SHR || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_NOT) {
+        if (e.lz_lazy_inst(inst) == 1) { e.lz_skip_narrow = 1; }
+        ei.gen_inst_shift_bitwise(inst, ctx);
+        e.lz_skip_narrow = 0;
+        return;
+    }
+    if (op == d.IR_RET || op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { ei.gen_inst_control(inst, ctx); return; }
+    if (op == d.IR_SET_ARG || op == d.IR_GET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_SYSCALL || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_VA_START || op == d.IR_FFI_CALL) { ei.gen_inst_calls(inst, ctx); return; }
+    if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) { ei.gen_inst_atomic(inst, ctx); return; }
+    if (op == d.IR_CMOV) { ei.gen_inst_cmov(inst, ctx); return; }
+    if (op == d.IR_ROL) { ei.gen_inst_rol(inst, ctx); return; }
+    if (op == d.IR_VZERO || op == d.IR_VLOADQ || op == d.IR_VADDQ || op == d.IR_VREDUCEQ
+        || op == d.IR_VADDD || op == d.IR_VREDUCED || op == d.IR_VADDPD || op == d.IR_VREDUCEPD
+        || op == d.IR_VSTOREQ || op == d.IR_VSUBQ || op == d.IR_VSUBD || op == d.IR_VSUBPD
+        || op == d.IR_VMULPD || op == d.IR_VDIVPD
+        || op == d.IR_HASAVX2 || op == d.IR_VZERO256 || op == d.IR_VLOADQ256 || op == d.IR_VADDQ256
+        || op == d.IR_VADDD256 || op == d.IR_VADDPD256 || op == d.IR_VREDUCEQ256 || op == d.IR_VREDUCED256
+        || op == d.IR_VREDUCEPD256 || op == d.IR_VSUBQ256 || op == d.IR_VSUBD256 || op == d.IR_VSUBPD256
+        || op == d.IR_VMULPD256 || op == d.IR_VDIVPD256 || op == d.IR_VSTOREQ256
+        || op == d.IR_VSPLATPD || op == d.IR_VSPLATPD256
+        || op == d.IR_VMULQ || op == d.IR_VMULQ256
+        || op == d.IR_VSPLATB || op == d.IR_VSPLATB256 || op == d.IR_VCMPEQB || op == d.IR_VCMPEQB256
+        || op == d.IR_VSADBW || op == d.IR_VSADBW256 || op == d.IR_VPAND || op == d.IR_VPAND256
+        || op == d.IR_VOP || op == d.IR_VOPG) { ei.gen_inst_vec(inst, ctx); return; }
+    // Memory, load/store, copy, asm, cast, set_ctx
+    ei.gen_inst_memory(inst, ctx);
+}
+
+// === gen_func ===

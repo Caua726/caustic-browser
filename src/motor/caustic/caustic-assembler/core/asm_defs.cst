@@ -1,0 +1,393 @@
+use "../../std/mem.cst" as mem;
+// === Register IDs ===
+// 64-bit: 0-15
+let is i32 as REG_RAX with imut = 0;
+let is i32 as REG_RCX with imut = 1;
+let is i32 as REG_RDX with imut = 2;
+let is i32 as REG_RBX with imut = 3;
+let is i32 as REG_RSP with imut = 4;
+let is i32 as REG_RBP with imut = 5;
+let is i32 as REG_RSI with imut = 6;
+let is i32 as REG_RDI with imut = 7;
+let is i32 as REG_R8  with imut = 8;
+let is i32 as REG_R9  with imut = 9;
+let is i32 as REG_R10 with imut = 10;
+let is i32 as REG_R11 with imut = 11;
+let is i32 as REG_R12 with imut = 12;
+let is i32 as REG_R13 with imut = 13;
+let is i32 as REG_R14 with imut = 14;
+let is i32 as REG_R15 with imut = 15;
+// 32-bit: 16-31
+let is i32 as REG_EAX with imut = 16;
+let is i32 as REG_ECX with imut = 17;
+let is i32 as REG_EDX with imut = 18;
+let is i32 as REG_EBX with imut = 19;
+let is i32 as REG_ESP with imut = 20;
+let is i32 as REG_EBP with imut = 21;
+let is i32 as REG_ESI with imut = 22;
+let is i32 as REG_EDI with imut = 23;
+let is i32 as REG_R8D  with imut = 24;
+let is i32 as REG_R9D  with imut = 25;
+let is i32 as REG_R10D with imut = 26;
+let is i32 as REG_R11D with imut = 27;
+let is i32 as REG_R12D with imut = 28;
+let is i32 as REG_R13D with imut = 29;
+let is i32 as REG_R14D with imut = 30;
+let is i32 as REG_R15D with imut = 31;
+// 16-bit: 32-47
+let is i32 as REG_AX with imut = 32;
+let is i32 as REG_CX with imut = 33;
+let is i32 as REG_DX with imut = 34;
+let is i32 as REG_BX with imut = 35;
+let is i32 as REG_SP with imut = 36;
+let is i32 as REG_BP with imut = 37;
+let is i32 as REG_SI with imut = 38;
+let is i32 as REG_DI with imut = 39;
+let is i32 as REG_R8W  with imut = 40;
+let is i32 as REG_R9W  with imut = 41;
+let is i32 as REG_R10W with imut = 42;
+let is i32 as REG_R11W with imut = 43;
+let is i32 as REG_R12W with imut = 44;
+let is i32 as REG_R13W with imut = 45;
+let is i32 as REG_R14W with imut = 46;
+let is i32 as REG_R15W with imut = 47;
+// 8-bit: 48-63
+let is i32 as REG_AL  with imut = 48;
+let is i32 as REG_CL  with imut = 49;
+let is i32 as REG_DL  with imut = 50;
+let is i32 as REG_BL  with imut = 51;
+let is i32 as REG_SPL with imut = 52;
+let is i32 as REG_BPL with imut = 53;
+let is i32 as REG_SIL with imut = 54;
+let is i32 as REG_DIL with imut = 55;
+let is i32 as REG_R8B  with imut = 56;
+let is i32 as REG_R9B  with imut = 57;
+let is i32 as REG_R10B with imut = 58;
+let is i32 as REG_R11B with imut = 59;
+let is i32 as REG_R12B with imut = 60;
+let is i32 as REG_R13B with imut = 61;
+let is i32 as REG_R14B with imut = 62;
+let is i32 as REG_R15B with imut = 63;
+// XMM: 64-79
+let is i32 as REG_XMM0  with imut = 64;
+let is i32 as REG_XMM1  with imut = 65;
+let is i32 as REG_XMM2  with imut = 66;
+let is i32 as REG_XMM3  with imut = 67;
+let is i32 as REG_XMM4  with imut = 68;
+let is i32 as REG_XMM5  with imut = 69;
+let is i32 as REG_XMM6  with imut = 70;
+let is i32 as REG_XMM7  with imut = 71;
+let is i32 as REG_XMM8  with imut = 72;
+let is i32 as REG_XMM9  with imut = 73;
+let is i32 as REG_XMM10 with imut = 74;
+let is i32 as REG_XMM11 with imut = 75;
+let is i32 as REG_XMM12 with imut = 76;
+let is i32 as REG_XMM13 with imut = 77;
+let is i32 as REG_XMM14 with imut = 78;
+let is i32 as REG_XMM15 with imut = 79;
+let is i32 as REG_RIP   with imut = 99;    // only as a base: [rip+label]
+let is i32 as REG_NONE  with imut = 255;
+
+// === Instruction IDs ===
+let is i32 as INST_MOV     with imut = 1;
+let is i32 as INST_MOVSX   with imut = 2;
+let is i32 as INST_MOVSXD  with imut = 3;
+let is i32 as INST_MOVZX   with imut = 4;
+let is i32 as INST_LEA     with imut = 5;
+let is i32 as INST_ADD     with imut = 6;
+let is i32 as INST_SUB     with imut = 7;
+let is i32 as INST_IMUL    with imut = 8;
+// MUL r/m64 (F7 /4): rdx:rax = rax * operand, UNSIGNED. The signed
+// counterpart (IMUL, F7 /5) was here and this was not, so the only
+// instruction that yields the high half of an unsigned product could
+// not be assembled at all.
+let is i32 as INST_MUL     with imut = 256;
+let is i32 as INST_IDIV    with imut = 9;
+let is i32 as INST_CQO     with imut = 10;
+let is i32 as INST_NEG     with imut = 11;
+let is i32 as INST_AND     with imut = 12;
+let is i32 as INST_OR      with imut = 13;
+let is i32 as INST_XOR     with imut = 14;
+let is i32 as INST_NOT     with imut = 15;
+let is i32 as INST_SHL     with imut = 16;
+let is i32 as INST_SHR     with imut = 17;
+let is i32 as INST_SAR     with imut = 18;
+let is i32 as INST_CMP     with imut = 19;
+let is i32 as INST_TEST    with imut = 20;
+let is i32 as INST_SETE    with imut = 21;
+let is i32 as INST_SETNE   with imut = 22;
+let is i32 as INST_SETL    with imut = 23;
+let is i32 as INST_SETLE   with imut = 24;
+let is i32 as INST_SETG    with imut = 25;
+let is i32 as INST_SETGE   with imut = 26;
+let is i32 as INST_SETB    with imut = 27;
+let is i32 as INST_SETBE   with imut = 28;
+let is i32 as INST_SETA    with imut = 29;
+let is i32 as INST_SETAE   with imut = 30;
+let is i32 as INST_PUSH    with imut = 31;
+let is i32 as INST_POP     with imut = 32;
+let is i32 as INST_CALL    with imut = 33;
+let is i32 as INST_RET     with imut = 34;
+let is i32 as INST_JMP     with imut = 35;
+let is i32 as INST_JZ      with imut = 36;
+let is i32 as INST_JNZ     with imut = 37;
+let is i32 as INST_JE      with imut = 38;
+let is i32 as INST_JNE     with imut = 39;
+let is i32 as INST_JL      with imut = 40;
+let is i32 as INST_JLE     with imut = 41;
+let is i32 as INST_JG      with imut = 42;
+let is i32 as INST_JGE     with imut = 43;
+let is i32 as INST_JA      with imut = 44;
+let is i32 as INST_JAE     with imut = 45;
+let is i32 as INST_JB      with imut = 46;
+let is i32 as INST_JBE     with imut = 47;
+let is i32 as INST_SYSCALL with imut = 48;
+let is i32 as INST_CLD     with imut = 49;
+let is i32 as INST_REP     with imut = 50;
+let is i32 as INST_MOVSB   with imut = 51;
+let is i32 as INST_NOP     with imut = 52;
+let is i32 as INST_MOVQ    with imut = 53;
+let is i32 as INST_ADDSD   with imut = 54;
+let is i32 as INST_SUBSD   with imut = 55;
+let is i32 as INST_MULSD   with imut = 56;
+let is i32 as INST_DIVSD   with imut = 57;
+let is i32 as INST_XORPD   with imut = 58;
+let is i32 as INST_CVTTSD2SI with imut = 59;
+let is i32 as INST_CVTSI2SD  with imut = 60;
+let is i32 as INST_CDQ     with imut = 61;
+let is i32 as INST_DIV     with imut = 62;
+let is i32 as INST_CVTSD2SS with imut = 63;
+let is i32 as INST_CVTSS2SD with imut = 64;
+let is i32 as INST_MOVD     with imut = 65;
+let is i32 as INST_INT      with imut = 66;
+let is i32 as INST_UCOMISD  with imut = 67;
+let is i32 as INST_SQRTSD   with imut = 68;
+let is i32 as INST_MOVSD    with imut = 69;
+// Atomics (B0)
+let is i32 as INST_LOCK     with imut = 70;  // F0 prefix (standalone line, like REP)
+let is i32 as INST_XCHG     with imut = 71;  // 87 /r (MR), implicit lock with mem
+let is i32 as INST_CMPXCHG  with imut = 72;  // 0F B1 /r (MR)
+let is i32 as INST_XADD     with imut = 73;  // 0F C1 /r (MR)
+let is i32 as INST_MFENCE   with imut = 74;  // 0F AE F0
+let is i32 as INST_PAUSE    with imut = 75;  // F3 90
+let is i32 as INST_CMOVNE   with imut = 76;  // 0F 45 /r (cmovnz dest, src)
+// Packed SSE2 (128-bit) for the auto-vectorizer. Arithmetic forms are reg,reg
+// (mirror addsd, prefix F2->66); movupd/movdqu have load/store mem forms.
+let is i32 as INST_MOVUPD   with imut = 77;  // 66 0F 10 (load) / 66 0F 11 (store) — 2x f64
+let is i32 as INST_ADDPD    with imut = 78;  // 66 0F 58 /r
+let is i32 as INST_SUBPD    with imut = 79;  // 66 0F 5C /r
+let is i32 as INST_MULPD    with imut = 80;  // 66 0F 59 /r
+let is i32 as INST_DIVPD    with imut = 81;  // 66 0F 5E /r
+let is i32 as INST_MOVDQU   with imut = 82;  // F3 0F 6F (load) / F3 0F 7F (store) — 128-bit int
+let is i32 as INST_PADDD    with imut = 83;  // 66 0F FE /r — 4x i32
+let is i32 as INST_PADDQ    with imut = 84;  // 66 0F D4 /r — 2x i64
+let is i32 as INST_PXOR     with imut = 85;  // 66 0F EF /r — zero/xor xmm
+let is i32 as INST_PSRLDQ   with imut = 86;  // 66 0F 73 /3 ib — byte shift right (lane extract)
+let is i32 as INST_PSUBD    with imut = 87;  // 66 0F FA /r — 4x i32
+let is i32 as INST_PSUBQ    with imut = 88;  // 66 0F FB /r — 2x i64
+// System / interrupt control — no-operand, single-byte (kernel uses these via
+// asm("cli\n") / asm("hlt\n") / asm("sti\n") in the idle loop, panic, idt, sched).
+let is i32 as INST_CLI      with imut = 89;  // FA — clear interrupt flag
+let is i32 as INST_STI      with imut = 90;  // FB — set interrupt flag
+let is i32 as INST_HLT      with imut = 91;  // F4 — halt until next interrupt
+// IEEE unordered conditions and scalar single precision. Keep existing IDs.
+let is i32 as INST_JP       with imut = 92;
+let is i32 as INST_JNP      with imut = 93;
+let is i32 as INST_SETP     with imut = 94;
+let is i32 as INST_SETNP    with imut = 95;
+let is i32 as INST_ADDSS    with imut = 96;
+let is i32 as INST_SUBSS    with imut = 97;
+let is i32 as INST_MULSS    with imut = 98;
+let is i32 as INST_DIVSS    with imut = 99;
+let is i32 as INST_SQRTSS   with imut = 100;
+let is i32 as INST_CVTSI2SS with imut = 101;
+// The rest of the cmov family (cmovne is 76): 0F 40+cc /r, reg, reg.
+let is i32 as INST_CMOVE    with imut = 102;  // 0F 44 /r
+let is i32 as INST_CMOVL    with imut = 103;  // 0F 4C /r
+let is i32 as INST_CMOVGE   with imut = 104;  // 0F 4D /r
+let is i32 as INST_CMOVLE   with imut = 105;  // 0F 4E /r
+let is i32 as INST_CMOVG    with imut = 106;  // 0F 4F /r
+let is i32 as INST_CMOVB    with imut = 107;  // 0F 42 /r
+let is i32 as INST_CMOVAE   with imut = 108;  // 0F 43 /r
+let is i32 as INST_CMOVBE   with imut = 109;  // 0F 46 /r
+let is i32 as INST_CMOVA    with imut = 110;  // 0F 47 /r
+let is i32 as INST_MOVSS     with imut = 111;  // F3 0F 10 load / F3 0F 11 store
+let is i32 as INST_MOVAPS    with imut = 112;  // 0F 28 /r (full register copy)
+let is i32 as INST_UCOMISS   with imut = 113;  // 0F 2E /r
+let is i32 as INST_CVTTSS2SI with imut = 114;  // F3 REX.W 0F 2C /r
+let is i32 as INST_ROL       with imut = 115;  // C1 /0 ib (D1 /0, D3 /0)
+let is i32 as INST_ROR       with imut = 116;  // C1 /1 ib (D1 /1, D3 /1)
+
+fn is_cmov(id as i32) as i32 {
+    if (id == INST_CMOVNE || (id >= INST_CMOVE && id <= INST_CMOVA)) { return 1; }
+    return 0;
+}
+
+// Second opcode byte of a cmov: 0x40 + condition code.
+fn cmov_opcode(id as i32) as i32 {
+    if (id == INST_CMOVE) { return 68; }
+    if (id == INST_CMOVL) { return 76; }
+    if (id == INST_CMOVGE) { return 77; }
+    if (id == INST_CMOVLE) { return 78; }
+    if (id == INST_CMOVG) { return 79; }
+    if (id == INST_CMOVB) { return 66; }
+    if (id == INST_CMOVAE) { return 67; }
+    if (id == INST_CMOVBE) { return 70; }
+    if (id == INST_CMOVA) { return 71; }
+    return 69;   // cmovne
+}
+let is i32 as INST_NONE    with imut = 0;
+
+// === Operand kinds ===
+let is i32 as OP_NONE  with imut = 0;
+let is i32 as OP_REG   with imut = 1;
+let is i32 as OP_IMM   with imut = 2;
+let is i32 as OP_MEM   with imut = 3;
+let is i32 as OP_LABEL  with imut = 4;
+let is i32 as OP_RIP_LABEL with imut = 5;
+
+struct Operand {
+    kind as i32;
+    reg_id as i32;
+    imm as i64;
+    mem_base as i32;
+    mem_disp as i64;
+    mem_size as i32;
+    mem_index as i32;
+    mem_scale as i32;
+    label_ptr as *u8;
+    label_len as i32;
+    // Segment override for a memory operand: 0, or the prefix byte itself —
+    // SEG_FS (0x64) or SEG_GS (0x65). Long mode ignores the other four; these
+    // two are the ones with a base of their own (thread and per-cpu blocks).
+    mem_seg as i32;
+}
+
+let is i32 as SEG_FS with imut = 0x64;
+let is i32 as SEG_GS with imut = 0x65;
+
+// Reverse of lookup_instruction: map an INST_ id back to its mnemonic, for
+// diagnostics. The encoder reaches its "unknown encoding" fall-through when the
+// mnemonic IS recognized (so it has a known id) but the *operand form* is not
+// implemented by any family encoder — so naming the instruction points the user
+// straight at the offending line's opcode.
+fn inst_name(id as i32) as *u8 {
+    if (id == INST_MOV) { return "mov"; }
+    if (id == INST_MOVSX) { return "movsx"; }
+    if (id == INST_MOVSXD) { return "movsxd"; }
+    if (id == INST_MOVZX) { return "movzx"; }
+    if (id == INST_LEA) { return "lea"; }
+    if (id == INST_ADD) { return "add"; }
+    if (id == INST_SUB) { return "sub"; }
+    if (id == INST_IMUL) { return "imul"; }
+    if (id == INST_MUL) { return "mul"; }
+    if (id == INST_IDIV) { return "idiv"; }
+    if (id == INST_CQO) { return "cqo"; }
+    if (id == INST_NEG) { return "neg"; }
+    if (id == INST_AND) { return "and"; }
+    if (id == INST_OR) { return "or"; }
+    if (id == INST_XOR) { return "xor"; }
+    if (id == INST_NOT) { return "not"; }
+    if (id == INST_SHL) { return "shl"; }
+    if (id == INST_SHR) { return "shr"; }
+    if (id == INST_SAR) { return "sar"; }
+    if (id == INST_CMP) { return "cmp"; }
+    if (id == INST_TEST) { return "test"; }
+    if (id == INST_SETE) { return "sete"; }
+    if (id == INST_SETNE) { return "setne"; }
+    if (id == INST_SETL) { return "setl"; }
+    if (id == INST_SETLE) { return "setle"; }
+    if (id == INST_SETG) { return "setg"; }
+    if (id == INST_SETGE) { return "setge"; }
+    if (id == INST_SETB) { return "setb"; }
+    if (id == INST_SETBE) { return "setbe"; }
+    if (id == INST_SETA) { return "seta"; }
+    if (id == INST_SETAE) { return "setae"; }
+    if (id == INST_PUSH) { return "push"; }
+    if (id == INST_POP) { return "pop"; }
+    if (id == INST_CALL) { return "call"; }
+    if (id == INST_RET) { return "ret"; }
+    if (id == INST_JMP) { return "jmp"; }
+    if (id == INST_JZ) { return "jz"; }
+    if (id == INST_JNZ) { return "jnz"; }
+    if (id == INST_JE) { return "je"; }
+    if (id == INST_JNE) { return "jne"; }
+    if (id == INST_JL) { return "jl"; }
+    if (id == INST_JLE) { return "jle"; }
+    if (id == INST_JG) { return "jg"; }
+    if (id == INST_JGE) { return "jge"; }
+    if (id == INST_JA) { return "ja"; }
+    if (id == INST_JAE) { return "jae"; }
+    if (id == INST_JB) { return "jb"; }
+    if (id == INST_JBE) { return "jbe"; }
+    if (id == INST_SYSCALL) { return "syscall"; }
+    if (id == INST_CLD) { return "cld"; }
+    if (id == INST_REP) { return "rep"; }
+    if (id == INST_MOVSB) { return "movsb"; }
+    if (id == INST_NOP) { return "nop"; }
+    if (id == INST_MOVQ) { return "movq"; }
+    if (id == INST_ADDSD) { return "addsd"; }
+    if (id == INST_SUBSD) { return "subsd"; }
+    if (id == INST_MULSD) { return "mulsd"; }
+    if (id == INST_DIVSD) { return "divsd"; }
+    if (id == INST_XORPD) { return "xorpd"; }
+    if (id == INST_CVTTSD2SI) { return "cvttsd2si"; }
+    if (id == INST_CVTSI2SD) { return "cvtsi2sd"; }
+    if (id == INST_CDQ) { return "cdq"; }
+    if (id == INST_DIV) { return "div"; }
+    if (id == INST_CVTSD2SS) { return "cvtsd2ss"; }
+    if (id == INST_CVTSS2SD) { return "cvtss2sd"; }
+    if (id == INST_MOVD) { return "movd"; }
+    if (id == INST_INT) { return "int"; }
+    if (id == INST_UCOMISD) { return "ucomisd"; }
+    if (id == INST_SQRTSD) { return "sqrtsd"; }
+    if (id == INST_MOVSD) { return "movsd"; }
+    if (id == INST_LOCK) { return "lock"; }
+    if (id == INST_XCHG) { return "xchg"; }
+    if (id == INST_CMPXCHG) { return "cmpxchg"; }
+    if (id == INST_XADD) { return "xadd"; }
+    if (id == INST_MFENCE) { return "mfence"; }
+    if (id == INST_PAUSE) { return "pause"; }
+    if (id == INST_CMOVNE) { return "cmovne"; }
+    if (id == INST_CMOVE) { return "cmove"; }
+    if (id == INST_CMOVL) { return "cmovl"; }
+    if (id == INST_CMOVGE) { return "cmovge"; }
+    if (id == INST_CMOVLE) { return "cmovle"; }
+    if (id == INST_CMOVG) { return "cmovg"; }
+    if (id == INST_CMOVB) { return "cmovb"; }
+    if (id == INST_CMOVAE) { return "cmovae"; }
+    if (id == INST_CMOVBE) { return "cmovbe"; }
+    if (id == INST_CMOVA) { return "cmova"; }
+    if (id == INST_MOVUPD) { return "movupd"; }
+    if (id == INST_ADDPD) { return "addpd"; }
+    if (id == INST_SUBPD) { return "subpd"; }
+    if (id == INST_MULPD) { return "mulpd"; }
+    if (id == INST_DIVPD) { return "divpd"; }
+    if (id == INST_MOVDQU) { return "movdqu"; }
+    if (id == INST_PADDD) { return "paddd"; }
+    if (id == INST_PADDQ) { return "paddq"; }
+    if (id == INST_PSUBD) { return "psubd"; }
+    if (id == INST_PSUBQ) { return "psubq"; }
+    if (id == INST_PXOR) { return "pxor"; }
+    if (id == INST_PSRLDQ) { return "psrldq"; }
+    if (id == INST_CLI) { return "cli"; }
+    if (id == INST_STI) { return "sti"; }
+    if (id == INST_HLT) { return "hlt"; }
+    if (id == INST_JP) { return "jp"; }
+    if (id == INST_JNP) { return "jnp"; }
+    if (id == INST_SETP) { return "setp"; }
+    if (id == INST_SETNP) { return "setnp"; }
+    if (id == INST_ADDSS) { return "addss"; }
+    if (id == INST_SUBSS) { return "subss"; }
+    if (id == INST_MULSS) { return "mulss"; }
+    if (id == INST_DIVSS) { return "divss"; }
+    if (id == INST_SQRTSS) { return "sqrtss"; }
+    if (id == INST_CVTSI2SS) { return "cvtsi2ss"; }
+    if (id == INST_MOVSS) { return "movss"; }
+    if (id == INST_MOVAPS) { return "movaps"; }
+    if (id == INST_UCOMISS) { return "ucomiss"; }
+    if (id == INST_CVTTSS2SI) { return "cvttss2si"; }
+    if (id == INST_ROL) { return "rol"; }
+    if (id == INST_ROR) { return "ror"; }
+    return "<unknown>";
+}

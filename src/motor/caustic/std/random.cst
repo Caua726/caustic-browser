@@ -1,0 +1,225 @@
+// =======================================================
+// std/random.cst
+// Pseudo-random number generation — xoshiro256**
+// Period: 2^256 - 1. High quality, fast, non-cryptographic.
+// Seed via getrandom syscall.
+// Supports both explicit state (Rng struct) and global convenience.
+// =======================================================
+
+use "os.cst" as os;
+if (__target_is_linux + __compat_mode)   use "os/linux.cst"   as linux;
+if (__target_is_windows + __compat_mode) use "os/windows.cst" as win;
+if (__target_is_wasm + __compat_mode)    use "os/wasm.cst"    as wasm_os;
+
+// --- State ---
+
+struct Rng {
+    s0 as i64;
+    s1 as i64;
+    s2 as i64;
+    s3 as i64;
+}
+
+// Global default RNG
+let is Rng as _grng with mut;
+
+// --- Internal: rotl ---
+
+fn _rotl(x as i64, k as i64) as i64 {
+    return (x << k) + ((x >> (64 - k)) & ((1 << k) - 1));
+}
+
+// --- Rng methods ---
+
+fn _entropy_fill(buf as *u8, n as i64) as i64 {
+    if (os.current() == os.OS_LINUX)   { return linux.getrandom(buf, n, 0); }
+    if (os.current() == os.OS_WINDOWS) {
+        let is i32 as status = win.BCryptGenRandom(0, buf, cast(u32, n), win.BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status == 0) { return n; }
+        return 0 - 1;
+    }
+    if (os.current() == os.OS_WASM)    { return wasm_os.getrandom(buf, n); }
+    return 0 - 1;
+}
+
+fn rng_init(r as *Rng) as void {
+    let is [32]u8 as buf;
+    let is i64 as ret = _entropy_fill(&buf, 32);
+    if (ret == 32) {
+        let is *i64 as p = cast(*i64, &buf);
+        r.s0 = p[0];
+        r.s1 = p[1];
+        r.s2 = p[2];
+        r.s3 = p[3];
+    } else {
+        r.s0 = 362436069;
+        r.s1 = 521288629;
+        r.s2 = 88675123;
+        r.s3 = 5783321;
+    }
+    // xoshiro requires at least one non-zero state word
+    if (r.s0 == 0 && r.s1 == 0 && r.s2 == 0 && r.s3 == 0) {
+        r.s0 = 362436069;
+        r.s1 = 521288629;
+        r.s2 = 88675123;
+        r.s3 = 5783321;
+    }
+}
+
+fn rng_seed(r as *Rng, a as i64, b as i64, c as i64, d as i64) as void {
+    r.s0 = a;
+    r.s1 = b;
+    r.s2 = c;
+    r.s3 = d;
+    if (a == 0 && b == 0 && c == 0 && d == 0) {
+        r.s0 = 362436069;
+        r.s1 = 521288629;
+        r.s2 = 88675123;
+        r.s3 = 5783321;
+    }
+}
+
+// xoshiro256** core
+fn rng_next(r as *Rng) as i64 {
+    let is i64 as result = _rotl(r.s1 * 5, 7) * 9;
+
+    let is i64 as t = r.s1 << 17;
+
+    r.s2 = r.s2 ^ r.s0;
+    r.s3 = r.s3 ^ r.s1;
+    r.s1 = r.s1 ^ r.s2;
+    r.s0 = r.s0 ^ r.s3;
+
+    r.s2 = r.s2 ^ t;
+    r.s3 = _rotl(r.s3, 45);
+
+    return result;
+}
+
+fn rng_next_u8(r as *Rng) as u8 {
+    return cast(u8, rng_next(r) & 255);
+}
+
+// [min, max) — rejection sampling, no modulo bias
+fn rng_range(r as *Rng, min as i64, max as i64) as i64 {
+    if (max <= min) { return min; }
+    let is i64 as span = max - min;
+
+    // Fast path: power of two
+    if ((span & (span - 1)) == 0) {
+        let is i64 as raw with mut = rng_next(r);
+        if (raw < 0) { raw = raw & 9223372036854775807; }
+        return min + (raw & (span - 1));
+    }
+
+    // Rejection sampling: reject values that cause modulo bias
+    // threshold = (2^63 / span) * span  (largest multiple of span <= 2^63)
+    let is i64 as limit = 9223372036854775807; // INT64_MAX
+    let is i64 as threshold = limit - (limit % span);
+
+    let is i64 as raw with mut = rng_next(r);
+    if (raw < 0) { raw = 0 - raw; }
+    while (raw >= threshold) {
+        raw = rng_next(r);
+        if (raw < 0) { raw = raw & 9223372036854775807; }
+    }
+    return min + (raw % span);
+}
+
+fn rng_bool(r as *Rng) as i64 {
+    if ((rng_next(r) & 1) == 1) { return 1; }
+    return 0;
+}
+
+fn rng_shuffle_i64(r as *Rng, arr as *i64, count as i64) as void {
+    let is i64 as i with mut = count - 1;
+    while (i > 0) {
+        let is i64 as j = rng_range(r, 0, i + 1);
+        let is i64 as tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+        i = i - 1;
+    }
+}
+
+fn rng_shuffle_i32(r as *Rng, arr as *i32, count as i64) as void {
+    let is i64 as i with mut = count - 1;
+    while (i > 0) {
+        let is i64 as j = rng_range(r, 0, i + 1);
+        let is i32 as tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+        i = i - 1;
+    }
+}
+
+fn rng_fill_i64(r as *Rng, arr as *i64, count as i64, min as i64, max as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        arr[i] = rng_range(r, min, max);
+        i = i + 1;
+    }
+}
+
+fn rng_fill_i32(r as *Rng, arr as *i32, count as i64, min as i32, max as i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        arr[i] = cast(i32, rng_range(r, cast(i64, min), cast(i64, max)));
+        i = i + 1;
+    }
+}
+
+// --- Global convenience functions (use _grng) ---
+
+fn seed() as void {
+    rng_init(&_grng);
+}
+
+fn seed_with(a as i64, b as i64, c as i64, d as i64) as void {
+    rng_seed(&_grng, a, b, c, d);
+}
+
+fn next_i64() as i64 {
+    return rng_next(&_grng);
+}
+
+fn next_u8() as u8 {
+    return rng_next_u8(&_grng);
+}
+
+fn range(min as i64, max as i64) as i64 {
+    return rng_range(&_grng, min, max);
+}
+
+fn range_max(max as i64) as i64 {
+    return rng_range(&_grng, 0, max);
+}
+
+fn next_bool() as i64 {
+    return rng_bool(&_grng);
+}
+
+fn shuffle_i64(arr as *i64, count as i64) as void {
+    rng_shuffle_i64(&_grng, arr, count);
+}
+
+fn shuffle_i32(arr as *i32, count as i64) as void {
+    rng_shuffle_i32(&_grng, arr, count);
+}
+
+fn fill_i64(arr as *i64, count as i64, min as i64, max as i64) as void {
+    rng_fill_i64(&_grng, arr, count, min, max);
+}
+
+fn fill_i32(arr as *i32, count as i64, min as i32, max as i32) as void {
+    rng_fill_i32(&_grng, arr, count, min, max);
+}
+
+fn fill_bytes(buf as *u8, count as i64) as void {
+    let is i64 as done with mut = 0;
+    while (done < count) {
+        let is i64 as n = _entropy_fill(cast(*u8, cast(i64, buf) + done), count - done);
+        if (n <= 0) { return; }
+        done = done + n;
+    }
+}

@@ -25,6 +25,7 @@ struct Job {
     data  as *u8;
     url   as [MAX_URL]u8;
     // A form's: copies, the page that sent it may be gone.
+    is_font as i64;
     posting as i64;
     ctype   as [MAX_TYPE]u8;
     body    as *u8;
@@ -83,6 +84,7 @@ fn _worker(arg as i64) as i64 {
             j.ok = cast(i64, net.post(f, u, cast(*u8, &j.ctype), j.body, j.body_n, cast(*u8, &j.origin), referer, &j.r) == 0);
         } else {
             j.ok = cast(i64, net.get(f, u, &j.r) == 0);
+            if (j.ok == 1 && j.is_font == 1) { net.unwrap_font(&j.r); }
         }
         sync.mutex_lock(&_lock);
         if (_done_tail == null) { _done = j; }
@@ -138,6 +140,12 @@ fn _give(j as *Job, front as i64) as void {
 
 fn get(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8, front as i64) as void {
     _give(_make(owner, era, tag, data, u), front);
+}
+
+fn get_font(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8) as void {
+    let is *Job as j = _make(owner, era, tag, data, u);
+    j.is_font = 1;
+    _give(j, 0);
 }
 
 fn post(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8, ctype as *u8, body as *u8, n as i64, origin as *u8, referer as *u8) as void {

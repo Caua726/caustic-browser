@@ -1,0 +1,1326 @@
+// std/causticos/term.cst — text-grid renderer on a CausticOS framebuffer.
+//
+// CausticOS-ONLY. Renders an 8x16 bitmap console font (font.cst, LatGrkCyr
+// with a Unicode map) the way Linux fbcon does: each glyph bit maps 1:1 to a pixel,
+// no anti-aliasing. The font carries its own spacing (blank top/bottom/side
+// rows are part of the 8x16 glyph), so we draw cells edge-to-edge and add only
+// a small screen margin (fbcon centres the grid the same way). flush() blits
+// via SYS_PRESENT. Drives rendering only — the keyboard is input.cst's job.
+//
+// Text is UTF-8. putc takes bytes as they come — a character split across two
+// writes is put together — and draws each code point in as many columns as
+// std/unicode says it takes: a combining mark folds into the character before
+// it (e + U+0301 is é) when the pair composes, a wide character takes two
+// cells. Malformed input draws U+FFFD, never bytes as Latin-1 or CP437.
+//
+//   let is gfx.Framebuffer as fb = gfx.open();
+//   let is term.Term as t = term.init(fb.base, fb.fd, fb.width, fb.height, fb.pitch, fb.bpp);
+//   term.puts(&t, "hello\n", 6);  term.flush(&t);
+use "../os/causticos.cst" as cos;
+use "font.cst" as font;
+use "../unicode/cpwidth.cst" as cpw;
+use "../unicode/compose.cst" as uc;
+
+let is i64 as GLYPH_W with imut = 8;
+let is i64 as GLYPH_H with imut = 16;
+let is i64 as PAD_X   with imut = 12;     // left/right screen margin (px)
+let is i64 as PAD_Y   with imut = 12;     // top/bottom screen margin (px)
+
+// Transient CSI parameter buffer. term.cst is statically linked into each
+// program and each program drives a single Term at a time, so one module-level
+// scratch buffer is safe: it only holds the parameters of the escape sequence
+// being parsed right now (e.g. CSI 38;2;255;100;50 m → [38,2,255,100,50]).
+let is [16]i64 as _csi_p;
+
+struct Term {
+    base   as *u8;   // backbuffer user VA
+    fd     as i64;   // surface fd (for present)
+    width  as i64;   // pixels
+    height as i64;
+    pitch  as i64;   // bytes per row
+    bpp    as i64;   // bytes per pixel
+    cols   as i64;   // usable text columns
+    rows   as i64;   // usable text rows
+    cx     as i64;   // cursor column
+    cy     as i64;   // cursor row
+    fg     as u32;
+    bg     as u32;
+    // -- appended (all i64): windowed-rendering support --
+    present_mode as i64;  // 1 = flush() presents (init, the fullscreen path);
+                          // 0 = render-only PIXELS (init_buffer: a pixel segment,
+                          //     no surface — the holder commits dirty pixel rects);
+                          // 2 = TEXT (init_text: NO pixel backbuffer at all — the
+                          //     glyph rasterisers are no-ops, only the cell grid is
+                          //     maintained; the holder flattens the grid into a text
+                          //     segment and the WM rasterises it on compose).
+    d_x0   as i64;        // accumulated dirty rect (pixel coords, x1/y1
+    d_y0   as i64;        // EXCLUSIVE); empty when d_x1 <= d_x0. The caller
+    d_x1   as i64;        // drains it with take_dirty() to know what to
+    d_y1   as i64;        // commit/present.
+    grid   as i64;        // *i64 cell array (0 = no grid attached)
+    grid_stride as i64;   // cells per grid row (fixed at attach)
+    grid_rows   as i64;   // grid row capacity (a RING of lines)
+    live_top as i64;      // physical grid row of the first LIVE visible line
+    hist_count as i64;    // valid history lines above the live view
+    view_off as i64;      // 0 = live; >0 = scrolled back this many lines
+    // -- appended (all i64): the ANSI/VT escape parser, so a TUI (btop, an
+    //    editor) running INSIDE the terminal can address the cursor, set
+    //    colour and clear — instead of grabbing the framebuffer. --
+    esc      as i64;      // parser state: 0 normal, 1 saw-ESC, 2 in-CSI
+    csi_q    as i64;      // 1 if the CSI carried a '?' (private sequence)
+    csi_n    as i64;      // index of the last CSI parameter (params in _csi_p)
+    cur_vis  as i64;      // 1 = draw the cursor on flush; CSI ?25l clears it
+    want_size as i64;     // CSI 18t sets this; the holder reports size + clears
+    def_fg   as i64;      // default fg/bg — SGR 0/39/49 restore these
+    def_bg   as i64;
+    // -- appended (all i64): xterm mouse tracking. A TUI enables it by writing
+    //    CSI ?1000h (button events) / ?1002h (and motion while a button is
+    //    held) / ?1003h (any motion), and
+    //    CSI ?1006h to get SGR-encoded reports. The holder reads these fields to
+    //    decide whether/how to encode a mouse event into the child's stdin. --
+    mouse_mode as i64;    // 0 = off, 1 = button (1000), 2 = button + drag (1002), 3 = any-event (1003)
+    mouse_sgr  as i64;    // 1 = SGR encoding (?1006): CSI < b;x;y M/m
+    // -- appended (all i64): a grid committed as the ring first fills it
+    //    (attach_grid_lazy) — scrollback costs memory only once it is used. --
+    grid_lazy  as i64;    // 1 = rows past grid_ready are reserved, not committed
+    grid_ready as i64;    // rows committed from the grid's start
+    grid_rdyb  as i64;    // bytes committed from the grid's start (page multiple)
+    grid_cap   as i64;    // rows reserved; grid_rows is less only when memory ran out
+    // -- appended (all i64): the alternate screen (CSI ?1049h/l), see alt_enter.
+    alt      as i64;      // 1 = a full-screen program has its own screen up
+    alt_save as i64;      // the main screen's visible rows, copied aside (0 = none)
+    alt_len  as i64;      // bytes mapped at alt_save
+    alt_rows as i64;      // rows copied
+    alt_cx   as i64;      // the main screen's cursor and colours
+    alt_cy   as i64;
+    alt_fg   as i64;
+    alt_bg   as i64;
+    // -- appended (all i64): the deferred wrap. A character written on the last
+    //    column leaves the cursor there with the wrap PENDING; the next
+    //    character wraps first. So a line that fills the width exactly takes one
+    //    row, not one row and an empty one, and writing the bottom-right cell
+    //    does not scroll the screen. Anything that moves the cursor drops it.
+    wrap_pend as i64;
+    // -- appended (all i64): UTF-8 arriving one byte at a time.
+    u8_need  as i64;      // continuation bytes still to come (0 = between characters)
+    u8_cp    as i64;      // the code point so far
+    u8_min   as i64;      // the smallest value this length may encode (overlong check)
+    // -- appended (all i64): the last character drawn, where a combining mark
+    //    that follows it folds in. last_cp 0 = nothing to fold into (the
+    //    cursor moved, the line ended, something was erased).
+    last_cp  as i64;
+    last_x   as i64;
+    last_y   as i64;
+    last_fg  as i64;
+    last_bg  as i64;
+    // -- appended (all i64): which rows are a long line the terminal wrapped,
+    //    so copying text gives the line back whole (attach_wraps).
+    wraps    as i64;      // *u8, one per grid row: 1 = continues the row above; 0 = none attached
+    wraps_n  as i64;      // rows it covers
+    // -- appended (all i64): lines the screen has moved up since the grid was
+    //    attached. A line's NUMBER, its line + scrolled, names the same text for
+    //    as long as the text is on the grid — what a selection holds on to
+    //    while output scrolls it up. clear() moves it past every line there was.
+    scrolled as i64;
+}
+
+// A lazy grid commits this much more each time the ring reaches its end.
+let is i64 as GRID_CHUNK with imut = 65536;
+
+// The grid is a ring of grid_rows text lines. The live view occupies
+// physical rows live_top..live_top+rows-1 (mod grid_rows); scrolling
+// advances live_top and the line that falls off the top BECOMES history
+// (up to grid_rows - rows lines of it). view_off slides the visible
+// window up into that history; any output snaps it back to live.
+fn _phys_row(t as *Term, r as i64) as i64 {
+    let is i64 as p = t.live_top + t.grid_rows - t.view_off + r;
+    return p - (p / t.grid_rows) * t.grid_rows;     // p % grid_rows
+}
+
+// A grid cell packs everything needed to repaint it after a resize:
+//   code point (bits 0-15) | fg RGB24 (bits 16-39) | bg RGB24 (bits 40-63).
+// 16 bits hold the Basic Multilingual Plane — every character the font draws;
+// one past it is stored as U+FFFD, which is what it would be drawn as anyway.
+// A terminal's TEXT segment carries cells in this layout to the compositor
+// (userspace/lib/wmproto txt_cell_*), so the two change together.
+let is i64 as CELL_WIDE_TAIL with imut = 0xFFFF;   // right half of a two-column character
+fn _cell_pack(cp as i64, fgc as u32, bgc as u32) as i64 {
+    return (cp & 0xFFFF) | ((cast(i64, fgc) & 0xFFFFFF) << 16) | ((cast(i64, bgc) & 0xFFFFFF) << 40);
+}
+fn cell_cp(cell as i64) as i64 { return cell & 0xFFFF; }
+fn cell_fg(cell as i64) as i64 { return (cell >> 16) & 0xFFFFFF; }
+fn cell_bg(cell as i64) as i64 { return (cell >> 40) & 0xFFFFFF; }
+
+// Accumulate a pixel rect into the dirty union (x1/y1 exclusive).
+fn _mark(t as *Term, x as i64, y as i64, w as i64, h as i64) as void {
+    if (w <= 0 || h <= 0) { return; }
+    if (t.d_x1 <= t.d_x0) {              // empty → take the rect as-is
+        t.d_x0 = x; t.d_y0 = y; t.d_x1 = x + w; t.d_y1 = y + h;
+        return;
+    }
+    if (x < t.d_x0) { t.d_x0 = x; }
+    if (y < t.d_y0) { t.d_y0 = y; }
+    if (x + w > t.d_x1) { t.d_x1 = x + w; }
+    if (y + h > t.d_y1) { t.d_y1 = y + h; }
+}
+
+// Drain the dirty rect: writes {x, y, w, h} to out and resets the
+// accumulator. Returns 1 if there was anything to take, 0 if clean.
+fn take_dirty(t as *Term, out as *i64) as i64 {
+    if (t.d_x1 <= t.d_x0) { return 0; }
+    out[0] = t.d_x0;
+    out[1] = t.d_y0;
+    out[2] = t.d_x1 - t.d_x0;
+    out[3] = t.d_y1 - t.d_y0;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    return 1;
+}
+
+fn _putpix(t as *Term, x as i64, y as i64, color as u32) as void {
+    if (t.present_mode == 2) { return; }   // TEXT mode: no pixel backbuffer to write
+    if (x < 0 || y < 0 || x >= t.width || y >= t.height) { return; }
+    let is *u32 as p = cast(*u32, cast(i64, t.base) + y * t.pitch + x * t.bpp);
+    p[0] = color;
+}
+
+// Pixel origin of text cell (cx,cy), inside the margin.
+fn _cellx(t as *Term, cx as i64) as i64 { return PAD_X + cx * GLYPH_W; }
+fn _celly(t as *Term, cy as i64) as i64 { return PAD_Y + cy * GLYPH_H; }
+
+// Blit one 8x16 glyph cell at pixel (px,py) with explicit colors: set bits →
+// fgc, clear bits → bgc, so the cell is fully repainted (erasing whatever was
+// there). MSB = leftmost.
+fn _glyph_c(t as *Term, ch as i64, px as i64, py as i64, fgc as u32, bgc as u32) as void {
+    let is i64 as cp with mut = ch;
+    if (cp == CELL_WIDE_TAIL || cp == 0) { cp = 0x20; }     // a wide character's tail is its blank half
+    let is *u8 as g = font.glyph(cp);
+    let is i64 as row with mut = 0;
+    while (row < GLYPH_H) {
+        let is i64 as bits = cast(i64, g[row]);
+        let is i64 as col with mut = 0;
+        while (col < GLYPH_W) {
+            let is i64 as mask = 128 >> col;
+            if ((bits & mask) != 0) { _putpix(t, px + col, py + row, fgc); }
+            else { _putpix(t, px + col, py + row, bgc); }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    _mark(t, px, py, GLYPH_W, GLYPH_H);
+}
+
+fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
+    _glyph_c(t, ch, px, py, t.fg, t.bg);
+}
+
+// Record the cell at visible (col,row) in the grid, if one is attached.
+// Writers always target the LIVE view (callers reset view_off first).
+fn _grid_set(t as *Term, col as i64, row as i64, ch as i64) as void {
+    if (t.grid == 0) { return; }
+    if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
+    let is i64 as p = t.live_top + row;
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is *i64 as g = cast(*i64, t.grid);
+    g[phys * t.grid_stride + col] = _cell_pack(ch, t.fg, t.bg);
+}
+
+// The same with explicit colours (a combining mark redraws a character in the
+// colours it was written in, whatever is current now).
+fn _grid_set_c(t as *Term, col as i64, row as i64, cp as i64, fgc as u32, bgc as u32) as void {
+    if (t.grid == 0) { return; }
+    if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
+    let is i64 as p = t.live_top + row;
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is *i64 as g = cast(*i64, t.grid);
+    g[phys * t.grid_stride + col] = _cell_pack(cp, fgc, bgc);
+}
+
+// The cell at visible (col,row) of the LIVE view; 0 without a grid.
+fn _grid_get(t as *Term, col as i64, row as i64) as i64 {
+    if (t.grid == 0) { return 0; }
+    if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return 0; }
+    let is i64 as p = t.live_top + row;
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is *i64 as g = cast(*i64, t.grid);
+    return g[phys * t.grid_stride + col];
+}
+
+// The wrap flag of physical grid row phys (see attach_wraps).
+fn _wrap_set(t as *Term, phys as i64, v as i64) as void {
+    if (t.wraps == 0 || phys < 0 || phys >= t.wraps_n) { return; }
+    let is *u8 as w = cast(*u8, t.wraps);
+    w[phys] = cast(u8, v);
+}
+// The same for LIVE row r (no grid, no flags: nothing to do).
+fn _wrap_live(t as *Term, r as i64, v as i64) as void {
+    if (t.wraps == 0 || t.grid == 0) { return; }
+    _wrap_set(t, _live_phys(t, r), v);
+}
+fn _wrap_get(t as *Term, phys as i64) as i64 {
+    if (t.wraps == 0 || phys < 0 || phys >= t.wraps_n) { return 0; }
+    let is *u8 as w = cast(*u8, t.wraps);
+    return cast(i64, w[phys]);
+}
+
+// A blank cell: a space in the current background, but the DEFAULT foreground.
+// A space shows no foreground, except where the cursor sits: a text surface
+// draws it as the cell in reverse. A line opened by the newline that ends a
+// red error message took the red, and the cursor on the prompt below it was
+// red until something else was typed over that cell.
+fn _blank(t as *Term) as i64 { return _cell_pack(0x20, cast(u32, t.def_fg), t.bg); }
+
+// Blank one physical grid row.
+fn _grid_blank_phys(t as *Term, phys as i64) as void {
+    _wrap_set(t, phys, 0);
+    let is *i64 as g = cast(*i64, t.grid);
+    let is i64 as blank = _blank(t);
+    let is i64 as c with mut = 0;
+    while (c < t.grid_stride) {
+        g[phys * t.grid_stride + c] = blank;
+        c = c + 1;
+    }
+    return;
+}
+
+// The physical grid row of LIVE visible row r (whatever view_off says).
+fn _live_phys(t as *Term, r as i64) as i64 {
+    let is i64 as p = t.live_top + r;
+    return p - (p / t.grid_rows) * t.grid_rows;
+}
+
+fn _grid_copy_row(t as *Term, from as i64, to as i64) as void {
+    _wrap_set(t, to, _wrap_get(t, from));
+    let is *i64 as g = cast(*i64, t.grid);
+    let is i64 as c with mut = 0;
+    while (c < t.grid_stride) {
+        g[to * t.grid_stride + c] = g[from * t.grid_stride + c];
+        c = c + 1;
+    }
+    return;
+}
+
+// _ring_advance — one line off the top of the live view into history: the
+// grid side of a scroll.
+fn _ring_advance(t as *Term) as void {
+    t.scrolled = t.scrolled + 1;
+    t.live_top = t.live_top + 1;
+    if (t.live_top >= t.grid_rows) { t.live_top = 0; }
+    let is i64 as p = t.live_top + t.rows - 1;
+    _grid_reach(t, p);
+    if (t.live_top >= t.grid_rows) { t.live_top = t.live_top - t.grid_rows; }
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    _grid_blank_phys(t, phys);
+    let is i64 as hmax = t.grid_rows - t.rows;
+    if (t.hist_count < hmax) { t.hist_count = t.hist_count + 1; }
+    if (t.hist_count > hmax) { t.hist_count = hmax; }
+    return;
+}
+
+// Repaint every visible cell from the grid (honors view_off) and refill the
+// background first — the one true re-render, used by resize and scrollback.
+fn _repaint_view(t as *Term) as void {
+    _fill_bg(t, t.width, t.height);
+    if (t.grid == 0) { _mark(t, 0, 0, t.width, t.height); return; }
+    let is *i64 as g = cast(*i64, t.grid);
+    let is i64 as r with mut = 0;
+    while (r < t.rows) {
+        let is i64 as phys = _phys_row(t, r);
+        let is i64 as c with mut = 0;
+        while (c < t.cols) {
+            let is i64 as cell = g[phys * t.grid_stride + c];
+            let is i64 as ch = cell_cp(cell);
+            let is u32 as cfg = cast(u32, cell_fg(cell));
+            let is u32 as cbg = cast(u32, cell_bg(cell));
+            if (ch != 0x20 || cbg != t.bg) {
+                _glyph_c(t, ch, _cellx(t, c), _celly(t, r), cfg, cbg);
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    _mark(t, 0, 0, t.width, t.height);
+    return;
+}
+
+// scroll_view — slide the visible window into history (delta > 0 = older)
+// or back toward live (delta < 0). Clamped to what history holds; any
+// change re-renders. The cursor is only drawn at live (flush skips it
+// while scrolled back).
+fn scroll_view(t as *Term, delta as i64) as void {
+    if (t.grid == 0) { return; }
+    if (t.alt == 1) { return; }              // the history is the main screen's
+    let is i64 as v with mut = t.view_off + delta;
+    if (v < 0) { v = 0; }
+    if (v > t.hist_count) { v = t.hist_count; }
+    if (v == t.view_off) { return; }
+    t.view_off = v;
+    _repaint_view(t);
+    return;
+}
+
+// Scroll the text area up one row (GLYPH_H px) and clear the bottom row. The
+// copy spans full pitch rows (side margins are bg, copying them up is a no-op;
+// in windowed mode — pitch wider than the window — the overshoot stays inside
+// the caller's own buffer and outside its visible rect, harmless). The grid,
+// when attached, shifts in lockstep so a later resize() re-renders the truth.
+fn _scroll(t as *Term) as void {
+    if (t.present_mode != 2) {              // TEXT mode keeps NO pixel backbuffer:
+        // scroll the pixels; the grid (below) carries the scroll on its own.
+        let is i64 as top = cast(i64, t.base) + PAD_Y * t.pitch;   // top of text area
+        let is i64 as rowbytes = t.pitch * GLYPH_H;
+        let is i64 as span = t.pitch * (t.rows * GLYPH_H);          // text-area height
+        let is *i64 as dst = cast(*i64, top);
+        let is *i64 as src = cast(*i64, top + rowbytes);
+        let is i64 as words = (span - rowbytes) / 8;
+        let is i64 as i with mut = 0;
+        while (i < words) { dst[i] = src[i]; i = i + 1; }
+        // clear the bottom text row to bg, as u32 pixels
+        let is *u32 as p = cast(*u32, top + (span - rowbytes));
+        let is i64 as pw = rowbytes / 4;
+        let is i64 as j with mut = 0;
+        while (j < pw) { p[j] = t.bg; j = j + 1; }
+    }
+    if (t.grid != 0) {
+        if (t.alt == 1) {
+            // The alternate screen scrolls in place: nothing a full-screen
+            // program draws becomes history.
+            let is i64 as r with mut = 0;
+            while (r + 1 < t.rows) { _grid_copy_row(t, _live_phys(t, r + 1), _live_phys(t, r)); r = r + 1; }
+            _grid_blank_phys(t, _live_phys(t, t.rows - 1));
+        } else {
+            // the ring absorbs the scroll: the line leaving the top becomes
+            // history, the fresh bottom line is blanked in place
+            _ring_advance(t);
+        }
+    }
+    _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
+    if (t.cy > 0) { t.cy = t.cy - 1; }
+}
+
+fn _newline(t as *Term) as void {
+    t.cx = 0;
+    t.cy = t.cy + 1;
+    if (t.cy >= t.rows) { _scroll(t); }
+}
+
+fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp as i64) as Term {
+    let is Term as t;
+    t.base = base; t.fd = fd; t.width = width; t.height = height;
+    t.pitch = pitch; t.bpp = bpp;
+    t.cols = (width - 2 * PAD_X) / GLYPH_W; t.rows = (height - 2 * PAD_Y) / GLYPH_H;
+    t.cx = 0; t.cy = 0;
+    t.fg = 0x00d3d7cf;        // soft light grey (Tango), not harsh pure white
+    t.bg = 0x00121417;        // near-black blue-grey, easier on the eyes than #000
+    t.present_mode = 1;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    t.live_top = 0; t.hist_count = 0; t.view_off = 0;
+    t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.mouse_mode = 0; t.mouse_sgr = 0;
+    t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
+    t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.wrap_pend = 0;
+    t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
+    t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
+    t.wraps = 0; t.wraps_n = 0; t.scrolled = 0;
+    t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
+    // clear the whole backbuffer to bg
+    let is *u32 as p = cast(*u32, cast(i64, base));
+    let is i64 as pw = (pitch * height) / 4;
+    let is i64 as i with mut = 0;
+    while (i < pw) { p[i] = t.bg; i = i + 1; }
+    _mark(&t, 0, 0, width, height);
+    return t;
+}
+
+// init_buffer — construct a Term over plain memory (a shared segment, not a
+// surface): clears the visible w x h region only (the buffer may be a full-
+// screen-pitch window sub-rect), never presents (no fd to present on); the
+// holder drains take_dirty() and tells its compositor what changed.
+fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i64) as Term {
+    let is Term as t;
+    t.base = base; t.fd = 0 - 1; t.width = width; t.height = height;
+    t.pitch = pitch; t.bpp = bpp;
+    t.cols = (width - 2 * PAD_X) / GLYPH_W; t.rows = (height - 2 * PAD_Y) / GLYPH_H;
+    t.cx = 0; t.cy = 0;
+    t.fg = 0x00d3d7cf;
+    t.bg = 0x00121417;
+    t.present_mode = 0;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    t.live_top = 0; t.hist_count = 0; t.view_off = 0;
+    t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.mouse_mode = 0; t.mouse_sgr = 0;
+    t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
+    t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.wrap_pend = 0;
+    t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
+    t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
+    t.wraps = 0; t.wraps_n = 0; t.scrolled = 0;
+    t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
+    _fill_bg(&t, width, height);
+    _mark(&t, 0, 0, width, height);
+    return t;
+}
+
+// init_text — construct a Term that keeps NO pixel backbuffer (present_mode 2).
+// The glyph rasterisers are inert (they no-op on t.base) and only the cell grid
+// is maintained: every putc still updates the grid via _grid_set and accumulates
+// a dirty rect via _mark. The holder (wterm) attaches a grid, then on flush
+// flattens the visible grid view into a small TEXT segment for the WM to
+// rasterise — so a terminal costs (header + cols*rows) i64 instead of a
+// full-screen pixel buffer. width/height are in PIXELS (the WM frames the window
+// in pixels and 8x16 cells), used only to derive cols/rows the same way init does.
+fn init_text(width as i64, height as i64) as Term {
+    let is Term as t;
+    t.base = cast(*u8, 0); t.fd = 0 - 1; t.width = width; t.height = height;
+    t.pitch = 0; t.bpp = 4;
+    // The whole window is cells: the compositor draws the grid from the
+    // window's corner, with no margin. Counting the pixel console's margin
+    // here told every program it had 3 columns and 2 rows fewer than it was
+    // shown — status lines stopped short, and the last rows went unused.
+    t.cols = width / GLYPH_W; t.rows = height / GLYPH_H;
+    t.cx = 0; t.cy = 0;
+    t.fg = 0x00d3d7cf;
+    t.bg = 0x00121417;
+    t.present_mode = 2;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    t.live_top = 0; t.hist_count = 0; t.view_off = 0;
+    t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.mouse_mode = 0; t.mouse_sgr = 0;
+    t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
+    t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.wrap_pend = 0;
+    t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
+    t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
+    t.wraps = 0; t.wraps_n = 0; t.scrolled = 0;
+    t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
+    _mark(&t, 0, 0, width, height);
+    return t;
+}
+
+// Clear the visible w x h region to bg, row by row (pitch-aware: in windowed
+// mode the buffer is wider than the window and the slack is not ours to wipe
+// beyond a clean row — staying inside w keeps the write pattern obvious).
+fn _fill_bg(t as *Term, w as i64, h as i64) as void {
+    if (t.present_mode == 2) { return; }   // TEXT mode: no pixel backbuffer
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is *u32 as p = cast(*u32, cast(i64, t.base) + y * t.pitch);
+        let is i64 as x with mut = 0;
+        while (x < w) { p[x] = t.bg; x = x + 1; }
+        y = y + 1;
+    }
+}
+
+// attach_grid — give the Term a cell-grid backing store so resize() can
+// re-render content. `cells` must hold stride * nrows i64 cells. The visible
+// grid is clamped to the backing dimensions; the cells are blanked.
+fn attach_grid(t as *Term, cells as *i64, stride as i64, nrows as i64) as void {
+    t.grid = cast(i64, cells);
+    t.grid_stride = stride;
+    t.grid_rows = nrows;
+    t.grid_lazy = 0;
+    t.grid_ready = nrows;
+    t.grid_rdyb = stride * nrows * 8;
+    t.grid_cap = nrows;
+    t.live_top = 0;
+    t.hist_count = 0;
+    t.view_off = 0;
+    if (t.cols > stride) { t.cols = stride; }
+    if (t.rows > nrows) { t.rows = nrows; }
+    let is i64 as blank = _blank(t);
+    let is i64 as i with mut = 0;
+    let is i64 as total = stride * nrows;
+    while (i < total) { cells[i] = blank; i = i + 1; }
+}
+
+// attach_grid_lazy — a grid over memory that is only RESERVED (cos.reserve,
+// page-aligned, stride * nrows * 8 bytes rounded up to pages). Rows are
+// committed as the ring first reaches them, so a long scrollback costs memory
+// only once there is that much history, and `clear` gives it back. If memory
+// runs out, the ring closes at the rows it has: history stops growing, and
+// nothing else changes. 0, or -1 when not even the visible rows can be had.
+fn attach_grid_lazy(t as *Term, cells as *i64, stride as i64, nrows as i64) as i64 {
+    t.grid = cast(i64, cells);
+    t.grid_stride = stride;
+    t.grid_rows = nrows;
+    t.grid_lazy = 1;
+    t.grid_ready = 0;
+    t.grid_rdyb = 0;
+    t.grid_cap = nrows;
+    t.live_top = 0;
+    t.hist_count = 0;
+    t.view_off = 0;
+    if (t.cols > stride) { t.cols = stride; }
+    if (t.rows > nrows) { t.rows = nrows; }
+    _grid_reach(t, t.rows - 1);
+    if (t.grid_ready < t.rows) { t.grid = 0; return 0 - 1; }
+    let is i64 as r with mut = 0;
+    while (r < t.rows) { _grid_blank_phys(t, r); r = r + 1; }
+    return 0;
+}
+
+// attach_wraps — remember which rows are a long line the terminal wrapped,
+// so copy_text can give it back as the one line it was. `flags` holds one
+// byte per grid row, n of them, at least the grid's capacity (call after
+// attach_grid / attach_grid_lazy). 0, or -1 when n is too small.
+fn attach_wraps(t as *Term, flags as *u8, n as i64) as i64 {
+    if (t.grid == 0 || n < t.grid_cap) { return 0 - 1; }
+    t.wraps = cast(i64, flags);
+    t.wraps_n = n;
+    let is i64 as i with mut = 0;
+    while (i < n) { flags[i] = cast(u8, 0); i = i + 1; }
+    return 0;
+}
+
+// ---- lines, for whoever selects and copies text ----------------------------
+//
+// A LINE here is a row of text counted from the live view's top row, 0; the
+// history above it is -1, -2, ... back to -hist_count. Unlike a visible row,
+// a line keeps naming the same text while the view is scrolled back — though
+// not once output scrolls the screen (every line moves up one).
+
+// The line visible row r (0 = top of the window) is showing.
+fn view_line(t as *Term, r as i64) as i64 { return r - t.view_off; }
+
+// A line's number (stays with its text as the screen scrolls), and back.
+fn line_number(t as *Term, line as i64) as i64 { return line + t.scrolled; }
+fn number_line(t as *Term, number as i64) as i64 { return number - t.scrolled; }
+
+// 1 when the line numbered `number` is still on the grid.
+fn number_kept(t as *Term, number as i64) as i64 {
+    let is i64 as line = number - t.scrolled;
+    if (line < 0 - t.hist_count || line >= t.rows) { return 0; }
+    return 1;
+}
+
+fn _line_phys(t as *Term, line as i64) as i64 {
+    let is i64 as p = t.live_top + t.grid_rows + line;
+    return p - (p / t.grid_rows) * t.grid_rows;
+}
+
+// 1 when line continues the line above it: the terminal wrapped a long line
+// there, rather than the text breaking it. 0 without attach_wraps.
+fn line_wrapped(t as *Term, line as i64) as i64 {
+    if (t.grid == 0 || line <= 0 - t.hist_count || line >= t.rows) { return 0; }
+    return _wrap_get(t, _line_phys(t, line));
+}
+
+// The cell at column col of line (0 off the grid).
+fn line_cell(t as *Term, line as i64, col as i64) as i64 {
+    if (t.grid == 0 || line < 0 - t.hist_count || line >= t.rows || col < 0 || col >= t.cols) { return 0; }
+    let is *i64 as g = cast(*i64, t.grid);
+    return g[_line_phys(t, line) * t.grid_stride + col];
+}
+
+// copy_text — the text from (l0, c0) up to, not including, (l1, c1), as UTF-8
+// into out (cap bytes); returns the bytes written, never part of a character.
+// What a reader would type to get it back: the right half of a wide
+// character is not a second character, the blanks a line ends in are not
+// text, and lines join with a newline — except where the terminal wrapped
+// one long line, which comes back whole.
+fn copy_text(t as *Term, l0 as i64, c0 as i64, l1 as i64, c1 as i64, out as *u8, cap as i64) as i64 {
+    if (t.grid == 0) { return 0; }
+    let is i64 as n with mut = 0;
+    let is i64 as line with mut = l0;
+    if (line < 0 - t.hist_count) { line = 0 - t.hist_count; }
+    let is i64 as last with mut = l1;
+    if (last >= t.rows) { last = t.rows - 1; }
+    while (line <= last) {
+        let is i64 as from with mut = 0;
+        if (line == l0) { from = c0; }
+        let is i64 as to with mut = t.cols;
+        if (line == l1) { to = c1; }
+        if (to > t.cols) { to = t.cols; }
+        // The line's text ends at its last non-blank cell, unless the next
+        // line continues it: then every cell up to the edge is text.
+        let is i64 as next_cont with mut = 0;
+        if (line < last) { next_cont = line_wrapped(t, line + 1); }
+        let is i64 as end with mut = to;
+        if (line_wrapped(t, line + 1) == 0) {
+            let is i64 as lend with mut = t.cols;
+            while (lend > 0) {
+                let is i64 as cp0 = cell_cp(line_cell(t, line, lend - 1));
+                if (cp0 != 0x20 && cp0 != 0) { break; }
+                lend = lend - 1;
+            }
+            if (end > lend) { end = lend; }
+        }
+        let is i64 as c with mut = from;
+        while (c < end) {
+            let is i64 as cp with mut = cell_cp(line_cell(t, line, c));
+            if (cp != CELL_WIDE_TAIL) {
+                if (cp == 0) { cp = 0x20; }
+                let is [4]u8 as e;
+                let is i64 as k = _utf8_put(cp, cast(*u8, &e[0]));
+                if (n + k > cap) { return n; }
+                let is i64 as j with mut = 0;
+                while (j < k) { out[n + j] = e[j]; j = j + 1; }
+                n = n + k;
+            }
+            c = c + 1;
+        }
+        if (line < last && next_cont == 0) {
+            if (n + 1 > cap) { return n; }
+            out[n] = cast(u8, 10);
+            n = n + 1;
+        }
+        line = line + 1;
+    }
+    return n;
+}
+
+// A BMP code point as UTF-8 (what a cell holds); its length.
+fn _utf8_put(cp as i64, e as *u8) as i64 {
+    if (cp < 0x80) { e[0] = cast(u8, cp); return 1; }
+    if (cp < 0x800) {
+        e[0] = cast(u8, 0xC0 | (cp >> 6));
+        e[1] = cast(u8, 0x80 | (cp & 0x3F));
+        return 2;
+    }
+    e[0] = cast(u8, 0xE0 | (cp >> 12));
+    e[1] = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+    e[2] = cast(u8, 0x80 | (cp & 0x3F));
+    return 3;
+}
+
+// _grid_reach — grid row p (unwrapped: live_top + r) is about to be written.
+// Before the ring first wraps, rows are used in order, so p past the
+// committed rows means "commit the next stretch". When the commit fails the
+// ring is closed at the rows that are there (grid_rows shrinks); the caller
+// takes p modulo the new grid_rows, which lands on the oldest history line.
+// The view's own rows are always there: attach_grid_lazy commits them, and
+// resize grows the view only into rows it could reach.
+fn _grid_reach(t as *Term, p as i64) as void {
+    if (t.grid_lazy == 0) { return; }
+    if (t.grid_ready >= t.grid_rows) { return; }
+    if (p < t.grid_ready) { return; }
+    let is i64 as rowb = t.grid_stride * 8;
+    let is i64 as end with mut = (p + 1) * rowb + GRID_CHUNK;
+    end = ((end + 4095) / 4096) * 4096;
+    let is i64 as full = ((t.grid_rows * rowb + 4095) / 4096) * 4096;
+    if (end > full) { end = full; }
+    if (cos.commit(t.grid + t.grid_rdyb, end - t.grid_rdyb, cos.PROT_READ | cos.PROT_WRITE) == 0) {
+        t.grid_rdyb = end;
+        t.grid_ready = end / rowb;
+        if (t.grid_ready > t.grid_rows) { t.grid_ready = t.grid_rows; }
+        return;
+    }
+    // A ring as tall as the view is still a ring: it keeps no history, and
+    // the screen goes on scrolling.
+    t.grid_rows = t.grid_ready;
+    let is i64 as hmax = t.grid_rows - t.rows;
+    if (t.hist_count > hmax) { t.hist_count = hmax; }
+    if (t.view_off > t.hist_count) { t.view_off = t.hist_count; }
+    return;
+}
+
+// Cursor: a thin underline (bottom 2 rows of the cell) in fg. It sits on the
+// empty input cell, so painting/erasing the whole cell is safe. putc lifts it
+// before moving; flush repaints it after a batch — so it tracks (cx,cy) cleanly.
+fn _cursor(t as *Term, on as i64) as void {
+    if (t.cur_vis == 0) { return; }       // hidden (CSI ?25l): nothing to draw OR erase
+    if (t.view_off != 0) { return; }     // the cursor lives at the live view only
+    let is i64 as px = _cellx(t, t.cx);
+    let is i64 as py = _celly(t, t.cy);
+    let is u32 as color with mut = t.bg;
+    if (on != 0) { color = t.fg; }
+    let is i64 as ry with mut = GLYPH_H - 2;
+    while (ry < GLYPH_H) {
+        let is i64 as rx with mut = 0;
+        while (rx < GLYPH_W) { _putpix(t, px + rx, py + ry, color); rx = rx + 1; }
+        ry = ry + 1;
+    }
+    _mark(t, px, py + GLYPH_H - 2, GLYPH_W, 2);
+}
+
+// ============================================================================
+// ANSI / VT escape parser — lets a TUI running INSIDE the terminal address the
+// cursor, set colour and clear, instead of grabbing the framebuffer. The
+// terminal is the emulator; the app just writes bytes to its stdout.
+// ============================================================================
+
+// The 16-colour ANSI palette (Tango, to match the default fg/bg). bright=1
+// selects the high-intensity variant (SGR 90-97 / 100-107).
+fn _ansi_color(idx as i64, bright as i64) as u32 {
+    if (bright == 0) {
+        if (idx == 0) { return cast(u32, 0x00000000); }
+        if (idx == 1) { return cast(u32, 0x00cc0000); }
+        if (idx == 2) { return cast(u32, 0x004e9a06); }
+        if (idx == 3) { return cast(u32, 0x00c4a000); }
+        if (idx == 4) { return cast(u32, 0x003465a4); }
+        if (idx == 5) { return cast(u32, 0x0075507b); }
+        if (idx == 6) { return cast(u32, 0x0006989a); }
+        return cast(u32, 0x00d3d7cf);
+    }
+    if (idx == 0) { return cast(u32, 0x00555753); }
+    if (idx == 1) { return cast(u32, 0x00ef2929); }
+    if (idx == 2) { return cast(u32, 0x008ae234); }
+    if (idx == 3) { return cast(u32, 0x00fce94f); }
+    if (idx == 4) { return cast(u32, 0x00729fcf); }
+    if (idx == 5) { return cast(u32, 0x00ad7fa8); }
+    if (idx == 6) { return cast(u32, 0x0034e2e2); }
+    return cast(u32, 0x00eeeeec);
+}
+
+fn _cube(c as i64) as i64 {
+    if (c == 0) { return 0; }
+    return 55 + c * 40;
+}
+
+// xterm 256-colour index → RGB (16 base + 6x6x6 cube + 24 greys).
+fn _xterm256(n as i64) as u32 {
+    if (n < 16) {
+        if (n >= 8) { return _ansi_color(n - 8, 1); }
+        return _ansi_color(n, 0);
+    }
+    if (n < 232) {
+        let is i64 as v = n - 16;
+        let is i64 as r = v / 36;
+        let is i64 as g = (v / 6) - (v / 36) * 6;
+        let is i64 as b = v - (v / 6) * 6;
+        return cast(u32, (_cube(r) << 16) | (_cube(g) << 8) | _cube(b));
+    }
+    let is i64 as gray = 8 + (n - 232) * 10;
+    return cast(u32, (gray << 16) | (gray << 8) | gray);
+}
+
+fn _clamp_cursor(t as *Term) as void {
+    if (t.cx < 0) { t.cx = 0; }
+    if (t.cy < 0) { t.cy = 0; }
+    if (t.cx >= t.cols) { t.cx = t.cols - 1; }
+    if (t.cy >= t.rows) { t.cy = t.rows - 1; }
+}
+
+// Erase one cell to the current bg (a space glyph repaints the whole cell).
+fn _erase_cell(t as *Term, col as i64, row as i64) as void {
+    if (col < 0 || row < 0 || col >= t.cols || row >= t.rows) { return; }
+    _glyph(t, 0x20, _cellx(t, col), _celly(t, row));
+    _grid_set_c(t, col, row, 0x20, cast(u32, t.def_fg), t.bg);
+}
+
+// CSI J — 0: cursor→end, 1: start→cursor, 2: whole screen.
+fn _erase_display(t as *Term, mode as i64) as void {
+    let is i64 as r with mut = 0;
+    let is i64 as c with mut = 0;
+    if (mode == 2) {
+        while (r < t.rows) { c = 0; while (c < t.cols) { _erase_cell(t, c, r); c = c + 1; } r = r + 1; }
+        return;
+    }
+    if (mode == 1) {
+        while (r < t.cy) { c = 0; while (c < t.cols) { _erase_cell(t, c, r); c = c + 1; } r = r + 1; }
+        c = 0; while (c <= t.cx) { _erase_cell(t, c, t.cy); c = c + 1; }
+        return;
+    }
+    c = t.cx; while (c < t.cols) { _erase_cell(t, c, t.cy); c = c + 1; }
+    r = t.cy + 1;
+    while (r < t.rows) { c = 0; while (c < t.cols) { _erase_cell(t, c, r); c = c + 1; } r = r + 1; }
+}
+
+// CSI K — 0: cursor→eol, 1: bol→cursor, 2: whole line.
+fn _erase_line(t as *Term, mode as i64) as void {
+    let is i64 as c0 with mut = 0;
+    let is i64 as c1 with mut = t.cols;
+    if (mode == 0) { c0 = t.cx; }
+    if (mode == 1) { c1 = t.cx + 1; }
+    let is i64 as c with mut = c0;
+    while (c < c1) { _erase_cell(t, c, t.cy); c = c + 1; }
+}
+
+// CSI m — Select Graphic Rendition: 0 reset, 30-37/90-97 fg, 40-47/100-107 bg,
+// 38/48;2;r;g;b truecolor, 38/48;5;n 256-colour, 39/49 default fg/bg.
+fn _sgr(t as *Term) as void {
+    let is i64 as n = t.csi_n + 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as code = _csi_p[i];
+        if (code == 0) { t.fg = cast(u32, t.def_fg); t.bg = cast(u32, t.def_bg); }
+        else if (code == 39) { t.fg = cast(u32, t.def_fg); }
+        else if (code == 49) { t.bg = cast(u32, t.def_bg); }
+        else if (code >= 30 && code <= 37) { t.fg = _ansi_color(code - 30, 0); }
+        else if (code >= 40 && code <= 47) { t.bg = _ansi_color(code - 40, 0); }
+        else if (code >= 90 && code <= 97) { t.fg = _ansi_color(code - 90, 1); }
+        else if (code >= 100 && code <= 107) { t.bg = _ansi_color(code - 100, 1); }
+        else if (code == 38 || code == 48) {
+            let is i64 as kind with mut = 0;
+            if (code == 48) { kind = 1; }
+            if (i + 1 < n) {
+                if (_csi_p[i + 1] == 2 && i + 4 < n) {
+                    let is u32 as col = cast(u32, (_csi_p[i + 2] << 16) | (_csi_p[i + 3] << 8) | _csi_p[i + 4]);
+                    if (kind == 0) { t.fg = col; } else { t.bg = col; }
+                    i = i + 4;
+                } else if (_csi_p[i + 1] == 5 && i + 2 < n) {
+                    let is u32 as col = _xterm256(_csi_p[i + 2]);
+                    if (kind == 0) { t.fg = col; } else { t.bg = col; }
+                    i = i + 2;
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Dispatch a complete CSI sequence on its final byte. Cursor moves lift the
+// drawn cursor first (flush repaints it); colours/erase use the live fg/bg.
+fn _csi_dispatch(t as *Term, final as i64) as void {
+    let is i64 as p0 = _csi_p[0];
+    let is i64 as p1 = _csi_p[1];
+    // Positioning and erasing drop a pending wrap; colours and modes do not.
+    // They also end what a combining mark could still fold into.
+    if (final != 0x6D && final != 0x68 && final != 0x6C && final != 0x74) { t.wrap_pend = 0; t.last_cp = 0; }
+    if (final == 0x48 || final == 0x66) {                    // 'H'/'f' position
+        _cursor(t, 0);
+        let is i64 as r with mut = p0; if (r < 1) { r = 1; }
+        let is i64 as c with mut = p1; if (c < 1) { c = 1; }
+        t.cy = r - 1; t.cx = c - 1; _clamp_cursor(t); return;
+    }
+    if (final == 0x41) { _cursor(t, 0); let is i64 as n with mut = p0; if (n < 1) { n = 1; } t.cy = t.cy - n; _clamp_cursor(t); return; }  // 'A' up
+    if (final == 0x42) { _cursor(t, 0); let is i64 as n with mut = p0; if (n < 1) { n = 1; } t.cy = t.cy + n; _clamp_cursor(t); return; }  // 'B' down
+    if (final == 0x43) { _cursor(t, 0); let is i64 as n with mut = p0; if (n < 1) { n = 1; } t.cx = t.cx + n; _clamp_cursor(t); return; }  // 'C' right
+    if (final == 0x44) { _cursor(t, 0); let is i64 as n with mut = p0; if (n < 1) { n = 1; } t.cx = t.cx - n; _clamp_cursor(t); return; }  // 'D' left
+    if (final == 0x47) { _cursor(t, 0); let is i64 as c with mut = p0; if (c < 1) { c = 1; } t.cx = c - 1; _clamp_cursor(t); return; }     // 'G' column
+    if (final == 0x64) { _cursor(t, 0); let is i64 as r with mut = p0; if (r < 1) { r = 1; } t.cy = r - 1; _clamp_cursor(t); return; }     // 'd' row
+    if (final == 0x4A) { _cursor(t, 0); _erase_display(t, p0); return; }   // 'J'
+    if (final == 0x4B) { _cursor(t, 0); _erase_line(t, p0); return; }      // 'K'
+    if (final == 0x6D) { _sgr(t); return; }                               // 'm' SGR
+    if (final == 0x6C) {                                                  // 'l' reset private mode
+        if (t.csi_q == 1) {
+            if (p0 == 25) { _cursor(t, 0); t.cur_vis = 0; }               // ?25l: erase, then hide
+            else if (p0 == 1000 || p0 == 1002 || p0 == 1003) { t.mouse_mode = 0; }
+            else if (p0 == 1006) { t.mouse_sgr = 0; }
+            else if (p0 == 1049 || p0 == 1047 || p0 == 47) { alt_leave(t); }
+        }
+        return;
+    }
+    if (final == 0x68) {                                                  // 'h' set private mode
+        if (t.csi_q == 1) {
+            if (p0 == 25) { t.cur_vis = 1; }                             // ?25h
+            else if (p0 == 1000) { t.mouse_mode = 1; }                   // button tracking
+            else if (p0 == 1002) { t.mouse_mode = 2; }                   // button + drag tracking
+            else if (p0 == 1003) { t.mouse_mode = 3; }                   // any-event (motion) tracking
+            else if (p0 == 1006) { t.mouse_sgr = 1; }                    // SGR-encoded reports
+            else if (p0 == 1049 || p0 == 1047 || p0 == 47) { alt_enter(t); }   // alternate screen
+        }
+        return;
+    }
+    if (final == 0x74) { if (p0 == 18) { t.want_size = 1; } return; }      // 't' 18t size report
+}
+
+// Feed one byte to the escape parser (called by putc when t.esc != 0).
+fn _esc_feed(t as *Term, ch as i64) as void {
+    if (t.esc == 1) {                            // just saw ESC
+        if (ch == 0x5B) {                        // '[' → CSI
+            t.esc = 2; t.csi_q = 0; t.csi_n = 0;
+            let is i64 as i with mut = 0;
+            while (i < 16) { _csi_p[i] = 0; i = i + 1; }
+            return;
+        }
+        t.esc = 0; return;                       // ESC + other: not handled
+    }
+    // t.esc == 2: collecting a CSI sequence
+    if (ch >= 0x30 && ch <= 0x39) { _csi_p[t.csi_n] = _csi_p[t.csi_n] * 10 + (ch - 0x30); return; }
+    if (ch == 0x3B) { if (t.csi_n < 15) { t.csi_n = t.csi_n + 1; } return; }   // ';'
+    if (ch == 0x3F) { t.csi_q = 1; return; }                                  // '?'
+    if (ch >= 0x40 && ch <= 0x7E) { _csi_dispatch(t, ch); t.esc = 0; return; }  // final byte
+    // intermediates (0x20-0x2F) and stray bytes: stay in CSI
+}
+
+// ---- the alternate screen (CSI ?1049h / ?1049l) ------------------------------
+//
+// A full-screen program (an editor, htop) draws on a screen of its own and,
+// when it leaves, the one there was comes back — the prompt, the commands and
+// their output — with the cursor where it was. Entering copies the visible
+// rows aside and clears the screen; while it is up a scroll moves the visible
+// rows only, so nothing the program draws becomes history, and the history
+// cannot be scrolled to; leaving puts the rows and the cursor back. Without a
+// grid nothing was recorded to give back, and the screen is just cleared.
+
+fn alt_enter(t as *Term) as void {
+    if (t.alt == 1) { return; }
+    _cursor(t, 0);
+    t.wrap_pend = 0;
+    t.last_cp = 0;
+    if (t.view_off != 0) { t.view_off = 0; _repaint_view(t); }
+    t.alt_cx = t.cx; t.alt_cy = t.cy;
+    t.alt_fg = cast(i64, t.fg); t.alt_bg = cast(i64, t.bg);
+    t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    if (t.grid != 0) {
+        // The rows, then a byte per row for its wrap flag.
+        let is i64 as rowb = t.grid_stride * 8;
+        let is i64 as bytes = ((t.rows * rowb + t.rows + 4095) / 4096) * 4096;
+        let is i64 as va = cos.mmap(0, bytes, cos.PROT_READ | cos.PROT_WRITE);
+        if (va > 0) {
+            let is *i64 as g = cast(*i64, t.grid);
+            let is *i64 as d = cast(*i64, va);
+            let is *u8 as dw = cast(*u8, va + t.rows * rowb);
+            let is i64 as r with mut = 0;
+            while (r < t.rows) {
+                let is i64 as phys = _live_phys(t, r);
+                let is i64 as c with mut = 0;
+                while (c < t.grid_stride) {
+                    d[r * t.grid_stride + c] = g[phys * t.grid_stride + c];
+                    c = c + 1;
+                }
+                dw[r] = cast(u8, _wrap_get(t, phys));
+                _wrap_set(t, phys, 0);               // the program's screen starts with no long lines
+                r = r + 1;
+            }
+            t.alt_save = va; t.alt_len = bytes; t.alt_rows = t.rows;
+        }
+    }
+    t.alt = 1;
+    _erase_display(t, 2);
+    return;
+}
+
+fn alt_leave(t as *Term) as void {
+    if (t.alt == 0) { return; }
+    _cursor(t, 0);
+    t.wrap_pend = 0;
+    t.last_cp = 0;
+    t.alt = 0;
+    t.view_off = 0;
+    t.fg = cast(u32, t.alt_fg); t.bg = cast(u32, t.alt_bg);
+    if (t.alt_save == 0) {
+        _erase_display(t, 2);
+        t.cx = 0; t.cy = 0;
+        return;
+    }
+    // Saved rows that no longer fit (the window shrank meanwhile) go into
+    // the history, the way a shrink pushes the top rows there; the cursor's
+    // row moves up with them.
+    let is i64 as sr = t.alt_rows;
+    let is i64 as k with mut = sr - t.rows;
+    if (k < 0) { k = 0; }
+    let is i64 as i with mut = 0;
+    while (i < k) { _ring_advance(t); i = i + 1; }
+    let is *i64 as g = cast(*i64, t.grid);
+    let is *i64 as s = cast(*i64, t.alt_save);
+    let is *u8 as sw = cast(*u8, t.alt_save + sr * t.grid_stride * 8);
+    let is i64 as r with mut = 0;
+    while (r < sr) {
+        // saved row r lands on live row r - k (the first k above the view)
+        let is i64 as p = t.live_top + t.grid_rows + r - k;
+        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+        let is i64 as c with mut = 0;
+        while (c < t.grid_stride) {
+            g[phys * t.grid_stride + c] = s[r * t.grid_stride + c];
+            c = c + 1;
+        }
+        _wrap_set(t, phys, cast(i64, sw[r]));
+        r = r + 1;
+    }
+    r = sr - k;
+    while (r < t.rows) { _grid_blank_phys(t, _live_phys(t, r)); r = r + 1; }
+    cos.munmap(t.alt_save, t.alt_len);
+    t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.cy = t.alt_cy - k;
+    t.cx = t.alt_cx;
+    _clamp_cursor(t);
+    _repaint_view(t);
+    return;
+}
+
+// end_program — undo what a program run in the terminal changed and may not
+// have put back (it was killed, or failed on its way out): its own screen, a
+// hidden cursor, mouse reporting, the colours, and a sequence it never
+// finished. The holder calls this when the program ends, before writing
+// anything of its own — a prompt drawn on the program's screen, with no
+// cursor, was what a killed htop left behind, and an escape sequence cut off
+// by Ctrl+C took the holder's "^C" and prompt as its parameters and final
+// byte, so the command line vanished.
+fn end_program(t as *Term) as void {
+    alt_leave(t);
+    t.cur_vis = 1;
+    t.mouse_mode = 0;
+    t.mouse_sgr = 0;
+    t.fg = cast(u32, t.def_fg);
+    t.bg = cast(u32, t.def_bg);
+    t.esc = 0; t.csi_q = 0; t.csi_n = 0;
+    t.u8_need = 0;
+    return;
+}
+
+// putc — one byte of output. Bytes are UTF-8: a control acts at once, a
+// character is drawn when its last byte has arrived, and a sequence split
+// across two writes comes together. A byte that cannot be part of UTF-8 —
+// a stray continuation, a lead promising more than came, an overlong form, a
+// surrogate — draws U+FFFD, and the byte after a broken sequence is read
+// afresh rather than swallowed with it.
+fn putc(t as *Term, ch as i64) as void {
+    let is i64 as b = ch & 0xFF;
+    if (t.esc != 0) { _esc_feed(t, b); return; }
+    if (t.u8_need > 0) {
+        if ((b & 0xC0) == 0x80) {
+            t.u8_cp = (t.u8_cp << 6) | (b & 0x3F);
+            t.u8_need = t.u8_need - 1;
+            if (t.u8_need == 0) {
+                let is i64 as cp with mut = t.u8_cp;
+                if (cp < t.u8_min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { cp = 0xFFFD; }
+                _put_cp(t, cp);
+            }
+            return;
+        }
+        t.u8_need = 0;
+        _put_cp(t, 0xFFFD);
+    }
+    if (b >= 0x80) {
+        if (b >= 0xC2 && b <= 0xDF) { t.u8_need = 1; t.u8_cp = b & 0x1F; t.u8_min = 0x80; return; }
+        if (b >= 0xE0 && b <= 0xEF) { t.u8_need = 2; t.u8_cp = b & 0x0F; t.u8_min = 0x800; return; }
+        if (b >= 0xF0 && b <= 0xF4) { t.u8_need = 3; t.u8_cp = b & 0x07; t.u8_min = 0x10000; return; }
+        _put_cp(t, 0xFFFD);
+        return;
+    }
+    if (b == 0x1B) { t.esc = 1; return; }                    // ESC begins a sequence
+    if (b < 0x20 || b == 0x7F) { _control(t, b); return; }
+    _put_cp(t, b);
+}
+
+// A C0 control. The ones a terminal acts on move the cursor or clear; the
+// rest (BEL, NUL, DEL, ...) draw nothing — they used to draw CP437 pictures.
+fn _control(t as *Term, b as i64) as void {
+    if (b != 0x0A && b != 0x0D && b != 0x0C && b != 0x08 && b != 0x09) { return; }
+    if (t.view_off != 0) {                                   // output snaps back to live
+        t.view_off = 0;
+        _repaint_view(t);
+    }
+    _cursor(t, 0);                                           // lift the cursor before moving/writing
+    t.last_cp = 0;
+    if (b == 0x0A) {                                         // \n: the row it reaches starts a line
+        t.wrap_pend = 0;
+        _newline(t);
+        _wrap_live(t, t.cy, 0);
+        return;
+    }
+    if (b == 0x0D) { t.wrap_pend = 0; t.cx = 0; return; }      // \r
+    if (b == 0x0C) { clear(t); return; }                     // \f form feed → clear + home
+    if (b == 0x08) {                                         // backspace
+        // VT BS moves the cursor; the cell it passes over is not erased.
+        t.wrap_pend = 0;
+        if (t.cx > 0) {
+            t.cx = t.cx - 1;
+        }
+        return;
+    }
+    // tab: to the next stop. Stops every 8 columns, as every terminal has
+    // them; the cells passed over keep what they hold, and the last column is
+    // as far as it goes (no wrap). It was 4 spaces wherever it started, which
+    // put no two columns of a table in line and wrapped names out of ls's grid.
+    t.wrap_pend = 0;
+    let is i64 as nx with mut = (t.cx / 8 + 1) * 8;
+    if (nx > t.cols - 1) { nx = t.cols - 1; }
+    if (nx > t.cx) { t.cx = nx; }
+}
+
+// Draw one code point at the cursor, in as many columns as it takes.
+fn _put_cp(t as *Term, cp_in as i64) as void {
+    let is i64 as cp with mut = cp_in;
+    if (cp >= 0x80 && cp <= 0x9F) { return; }                // C1 controls draw nothing
+    let is i64 as w = cpw.cp_width(cast(i32, cp));
+    if (w == 0) { _combine(t, cp); return; }
+    if (t.view_off != 0) {
+        t.view_off = 0;
+        _repaint_view(t);
+    }
+    _cursor(t, 0);
+    if (cp > 0xFFFF) { cp = 0xFFFD; }                        // a cell holds the BMP
+    if (t.wrap_pend == 1) {                                  // the wrap a full row left pending
+        t.wrap_pend = 0;
+        _newline(t);
+        _wrap_live(t, t.cy, 1);
+    }
+    let is i64 as wide with mut = 0;
+    if (w == 2 && t.cols >= 2) { wide = 1; }
+    if (wide == 1 && t.cx + 1 >= t.cols) {
+        // No room for both halves: the last column stays empty and the
+        // character starts the next line, as xterm does.
+        _put_cell(t, t.cx, t.cy, 0x20);
+        _newline(t);
+        _wrap_live(t, t.cy, 1);
+    }
+    _put_cell(t, t.cx, t.cy, cp);
+    t.last_cp = cp; t.last_x = t.cx; t.last_y = t.cy;
+    t.last_fg = cast(i64, t.fg); t.last_bg = cast(i64, t.bg);
+    if (wide == 1) {
+        t.cx = t.cx + 1;
+        _put_tail(t, t.cx, t.cy);
+    }
+    if (t.cx + 1 >= t.cols) { t.wrap_pend = 1; } else { t.cx = t.cx + 1; }
+}
+
+// A character that takes no columns. A combining mark folds into the
+// character just drawn when the pair composes to one a cell can hold — "e"
+// then U+0301 is "é" — and is dropped when it does not: a cell draws one
+// glyph, and the other way, the mark in a cell of its own, puts a stray accent
+// between two letters. Joiners, variation selectors and format characters
+// (U+200B, U+FEFF) change nothing on a character grid either.
+fn _combine(t as *Term, mark as i64) as void {
+    if (t.last_cp == 0) { return; }
+    let is i64 as c = uc.compose(t.last_cp, mark);
+    if (c == 0 || c > 0xFFFF) { return; }
+    if (cpw.cp_width(cast(i32, c)) != 1) { return; }
+    if (t.view_off != 0) {
+        t.view_off = 0;
+        _repaint_view(t);
+    }
+    _cursor(t, 0);
+    let is u32 as fg = cast(u32, t.last_fg);
+    let is u32 as bg = cast(u32, t.last_bg);
+    _glyph_c(t, c, _cellx(t, t.last_x), _celly(t, t.last_y), fg, bg);
+    _grid_set_c(t, t.last_x, t.last_y, c, fg, bg);
+    t.last_cp = c;
+}
+
+// One cell: glyph and grid. Writing over half of a two-column character
+// leaves the other half meaningless, so it is blanked, as xterm does.
+fn _put_cell(t as *Term, col as i64, row as i64, cp as i64) as void {
+    if (t.grid != 0) {
+        if (cell_cp(_grid_get(t, col, row)) == CELL_WIDE_TAIL) {
+            if (col > 0) {
+                _glyph(t, 0x20, _cellx(t, col - 1), _celly(t, row));
+                _grid_set(t, col - 1, row, 0x20);
+            }
+        } else if (col + 1 < t.cols && cell_cp(_grid_get(t, col + 1, row)) == CELL_WIDE_TAIL) {
+            _glyph(t, 0x20, _cellx(t, col + 1), _celly(t, row));
+            _grid_set(t, col + 1, row, 0x20);
+        }
+    }
+    _glyph(t, cp, _cellx(t, col), _celly(t, row));
+    _grid_set(t, col, row, cp);
+}
+
+// The right half of the wide character just drawn at col - 1.
+fn _put_tail(t as *Term, col as i64, row as i64) as void {
+    if (t.grid != 0 && col + 1 < t.cols && cell_cp(_grid_get(t, col + 1, row)) == CELL_WIDE_TAIL) {
+        _glyph(t, 0x20, _cellx(t, col + 1), _celly(t, row));
+        _grid_set(t, col + 1, row, 0x20);
+    }
+    _glyph(t, CELL_WIDE_TAIL, _cellx(t, col), _celly(t, row));
+    _grid_set(t, col, row, CELL_WIDE_TAIL);
+}
+
+fn puts(t as *Term, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { putc(t, cast(i64, s[i])); i = i + 1; }
+}
+
+// flush — paint the cursor, then (fullscreen mode) publish to the scanout.
+// In render-only mode (init_buffer) presenting is the holder's job: it drains
+// take_dirty() and routes the rect to its compositor instead.
+fn flush(t as *Term) as void {
+    if (t.cur_vis != 0) { _cursor(t, 1); }       // a TUI hides it via CSI ?25l
+    if (t.present_mode == 1) {
+        cos.present(t.fd, 0, 0, t.width, t.height);
+    }
+}
+
+// set_color — change fg/bg for subsequent glyphs (the shell uses this to colour
+// the prompt green, errors red, etc.).
+fn set_color(t as *Term, fg as u32, bg as u32) as void {
+    t.fg = fg; t.bg = bg;
+}
+
+// clear — wipe the visible region to bg and home the cursor (the shell's
+// `clear`). Pitch-aware row fill so windowed buffers only touch their rect.
+fn clear(t as *Term) as void {
+    t.last_cp = 0;
+    if (t.alt == 1) {                            // a program's own screen: the
+        _cursor(t, 0);                           // history under it is not its
+        _erase_display(t, 2);                    // to wipe
+        t.cx = 0; t.cy = 0;
+        t.wrap_pend = 0;
+        _mark(t, 0, 0, t.width, t.height);
+        flush(t);
+        return;
+    }
+    _fill_bg(t, t.width, t.height);
+    if (t.grid != 0) {
+        // A lazy grid gives the history's memory back: everything past the
+        // visible rows and one stretch more is decommitted, and a ring that
+        // had closed early for want of memory may grow to its full size again.
+        if (t.grid_lazy == 1) {
+            let is i64 as rowb = t.grid_stride * 8;
+            let is i64 as keep with mut = t.rows * rowb + GRID_CHUNK;
+            keep = ((keep + 4095) / 4096) * 4096;
+            if (keep < t.grid_rdyb) {
+                cos.decommit(t.grid + keep, t.grid_rdyb - keep);
+                t.grid_rdyb = keep;
+                t.grid_ready = keep / rowb;
+            }
+            t.grid_rows = t.grid_cap;
+            if (t.grid_ready > t.grid_rows) { t.grid_ready = t.grid_rows; }
+        }
+        let is *i64 as g = cast(*i64, t.grid);
+        let is i64 as blank = _blank(t);
+        let is i64 as i with mut = 0;
+        let is i64 as total = t.grid_stride * t.grid_ready;
+        while (i < total) { g[i] = blank; i = i + 1; }
+        i = 0;
+        while (i < t.wraps_n) { _wrap_set(t, i, 0); i = i + 1; }
+        // Every line there was is gone: their numbers are left behind.
+        t.scrolled = t.scrolled + t.hist_count + t.rows;
+        t.live_top = 0;
+        t.hist_count = 0;
+        t.view_off = 0;
+    }
+    t.cx = 0; t.cy = 0;
+    t.wrap_pend = 0;
+    _mark(t, 0, 0, t.width, t.height);
+    flush(t);
+}
+
+// resize — re-lay the terminal out over a new w x h inside the SAME buffer
+// (the buffer is allocated full-screen once; pitch never changes). Lines do
+// not re-wrap: each grid row maps to the same row, truncated to the new
+// width. The view anchors at the BOTTOM — if the cursor row would fall off,
+// the grid shifts up so the prompt stays visible. Requires an attached grid
+// to re-render content; without one the screen is cleared (documented: a
+// grid is what makes content survive a resize).
+fn resize(t as *Term, new_w as i64, new_h as i64) as void {
+    t.wrap_pend = 0;
+    t.last_cp = 0;
+    let is i64 as new_cols with mut = (new_w - 2 * PAD_X) / GLYPH_W;
+    let is i64 as new_rows with mut = (new_h - 2 * PAD_Y) / GLYPH_H;
+    if (t.present_mode == 2) { new_cols = new_w / GLYPH_W; new_rows = new_h / GLYPH_H; }   // text: no margin (init_text)
+    if (new_cols < 1) { new_cols = 1; }
+    if (new_rows < 1) { new_rows = 1; }
+    if (t.grid != 0) {
+        if (new_cols > t.grid_stride) { new_cols = t.grid_stride; }
+        if (new_rows > t.rows) { _grid_reach(t, t.live_top + new_rows - 1); }
+        if (new_rows > t.grid_rows) { new_rows = t.grid_rows; }
+        t.view_off = 0;                              // a resize snaps to live
+        // bottom anchor: lines pushed off the top become HISTORY (the ring
+        // just advances — nothing is copied or lost)
+        if (t.cy >= new_rows && t.alt == 1) {
+            t.cy = new_rows - 1;                     // the alternate screen keeps no history
+        }
+        if (t.cy >= new_rows) {
+            let is i64 as shift = t.cy - new_rows + 1;
+            t.scrolled = t.scrolled + shift;
+            let is i64 as p = t.live_top + shift;
+            t.live_top = p - (p / t.grid_rows) * t.grid_rows;
+            t.hist_count = t.hist_count + shift;
+            t.cy = new_rows - 1;
+        }
+        // growing: physical rows entering at the bottom may hold recycled
+        // ancient ring lines — blank them
+        if (new_rows > t.rows) {
+            let is i64 as r with mut = t.rows;
+            while (r < new_rows) {
+                let is i64 as q = t.live_top + r;
+                _grid_blank_phys(t, q - (q / t.grid_rows) * t.grid_rows);
+                r = r + 1;
+            }
+        }
+        let is i64 as hmax = t.grid_rows - new_rows;
+        if (t.hist_count > hmax) { t.hist_count = hmax; }
+    } else {
+        if (t.cy >= new_rows) { t.cy = new_rows - 1; }
+    }
+    if (t.cx >= new_cols) { t.cx = new_cols - 1; }
+    t.width = new_w; t.height = new_h;
+    t.cols = new_cols; t.rows = new_rows;
+    _repaint_view(t);
+}

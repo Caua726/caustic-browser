@@ -9,11 +9,16 @@
 
 use "caustic-net/client/fetch.cst" as fetch;
 use "caustic-net/core/conn.cst" as conn;
+use "caustic-media/text/sfnt/woff.cst" as woff;
 use "caustic-net/proto/cookie.cst" as cookie;
 use "caustic-net/tls/trust.cst" as trust;
 use "std/mem.cst" as mem;
+use "std/env.cst" as env;
 use "./file.cst" as file;
 use "./url.cst" as url;
+use "caustic-net/proto/url.cst" as parsed;
+use "std/sync.cst" as sync;
+use "std/time.cst" as time;
 
 let is i64 as DEADLINE_MS with imut = 15000;
 let is i64 as MAX_URL     with imut = 4096;
@@ -27,7 +32,13 @@ struct Resource {
     ctype  as [MAX_TYPE]u8;     // lower case, up to any semicolon; empty when unknown
     final  as [MAX_URL]u8;      // where it really came from, after redirects
     error  as *u8;     // why it could not be had, in words a page can show
+    xfo    as [32]u8;  // X-Frame-Options, lower case
+    fa     as [256]u8; // frame-ancestors from its Content-Security-Policy, lower case
 }
+
+// Who this browser says it is. "Mozilla/5.0" is the word every browser has opened with since the
+// nineties, and servers still look for it; it claims to be none of them.
+let is *u8 as USER_AGENT with mut = "Mozilla/5.0 (X11; Linux x86_64) CausticBrowser/0.0.2";
 
 let is trust.TrustStore as _store with mut;
 let is cookie.Jar as _jar with mut;
@@ -37,6 +48,10 @@ fn _setup() as void {
     if (_ready != 0) { return; }
     _ready = 1;
     cookie.jar_init(&_jar, 256);
+    // For testing how servers answer another name. The default is the browser's own.
+    let is *u8 as ua_test = env.getenv("CAUSTIC_UA");
+    if (ua_test != null && ua_test[0] != 0) { USER_AGENT = ua_test; }
+    fetch.fetch_set_user_agent(USER_AGENT);
     if (trust.trust_init(&_store) > 0) { _ready = 2; }
 }
 
@@ -46,6 +61,8 @@ fn _init(r as *Resource, u as *u8) as void {
     r.cap = 0;
     r.status = 200;
     r.ctype[0] = cast(u8, 0);
+    r.xfo[0] = cast(u8, 0);
+    r.fa[0] = cast(u8, 0);
     r.error = cast(*u8, 0);
     let is i64 as i with mut = 0;
     while (i < MAX_URL - 1 && u[i] != 0) {
@@ -130,6 +147,123 @@ fn _set_type(r as *Resource, s as *u8) as void {
     r.ctype[i] = cast(u8, 0);
 }
 
+// Windows-1252 is what the web means by Latin-1. These are the 32 places where they differ.
+fn _cp1252(c as i64) as i64 {
+    if (c < 128 || c >= 160) { return c; }
+    let is [32]i64 as t;
+    t[0] = 8364; t[1] = 129; t[2] = 8218; t[3] = 402; t[4] = 8222; t[5] = 8230; t[6] = 8224; t[7] = 8225;
+    t[8] = 710; t[9] = 8240; t[10] = 352; t[11] = 8249; t[12] = 338; t[13] = 141; t[14] = 381; t[15] = 143;
+    t[16] = 144; t[17] = 8216; t[18] = 8217; t[19] = 8220; t[20] = 8221; t[21] = 8226; t[22] = 8211; t[23] = 8212;
+    t[24] = 732; t[25] = 8482; t[26] = 353; t[27] = 8250; t[28] = 339; t[29] = 157; t[30] = 382; t[31] = 376;
+    return t[c - 128];
+}
+fn _lower(c as u8) as i64 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 65 && v <= 90) { return v + 32; }
+    return v;
+}
+// Where "charset=" ends in s, within n bytes, or -1.
+fn _after_charset(s as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i + 8 <= n) {
+        if (_lower(s[i]) == 99 && _lower(s[i + 1]) == 104 && _lower(s[i + 2]) == 97 && _lower(s[i + 3]) == 114
+            && _lower(s[i + 4]) == 115 && _lower(s[i + 5]) == 101 && _lower(s[i + 6]) == 116 && s[i + 7] == 61) {
+            let is i64 as j with mut = i + 8;
+            while (j < n && (s[j] == 34 || s[j] == 39 || s[j] == 32)) { j = j + 1; }
+            return j;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn _label_is(s as *u8, n as i64, name as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (name[i] != 0) {
+        if (i >= n || _lower(s[i]) != cast(i64, name[i])) { return 0; }
+        i = i + 1;
+    }
+    if (i < n) {
+        let is i64 as c = _lower(s[i]);
+        if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95) { return 0; }
+    }
+    return 1;
+}
+fn _is_latin1(s as *u8, n as i64) as i64 {
+    return _label_is(s, n, "iso-8859-1") + _label_is(s, n, "latin1") + _label_is(s, n, "windows-1252")
+         + _label_is(s, n, "cp1252") + _label_is(s, n, "us-ascii") + _label_is(s, n, "ascii");
+}
+fn _strlen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+fn _type_starts(r as *Resource, p as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (p[i] != 0) { if (r.ctype[i] != p[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+fn _frame_ancestors(r as *Resource, csp as *u8) as void {
+    let is *u8 as w = "frame-ancestors";
+    let is i64 as i with mut = 0;
+    while (csp[i] != 0) {
+        let is i64 as q with mut = 0;
+        while (w[q] != 0 && _lower(csp[i + q]) == cast(i64, w[q])) { q = q + 1; }
+        if (w[q] == 0) {
+            let is i64 as at with mut = i + q;
+            let is i64 as o with mut = 0;
+            while (csp[at] != 0 && csp[at] != 59 && o < 254) {
+                r.fa[o] = cast(u8, _lower(csp[at]));
+                o = o + 1;
+                at = at + 1;
+            }
+            // Never empty once it was named: an empty list allows nothing, like 'none'.
+            r.fa[o] = cast(u8, 32);
+            r.fa[o + 1] = cast(u8, 0);
+            return;
+        }
+        i = i + 1;
+    }
+}
+// Text in the one encoding the rest of the browser reads. A charset named by the header wins,
+// then one named in the first bytes of a page, as HTML says; anything else is taken for UTF-8.
+fn _to_utf8(r as *Resource, head as *u8) as void {
+    if (r.len == 0 || (_type_starts(r, "text/") == 0 && _type_starts(r, "application/javascript") == 0)) { return; }
+    let is i64 as latin with mut = 0;
+    let is i64 as hn = _strlen(head);
+    let is i64 as at = _after_charset(head, hn);
+    if (at >= 0) {
+        latin = _is_latin1(cast(*u8, cast(i64, head) + at), hn - at);
+    } else if (_type_starts(r, "text/html") == 1) {
+        let is i64 as lim with mut = r.len;
+        if (lim > 1024) { lim = 1024; }
+        let is i64 as m = _after_charset(r.data, lim);
+        if (m >= 0) { latin = _is_latin1(cast(*u8, cast(i64, r.data) + m), lim - m); }
+    }
+    if (latin == 0) { return; }
+    let is i64 as high with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < r.len) { if (cast(i64, r.data[i]) >= 128) { high = high + 1; } i = i + 1; }
+    if (high == 0) { return; }
+    let is i64 as cap = r.len + high * 2 + 1;
+    let is *u8 as out = mem.core.mmap_anon(cap);
+    let is i64 as ov = cast(i64, out);
+    if (ov == 0 || ov == 0 - 1) { return; }
+    let is i64 as w with mut = 0;
+    i = 0;
+    while (i < r.len) {
+        let is i64 as c = _cp1252(cast(i64, r.data[i]));
+        if (c < 128) { out[w] = cast(u8, c); w = w + 1; }
+        else if (c < 2048) { out[w] = cast(u8, 192 + (c >> 6)); out[w + 1] = cast(u8, 128 + (c & 63)); w = w + 2; }
+        else { out[w] = cast(u8, 224 + (c >> 12)); out[w + 1] = cast(u8, 128 + ((c >> 6) & 63)); out[w + 2] = cast(u8, 128 + (c & 63)); w = w + 3; }
+        i = i + 1;
+    }
+    out[w] = cast(u8, 0);
+    free(r);
+    r.data = out;
+    r.len = w;
+    r.cap = cap;
+}
+
 // What a file is, from its name.
 fn _type_of_path(r as *Resource, p as *u8, n as i64) as void {
     if (_ends(p, n, ".html") == 1 || _ends(p, n, ".htm") == 1 || _ends(p, n, ".xhtml") == 1) { _set_type(r, "text/html"); return; }
@@ -173,6 +307,7 @@ fn _get_file(u as *u8, r as *Resource) as i64 {
     if (f.len > 0) { mem.core.memcpy(r.data, f.data, f.len); }
     r.len = f.len;
     file.free(&f);
+    _to_utf8(r, "");
     return 0;
 }
 
@@ -231,6 +366,8 @@ fn _get_data(u as *u8, r as *Resource) as i64 {
     return 0;
 }
 
+fn get_data(u as *u8, r as *Resource) as i64 { return _get_data(u, r); }
+
 fn _get_http(f as *fetch.Fetch, u as *u8, r as *Resource) as i64 {
     return _exchange(f, u, cast(*u8, 0), cast(*u8, 0), 0, cast(*u8, 0), cast(*u8, 0), r);
 }
@@ -256,7 +393,16 @@ fn _exchange(f as *fetch.Fetch, u as *u8, ctype as *u8, body as *u8, n0 as i64, 
     }
     r.status = fetch.fetch_status(f);
     let is [256]u8 as head with mut;
+    head[0] = cast(u8, 0);
     if (fetch.fetch_header(f, "content-type", &head[0], 256) > 0) { _set_type(r, &head[0]); }
+    let is [32]u8 as xh with mut;
+    if (fetch.fetch_header(f, "x-frame-options", &xh[0], 32) > 0) {
+        let is i64 as xi with mut = 0;
+        while (xi < 31 && xh[xi] != 0) { r.xfo[xi] = cast(u8, _lower(xh[xi])); xi = xi + 1; }
+        r.xfo[xi] = cast(u8, 0);
+    }
+    let is [4096]u8 as csp with mut;
+    if (fetch.fetch_header(f, "content-security-policy", &csp[0], 4096) > 0) { _frame_ancestors(r, cast(*u8, &csp)); }
     let is *u8 as fin = fetch.fetch_final_url(f);
     let is i64 as i with mut = 0;
     while (i < MAX_URL - 1 && fin[i] != 0) {
@@ -273,10 +419,75 @@ fn _exchange(f as *fetch.Fetch, u as *u8, ctype as *u8, body as *u8, n0 as i64, 
     if (n > 0) { mem.core.memcpy(r.data, fetch.fetch_body(f), n); }
     r.len = n;
     fetch.fetch_free(f);
+    _to_utf8(r, &head[0]);
     return 0;
 }
 
 // What everything after this needs, made before there is more than one thread to want it.
+// A font as it came into the sfnt a reader wants, in r. Left alone if it is one already,
+// r.len 0 if it is neither. On a worker: a big WOFF2 takes more than a frame.
+fn unwrap_font(r as *Resource) as void {
+    if (woff.is_wrapped(r.data, r.len) == 0) { return; }
+    let is i64 as size with mut = 0;
+    fetch.fetch_decode_lock();
+    let is *u8 as out = woff.unwrap(r.data, r.len, &size);
+    fetch.fetch_decode_unlock();
+    free(r);
+    if (cast(i64, out) == 0) { return; }
+    r.data = out;
+    r.len = size;
+    r.cap = size;
+}
+
+// document.cookie, for a page at u: what its scripts may read, as a Cookie header would have it.
+fn script_cookies(u as *u8, out as *u8, max as i64) as i64 {
+    _setup();
+    let is parsed.Url as pu with mut = parsed.url_parse(u);
+    let is [256]u8 as host;
+    let is [512]u8 as rpath;
+    if (parsed.url_host(&pu, cast(*u8, &host), cookie.MAX_DOMAIN) < 0) { return 0; }
+    if (parsed.url_path(&pu, cast(*u8, &rpath), cookie.MAX_PATH) < 0) { rpath[0] = 47; rpath[1] = 0; }
+    let is i64 as https = parsed.url_scheme_is(&pu, "https");
+    let is i64 as now = time.unix_time();
+    let is i64 as w with mut = 0;
+    sync.mutex_lock(&fetch._jar_lock);
+    let is i64 as i with mut = 0;
+    let is i64 as n = cookie.jar_count(&_jar);
+    while (i < n) {
+        let is *cookie.Cookie as c = cookie.jar_at(&_jar, i);
+        if (c.http_only == 0 && cookie.cookie_applies(c, cast(*u8, &host), cast(*u8, &rpath), https, now) == 1) {
+            let is i64 as a = _strlen(cast(*u8, &c.name));
+            let is i64 as b = _strlen(cast(*u8, &c.value));
+            if (w + a + b + 3 < max) {
+                if (w > 0) { out[w] = 59; out[w + 1] = 32; w = w + 2; }
+                mem.core.memcpy(cast(*u8, cast(i64, out) + w), cast(*u8, &c.name), a);
+                w = w + a;
+                out[w] = 61;
+                w = w + 1;
+                mem.core.memcpy(cast(*u8, cast(i64, out) + w), cast(*u8, &c.value), b);
+                w = w + b;
+            }
+        }
+        i = i + 1;
+    }
+    sync.mutex_unlock(&fetch._jar_lock);
+    return w;
+}
+fn script_set_cookie(u as *u8, text as *u8) as void {
+    _setup();
+    let is parsed.Url as pu with mut = parsed.url_parse(u);
+    let is [256]u8 as host;
+    let is [512]u8 as rpath;
+    if (parsed.url_host(&pu, cast(*u8, &host), cookie.MAX_DOMAIN) < 0) { return; }
+    if (parsed.url_path(&pu, cast(*u8, &rpath), cookie.MAX_PATH) < 0) { rpath[0] = 47; rpath[1] = 0; }
+    let is i64 as now = time.unix_time();
+    let is cookie.Cookie as c;
+    if (cookie.cookie_parse(text, cast(*u8, &host), cast(*u8, &rpath), now, &c) != 0 || c.http_only == 1) { return; }
+    sync.mutex_lock(&fetch._jar_lock);
+    cookie.jar_store(&_jar, &c, now);
+    sync.mutex_unlock(&fetch._jar_lock);
+}
+
 fn prepare() as void {
     conn.conn_heap_warm();
     _setup();

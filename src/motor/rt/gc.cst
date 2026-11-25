@@ -1,0 +1,374 @@
+// ── Memory: non-moving mark and sweep, conservative about what is a pointer ──
+//
+// Everything lives in one reserved span, cut into 1 MB segments, so "is this a pointer of
+// ours" is a range check and a table lookup. A value is a raw address or has high bits set,
+// which is why any word anywhere can simply be tried. Small cells come in size classes, with
+// a mark bitmap at the head of their segment. Strings' bytes live in chunks of their own,
+// with no pointers in them, marked whole: substrings point into the middle of them.
+let is i64 as HEAP_SPAN with imut = 68719476736;
+let is i64 as SEG with imut = 1048576;
+let is i64 as SEG_HDR with imut = 8192;
+let is i64 as MAX_SMALL with imut = 65536;
+let is i64 as BYTE_CHUNK_SEGS with imut = 4;
+let is i64 as GC_MIN with imut = 33554432;
+let is i64 as NCLS with imut = 28;
+let is i64 as SK_FREE with imut = 0;
+let is i64 as SK_SMALL with imut = 1;
+let is i64 as SK_LARGE with imut = 2;
+let is i64 as SK_CONT with imut = 3;
+let is i64 as SK_BYTES with imut = 4;
+struct Seg { kind as i64; size as i64; head as i64; marked as i64; nsegs as i64; }
+
+let is i64 as heap_lo with mut = 0;
+let is i64 as heap_hi with mut = 0;
+let is i64 as heap_next with mut = 0;
+let is *Seg as segs with mut = cast(*Seg, 0);
+let is *i64 as free_segs with mut = cast(*i64, 0);
+let is i64 as nfree_segs with mut = 0;
+let is *u8 as cls_tab with mut = cast(*u8, 0);
+let is [28]i64 as cls_size with mut;
+let is [28]i64 as gc_free with mut;
+let is [28]i64 as gc_bump with mut;
+let is [28]i64 as gc_bump_end with mut;
+let is i64 as gc_debt with mut = 0;
+let is i64 as gc_limit with mut = 33554432;
+let is i64 as gc_count with mut = 0;
+let is i64 as gc_live with mut = 0;
+let is i64 as gc_ms_total with mut = 0;
+let is i64 as gc_stack_top with mut = 0;
+let is i64 as gc_busy with mut = 0;
+let is i64 as byte_p with mut = 0;
+let is i64 as byte_end with mut = 0;
+let is i64 as byte_seg with mut = -1;
+let is *i64 as mstack with mut = cast(*i64, 0);
+let is i64 as mstack_cap with mut = 0;
+let is i64 as mstack_n with mut = 0;
+
+fn os_map(n as i64) as i64 {
+    return syscall(9, 0, n, 3, 34, -1, 0);
+}
+fn gc_init() as void {
+    // Reserved, not committed: only what is touched costs anything.
+    let is i64 as raw = syscall(9, 0, HEAP_SPAN + SEG, 3, 16418, -1, 0);
+    heap_lo = (raw + SEG - 1) & (0 - SEG);
+    heap_hi = heap_lo + HEAP_SPAN;
+    let is i64 as nseg = HEAP_SPAN / SEG;
+    segs = cast(*Seg, os_map(nseg * sizeof(Seg)));
+    free_segs = cast(*i64, os_map(nseg * 8));
+    let is *i64 as cs = cast(*i64, &cls_size);
+    cs[0] = 16; cs[1] = 32; cs[2] = 48; cs[3] = 64; cs[4] = 80; cs[5] = 96; cs[6] = 112; cs[7] = 128;
+    cs[8] = 160; cs[9] = 192; cs[10] = 224; cs[11] = 256; cs[12] = 320; cs[13] = 384; cs[14] = 448; cs[15] = 512;
+    cs[16] = 640; cs[17] = 768; cs[18] = 1024; cs[19] = 1536; cs[20] = 2048; cs[21] = 3072; cs[22] = 4096; cs[23] = 8192;
+    cs[24] = 16384; cs[25] = 32768; cs[26] = 49152; cs[27] = 65536;
+    cls_tab = cast(*u8, os_map(MAX_SMALL / 16 + 2));
+    let is i64 as c with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i <= MAX_SMALL / 16) {
+        while (cs[c] < i * 16) { c = c + 1; }
+        cls_tab[i] = cast(u8, c);
+        i = i + 1;
+    }
+    mstack_cap = 262144;
+    mstack = cast(*i64, os_map(mstack_cap * 16));
+}
+fn seg_take(n as i64) as i64 {
+    if (n == 1 && nfree_segs > 0) {
+        nfree_segs = nfree_segs - 1;
+        return free_segs[nfree_segs];
+    }
+    let is i64 as s = heap_next;
+    heap_next = heap_next + n;
+    if (heap_next * SEG > HEAP_SPAN) { syscall(1, 2, "js: out of memory\n", 18); syscall(231, 1); }
+    return s;
+}
+fn seg_give(s as i64, n as i64) as void {
+    // Back to the system, which hands it back zeroed.
+    syscall(28, heap_lo + s * SEG, n * SEG, 4);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        segs[s + i].kind = SK_FREE;
+        free_segs[nfree_segs] = s + i;
+        nfree_segs = nfree_segs + 1;
+        i = i + 1;
+    }
+}
+fn alloc_cold(c as i64) as i64 {
+    let is i64 as s = seg_take(1);
+    let is *Seg as g = &segs[s];
+    g.kind = SK_SMALL;
+    g.size = cls_size[c];
+    let is i64 as base = heap_lo + s * SEG;
+    let is i64 as r = base + SEG_HDR;
+    gc_bump[c] = r + g.size;
+    gc_bump_end[c] = base + SEG;
+    return r;
+}
+fn alloc_large(n as i64) as i64 {
+    let is i64 as ns = (n + SEG - 1) / SEG;
+    let is i64 as s = seg_take(ns);
+    segs[s].kind = SK_LARGE;
+    segs[s].size = n;
+    segs[s].nsegs = ns;
+    segs[s].marked = 0;
+    let is i64 as i with mut = 1;
+    while (i < ns) { segs[s + i].kind = SK_CONT; segs[s + i].head = s; i = i + 1; }
+    return heap_lo + s * SEG;
+}
+// Zeroed, as code here assumes of anything new.
+fn alloc(sz as i64) as i64 {
+    let is i64 as n = (sz + 15) & -16;
+    gc_debt = gc_debt + n;
+    if (gc_debt > gc_limit) { gc_collect(); }
+    if (n > MAX_SMALL) { return alloc_large(n); }
+    let is i64 as c = cast(i64, cls_tab[n >> 4]);
+    let is i64 as r = gc_free[c];
+    if (r != 0) {
+        gc_free[c] = *cast(*i64, r);
+        *cast(*i64, r) = 0;
+        return r;
+    }
+    let is i64 as b = gc_bump[c];
+    let is i64 as e = b + cls_size[c];
+    if (e <= gc_bump_end[c]) { gc_bump[c] = e; return b; }
+    return alloc_cold(c);
+}
+fn byte_alloc(n as i64) as i64 {
+    if (byte_p + n > byte_end) {
+        gc_debt = gc_debt + BYTE_CHUNK_SEGS * SEG;
+        if (gc_debt > gc_limit) { gc_collect(); }
+        let is i64 as ns with mut = BYTE_CHUNK_SEGS;
+        if (n > ns * SEG) { ns = (n + SEG - 1) / SEG; }
+        let is i64 as s = seg_take(ns);
+        segs[s].kind = SK_BYTES;
+        segs[s].nsegs = ns;
+        segs[s].marked = 0;
+        let is i64 as i with mut = 1;
+        while (i < ns) { segs[s + i].kind = SK_CONT; segs[s + i].head = s; i = i + 1; }
+        byte_seg = s;
+        byte_p = heap_lo + s * SEG;
+        byte_end = byte_p + ns * SEG;
+    }
+    let is i64 as r = byte_p;
+    byte_p = byte_p + n;
+    return r;
+}
+fn mark_push(p as i64, n as i64) as void {
+    if (mstack_n == mstack_cap) {
+        let is *i64 as bigger = cast(*i64, os_map(mstack_cap * 32));
+        let is i64 as i with mut = 0;
+        while (i < mstack_n * 2) { bigger[i] = mstack[i]; i = i + 1; }
+        syscall(11, mstack, mstack_cap * 16);
+        mstack = bigger;
+        mstack_cap = mstack_cap * 2;
+    }
+    mstack[mstack_n * 2] = p;
+    mstack[mstack_n * 2 + 1] = n;
+    mstack_n = mstack_n + 1;
+}
+fn gc_try(v as i64) as void {
+    if (v < heap_lo || v >= heap_hi) { return; }
+    let is i64 as s with mut = (v - heap_lo) >> 20;
+    if (s >= heap_next) { return; }
+    let is *Seg as g with mut = &segs[s];
+    let is i64 as kd with mut = g.kind;
+    if (kd == SK_SMALL) {
+        let is i64 as base = heap_lo + s * SEG;
+        let is i64 as off = v - base - SEG_HDR;
+        if (off < 0) { return; }
+        let is i64 as sz = g.size;
+        let is i64 as idx = off / sz;
+        if (base + SEG_HDR + (idx + 1) * sz > base + SEG) { return; }
+        let is *u8 as bits = cast(*u8, base);
+        let is i64 as bb = cast(i64, bits[idx >> 3]);
+        let is i64 as bm = 1 << (idx & 7);
+        if ((bb & bm) != 0) { return; }
+        bits[idx >> 3] = cast(u8, bb | bm);
+        gc_live = gc_live + sz;
+        mark_push(base + SEG_HDR + idx * sz, sz);
+        return;
+    }
+    if (kd == SK_CONT) {
+        s = g.head;
+        g = &segs[s];
+        kd = g.kind;
+    }
+    if (kd == SK_LARGE) {
+        if (g.marked == 1) { return; }
+        g.marked = 1;
+        gc_live = gc_live + g.size;
+        mark_push(heap_lo + s * SEG, g.size);
+        return;
+    }
+    if (kd == SK_BYTES) {
+        if (g.marked == 0) { g.marked = 1; gc_live = gc_live + g.nsegs * SEG; }
+    }
+}
+fn gc_range(a as i64, n as i64) as void {
+    let is i64 as p with mut = a & -8;
+    let is i64 as e = a + n;
+    while (p + 8 <= e) {
+        let is i64 as v = *cast(*i64, p);
+        if (v >= heap_lo && v < heap_hi) { gc_try(v); }
+        p = p + 8;
+    }
+}
+fn gc_drain() as void {
+    while (mstack_n > 0) {
+        mstack_n = mstack_n - 1;
+        gc_range(mstack[mstack_n * 2], mstack[mstack_n * 2 + 1]);
+    }
+}
+fn gc_sweep() as void {
+    let is i64 as c with mut = 0;
+    while (c < NCLS) { gc_free[c] = 0; c = c + 1; }
+    let is i64 as s with mut = 0;
+    let is i64 as top = heap_next;
+    while (s < top) {
+        let is *Seg as g = &segs[s];
+        let is i64 as kd = g.kind;
+        if (kd == SK_SMALL) {
+            let is i64 as base = heap_lo + s * SEG;
+            let is i64 as sz = g.size;
+            let is i64 as cl = cast(i64, cls_tab[sz >> 4]);
+            let is i64 as cells = (SEG - SEG_HDR) / sz;
+            let is i64 as limit with mut = cells;
+            let is i64 as is_bump = cast(i64, gc_bump_end[cl] == base + SEG);
+            if (is_bump == 1) { limit = (gc_bump[cl] - base - SEG_HDR) / sz; }
+            let is i64 as any with mut = 0;
+            let is i64 as w with mut = 0;
+            let is i64 as words = (cells + 63) / 64;
+            while (w < words) {
+                if (*cast(*i64, base + w * 8) != 0) { any = 1; break; }
+                w = w + 1;
+            }
+            if (any == 0 && is_bump == 0) {
+                seg_give(s, 1);
+            } else if (any == 0) {
+                // The one being cut from starts over, with its memory given back.
+                syscall(28, base, SEG, 4);
+                gc_bump[cl] = base + SEG_HDR;
+            } else {
+                let is *u8 as bits = cast(*u8, base);
+                let is i64 as idx with mut = limit - 1;
+                while (idx >= 0) {
+                    if ((cast(i64, bits[idx >> 3]) & (1 << (idx & 7))) == 0) {
+                        let is i64 as cell = base + SEG_HDR + idx * sz;
+                        let is i64 as q with mut = 0;
+                        while (q < sz) { *cast(*i64, cell + q) = 0; q = q + 8; }
+                        *cast(*i64, cell) = gc_free[cl];
+                        gc_free[cl] = cell;
+                    }
+                    idx = idx - 1;
+                }
+                w = 0;
+                while (w < words) { *cast(*i64, base + w * 8) = 0; w = w + 1; }
+            }
+            s = s + 1;
+        } else if (kd == SK_LARGE || kd == SK_BYTES) {
+            let is i64 as ns = g.nsegs;
+            if (g.marked == 0 && !(kd == SK_BYTES && s == byte_seg)) { seg_give(s, ns); }
+            g.marked = 0;
+            s = s + ns;
+        } else {
+            s = s + 1;
+        }
+    }
+}
+// Interned strings nothing else holds go: the table is weak, and is made again without them.
+fn gc_itab_is_live(v as i64) as i64 {
+    if (v < heap_lo || v >= heap_hi) { return 1; }
+    let is i64 as s = (v - heap_lo) >> 20;
+    let is i64 as base = heap_lo + s * SEG;
+    let is i64 as sz = segs[s].size;
+    let is i64 as idx = (v - base - SEG_HDR) / sz;
+    let is *u8 as bits = cast(*u8, base);
+    return (cast(i64, bits[idx >> 3]) >> (idx & 7)) & 1;
+}
+fn gc_itab_clean() as void {
+    let is i64 as dead with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < INTERN_SZ) {
+        let is i64 as e = *cast(*i64, itab + i * 8);
+        if (e != 0 && gc_itab_is_live(e) == 0) { dead = 1; break; }
+        i = i + 1;
+    }
+    if (dead == 0) { return; }
+    let is i64 as fresh = os_map(INTERN_SZ * 8);
+    i = 0;
+    while (i < INTERN_SZ) {
+        let is i64 as e = *cast(*i64, itab + i * 8);
+        if (e != 0 && gc_itab_is_live(e) == 1) {
+            let is i64 as h with mut = cast(*Str, e).hash & (INTERN_SZ - 1);
+            while (*cast(*i64, fresh + h * 8) != 0) { h = (h + 1) & (INTERN_SZ - 1); }
+            *cast(*i64, fresh + h * 8) = e;
+        }
+        i = i + 1;
+    }
+    syscall(11, itab, INTERN_SZ * 8);
+    itab = fresh;
+}
+// This function's frame is below the collector's, whose saved registers it must see.
+fn gc_mark_all(regs as i64) as void {
+    let is i64 as here = 0;
+    gc_range(regs, 256);
+    gc_roots_rt();
+    js_gc_roots();
+    let is i64 as ei with mut = 0;
+    while (ei < ev_n) { call(cast(*u8, ev_roots[ei])); ei = ei + 1; }
+    if (wrap_tab != 0) { gc_range(wrap_tab, wrap_sz * 16); }
+    gc_drain();
+    // The stacks, from the one running out through whoever resumed it.
+    let is i64 as sp with mut = cast(i64, &here);
+    let is *Co as co with mut = co_cur;
+    while (cast(i64, co) != 0) {
+        gc_range(sp, co.stack + CO_STACK - sp);
+        gc_drain();
+        sp = co.caller_sp;
+        co = co.prev_co;
+    }
+    if (gc_stack_top > sp) { gc_range(sp, gc_stack_top - sp); }
+    gc_drain();
+    // Those waiting: each from where it stopped. A finished one leaves the list.
+    let is *Co as w with mut = co_list;
+    let is *Co as last with mut = cast(*Co, 0);
+    while (cast(i64, w) != 0) {
+        let is *Co as nx = w.all_next;
+        if (w.state == 3) {
+            if (cast(i64, last) == 0) { co_list = nx; } else { last.all_next = nx; }
+        } else {
+            gc_try(cast(i64, w));
+            if (w.state == 1) { gc_range(w.sp, w.stack + CO_STACK - w.sp); }
+            gc_drain();
+            last = w;
+        }
+        w = nx;
+    }
+    gc_try(cast(i64, co_list));
+    gc_drain();
+}
+fn gc_collect() as void {
+    if (gc_busy == 1) { return; }
+    gc_busy = 1;
+    let is [2]i64 as t0;
+    syscall(228, 1, &t0);
+    gc_live = 0;
+    let is ex.Frame as regs;
+    ex.begin(&regs);
+    gc_mark_all(cast(i64, &regs));
+    gc_itab_clean();
+    gc_sweep();
+    gc_count = gc_count + 1;
+    gc_debt = 0;
+    gc_limit = gc_live;
+    if (gc_limit < GC_MIN) { gc_limit = GC_MIN; }
+    let is [2]i64 as t1;
+    syscall(228, 1, &t1);
+    gc_ms_total = gc_ms_total + (t1[0] - t0[0]) * 1000 + (t1[1] - t0[1]) / 1000000;
+    gc_busy = 0;
+}
+fn n_gc_info(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (a == TRUEV) { gc_collect(); }
+    let is i64 as r = arr_new(3);
+    arr_push(r, box_i(gc_count)); arr_push(r, box_i(gc_live)); arr_push(r, box_i(gc_ms_total));
+    return r;
+}

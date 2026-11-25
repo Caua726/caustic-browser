@@ -1,0 +1,11 @@
+<!DOCTYPE html><html><head><title>inner</title><style>body{margin:8px;background:#def;font:16px sans-serif}.b:hover{background:#fc8}.b{display:inline-block;padding:6px 12px;background:#8cf}#pad{height:600px;background:linear-gradient(#def,#39c)}</style></head><body>
+<div class="b" id="btn">Press me</div> <a id="ln" href="/second.html">go second</a> <a href="/blank.html" target="_blank">new tab</a><br><br>
+<input id="i" value="" placeholder="type" style="width:200px"> <span id="echo"></span><br>
+<input type="checkbox" id="c"> <label for="c">box</label> <span id="cs"></span>
+<div id="pad">tall</div><p id="end">the end</p>
+<script>
+var n=0;document.getElementById('btn').addEventListener('click',function(){n++;this.textContent='Pressed '+n;parent.postMessage('click '+n,'*')});
+document.getElementById('i').addEventListener('input',function(){document.getElementById('echo').textContent=this.value;parent.postMessage('typed '+this.value,'*')});
+document.getElementById('c').addEventListener('change',function(){document.getElementById('cs').textContent=this.checked?'on':'off'});
+document.getElementById('c').addEventListener('click',function(){document.getElementById('cs').textContent=this.checked?'on':'off'});
+</script></body></html>

@@ -1,0 +1,5 @@
+<!DOCTYPE html><html><head><title>outer</title><style>body{margin:10px;font:16px sans-serif}iframe{display:block;margin:8px 0}</style></head><body>
+<div id="log">outer: nothing yet</div>
+<iframe id="f" src="http://127.0.0.1:5191/inner.html" width="500" height="260"></iframe>
+<script>addEventListener('message',function(e){document.getElementById('log').textContent='outer got: '+e.data;document.title=e.data})</script>
+</body></html>

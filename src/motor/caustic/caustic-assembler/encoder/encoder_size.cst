@@ -1,0 +1,481 @@
+use "../../std/mem.cst" as mem;
+use "../core/asm_defs.cst" as def;
+use "../core/buf.cst" as buf;
+
+// === Register helpers ===
+use "encoder_util.cst" as eu;
+
+fn _xmm_source_size(op1 as *def.Operand, op2 as *def.Operand, memory_width as i32) as i32 {
+    if (op1.kind != def.OP_REG || eu.is_xmm(op1.reg_id) != 1) { return 0; }
+    let is i32 as has_rex with mut = eu.reg_ext(op1.reg_id);
+    if (op2.kind == def.OP_REG && eu.is_xmm(op2.reg_id) == 1) {
+        if (eu.reg_ext(op2.reg_id) != 0) { has_rex = 1; }
+        return 4 + has_rex;
+    }
+    if (op2.kind == def.OP_MEM || op2.kind == def.OP_RIP_LABEL) {
+        if (op2.mem_size != 0 && op2.mem_size != memory_width) { return 0; }
+        if (op2.kind == def.OP_RIP_LABEL) { return 8 + has_rex; }
+        if (op2.mem_base != def.REG_NONE && eu.reg_ext(op2.mem_base) != 0) { has_rex = 1; }
+        if (eu.has_sib(op2) == 1 && eu.reg_ext(op2.mem_index) != 0) { has_rex = 1; }
+        let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+        if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+        return 3 + has_rex + mm;
+    }
+    return 0;
+}
+
+fn fast_inst_size(inst as i32, op1 as *def.Operand, op2 as *def.Operand) as i32 {
+    // A segment override is one prefix byte in front of whatever follows.
+    if (eu.seg_prefix(op1, op2) != 0) { return 1 + _inst_size(inst, op1, op2); }
+    return _inst_size(inst, op1, op2);
+}
+
+fn _inst_size(inst as i32, op1 as *def.Operand, op2 as *def.Operand) as i32 {
+    // No-operand instructions
+    if (inst == def.INST_RET)     { return 1; }
+    if (inst == def.INST_SYSCALL) { return 2; }
+    if (inst == def.INST_CLD)     { return 1; }
+    if (inst == def.INST_CLI)     { return 1; }   // FA
+    if (inst == def.INST_STI)     { return 1; }   // FB
+    if (inst == def.INST_HLT)     { return 1; }   // F4
+    if (inst == def.INST_NOP)     { return 1; }
+    if (inst == def.INST_CQO)     { return 2; }
+    if (inst == def.INST_CDQ)     { return 1; }
+    if (inst == def.INST_MOVSB)   { return 1; }
+    if (inst == def.INST_REP)     { return 1; }
+    // Atomics (B0) — sizes must EXACTLY mirror encoder_alu/encoder_ctrl.
+    if (inst == def.INST_LOCK)    { return 1; }   // F0
+    if (inst == def.INST_PAUSE)   { return 2; }   // F3 90
+    if (inst == def.INST_MFENCE)  { return 3; }   // 0F AE F0
+    if (inst == def.INST_XCHG || inst == def.INST_CMPXCHG || inst == def.INST_XADD) {
+        let is *def.Operand as d with mut = op1;
+        let is *def.Operand as s with mut = op2;
+        if (inst == def.INST_XCHG && op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            d = op2;
+            s = op1;
+        }
+        if (s.kind == def.OP_REG) {
+            let is i32 as sz = eu.reg_size(s.reg_id);
+            let is i32 as opcode_bytes with mut = 1;
+            if (inst == def.INST_CMPXCHG || inst == def.INST_XADD) { opcode_bytes = 2; }
+            if (d.kind == def.OP_MEM) {
+                let is i32 as total with mut = 1 + opcode_bytes;   // REX always + opcode
+                if (sz == 16) { total = total + 1; }               // 0x66
+                let is i32 as mm with mut = eu.mem_modrm_size(d.mem_base, d.mem_disp);
+                if (eu.has_sib(d) == 1) { mm = eu.mem_modrm_sib_size(d.mem_base, d.mem_disp); }
+                return total + mm;
+            }
+            if (d.kind == def.OP_REG) {
+                let is i32 as total with mut = opcode_bytes + 1;   // opcode + modrm
+                if (sz == 16) { total = total + 1; }
+                let is i32 as need_rex with mut = 0;
+                if (sz == 64) { need_rex = 1; }
+                if (eu.reg_ext(d.reg_id) == 1 || eu.reg_ext(s.reg_id) == 1) { need_rex = 1; }
+                if (sz == 8 && (eu.needs_rex_for_8bit(d.reg_id) == 1 || eu.needs_rex_for_8bit(s.reg_id) == 1)) { need_rex = 1; }
+                return total + need_rex;
+            }
+        }
+    }
+
+    // INT imm8: CD ib
+    if (inst == def.INST_INT && op1.kind == def.OP_IMM) { return 2; }
+
+    // PUSH/POP reg: opcode(1) + optional REX(1)
+    if (inst == def.INST_PUSH && op1.kind == def.OP_REG) { return 1 + eu.reg_ext(op1.reg_id); }
+    if (inst == def.INST_POP && op1.kind == def.OP_REG)  { return 1 + eu.reg_ext(op1.reg_id); }
+
+    // CALL/JMP label: opcode(1) + rel32(4) = 5
+    if (inst == def.INST_CALL && op1.kind == def.OP_LABEL) { return 5; }
+    if (inst == def.INST_JMP && op1.kind == def.OP_LABEL)  { return 5; }
+    // CALL [rip+label] (FF /5 indirect): FF(1) + ModRM(1) + disp32(4) = 6
+    if (inst == def.INST_CALL && op1.kind == def.OP_RIP_LABEL) { return 6; }
+
+    // CALL/JMP reg: optional REX(1) + FF(1) + ModRM(1) = 2 or 3
+    if (inst == def.INST_CALL && op1.kind == def.OP_REG) { return 2 + eu.reg_ext(op1.reg_id); }
+    if (inst == def.INST_JMP && op1.kind == def.OP_REG)  { return 2 + eu.reg_ext(op1.reg_id); }
+
+    // Jcc label: 0F(1) + cc(1) + rel32(4) = 6
+    if (((inst >= def.INST_JZ && inst <= def.INST_JBE) || inst == def.INST_JP || inst == def.INST_JNP) && op1.kind == def.OP_LABEL) { return 6; }
+
+    // SETcc reg: optional REX + 0F + cc + ModRM = 3 or 4
+    if (((inst >= def.INST_SETE && inst <= def.INST_SETAE) || inst == def.INST_SETP || inst == def.INST_SETNP) && op1.kind == def.OP_REG) {
+        let is i32 as has_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op1.reg_id) == 1) { has_rex = 1; }
+        return 3 + has_rex;
+    }
+
+    // IDIV/DIV/NEG/NOT reg: always REX + opcode + ModRM = 3
+    if ((inst == def.INST_IDIV || inst == def.INST_DIV || inst == def.INST_MUL || inst == def.INST_NEG || inst == def.INST_NOT) && op1.kind == def.OP_REG) {
+        return 3;
+    }
+
+    // IMUL reg (single-op, F7 /5): REX + opcode + ModRM = 3
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_NONE) {
+        return 3;
+    }
+
+    // IMUL reg, imm (three-op encoded as imul dest,dest,imm): REX + 69/6B /r imm
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_IMM) {
+        if (op2.imm >= 0 - 128 && op2.imm <= 127) { return 4; }   // REX + 6B + modrm + imm8
+        return 7;                                                  // REX + 69 + modrm + imm32
+    }
+
+    // MOV
+    if (inst == def.INST_MOV) {
+        // MOV reg, reg
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (sz == 64) { need_rex = 1; }
+            if (eu.reg_ext(op2.reg_id) == 1 || eu.reg_ext(op1.reg_id) == 1) { need_rex = 1; }
+            if (sz == 8 && (eu.needs_rex_for_8bit(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op2.reg_id) == 1)) { need_rex = 1; }
+            return s + need_rex + 2;
+        }
+        // MOV reg, imm
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_IMM) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            if (sz == 64) {
+                if (eu.imm_is32(op2.imm) == 1) { return 7; }
+                return 10;
+            }
+            if (sz == 32) { return 5 + eu.reg_ext(op1.reg_id); }
+            if (sz == 16) { return 4 + eu.reg_ext(op1.reg_id); }
+            // sz == 8
+            let is i32 as has_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op1.reg_id) == 1) { has_rex = 1; }
+            return 2 + has_rex;
+        }
+        // MOV [mem], reg
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_REG) {
+            let is i32 as sz with mut = eu.reg_size(op2.reg_id);
+            if (op1.mem_size > 0 && op1.mem_size < sz) { sz = op1.mem_size; }
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (sz == 64) { need_rex = 1; }
+            if (eu.reg_ext(op2.reg_id) == 1 || eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            if (sz == 8 && eu.needs_rex_for_8bit(op2.reg_id) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op1.mem_base, op1.mem_disp);
+            if (eu.has_sib(op1) == 1) { mm = eu.mem_modrm_sib_size(op1.mem_base, op1.mem_disp); }
+            return s + need_rex + 1 + mm;
+        }
+        // MOV reg, [mem]
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (sz == 64) { need_rex = 1; }
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op2) == 1 && eu.reg_ext(op2.mem_index) == 1) { need_rex = 1; }
+            if (sz == 8 && eu.needs_rex_for_8bit(op1.reg_id) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return s + need_rex + 1 + mm;
+        }
+        // MOV reg, [rip+label]
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_RIP_LABEL) { return 7; }
+        // MOV [mem], imm
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_IMM) {
+            let is i32 as sz with mut = op1.mem_size;
+            if (sz == 0) { sz = 64; }
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (sz == 64) { need_rex = 1; }
+            if (eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op1.mem_base, op1.mem_disp);
+            if (eu.has_sib(op1) == 1) { mm = eu.mem_modrm_sib_size(op1.mem_base, op1.mem_disp); }
+            s = s + need_rex + 1 + mm;
+            if (sz == 8) { return s + 1; }
+            if (sz == 16) { return s + 2; }
+            return s + 4;
+        }
+    }
+
+    // LEA
+    if (inst == def.INST_LEA) {
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return 2 + mm;
+        }
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_RIP_LABEL) { return 7; }
+    }
+
+    // ADD/SUB/AND/OR/XOR/CMP
+    if (inst == def.INST_ADD || inst == def.INST_SUB || inst == def.INST_AND || inst == def.INST_OR || inst == def.INST_XOR || inst == def.INST_CMP) {
+        // reg, reg
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (sz == 64) { need_rex = 1; }
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            if (sz == 8 && (eu.needs_rex_for_8bit(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op2.reg_id) == 1)) { need_rex = 1; }
+            return s + need_rex + 2;
+        }
+        // reg, imm
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_IMM) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (sz == 64) { need_rex = 1; }
+            if (eu.reg_ext(op1.reg_id) == 1) { need_rex = 1; }
+            if (sz == 8 && eu.needs_rex_for_8bit(op1.reg_id) == 1) { need_rex = 1; }
+            s = s + need_rex;
+            if (eu.imm_is8(op2.imm) == 1 && sz != 8) { return s + 3; }
+            if (sz == 8) { return s + 3; }
+            if (sz == 16) { return s + 4; }
+            return s + 6;
+        }
+        // BYTE PTR [mem], imm8 — [REX] 80 modrm.. ib
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_IMM && op1.mem_size == 8
+            && op2.imm >= 0 - 128 && op2.imm <= 255) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op1.mem_base, op1.mem_disp);
+            if (eu.has_sib(op1) == 1) { mm = eu.mem_modrm_sib_size(op1.mem_base, op1.mem_disp); }
+            return need_rex + 1 + mm + 1;
+        }
+        // WORD/DWORD/QWORD PTR [mem], imm — [66] [REX] 83 ib / 81 iw|id
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_IMM
+            && (op1.mem_size == 16 || op1.mem_size == 32 || op1.mem_size == 64)
+            && op2.imm >= 0 - 2147483648 && op2.imm <= 2147483647) {
+            let is i32 as s with mut = 0;
+            if (op1.mem_size == 16) { s = s + 1; }
+            let is i32 as need_rex with mut = 0;
+            if (op1.mem_size == 64) { need_rex = 1; }
+            if (eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op1.mem_base, op1.mem_disp);
+            if (eu.has_sib(op1) == 1) { mm = eu.mem_modrm_sib_size(op1.mem_base, op1.mem_disp); }
+            if (eu.imm_is8(op2.imm) == 1) { return s + need_rex + 1 + mm + 1; }
+            if (op1.mem_size == 16) { return s + need_rex + 1 + mm + 2; }
+            return s + need_rex + 1 + mm + 4;
+        }
+        // reg, [mem] — always emits REX
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            let is i32 as sz = eu.reg_size(op1.reg_id);
+            let is i32 as s with mut = 0;
+            if (sz == 16) { s = s + 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return s + 1 + 1 + mm;
+        }
+    }
+
+    // TEST reg, reg
+    if (inst == def.INST_TEST && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as sz = eu.reg_size(op1.reg_id);
+        let is i32 as s with mut = 0;
+        if (sz == 16) { s = s + 1; }
+        let is i32 as need_rex with mut = 0;
+        if (sz == 64) { need_rex = 1; }
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+        if (sz == 8 && (eu.needs_rex_for_8bit(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op2.reg_id) == 1)) { need_rex = 1; }
+        return s + need_rex + 2;
+    }
+
+    // TEST reg64, imm32 — REX.W + F7 + ModRM + imm32 = 7
+    if (inst == def.INST_TEST && op1.kind == def.OP_REG && op2.kind == def.OP_IMM
+        && eu.reg_size(op1.reg_id) == 64) { return 7; }
+
+    // IMUL reg, reg — always REX + 0F + opcode + ModRM = 4
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_REG) { return 4; }
+    // IMUL reg, [mem] — always REX + 0F + AF + ModRM(+SIB+disp)
+    if (inst == def.INST_IMUL && op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+        let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+        if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+        return 3 + mm;
+    }
+
+    // CMOVcc reg, reg — REX + 0F + opcode + ModRM = 4
+    if (def.is_cmov(inst) == 1 && op1.kind == def.OP_REG && op2.kind == def.OP_REG) { return 4; }
+
+    // SHL/SHR/SAR — always emits REX
+    if ((inst == def.INST_SHL || inst == def.INST_SHR || inst == def.INST_SAR
+         || inst == def.INST_ROL || inst == def.INST_ROR) && op1.kind == def.OP_REG) {
+        if (op2.kind == def.OP_REG) { return 3; }
+        if (op2.kind == def.OP_IMM) {
+            if (op2.imm == 1) { return 3; }
+            return 4;
+        }
+    }
+
+    // MOVSXD — always REX
+    if (inst == def.INST_MOVSXD) {
+        if (op2.kind == def.OP_MEM) {
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return 2 + mm;
+        }
+        if (op2.kind == def.OP_REG) { return 3; }
+    }
+
+    // MOVSX — always REX + 0F prefix
+    if (inst == def.INST_MOVSX) {
+        if (op2.kind == def.OP_MEM) {
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return 3 + mm;
+        }
+        if (op2.kind == def.OP_REG) { return 4; }
+    }
+
+    // MOVZX — REX + 0F prefix
+    if (inst == def.INST_MOVZX) {
+        if (op2.kind == def.OP_MEM) {
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return 3 + mm;
+        }
+        if (op2.kind == def.OP_REG) { return 4; }
+    }
+
+    // MOVQ (SSE): 66 + REX + 0F + opcode + ModRM = 5
+    if (inst == def.INST_MOVQ) { return 5; }
+
+    // MOVSD: F2(1) + [REX(1)] + 0F(1) + opcode(1) + ModRM(+SIB+disp)
+    if (inst == def.INST_MOVSD) {
+        let is i32 as base = 4; // F2 + 0F + opcode + ModRM
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            return base + need_rex;
+        }
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op2) == 1 && eu.reg_ext(op2.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return 3 + need_rex + mm; // F2 + 0F + opcode + (ModRM+SIB+disp via mm)
+        }
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_REG) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op2.reg_id) == 1 || eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op1.mem_base, op1.mem_disp);
+            if (eu.has_sib(op1) == 1) { mm = eu.mem_modrm_sib_size(op1.mem_base, op1.mem_disp); }
+            return 3 + need_rex + mm;
+        }
+    }
+
+    // Scalar arithmetic must exactly mirror register/ModRM/SIB/RIP emission.
+    if (inst == def.INST_ADDSD || inst == def.INST_SUBSD || inst == def.INST_MULSD || inst == def.INST_DIVSD || inst == def.INST_SQRTSD) {
+        return _xmm_source_size(op1, op2, 64);
+    }
+    if (inst >= def.INST_ADDSS && inst <= def.INST_SQRTSS) {
+        return _xmm_source_size(op1, op2, 32);
+    }
+
+    // XORPD: 66 + optional REX + 0F + opcode + ModRM
+    if (inst == def.INST_XORPD && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as need_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+        return 4 + need_rex;
+    }
+
+    // UCOMISD: 66 + optional REX + 0F + 2E + ModRM
+    if (inst == def.INST_UCOMISD && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as need_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+        return 4 + need_rex;
+    }
+
+    // MOVSS load (xmm, xmm/m32) mirrors the scalar arithmetic layout; the
+    // store form has the same length with the operands swapped.
+    if (inst == def.INST_MOVSS) {
+        if (op1.kind == def.OP_MEM) { return _xmm_source_size(op2, op1, 32); }
+        return _xmm_source_size(op1, op2, 32);
+    }
+    // MOVAPS / UCOMISS: no prefix, so one byte shorter than the F3/F2 forms.
+    if (inst == def.INST_MOVAPS) {
+        let is i32 as n = _xmm_source_size(op1, op2, 128);
+        if (n == 0) { return 0; }
+        return n - 1;
+    }
+    if (inst == def.INST_UCOMISS) {
+        let is i32 as n = _xmm_source_size(op1, op2, 32);
+        if (n == 0) { return 0; }
+        return n - 1;
+    }
+    if (inst == def.INST_UCOMISD && op1.kind == def.OP_REG && op2.kind != def.OP_REG) {
+        return _xmm_source_size(op1, op2, 64);
+    }
+    // CVTTSS2SI r64, xmm: F3 + REX.W + 0F + 2C + ModRM = 5
+    if (inst == def.INST_CVTTSS2SI && op1.kind == def.OP_REG && op2.kind == def.OP_REG) { return 5; }
+
+    // CVTTSD2SI: F2 + REX + 0F + opcode + ModRM = 5
+    if (inst == def.INST_CVTTSD2SI && op1.kind == def.OP_REG && op2.kind == def.OP_REG) { return 5; }
+
+    // CVTSI2SD: F2 + REX + 0F + opcode + ModRM = 5
+    if (inst == def.INST_CVTSI2SD && op1.kind == def.OP_REG && op2.kind == def.OP_REG) { return 5; }
+
+    if (inst == def.INST_CVTSI2SS && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as has_rex with mut = 0;
+        if (eu.reg_size(op2.reg_id) == 64 || eu.reg_ext(op1.reg_id) != 0 || eu.reg_ext(op2.reg_id) != 0) { has_rex = 1; }
+        return 4 + has_rex;
+    }
+    if (inst == def.INST_CVTSD2SS) { return _xmm_source_size(op1, op2, 64); }
+    if (inst == def.INST_CVTSS2SD) { return _xmm_source_size(op1, op2, 32); }
+
+    // MOVD: 66 + [REX] + 0F + opcode + ModRM = 4 or 5
+    if (inst == def.INST_MOVD && op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+        let is i32 as has_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { has_rex = 1; }
+        return 4 + has_rex;
+    }
+
+    // Packed SSE2 arithmetic (reg,reg): 66 + [REX] + 0F + opcode + ModRM
+    if (inst == def.INST_ADDPD || inst == def.INST_SUBPD || inst == def.INST_MULPD
+        || inst == def.INST_DIVPD || inst == def.INST_PADDD || inst == def.INST_PADDQ
+        || inst == def.INST_PSUBD || inst == def.INST_PSUBQ
+        || inst == def.INST_PXOR) {
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            return 4 + need_rex;
+        }
+    }
+    // PSRLDQ xmm, imm8: 66 + [REX] + 0F + 73 + ModRM + ib
+    if (inst == def.INST_PSRLDQ && op1.kind == def.OP_REG && op2.kind == def.OP_IMM) {
+        let is i32 as need_rex with mut = 0;
+        if (eu.reg_ext(op1.reg_id) == 1) { need_rex = 1; }
+        return 5 + need_rex;
+    }
+    // MOVUPD / MOVDQU: prefix + [REX] + 0F + opcode + ModRM(+SIB+disp) — same shape as MOVSD
+    if (inst == def.INST_MOVUPD || inst == def.INST_MOVDQU) {
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_REG) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.reg_id) == 1) { need_rex = 1; }
+            return 4 + need_rex;
+        }
+        if (op1.kind == def.OP_REG && op2.kind == def.OP_MEM) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op1.reg_id) == 1 || eu.reg_ext(op2.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op2) == 1 && eu.reg_ext(op2.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op2.mem_base, op2.mem_disp);
+            if (eu.has_sib(op2) == 1) { mm = eu.mem_modrm_sib_size(op2.mem_base, op2.mem_disp); }
+            return 3 + need_rex + mm;
+        }
+        if (op1.kind == def.OP_MEM && op2.kind == def.OP_REG) {
+            let is i32 as need_rex with mut = 0;
+            if (eu.reg_ext(op2.reg_id) == 1 || eu.reg_ext(op1.mem_base) == 1) { need_rex = 1; }
+            if (eu.has_sib(op1) == 1 && eu.reg_ext(op1.mem_index) == 1) { need_rex = 1; }
+            let is i32 as mm with mut = eu.mem_modrm_size(op1.mem_base, op1.mem_disp);
+            if (eu.has_sib(op1) == 1) { mm = eu.mem_modrm_sib_size(op1.mem_base, op1.mem_disp); }
+            return 3 + need_rex + mm;
+        }
+    }
+
+    return 0;
+}

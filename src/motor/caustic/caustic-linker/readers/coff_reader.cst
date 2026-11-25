@@ -1,0 +1,425 @@
+use "../../std/io.cst" as io;
+use "../../src/ir/opt_mem.cst" as om;
+use "elf_reader.cst" as reader;
+use "../../src/codegen/target.cst" as tgt;
+
+// ============================================================
+// coff_reader.cst — PE/COFF object file reader
+//
+// Parses a COFF AMD64 .obj produced by caustic-as in --target=windows-x86_64
+// mode and populates a reader.ObjFile so the linker's relocation engine,
+// gsym resolver, and section merger work without per-format branching.
+// IMAGE_REL_AMD64_* codes are translated to R_X86_64_* on the way in.
+//
+// COFF AMD64 layout (16-bit and 32-bit little-endian):
+//   File header   (20 bytes)
+//   Section table (40 bytes per section)
+//   Section raw data + relocations (10 bytes each)
+//   Symbol table  (18 bytes per entry, may carry aux records)
+//   String table  (4 bytes total size including itself + null-terminated names)
+//
+// Symbol section convention into reader.ObjFile.section field:
+//   .text   → reader.SECIDX_TEXT   (1)
+//   .data   → reader.SECIDX_DATA   (2)
+//   .rdata  → reader.SECIDX_RODATA (3)
+//   .bss    → reader.SECIDX_BSS    (4)
+//   <custom>→ 5..99
+//   undef   → 0
+// 0, not 99: the custom-section id space runs up to 99 (the ELF writer uses
+// it too), so 99 cannot double as "undefined" without a symbol in the last
+// custom section looking undefined. 0 is what the ELF reader uses, so the
+// linker's "is it defined" tests work for both formats.
+// ============================================================
+
+fn read_file(path as *u8, out_size as *i64) as *u8 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (size <= 0) { io._close_fd(fd); return cast(*u8, 0); }
+    let is *u8 as buf = om.opt_alloc(size + 1);
+    io._read_fd(fd, buf, size);
+    buf[size] = cast(u8, 0);
+    io._close_fd(fd);
+    *out_size = size;
+    return buf;
+}
+
+fn name8_matches(name8 as *u8, target as *u8, tlen as i32) as i32 {
+    if (tlen > 8) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < tlen) {
+        if (name8[i] != target[i]) { return 0; }
+        i = i + 1;
+    }
+    if (i < 8 && name8[i] != cast(u8, 0)) { return 0; }
+    return 1;
+}
+
+// Resolve a COFF section name. Inline (8 bytes) or "/<offset>" pointing
+// into the COFF string table. Returns (name_ptr, name_len) via out params.
+// strtab_size is the size of the string table (read from its first u32);
+// out-of-range offsets fall back to an empty name rather than reading OOB.
+fn read_section_name(name8 as *u8, strtab as *u8, strtab_size as i64,
+                     out_ptr as **u8, out_len as *i32) as void {
+    if (name8[0] == 47) {
+        let is i32 as off with mut = 0;
+        let is i32 as ni with mut = 1;
+        while (ni < 8 && name8[ni] >= 48 && name8[ni] <= 57) {
+            off = off * 10 + cast(i32, name8[ni]) - 48;
+            ni = ni + 1;
+        }
+        if (cast(i64, off) >= strtab_size) {
+            *out_ptr = name8;
+            *out_len = 0;
+            return;
+        }
+        let is *u8 as p = cast(*u8, cast(i64, strtab) + cast(i64, off));
+        *out_ptr = p;
+        let is i32 as plen with mut = 0;
+        while (cast(i64, off) + cast(i64, plen) < strtab_size && p[plen] != cast(u8, 0)) {
+            plen = plen + 1;
+        }
+        *out_len = plen;
+        return;
+    }
+    *out_ptr = name8;
+    let is i32 as nl with mut = 0;
+    while (nl < 8 && name8[nl] != cast(u8, 0)) { nl = nl + 1; }
+    *out_len = nl;
+}
+
+// Resolve a COFF symbol name: either 8-byte inline or 4 zero bytes + 4-byte
+// strtab offset. Returns a null-terminated pointer (or pointer into raw
+// section if inline; we copy inline names into a small buffer kept in obj.data).
+// Out-of-range strtab offsets fall back to empty so we don't read past the
+// file buffer when the .obj is malformed.
+fn read_symbol_name(name8 as *u8, strtab as *u8, strtab_size as i64,
+                    out_ptr as **u8, out_len as *i32, scratch as *u8) as void {
+    if (name8[0] != cast(u8, 0) || name8[1] != cast(u8, 0)
+        || name8[2] != cast(u8, 0) || name8[3] != cast(u8, 0)) {
+        let is i32 as i with mut = 0;
+        while (i < 8 && name8[i] != cast(u8, 0)) {
+            scratch[i] = name8[i];
+            i = i + 1;
+        }
+        scratch[i] = cast(u8, 0);
+        *out_ptr = scratch;
+        *out_len = i;
+        return;
+    }
+    let is i32 as off = cast(i32, reader.read_u32(name8, 4));
+    if (cast(i64, off) >= strtab_size) {
+        scratch[0] = cast(u8, 0);
+        *out_ptr = scratch;
+        *out_len = 0;
+        return;
+    }
+    let is *u8 as p = cast(*u8, cast(i64, strtab) + cast(i64, off));
+    *out_ptr = p;
+    let is i32 as plen with mut = 0;
+    while (cast(i64, off) + cast(i64, plen) < strtab_size && p[plen] != cast(u8, 0)) {
+        plen = plen + 1;
+    }
+    *out_len = plen;
+}
+
+// Map IMAGE_REL_AMD64_* → R_X86_64_* (with implicit addend for PC-rel).
+// PC-relative COFF relocations have an implicit addend of -(4 + offset_n)
+// for REL32_N (REL32=4, REL32_1=5, REL32_2=6, ... REL32_5=9).
+fn coff_reloc_to_elf(coff_type as i64, out_rtype as *i64, out_addend as *i64) as void {
+    // ARM64 objects use their own code space, and running them through the
+    // AMD64 table below silently produced x86 relocation types the linker then
+    // refused to apply (PAGEBASE_REL21 = 4 arrived as R_X86_64_PC32 = 2), so an
+    // ARM64 PE linked with unrelocated call sites.
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) {
+        *out_addend = 0;
+        if (coff_type == 3) { *out_rtype = reader.R_AARCH64_CALL26; return; }          // BRANCH26
+        if (coff_type == 4) { *out_rtype = reader.R_AARCH64_ADR_PREL_PG_HI21; return; }// PAGEBASE_REL21
+        if (coff_type == 6) { *out_rtype = reader.R_AARCH64_ADD_ABS_LO12_NC; return; } // PAGEOFFSET_12A
+        if (coff_type == 15) { *out_rtype = reader.R_AARCH64_CONDBR19; return; }       // BRANCH19
+        *out_rtype = reader.R_AARCH64_ABS64;                                            // ADDR64 (14)
+        return;
+    }
+    if (coff_type == 1) {
+        // ADDR64
+        *out_rtype = reader.R_X86_64_64;
+        *out_addend = 0;
+        return;
+    }
+    if (coff_type == 2) {
+        // ADDR32
+        *out_rtype = reader.R_X86_64_32;
+        *out_addend = 0;
+        return;
+    }
+    if (coff_type == 3) {
+        // ADDR32NB — image-relative 32-bit. The linker treats it as ADDR32
+        // for object resolution (image base subtraction happens at PE write
+        // time when emitting .pdata entries).
+        *out_rtype = reader.R_X86_64_32;
+        *out_addend = 0;
+        return;
+    }
+    if (coff_type >= 4 && coff_type <= 9) {
+        // REL32 (4) … REL32_5 (9). Implicit addend = -(4 + N).
+        *out_rtype = reader.R_X86_64_PC32;
+        *out_addend = 0 - 4 - (coff_type - 4);
+        return;
+    }
+    // Anything else (ABSOLUTE etc) — emit as no-op ADDR32.
+    *out_rtype = reader.R_X86_64_32;
+    *out_addend = 0;
+}
+
+fn read_coff_obj(path as *u8, obj as *reader.ObjFile) as i32 {
+    obj.filename = path;
+    obj.sym_count = 0;
+    obj.reloc_count = 0;
+    obj.text_offset = 0;
+    obj.data_offset = 0;
+    obj.rodata_offset = 0;
+    obj.bss_offset = 0;
+    obj.bss_size = 0;
+    obj.csec_count = 0;
+    // Section structs may be left uninitialized when the .obj has no
+    // .text/.data/.rdata — merge_sections checks .size > 0, so leaking
+    // memory garbage from opt_alloc results in spurious giant sizes and
+    // an immediate segfault on buf_append.
+    obj.text.data = cast(*u8, 0);
+    obj.text.size = 0;
+    obj.text.sh_offset = 0;
+    obj.data_sec.data = cast(*u8, 0);
+    obj.data_sec.size = 0;
+    obj.data_sec.sh_offset = 0;
+    obj.rodata.data = cast(*u8, 0);
+    obj.rodata.size = 0;
+    obj.rodata.sh_offset = 0;
+
+    let is i64 as fsize with mut = 0;
+    let is *u8 as data = read_file(path, &fsize);
+    if (cast(i64, data) == 0) {
+        io._write_fd(io.STDERR, "caustic-ld: cannot open ", 24);
+        io._write_fd(io.STDERR, path, cast(i64, reader.strlen(path)));
+        io._write_fd(io.STDERR, "\n", 1);
+        return 1;
+    }
+    obj.data = data;
+    obj.file_size = fsize;
+
+    // === File header (20 bytes) ===
+    let is i64 as machine = reader.read_u16(data, 0);
+    if (machine != 34404 && machine != 43620) {  // 0x8664 AMD64, 0xAA64 ARM64
+        io._write_fd(io.STDERR, "caustic-ld: not a COFF AMD64/ARM64 object\n", 42);
+        return 1;
+    }
+    let is i64 as num_sections = reader.read_u16(data, 2);
+    let is i64 as ptr_symtab = reader.read_u32(data, 8);
+    let is i64 as num_syms = reader.read_u32(data, 12);
+    let is i64 as opt_hdr_size = reader.read_u16(data, 16);
+
+    // === String table ===
+    let is i64 as ptr_strtab = ptr_symtab + num_syms * 18;
+    let is *u8 as strtab = cast(*u8, cast(i64, data) + ptr_strtab);
+    // First u32 of the strtab is its total size (including those 4 bytes).
+    // We pass this to name resolvers so they reject out-of-range offsets.
+    let is i64 as strtab_size with mut = reader.read_u32(data, ptr_strtab);
+    if (strtab_size < 4 || ptr_strtab + strtab_size > fsize) {
+        strtab_size = 4;
+    }
+
+    // === Section table starts after file header + optional header ===
+    let is i64 as ptr_secs = 20 + opt_hdr_size;
+
+    // Track section number (1-based) for each kind. 0 = not present.
+    let is i32 as sn_text with mut = 0;
+    let is i32 as sn_data with mut = 0;
+    let is i32 as sn_rdata with mut = 0;
+    let is i32 as sn_bss with mut = 0;
+    // COFF sec# → SECIDX_*, and the custom-section arrays, sized by the
+    // object's own section count. The map was a [256] on the stack written at
+    // the section number with no bound, so a 256th section wrote past it; the
+    // custom sections stopped at 32 and dropped the rest in silence.
+    let is i64 as ncap = num_sections + 1;
+    let is *i32 as sn_to_secidx = cast(*i32, om.opt_alloc(ncap * 4));
+    let is i64 as sni with mut = 0;
+    while (sni < ncap) { sn_to_secidx[sni] = 0; sni = sni + 1; }
+
+    // Pass 1: identify .text/.data/.rdata/.bss and assign secidx mapping.
+    // Custom sections get SECIDX 5..(4+csec_count).
+    obj.csec_data = om.opt_alloc(ncap * sizeof(reader.ObjSection));
+    obj.csec_names = om.opt_alloc(ncap * 8);
+    obj.csec_name_lens = om.opt_alloc(ncap * 4);
+    obj.csec_indices = om.opt_alloc(ncap * 4);
+    obj.csec_offsets = om.opt_alloc(ncap * 8);
+    // Parallel to the ELF reader's SHF_EXECINSTR bits; merge_sections reads
+    // this for every object, so leaving it null segfaults there.
+    obj.csec_execs = om.opt_alloc(ncap * 4);
+
+    let is i32 as si with mut = 0;
+    while (si < cast(i32, num_sections)) {
+        let is i64 as sent = ptr_secs + cast(i64, si) * 40;
+        let is *u8 as name8 = cast(*u8, cast(i64, data) + sent);
+        let is *u8 as name_ptr;
+        let is i32 as name_len;
+        read_section_name(name8, strtab, strtab_size, &name_ptr, &name_len);
+
+        let is i64 as raw_size = reader.read_u32(data, sent + 16);
+        let is i64 as raw_off = reader.read_u32(data, sent + 20);
+        let is i32 as coff_sn = si + 1;
+
+        if (name8_matches(name8, ".text", 5) == 1) {
+            sn_text = coff_sn;
+            sn_to_secidx[coff_sn] = reader.SECIDX_TEXT;
+            obj.text.data = cast(*u8, cast(i64, data) + raw_off);
+            obj.text.size = raw_size;
+            obj.text.sh_offset = raw_off;
+        } else if (name8_matches(name8, ".data", 5) == 1) {
+            sn_data = coff_sn;
+            sn_to_secidx[coff_sn] = reader.SECIDX_DATA;
+            obj.data_sec.data = cast(*u8, cast(i64, data) + raw_off);
+            obj.data_sec.size = raw_size;
+            obj.data_sec.sh_offset = raw_off;
+        } else if (name8_matches(name8, ".rdata", 6) == 1) {
+            sn_rdata = coff_sn;
+            sn_to_secidx[coff_sn] = reader.SECIDX_RODATA;
+            obj.rodata.data = cast(*u8, cast(i64, data) + raw_off);
+            obj.rodata.size = raw_size;
+            obj.rodata.sh_offset = raw_off;
+        } else if (name8_matches(name8, ".bss", 4) == 1) {
+            sn_bss = coff_sn;
+            sn_to_secidx[coff_sn] = reader.SECIDX_BSS;
+            // Caustic-as writes BSS size to SizeOfRawData (offset 16);
+            // standard COFF puts it in VirtualSize (offset 8) with
+            // SizeOfRawData=0. Prefer the nonzero one.
+            let is i64 as vsize = reader.read_u32(data, sent + 8);
+            if (raw_size == 0) { obj.bss_size = vsize; }
+            else { obj.bss_size = raw_size; }
+        } else {
+            // Custom section.
+            if (cast(i64, obj.csec_count) < ncap) {
+                let is i32 as ci = obj.csec_count;
+                let is *reader.ObjSection as csarr = cast(*reader.ObjSection, obj.csec_data);
+                let is *reader.ObjSection as cs = cast(*reader.ObjSection,
+                    cast(i64, csarr) + cast(i64, ci) * sizeof(reader.ObjSection));
+                cs.data = cast(*u8, cast(i64, data) + raw_off);
+                cs.size = raw_size;
+                cs.sh_offset = raw_off;
+                let is *i64 as cnames = cast(*i64, obj.csec_names);
+                let is *i32 as cnlens = cast(*i32, obj.csec_name_lens);
+                let is *i32 as cidxs = cast(*i32, obj.csec_indices);
+                cnames[ci] = cast(i64, name_ptr);
+                cnlens[ci] = name_len;
+                cidxs[ci] = 5 + ci;  // SECIDX_TEXT(1)..BSS(4) reserved; custom start at 5
+                sn_to_secidx[coff_sn] = 5 + ci;
+                // IMAGE_SCN_MEM_EXECUTE (0x20000000) — the COFF spelling of
+                // SHF_EXECINSTR, telling the layout this section holds code.
+                let is i64 as scn_chars = reader.read_u32(data, sent + 36);
+                let is *i32 as cexecs = cast(*i32, obj.csec_execs);
+                if ((scn_chars & 536870912) != 0) { cexecs[ci] = 1; } else { cexecs[ci] = 0; }
+                obj.csec_count = obj.csec_count + 1;
+            }
+        }
+        si = si + 1;
+    }
+
+    // === Symbol table ===
+    // Allocate scratch buffer for inline names (8 chars + null, per sym).
+    obj.syms = om.opt_alloc((num_syms + 2) * sizeof(reader.ObjSym));
+    let is *u8 as name_scratch = om.opt_alloc(cast(i64, num_syms) * 16);
+
+    // The linker's build_symtab() skips obj.syms[0] as "null entry" (ELF
+    // convention). COFF has no null entry, so insert a placeholder at
+    // index 0 here; real symbols start at index 1.
+    reader.sym_add(obj, cast(*u8, 0), 0, 0, 0, 0, 0);
+
+    // sym_map[coff sym index] = obj sym index (real index, accounts for
+    // the +1 shift due to the inserted null placeholder above).
+    let is *i32 as sym_map = cast(*i32, om.opt_alloc(cast(i64, num_syms + 1) * 4));
+    let is i64 as syi with mut = 0;
+    while (syi < num_syms) {
+        let is i64 as sent = ptr_symtab + syi * 18;
+        let is *u8 as nm8 = cast(*u8, cast(i64, data) + sent);
+        let is *u8 as nm_ptr;
+        let is i32 as nm_len;
+        read_symbol_name(nm8, strtab, strtab_size,
+                         &nm_ptr, &nm_len,
+                         cast(*u8, cast(i64, name_scratch) + syi * 16));
+
+        let is i32 as value = cast(i32, reader.read_u32(data, sent + 8));
+        let is i32 as scnum = cast(i32, reader.read_u16(data, sent + 12));
+        let is i32 as sclass = cast(i32, reader.read_u8(data, sent + 16));
+        let is i32 as num_aux = cast(i32, reader.read_u8(data, sent + 17));
+
+        let is i32 as obj_sec with mut = 0;        // undefined
+        if (scnum > 0 && cast(i64, scnum) < ncap) {
+            obj_sec = sn_to_secidx[scnum];
+        }
+        let is i32 as binding with mut = 0;        // STB_LOCAL
+        if (sclass == 2) { binding = 1; }          // EXTERNAL → STB_GLOBAL
+
+        let is *i32 as map_slot = cast(*i32, cast(i64, sym_map) + syi * 4);
+        *map_slot = obj.sym_count;
+        reader.sym_add(obj, nm_ptr, nm_len, obj_sec, cast(i64, value), binding, 0);
+
+        // Skip aux records — they're not represented in ObjSym.
+        let is i64 as ax with mut = 0;
+        while (ax < cast(i64, num_aux)) {
+            syi = syi + 1;
+            // Mark aux as "no obj sym" so relocs referencing aux misbehave loudly.
+            if (syi < num_syms) {
+                let is *i32 as ms2 = cast(*i32, cast(i64, sym_map) + syi * 4);
+                *ms2 = 0 - 1;
+            }
+            ax = ax + 1;
+        }
+        syi = syi + 1;
+    }
+
+    // === Relocations: walk each section header again, read its reloc table. ===
+    let is i64 as total_relocs with mut = 0;
+    si = 0;
+    while (si < cast(i32, num_sections)) {
+        let is i64 as sent2 = ptr_secs + cast(i64, si) * 40;
+        let is i64 as reloc_count = reader.read_u16(data, sent2 + 32);
+        total_relocs = total_relocs + reloc_count;
+        si = si + 1;
+    }
+    obj.relocs = om.opt_alloc((total_relocs + 1) * sizeof(reader.ObjReloc));
+
+    si = 0;
+    while (si < cast(i32, num_sections)) {
+        let is i64 as sent2 = ptr_secs + cast(i64, si) * 40;
+        let is i64 as reloc_off = reader.read_u32(data, sent2 + 24);
+        let is i64 as reloc_count = reader.read_u16(data, sent2 + 32);
+        let is i32 as obj_sec = sn_to_secidx[si + 1];
+
+        let is i64 as ri with mut = 0;
+        while (ri < reloc_count) {
+            let is i64 as rent = reloc_off + ri * 10;
+            let is i64 as r_offset = reader.read_u32(data, rent);
+            let is i64 as r_sym = reader.read_u32(data, rent + 4);
+            let is i64 as r_type = reader.read_u16(data, rent + 8);
+
+            // Reject relocs whose SymbolTableIndex would read past sym_map.
+            // Hand-written or foreign .obj files may carry corrupt indices.
+            if (r_sym >= num_syms) {
+                ri = ri + 1;
+                continue;
+            }
+            let is *i32 as ms = cast(*i32, cast(i64, sym_map) + r_sym * 4);
+            let is i32 as mapped_sym with mut = *ms;
+            if (mapped_sym < 0) { mapped_sym = cast(i32, r_sym); }
+
+            let is i64 as elf_rtype with mut = 0;
+            let is i64 as elf_addend with mut = 0;
+            coff_reloc_to_elf(r_type, &elf_rtype, &elf_addend);
+
+            reader.reloc_add(obj, r_offset, mapped_sym, elf_rtype, elf_addend, obj_sec);
+            ri = ri + 1;
+        }
+        si = si + 1;
+    }
+
+    return 0;
+}

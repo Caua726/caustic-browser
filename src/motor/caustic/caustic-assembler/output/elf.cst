@@ -1,0 +1,835 @@
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../../std/os.cst" as os;
+use "../../src/ir/opt_mem.cst" as om;
+use "../encoder/encoder_util.cst" as enc;
+use "../core/buf.cst" as buf;
+use "../../src/codegen/target.cst" as tgt;
+
+// ELF constants
+let is i32 as ET_REL with imut = 1;
+let is i32 as EM_X86_64 with imut = 62;
+let is i32 as EM_AARCH64 with imut = 183;
+let is i32 as SHT_NULL with imut = 0;
+let is i32 as SHT_PROGBITS with imut = 1;
+let is i32 as SHT_SYMTAB with imut = 2;
+let is i32 as SHT_STRTAB with imut = 3;
+let is i32 as SHT_RELA with imut = 4;
+let is i32 as SHT_NOBITS with imut = 8;
+let is i32 as SHF_WRITE with imut = 1;
+let is i32 as SHF_ALLOC with imut = 2;
+let is i32 as SHF_EXECINSTR with imut = 4;
+
+// Per-custom-section "holds code" bits (one i32 each), published by
+// custom_sections.csec_init. It lives here rather than being imported because
+// custom_sections already depends on this module; a direct import would cycle.
+let is *u8 as csec_exec_ptr with mut;
+fn csec_exec_flags(idx as i32) as i32 {
+    if (cast(i64, csec_exec_ptr) == 0) { return 0; }
+    let is *i32 as p = cast(*i32, csec_exec_ptr);
+    return p[idx];
+}
+let is i32 as STB_LOCAL with imut = 0;
+let is i32 as STB_GLOBAL with imut = 1;
+let is i32 as STT_NOTYPE with imut = 0;
+let is i32 as STT_OBJECT with imut = 1;
+let is i32 as STT_FUNC with imut = 2;
+let is i32 as STT_SECTION with imut = 3;
+// The assembler's "undefined section" id. Must equal cs.SECTION_UNDEF
+// (parser/custom_sections.cst); elf.cst can't import custom_sections (that
+// would be an import cycle), so the value is repeated here.
+let is i32 as SECTION_UNDEF with imut = 99;
+let is i64 as R_X86_64_64      with imut = 1;
+let is i64 as R_X86_64_PC32    with imut = 2;
+let is i64 as R_X86_64_PLT32   with imut = 4;
+let is i64 as R_X86_64_GOTPCREL with imut = 9;
+
+// Symbol
+struct Symbol {
+    name_ptr as *u8;
+    name_len as i32;
+    section as i32;
+    offset as i64;
+    is_global as i32;
+    strtab_off as i32;
+}
+
+struct SymbolTable {
+    data as *u8;
+    count as i32;
+    cap as i32;
+    // Hash table for O(1) lookup
+    hash_buckets as *i32;  // bucket[h] = first symbol index, -1 = empty
+    hash_next as *i32;     // next[i] = next symbol in chain, -1 = end
+    hash_size as i32;      // number of buckets
+    hash_cap as i32;       // capacity of hash_next array
+}
+
+fn sym_hash(name_ptr as *u8, name_len as i32, table_size as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    if (h < 0) { h = 0 - h; }
+    return cast(i32, h % cast(i64, table_size));
+}
+
+fn sym_init() as SymbolTable {
+    let is i32 as cap = 1024;
+    let is i32 as hash_sz = 16384;
+    let is SymbolTable as st;
+    st.data = om.opt_alloc(cast(i64, cap) * sizeof(Symbol));
+    st.count = 0;
+    st.cap = cap;
+    st.hash_size = hash_sz;
+    st.hash_cap = cap;
+    st.hash_buckets = cast(*i32, om.opt_alloc(cast(i64, hash_sz) * 4));
+    st.hash_next = cast(*i32, om.opt_alloc(cast(i64, cap) * 4));
+    // Init buckets to -1
+    let is i32 as bi with mut = 0;
+    while (bi < hash_sz) {
+        st.hash_buckets[bi] = 0 - 1;
+        bi = bi + 1;
+    }
+    return st;
+}
+
+fn sym_get(st as *SymbolTable, idx as i32) as *Symbol {
+    return cast(*Symbol, cast(i64, st.data) + cast(i64, idx) * sizeof(Symbol));
+}
+
+fn sym_free(st as *SymbolTable) as void {
+    om.opt_free(st.data);
+    om.opt_free(cast(*u8, st.hash_buckets));
+    om.opt_free(cast(*u8, st.hash_next));
+    st.count = 0;
+    st.cap = 0;
+}
+
+fn sym_add(st as *SymbolTable, name_ptr as *u8, name_len as i32, section as i32, offset as i64, is_global as i32) as void {
+    if (st.count >= st.cap) {
+        let is i32 as new_cap = st.cap * 2;
+        let is *u8 as new_data = om.opt_alloc(cast(i64, new_cap) * sizeof(Symbol));
+        mem.memcpy(new_data, st.data, cast(i64, st.count) * sizeof(Symbol));
+        om.opt_free(st.data);
+        st.data = new_data;
+        st.cap = new_cap;
+        // Grow hash_next array
+        let is *i32 as new_next = cast(*i32, om.opt_alloc(cast(i64, new_cap) * 4));
+        mem.memcpy(cast(*u8, new_next), cast(*u8, st.hash_next), cast(i64, st.hash_cap) * 4);
+        om.opt_free(cast(*u8, st.hash_next));
+        st.hash_next = new_next;
+        st.hash_cap = new_cap;
+    }
+    let is i32 as idx = st.count;
+    let is *Symbol as s = sym_get(st, idx);
+    s.name_ptr = name_ptr;
+    s.name_len = name_len;
+    s.section = section;
+    s.offset = offset;
+    s.is_global = is_global;
+    s.strtab_off = 0;
+    // Insert into hash table
+    let is i32 as h = sym_hash(name_ptr, name_len, st.hash_size);
+    st.hash_next[idx] = st.hash_buckets[h];
+    st.hash_buckets[h] = idx;
+    st.count = st.count + 1;
+}
+
+fn sym_find(st as *SymbolTable, name_ptr as *u8, name_len as i32) as i32 {
+    let is i32 as h = sym_hash(name_ptr, name_len, st.hash_size);
+    let is i32 as idx with mut = st.hash_buckets[h];
+    while (idx >= 0) {
+        let is *Symbol as s = sym_get(st, idx);
+        if (enc.streq(s.name_ptr, s.name_len, name_ptr, name_len) == 1) {
+            return idx;
+        }
+        idx = st.hash_next[idx];
+    }
+    return 99999;
+}
+
+fn sym_find_or_add(st as *SymbolTable, name_ptr as *u8, name_len as i32, section as i32, offset as i64, is_global as i32) as i32 {
+    let is i32 as idx = sym_find(st, name_ptr, name_len);
+    if (idx != 99999) {
+        // Update if it was a forward reference
+        let is *Symbol as s = sym_get(st, idx);
+        if (s.section == SECTION_UNDEF && section != SECTION_UNDEF) {
+            s.section = section;
+            s.offset = offset;
+        }
+        if (is_global == 1) { s.is_global = 1; }
+        return idx;
+    }
+    sym_add(st, name_ptr, name_len, section, offset, is_global);
+    return st.count - 1;
+}
+
+// Relocation entry
+struct Reloc {
+    offset as i64;
+    sym_idx as i64;
+    rtype as i64;
+    addend as i64;
+}
+
+struct RelocList {
+    data as *u8;
+    count as i32;
+    cap as i32;
+}
+
+fn reloc_init() as RelocList {
+    let is i32 as cap = 256;
+    let is RelocList as rl;
+    rl.data = om.opt_alloc(cast(i64, cap) * sizeof(Reloc));
+    rl.count = 0;
+    rl.cap = cap;
+    return rl;
+}
+
+fn reloc_free(rl as *RelocList) as void {
+    om.opt_free(rl.data);
+    rl.count = 0;
+    rl.cap = 0;
+}
+
+fn reloc_get(rl as *RelocList, idx as i32) as *Reloc {
+    return cast(*Reloc, cast(i64, rl.data) + cast(i64, idx) * sizeof(Reloc));
+}
+
+fn reloc_add(rl as *RelocList, offset as i64, sym_idx as i64, rtype as i64, addend as i64) as void {
+    if (rl.count >= rl.cap) {
+        let is i32 as new_cap = rl.cap * 2;
+        let is *u8 as new_data = om.opt_alloc(cast(i64, new_cap) * sizeof(Reloc));
+        mem.memcpy(new_data, rl.data, cast(i64, rl.count) * sizeof(Reloc));
+        om.opt_free(rl.data);
+        rl.data = new_data;
+        rl.cap = new_cap;
+    }
+    let is *Reloc as r = reloc_get(rl, rl.count);
+    r.offset = offset;
+    r.sym_idx = sym_idx;
+    r.rtype = rtype;
+    r.addend = addend;
+    rl.count = rl.count + 1;
+}
+
+// Write ELF64 relocatable object file.
+// Sections: null, .text, .data, .rodata, .bss, [csec...], .symtab, .strtab,
+//           .rela.text, [.rela.data], .shstrtab
+fn write_elf(fd as i64, text_buf as *buf.ByteBuffer, data_buf as *buf.ByteBuffer,
+             rodata_buf as *buf.ByteBuffer, bss_size as i64,
+             symtab as *SymbolTable, relocs as *RelocList,
+             data_relocs as *RelocList,
+             csec_buf_ptrs as *u8, csec_name_ptrs as *u8,
+             csec_name_lens as *u8, csec_reloc_ptrs as *u8,
+             csec_count as i32) as void {
+
+    let is buf.ByteBuffer as out = buf.buf_init(65536);
+
+    let is i32 as has_rela_data with mut = 0;
+    if (data_relocs.count > 0) { has_rela_data = 1; }
+
+    // Count custom sections that have relocations (each gets a .rela.<name>).
+    let is *i64 as csec_rps = cast(*i64, csec_reloc_ptrs);
+    let is i32 as csec_rela_count with mut = 0;
+    let is i32 as _rci with mut = 0;
+    while (_rci < csec_count) {
+        let is *RelocList as _rl = cast(*RelocList, csec_rps[_rci]);
+        if (_rl.count > 0) { csec_rela_count = csec_rela_count + 1; }
+        _rci = _rci + 1;
+    }
+
+    // Section indices. Custom sections go between .bss and .symtab; .rela.<N>
+    // go after .rela.text and .rela.data.
+    let is i32 as _SEC_NULL with mut = 0;
+    let is i32 as SEC_TEXT with mut = 1;
+    let is i32 as SEC_DATA with mut = 2;
+    let is i32 as _SEC_RODATA with mut = 3;
+    let is i32 as _SEC_BSS with mut = 4;
+    let is i32 as SEC_SYMTAB with mut = 5 + csec_count;
+    let is i32 as SEC_STRTAB with mut = 6 + csec_count;
+    let is i32 as _SEC_RELA with mut = 7 + csec_count;
+    let is i32 as SEC_SHSTRTAB with mut = 8 + csec_count + has_rela_data + csec_rela_count;
+    let is i32 as NUM_SECTIONS with mut = 9 + csec_count + has_rela_data + csec_rela_count;
+
+    // Build .shstrtab
+    let is buf.ByteBuffer as shstrtab = buf.buf_init(256);
+    buf.buf_emit8(&shstrtab, 0); // null byte at start
+    // Record offsets of each name
+    let is i32 as sh_text_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".text", 6);
+    let is i32 as sh_data_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".data", 6);
+    let is i32 as sh_rodata_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".rodata", 8);
+    let is i32 as sh_bss_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".bss", 5);
+    // Custom section names.
+    let is *i32 as csec_sh_names = cast(*i32, om.opt_alloc(cast(i64, csec_count + 1) * 4));
+    let is *i64 as csec_nps = cast(*i64, csec_name_ptrs);
+    let is *i32 as csec_nls = cast(*i32, csec_name_lens);
+    let is i32 as csi with mut = 0;
+    while (csi < csec_count) {
+        csec_sh_names[csi] = cast(i32, shstrtab.len);
+        buf.buf_append(&shstrtab, cast(*u8, csec_nps[csi]), cast(i64, csec_nls[csi]));
+        buf.buf_emit8(&shstrtab, 0);
+        csi = csi + 1;
+    }
+    let is i32 as sh_symtab_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".symtab", 8);
+    let is i32 as sh_strtab_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".strtab", 8);
+    let is i32 as sh_rela_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".rela.text", 11);
+    let is i32 as sh_rela_data_name with mut = 0;
+    if (has_rela_data == 1) {
+        sh_rela_data_name = cast(i32, shstrtab.len);
+        buf.buf_append(&shstrtab, ".rela.data", 11);
+    }
+    // .rela.<csec_name> — one per custom section with relocs.
+    let is *i32 as csec_rela_sh_names = cast(*i32, om.opt_alloc(cast(i64, csec_count + 1) * 4));
+    let is i32 as _sn with mut = 0;
+    while (_sn < csec_count) {
+        let is *RelocList as _rl2 = cast(*RelocList, csec_rps[_sn]);
+        if (_rl2.count > 0) {
+            csec_rela_sh_names[_sn] = cast(i32, shstrtab.len);
+            buf.buf_append(&shstrtab, ".rela", 5);
+            buf.buf_append(&shstrtab, cast(*u8, csec_nps[_sn]), cast(i64, csec_nls[_sn]));
+            buf.buf_emit8(&shstrtab, 0);
+        }
+        _sn = _sn + 1;
+    }
+    let is i32 as sh_shstrtab_name = cast(i32, shstrtab.len);
+    buf.buf_append(&shstrtab, ".shstrtab", 10);
+
+    // Build .strtab (for symbol names)
+    let is buf.ByteBuffer as strtab = buf.buf_init(4096);
+    buf.buf_emit8(&strtab, 0); // null byte at start
+
+    // Build ELF symtab entries
+    // First: null entry (24 bytes of zeros)
+    // Then: section symbols for .text, .data, .rodata, .bss
+    // Then: all user symbols
+    let is buf.ByteBuffer as symtab_buf = buf.buf_init(4096);
+
+    // Null symbol (24 bytes)
+    let is i32 as sym_entry_size = 24;
+    let is i32 as si with mut = 0;
+    while (si < sym_entry_size) {
+        buf.buf_emit8(&symtab_buf, 0);
+        si = si + 1;
+    }
+
+    // Section symbols (4 fixed + N custom).
+    let is i32 as _sec_sym_start = 1;
+    let is i32 as num_sec_syms = 4 + csec_count;
+    let is i32 as sec_idx with mut = 0;
+    while (sec_idx < num_sec_syms) {
+        // st_name = 0
+        buf.buf_emit32_le(&symtab_buf, 0);
+        // st_info = STT_SECTION | (STB_LOCAL << 4)
+        buf.buf_emit8(&symtab_buf, STT_SECTION);
+        // st_other = 0
+        buf.buf_emit8(&symtab_buf, 0);
+        // st_shndx = section index (1-indexed)
+        buf.buf_emit16_le(&symtab_buf, sec_idx + 1);
+        // st_value = 0
+        buf.buf_emit64_le(&symtab_buf, 0);
+        // st_size = 0
+        buf.buf_emit64_le(&symtab_buf, 0);
+        sec_idx = sec_idx + 1;
+    }
+
+    // Count local symbols first (for sh_info)
+    let is i32 as num_locals with mut = 1 + num_sec_syms; // null + section symbols
+    let is i32 as syi with mut = 0;
+    while (syi < symtab.count) {
+        let is *Symbol as s = sym_get(symtab, syi);
+        if (s.is_global == 0) {
+            num_locals = num_locals + 1;
+        }
+        syi = syi + 1;
+    }
+
+    // Add local symbols first, then globals
+    // We need to build a mapping: original sym index -> ELF sym index
+    let is *i32 as sym_map = cast(*i32, om.opt_alloc(cast(i64, symtab.count + 1) * 4));
+    let is i32 as elf_sym_idx with mut = 1 + num_sec_syms; // after null + section syms
+
+    // Pass 1: locals
+    syi = 0;
+    while (syi < symtab.count) {
+        let is *Symbol as s = sym_get(symtab, syi);
+        if (s.is_global == 0) {
+            // Add string to strtab
+            let is i32 as str_off = cast(i32, strtab.len);
+            s.strtab_off = str_off;
+            buf.buf_append(&strtab, s.name_ptr, cast(i64, s.name_len));
+            buf.buf_emit8(&strtab, 0);
+
+            // st_name
+            buf.buf_emit32_le(&symtab_buf, cast(i64, str_off));
+            // st_info: STT_NOTYPE | (STB_LOCAL << 4)
+            buf.buf_emit8(&symtab_buf, STT_NOTYPE);
+            // st_other
+            buf.buf_emit8(&symtab_buf, 0);
+            // st_shndx
+            let is i32 as shndx with mut = s.section + 1;
+            if (s.section == SECTION_UNDEF) { shndx = 0; }
+            buf.buf_emit16_le(&symtab_buf, shndx);
+            // st_value
+            buf.buf_emit64_le(&symtab_buf, s.offset);
+            // st_size
+            buf.buf_emit64_le(&symtab_buf, 0);
+
+            // Record in our local mapping array using pointer arithmetic
+            let is *i32 as map_slot = cast(*i32, cast(i64, sym_map) + cast(i64, syi) * 4);
+            *map_slot = elf_sym_idx;
+            elf_sym_idx = elf_sym_idx + 1;
+        }
+        syi = syi + 1;
+    }
+
+    // Pass 2: globals
+    syi = 0;
+    while (syi < symtab.count) {
+        let is *Symbol as s = sym_get(symtab, syi);
+        if (s.is_global == 1) {
+            let is i32 as str_off = cast(i32, strtab.len);
+            s.strtab_off = str_off;
+            buf.buf_append(&strtab, s.name_ptr, cast(i64, s.name_len));
+            buf.buf_emit8(&strtab, 0);
+
+            buf.buf_emit32_le(&symtab_buf, cast(i64, str_off));
+            // STT_FUNC for .text, STT_OBJECT for .data/.rodata/.bss, STT_NOTYPE for undefined
+            let is i32 as sym_type with mut = STT_FUNC;
+            if (s.section == 1 || s.section == 2 || s.section == 3) { sym_type = STT_OBJECT; }
+            if (s.section == SECTION_UNDEF) { sym_type = 0; }
+            let is i32 as info = sym_type + STB_GLOBAL * 16;
+            buf.buf_emit8(&symtab_buf, info);
+            buf.buf_emit8(&symtab_buf, 0);
+            let is i32 as shndx with mut = s.section + 1;
+            if (s.section == SECTION_UNDEF) { shndx = 0; }
+            buf.buf_emit16_le(&symtab_buf, shndx);
+            buf.buf_emit64_le(&symtab_buf, s.offset);
+            buf.buf_emit64_le(&symtab_buf, 0);
+
+            let is *i32 as map_slot = cast(*i32, cast(i64, sym_map) + cast(i64, syi) * 4);
+            *map_slot = elf_sym_idx;
+            elf_sym_idx = elf_sym_idx + 1;
+        }
+        syi = syi + 1;
+    }
+
+    // Build .rela.text
+    let is buf.ByteBuffer as rela_buf = buf.buf_init(4096);
+    let is i32 as ri with mut = 0;
+    while (ri < relocs.count) {
+        let is *Reloc as r = reloc_get(relocs, ri);
+        buf.buf_emit64_le(&rela_buf, r.offset);
+        let is i64 as mapped_idx with mut = r.sym_idx;
+        if (r.sym_idx >= 0 && r.sym_idx < cast(i64, symtab.count)) {
+            let is *i32 as map_slot = cast(*i32, cast(i64, sym_map) + r.sym_idx * 4);
+            mapped_idx = cast(i64, *map_slot);
+        }
+        let is i64 as info = mapped_idx * 4294967296 + r.rtype;
+        buf.buf_emit64_le(&rela_buf, info);
+        buf.buf_emit64_le(&rela_buf, r.addend);
+        ri = ri + 1;
+    }
+
+    // Build .rela.data (optional — empty if has_rela_data == 0).
+    let is buf.ByteBuffer as rela_data_buf = buf.buf_init(512);
+    let is i32 as rdi with mut = 0;
+    while (rdi < data_relocs.count) {
+        let is *Reloc as rd = reloc_get(data_relocs, rdi);
+        buf.buf_emit64_le(&rela_data_buf, rd.offset);
+        let is i64 as mapped_idx2 with mut = rd.sym_idx;
+        if (rd.sym_idx >= 0 && rd.sym_idx < cast(i64, symtab.count)) {
+            let is *i32 as map_slot2 = cast(*i32, cast(i64, sym_map) + rd.sym_idx * 4);
+            mapped_idx2 = cast(i64, *map_slot2);
+        }
+        let is i64 as info2 = mapped_idx2 * 4294967296 + rd.rtype;
+        buf.buf_emit64_le(&rela_data_buf, info2);
+        buf.buf_emit64_le(&rela_data_buf, rd.addend);
+        rdi = rdi + 1;
+    }
+
+    // Build .rela.<csec> for each custom section with relocs.
+    // This and the four offset/size arrays below are sized by csec_count. They
+    // were [32] on the stack, indexed past their end by a 33rd custom section.
+    let is *buf.ByteBuffer as csec_rela_bufs = cast(*buf.ByteBuffer, om.opt_alloc(cast(i64, csec_count + 1) * sizeof(buf.ByteBuffer)));
+    let is i32 as _crb with mut = 0;
+    while (_crb < csec_count) {
+        csec_rela_bufs[_crb] = buf.buf_init(128);
+        let is *RelocList as _crl = cast(*RelocList, csec_rps[_crb]);
+        let is i32 as _cri with mut = 0;
+        while (_cri < _crl.count) {
+            let is *Reloc as _cr = reloc_get(_crl, _cri);
+            buf.buf_emit64_le(&csec_rela_bufs[_crb], _cr.offset);
+            let is i64 as _cmapped with mut = _cr.sym_idx;
+            if (_cr.sym_idx >= 0 && _cr.sym_idx < cast(i64, symtab.count)) {
+                let is *i32 as _cmap = cast(*i32, cast(i64, sym_map) + _cr.sym_idx * 4);
+                _cmapped = cast(i64, *_cmap);
+            }
+            let is i64 as _cinfo = _cmapped * 4294967296 + _cr.rtype;
+            buf.buf_emit64_le(&csec_rela_bufs[_crb], _cinfo);
+            buf.buf_emit64_le(&csec_rela_bufs[_crb], _cr.addend);
+            _cri = _cri + 1;
+        }
+        _crb = _crb + 1;
+    }
+
+    // Now compute layout
+    let is i64 as elf_hdr_size = 64;
+    let is i64 as _sh_entry_size = 64;
+
+    // Section data starts after ELF header
+    let is i64 as off with mut = elf_hdr_size;
+
+    // .text
+    let is i64 as text_off = off;
+    let is i64 as text_size = text_buf.len;
+    off = off + text_size;
+    // Align to 16
+    if (off % 16 != 0) { off = off + 16 - (off % 16); }
+
+    // .data
+    let is i64 as data_off = off;
+    let is i64 as data_size = data_buf.len;
+    off = off + data_size;
+    if (off % 16 != 0 && data_size > 0) { off = off + 16 - (off % 16); }
+
+    // .rodata
+    let is i64 as rodata_off = off;
+    let is i64 as rodata_size = rodata_buf.len;
+    off = off + rodata_size;
+    if (off % 16 != 0 && rodata_size > 0) { off = off + 16 - (off % 16); }
+
+    // .bss (no data in file)
+    let is i64 as bss_off = off;
+
+    // Custom sections layout. csec_buf_ptrs is *u8 → array of i64 pointers
+    // (one per ByteBuffer). Dereference each to get its real buffer.
+    let is *i64 as csec_file_offs = cast(*i64, om.opt_alloc(cast(i64, csec_count + 1) * 8));
+    let is *i64 as csec_file_sizes = cast(*i64, om.opt_alloc(cast(i64, csec_count + 1) * 8));
+    let is *i64 as csec_bps = cast(*i64, csec_buf_ptrs);
+    csi = 0;
+    while (csi < csec_count) {
+        let is *buf.ByteBuffer as bb = cast(*buf.ByteBuffer, csec_bps[csi]);
+        if (off % 8 != 0 && bb.len > 0) { off = off + 8 - (off % 8); }
+        csec_file_offs[csi] = off;
+        csec_file_sizes[csi] = bb.len;
+        off = off + bb.len;
+        csi = csi + 1;
+    }
+
+    // .symtab
+    let is i64 as symtab_off = off;
+    let is i64 as symtab_size = symtab_buf.len;
+    off = off + symtab_size;
+    if (off % 8 != 0) { off = off + 8 - (off % 8); }
+
+    // .strtab
+    let is i64 as strtab_off = off;
+    let is i64 as strtab_size = strtab.len;
+    off = off + strtab_size;
+
+    // .rela.text
+    if (off % 8 != 0 && rela_buf.len > 0) { off = off + 8 - (off % 8); }
+    let is i64 as rela_off = off;
+    let is i64 as rela_size = rela_buf.len;
+    off = off + rela_size;
+
+    // .rela.data
+    let is i64 as rela_data_off with mut = 0;
+    let is i64 as rela_data_sz  with mut = 0;
+    if (has_rela_data == 1) {
+        if (off % 8 != 0) { off = off + 8 - (off % 8); }
+        rela_data_off = off;
+        rela_data_sz = rela_data_buf.len;
+        off = off + rela_data_sz;
+    }
+
+    // .rela.<csec> layout (one per non-empty csec reloc list).
+    let is *i64 as csec_rela_offs = cast(*i64, om.opt_alloc(cast(i64, csec_count + 1) * 8));
+    let is *i64 as csec_rela_sizes = cast(*i64, om.opt_alloc(cast(i64, csec_count + 1) * 8));
+    let is i32 as _cro with mut = 0;
+    while (_cro < csec_count) {
+        csec_rela_offs[_cro] = 0;
+        csec_rela_sizes[_cro] = 0;
+        if (csec_rela_bufs[_cro].len > 0) {
+            if (off % 8 != 0) { off = off + 8 - (off % 8); }
+            csec_rela_offs[_cro] = off;
+            csec_rela_sizes[_cro] = csec_rela_bufs[_cro].len;
+            off = off + csec_rela_bufs[_cro].len;
+        }
+        _cro = _cro + 1;
+    }
+
+    // .shstrtab
+    let is i64 as shstrtab_off = off;
+    let is i64 as shstrtab_size = shstrtab.len;
+    off = off + shstrtab_size;
+    if (off % 8 != 0) { off = off + 8 - (off % 8); }
+
+    // Section headers
+    let is i64 as shdr_off = off;
+
+    // === Write ELF header ===
+    // Magic
+    buf.buf_emit8(&out, 127); buf.buf_emit8(&out, 69); buf.buf_emit8(&out, 76); buf.buf_emit8(&out, 70);
+    // Class (64-bit), Data (LE), Version, OS/ABI, padding
+    buf.buf_emit8(&out, 2); buf.buf_emit8(&out, 1); buf.buf_emit8(&out, 1); buf.buf_emit8(&out, 0);
+    buf.buf_emit64_le(&out, 0); // padding
+    // e_type = ET_REL
+    buf.buf_emit16_le(&out, ET_REL);
+    // e_machine follows the selected compiler target.
+    let is i32 as machine with mut = EM_X86_64;
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) { machine = EM_AARCH64; }
+    buf.buf_emit16_le(&out, machine);
+    // e_version
+    buf.buf_emit32_le(&out, 1);
+    // e_entry
+    buf.buf_emit64_le(&out, 0);
+    // e_phoff
+    buf.buf_emit64_le(&out, 0);
+    // e_shoff
+    buf.buf_emit64_le(&out, shdr_off);
+    // e_flags
+    buf.buf_emit32_le(&out, 0);
+    // e_ehsize
+    buf.buf_emit16_le(&out, 64);
+    // e_phentsize, e_phnum
+    buf.buf_emit16_le(&out, 0);
+    buf.buf_emit16_le(&out, 0);
+    // e_shentsize
+    buf.buf_emit16_le(&out, 64);
+    // e_shnum
+    buf.buf_emit16_le(&out, NUM_SECTIONS);
+    // e_shstrndx
+    buf.buf_emit16_le(&out, SEC_SHSTRTAB);
+
+    // === Write section data ===
+    // .text
+    buf.buf_append(&out, text_buf.data, text_size);
+    buf.buf_align(&out, 16);
+    // .data
+    if (data_size > 0) {
+        buf.buf_append(&out, data_buf.data, data_size);
+        buf.buf_align(&out, 16);
+    }
+    // .rodata
+    if (rodata_size > 0) {
+        buf.buf_append(&out, rodata_buf.data, rodata_size);
+        buf.buf_align(&out, 16);
+    }
+    // Custom sections data.
+    csi = 0;
+    while (csi < csec_count) {
+        let is *buf.ByteBuffer as bb2 = cast(*buf.ByteBuffer, csec_bps[csi]);
+        if (bb2.len > 0) {
+            buf.buf_align(&out, 8);
+            buf.buf_append(&out, bb2.data, bb2.len);
+        }
+        csi = csi + 1;
+    }
+    // .symtab
+    buf.buf_append(&out, symtab_buf.data, symtab_size);
+    buf.buf_align(&out, 8);
+    // .strtab
+    buf.buf_append(&out, strtab.data, strtab_size);
+    // .rela.text
+    if (rela_size > 0) {
+        buf.buf_align(&out, 8);
+        buf.buf_append(&out, rela_buf.data, rela_size);
+    }
+    // .rela.data
+    if (rela_data_sz > 0) {
+        buf.buf_align(&out, 8);
+        buf.buf_append(&out, rela_data_buf.data, rela_data_sz);
+    }
+    // .rela.<csec> data
+    let is i32 as _crw with mut = 0;
+    while (_crw < csec_count) {
+        if (csec_rela_sizes[_crw] > 0) {
+            buf.buf_align(&out, 8);
+            buf.buf_append(&out, csec_rela_bufs[_crw].data, csec_rela_sizes[_crw]);
+        }
+        _crw = _crw + 1;
+    }
+    // .shstrtab
+    buf.buf_append(&out, shstrtab.data, shstrtab_size);
+    buf.buf_align(&out, 8);
+
+    // === Write section headers ===
+    // Helper: write one section header (64 bytes)
+    // 0: SHT_NULL
+    let is i32 as shi with mut = 0;
+    while (shi < 64) { buf.buf_emit8(&out, 0); shi = shi + 1; }
+
+    // 1: .text
+    buf.buf_emit32_le(&out, cast(i64, sh_text_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_PROGBITS));
+    buf.buf_emit64_le(&out, cast(i64, SHF_ALLOC + SHF_EXECINSTR));
+    buf.buf_emit64_le(&out, 0); // addr
+    buf.buf_emit64_le(&out, text_off);
+    buf.buf_emit64_le(&out, text_size);
+    buf.buf_emit32_le(&out, 0); // link
+    buf.buf_emit32_le(&out, 0); // info
+    buf.buf_emit64_le(&out, 16); // addralign
+    buf.buf_emit64_le(&out, 0); // entsize
+
+    // 2: .data
+    buf.buf_emit32_le(&out, cast(i64, sh_data_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_PROGBITS));
+    buf.buf_emit64_le(&out, cast(i64, SHF_ALLOC + SHF_WRITE));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, data_off);
+    buf.buf_emit64_le(&out, data_size);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit64_le(&out, 8);
+    buf.buf_emit64_le(&out, 0);
+
+    // 3: .rodata
+    buf.buf_emit32_le(&out, cast(i64, sh_rodata_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_PROGBITS));
+    buf.buf_emit64_le(&out, cast(i64, SHF_ALLOC));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, rodata_off);
+    buf.buf_emit64_le(&out, rodata_size);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit64_le(&out, 1);
+    buf.buf_emit64_le(&out, 0);
+
+    // 4: .bss
+    buf.buf_emit32_le(&out, cast(i64, sh_bss_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_NOBITS));
+    buf.buf_emit64_le(&out, cast(i64, SHF_ALLOC + SHF_WRITE));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, bss_off);
+    buf.buf_emit64_le(&out, bss_size);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit64_le(&out, 8);
+    buf.buf_emit64_le(&out, 0);
+
+    // 5..5+N: custom sections. A section declared with an "x" flag holds code
+    // (a function carrying `with section(...)`), so it gets ALLOC+EXECINSTR and
+    // the linker maps it executable; everything else stays ALLOC+WRITE data.
+    csi = 0;
+    while (csi < csec_count) {
+        let is i64 as cs_flags with mut = cast(i64, SHF_ALLOC + SHF_WRITE);
+        if (csec_exec_flags(csi) == 1) { cs_flags = cast(i64, SHF_ALLOC + SHF_EXECINSTR); }
+        buf.buf_emit32_le(&out, cast(i64, csec_sh_names[csi]));
+        buf.buf_emit32_le(&out, cast(i64, SHT_PROGBITS));
+        buf.buf_emit64_le(&out, cs_flags);
+        buf.buf_emit64_le(&out, 0);
+        buf.buf_emit64_le(&out, csec_file_offs[csi]);
+        buf.buf_emit64_le(&out, csec_file_sizes[csi]);
+        buf.buf_emit32_le(&out, 0);
+        buf.buf_emit32_le(&out, 0);
+        buf.buf_emit64_le(&out, 8);
+        buf.buf_emit64_le(&out, 0);
+        csi = csi + 1;
+    }
+
+    // 5+N: .symtab
+    buf.buf_emit32_le(&out, cast(i64, sh_symtab_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_SYMTAB));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, symtab_off);
+    buf.buf_emit64_le(&out, symtab_size);
+    buf.buf_emit32_le(&out, cast(i64, SEC_STRTAB)); // link = .strtab
+    buf.buf_emit32_le(&out, cast(i64, num_locals)); // info = first global sym idx
+    buf.buf_emit64_le(&out, 8);
+    buf.buf_emit64_le(&out, 24); // entsize
+
+    // 6: .strtab
+    buf.buf_emit32_le(&out, cast(i64, sh_strtab_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_STRTAB));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, strtab_off);
+    buf.buf_emit64_le(&out, strtab_size);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit64_le(&out, 1);
+    buf.buf_emit64_le(&out, 0);
+
+    // 7: .rela.text
+    buf.buf_emit32_le(&out, cast(i64, sh_rela_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_RELA));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, rela_off);
+    buf.buf_emit64_le(&out, rela_size);
+    buf.buf_emit32_le(&out, cast(i64, SEC_SYMTAB)); // link = .symtab
+    buf.buf_emit32_le(&out, cast(i64, SEC_TEXT));    // info = .text section
+    buf.buf_emit64_le(&out, 8);
+    buf.buf_emit64_le(&out, 24); // entsize
+
+    // 7+1: .rela.data (optional)
+    if (has_rela_data == 1) {
+        buf.buf_emit32_le(&out, cast(i64, sh_rela_data_name));
+        buf.buf_emit32_le(&out, cast(i64, SHT_RELA));
+        buf.buf_emit64_le(&out, 0);
+        buf.buf_emit64_le(&out, 0);
+        buf.buf_emit64_le(&out, rela_data_off);
+        buf.buf_emit64_le(&out, rela_data_sz);
+        buf.buf_emit32_le(&out, cast(i64, SEC_SYMTAB)); // link
+        buf.buf_emit32_le(&out, cast(i64, SEC_DATA));    // info = .data
+        buf.buf_emit64_le(&out, 8);
+        buf.buf_emit64_le(&out, 24);
+    }
+
+    // .rela.<csec> section headers. sh_info points at the target csec
+    // section index (5 + csec_index).
+    let is i32 as _crh with mut = 0;
+    while (_crh < csec_count) {
+        if (csec_rela_sizes[_crh] > 0) {
+            buf.buf_emit32_le(&out, cast(i64, csec_rela_sh_names[_crh]));
+            buf.buf_emit32_le(&out, cast(i64, SHT_RELA));
+            buf.buf_emit64_le(&out, 0);
+            buf.buf_emit64_le(&out, 0);
+            buf.buf_emit64_le(&out, csec_rela_offs[_crh]);
+            buf.buf_emit64_le(&out, csec_rela_sizes[_crh]);
+            buf.buf_emit32_le(&out, cast(i64, SEC_SYMTAB));
+            buf.buf_emit32_le(&out, cast(i64, 5 + _crh));  // target csec section index
+            buf.buf_emit64_le(&out, 8);
+            buf.buf_emit64_le(&out, 24);
+        }
+        _crh = _crh + 1;
+    }
+
+    // 8: .shstrtab
+    buf.buf_emit32_le(&out, cast(i64, sh_shstrtab_name));
+    buf.buf_emit32_le(&out, cast(i64, SHT_STRTAB));
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, 0);
+    buf.buf_emit64_le(&out, shstrtab_off);
+    buf.buf_emit64_le(&out, shstrtab_size);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit32_le(&out, 0);
+    buf.buf_emit64_le(&out, 1);
+    buf.buf_emit64_le(&out, 0);
+
+    // Write to file
+    io._write_fd(fd, out.data, out.len);
+
+    // The compiler assembles every module in one process.
+    buf.buf_free(&out);
+    buf.buf_free(&shstrtab);
+    buf.buf_free(&strtab);
+    buf.buf_free(&symtab_buf);
+    buf.buf_free(&rela_buf);
+    buf.buf_free(&rela_data_buf);
+    om.opt_free(cast(*u8, sym_map));
+}

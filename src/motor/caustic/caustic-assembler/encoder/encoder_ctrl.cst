@@ -1,0 +1,143 @@
+use "../core/asm_defs.cst" as def;
+use "../core/buf.cst" as buf;
+use "encoder_util.cst" as eu;
+
+// Control-flow & stack family: no-operand ops, INT, PUSH/POP, CALL/JMP/Jcc, SETcc.
+// Returns the encoded size in bytes, or eu.ENC_SKIP if this family does not
+// handle the given instruction.
+fn encode_ctrl(b as *buf.ByteBuffer, inst as i32, op1 as *def.Operand, op2 as *def.Operand, resolve_label as i64, cur_off as i64) as i32 {
+    let is i64 as start = b.len;
+
+    // --- No-operand instructions ---
+    if (inst == def.INST_RET)     { buf.buf_emit8(b, 195); return 1; }
+    if (inst == def.INST_SYSCALL) { buf.buf_emit8(b, 15); buf.buf_emit8(b, 5); return 2; }
+    if (inst == def.INST_CLD)     { buf.buf_emit8(b, 252); return 1; }
+    if (inst == def.INST_CLI)     { buf.buf_emit8(b, 250); return 1; }                       // FA
+    if (inst == def.INST_STI)     { buf.buf_emit8(b, 251); return 1; }                       // FB
+    if (inst == def.INST_HLT)     { buf.buf_emit8(b, 244); return 1; }                       // F4
+    if (inst == def.INST_NOP)     { buf.buf_emit8(b, 144); return 1; }
+    if (inst == def.INST_CQO)     { buf.buf_emit8(b, eu.make_rex(1,0,0,0)); buf.buf_emit8(b, 153); return 2; }
+    if (inst == def.INST_CDQ)     { buf.buf_emit8(b, 153); return 1; }
+    if (inst == def.INST_MOVSB)   { buf.buf_emit8(b, 164); return 1; }
+    if (inst == def.INST_REP)     { buf.buf_emit8(b, 243); return 1; }
+    if (inst == def.INST_LOCK)    { buf.buf_emit8(b, 240); return 1; }                       // F0 prefix (standalone)
+    if (inst == def.INST_PAUSE)   { buf.buf_emit8(b, 243); buf.buf_emit8(b, 144); return 2; } // F3 90
+    if (inst == def.INST_MFENCE)  { buf.buf_emit8(b, 15); buf.buf_emit8(b, 174); buf.buf_emit8(b, 240); return 3; } // 0F AE F0
+
+    // INT imm8: CD ib
+    if (inst == def.INST_INT && op1.kind == def.OP_IMM) {
+        buf.buf_emit8(b, 205);                                  // 0xCD
+        buf.buf_emit8(b, cast(i32, op1.imm & 0xFF));
+        return 2;
+    }
+
+    // --- PUSH/POP reg ---
+    if (inst == def.INST_PUSH && op1.kind == def.OP_REG) {
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        if (eu.reg_ext(op1.reg_id) == 1) {
+            buf.buf_emit8(b, eu.make_rex(0,0,0,1));
+        }
+        buf.buf_emit8(b, 80 + code);
+        return cast(i32, b.len - start);
+    }
+    if (inst == def.INST_POP && op1.kind == def.OP_REG) {
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        if (eu.reg_ext(op1.reg_id) == 1) {
+            buf.buf_emit8(b, eu.make_rex(0,0,0,1));
+        }
+        buf.buf_emit8(b, 88 + code);
+        return cast(i32, b.len - start);
+    }
+
+    // --- CALL reg (FF /2) ---
+    if (inst == def.INST_CALL && op1.kind == def.OP_REG) {
+        let is i32 as r = op1.reg_id % 16;
+        if (r >= 8) { buf.buf_emit8(b, 65); }
+        buf.buf_emit8(b, 255);
+        buf.buf_emit8(b, 208 + (r & 7));
+        return 2 + eu.reg_ext(op1.reg_id);
+    }
+
+    // --- CALL/JMP/Jcc label ---
+    if (inst == def.INST_CALL && op1.kind == def.OP_LABEL) {
+        buf.buf_emit8(b, 232);
+        let is i64 as rel = resolve_label - (cur_off + 5);
+        buf.buf_emit32_le(b, rel);
+        return 5;
+    }
+    // --- CALL [rip+label] (FF /5 indirect via RIP-relative memory) ---
+    // Windows IAT calls: `call QWORD PTR [rip+__imp_X]`. 6 bytes: FF 15 disp32.
+    // Caller emits a REL32 reloc against the label at offset (cur_off + 2).
+    if (inst == def.INST_CALL && op1.kind == def.OP_RIP_LABEL) {
+        buf.buf_emit8(b, 255);
+        buf.buf_emit8(b, 21);
+        buf.buf_emit32_le(b, 0);
+        return 6;
+    }
+    // --- JMP reg (FF /4) ---
+    if (inst == def.INST_JMP && op1.kind == def.OP_REG) {
+        let is i32 as r = op1.reg_id % 16;
+        if (r >= 8) { buf.buf_emit8(b, 65); }
+        buf.buf_emit8(b, 255);
+        buf.buf_emit8(b, 224 + (r & 7));
+        return 2 + eu.reg_ext(op1.reg_id);
+    }
+
+    if (inst == def.INST_JMP && op1.kind == def.OP_LABEL) {
+        buf.buf_emit8(b, 233);
+        let is i64 as rel = resolve_label - (cur_off + 5);
+        buf.buf_emit32_le(b, rel);
+        return 5;
+    }
+    // Jcc: 0F 8x + rel32
+    if (((inst >= def.INST_JZ && inst <= def.INST_JBE) || inst == def.INST_JP || inst == def.INST_JNP) && op1.kind == def.OP_LABEL) {
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, jcc_cc(inst));
+        let is i64 as rel = resolve_label - (cur_off + 6);
+        buf.buf_emit32_le(b, rel);
+        return 6;
+    }
+
+    // --- SETcc reg8 ---
+    if (((inst >= def.INST_SETE && inst <= def.INST_SETAE) || inst == def.INST_SETP || inst == def.INST_SETNP) && op1.kind == def.OP_REG) {
+        let is i32 as cc with mut = 0;
+        if (inst == def.INST_SETE) { cc = 148; }
+        if (inst == def.INST_SETNE) { cc = 149; }
+        if (inst == def.INST_SETL) { cc = 156; }
+        if (inst == def.INST_SETLE) { cc = 158; }
+        if (inst == def.INST_SETG) { cc = 159; }
+        if (inst == def.INST_SETGE) { cc = 157; }
+        if (inst == def.INST_SETB) { cc = 146; }
+        if (inst == def.INST_SETBE) { cc = 150; }
+        if (inst == def.INST_SETA) { cc = 151; }
+        if (inst == def.INST_SETAE) { cc = 147; }
+        if (inst == def.INST_SETP) { cc = 154; }
+        if (inst == def.INST_SETNP) { cc = 155; }
+        let is i32 as code = eu.reg_code(op1.reg_id);
+        if (eu.reg_ext(op1.reg_id) == 1 || eu.needs_rex_for_8bit(op1.reg_id) == 1) {
+            buf.buf_emit8(b, eu.make_rex(0, 0, 0, eu.reg_ext(op1.reg_id)));
+        }
+        buf.buf_emit8(b, 15);
+        buf.buf_emit8(b, cc);
+        buf.buf_emit8(b, eu.make_modrm(3, 0, code));
+        return cast(i32, b.len - start);
+    }
+
+    return eu.ENC_SKIP;
+}
+
+// Second byte of the rel32 Jcc (0F 8x); the rel8 form is that minus 0x10 (7x).
+fn jcc_cc(inst as i32) as i32 {
+    if (inst == def.INST_JZ || inst == def.INST_JE) { return 132; }
+    if (inst == def.INST_JNZ || inst == def.INST_JNE) { return 133; }
+    if (inst == def.INST_JL) { return 140; }
+    if (inst == def.INST_JLE) { return 142; }
+    if (inst == def.INST_JG) { return 143; }
+    if (inst == def.INST_JGE) { return 141; }
+    if (inst == def.INST_JA) { return 135; }
+    if (inst == def.INST_JAE) { return 131; }
+    if (inst == def.INST_JB) { return 130; }
+    if (inst == def.INST_JBE) { return 134; }
+    if (inst == def.INST_JP) { return 138; }
+    return 139;
+}

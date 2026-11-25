@@ -1,0 +1,49 @@
+// =======================================================
+// std/io/wasm.cst — Portable I/O backend, WASI impl
+//
+// Per-OS portable subset used via `use "std/io/<TARGET>.cst"` and by io.cst's
+// os.current() dispatch. Delegates to std/os/wasm.cst WASI bindings.
+//
+// Console I/O (write/read/exit) is fully supported. Filesystem operations
+// require WASI path_* calls over preopened directory descriptors, which are not
+// wired yet — they return errors and are dead-stripped from programs that don't
+// use them.
+// =======================================================
+
+use "../os/wasm.cst" as wasi;
+
+let is i64 as STDIN  with imut = 0;
+let is i64 as STDOUT with imut = 1;
+let is i64 as STDERR with imut = 2;
+
+fn write_stdout(buf as *u8, len as i64) as i64 { return wasi.write(STDOUT, buf, len); }
+fn write_stderr(buf as *u8, len as i64) as i64 { return wasi.write(STDERR, buf, len); }
+fn read_stdin(buf as *u8, max as i64) as i64 { return wasi.read(STDIN, buf, max); }
+
+fn write(handle as i64, buf as *u8, len as i64) as i64 { return wasi.write(handle, buf, len); }
+fn read(handle as i64, buf as *u8, max as i64) as i64 { return wasi.read(handle, buf, max); }
+fn exit(code as i32) as void { wasi.exit(cast(i64, code)); }
+
+// SEEK_* kept for API parity.
+let is i32 as SEEK_SET with imut = 0;
+let is i32 as SEEK_CUR with imut = 1;
+let is i32 as SEEK_END with imut = 2;
+
+// --- Filesystem ops over WASI path_open + preopened dirs (fd 3) ---
+fn open_read(path as *u8) as i64 { return wasi.open_read(path); }
+fn open_write(path as *u8) as i64 { return wasi.open_write(path); }
+fn open_append(path as *u8) as i64 { return wasi.open_append(path); }
+fn close(handle as i64) as i32 { return wasi.close(handle); }
+fn lseek(handle as i64, offset as i64, whence as i32) as i64 { return wasi.seek(handle, offset, whence); }
+
+// Filesystem mutators over WASI path_* (relative to the fd-3 preopen).
+fn unlink(path as *u8) as i32 { return wasi.unlink(path); }
+fn rename(src as *u8, dst as *u8) as i32 { return wasi.rename(src, dst); }
+fn mkdir(path as *u8) as i32 { return wasi.mkdir(path); }
+fn rmdir(path as *u8) as i32 { return wasi.rmdir(path); }
+fn exists(path as *u8) as i32 { return wasi.exists(path); }
+fn mtime(path as *u8) as i64 { return wasi.mtime(path); }
+
+// WASI has no concept of the running executable path or an executable bit.
+fn get_self_path(buf as *u8, size as i64) as i64 { return 0; }
+fn make_executable(path as *u8) as i32 { return 0; }

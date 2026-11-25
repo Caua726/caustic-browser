@@ -1,0 +1,30 @@
+<!DOCTYPE html><html><head><title>W</title></head><body><pre id="out"></pre>
+<iframe name="kid" id="k" srcdoc="<!DOCTYPE html><body><script>parent.postMessage({name:window.name,sib:parent.frames.length,mine:parent.frames.kid===window},'*')</script>"></iframe>
+<script>
+var R=[];function P(){R.push(Array.prototype.join.call(arguments,' '))}
+function J(x){return JSON.stringify(x)}
+var f=document.createElement('iframe');f.style.display='none';document.body.appendChild(f);
+var w0=f.contentWindow;P('blank',typeof w0.JSON.parse,w0.JSON.parse('[1]')[0],typeof w0.Object.keys);document.body.removeChild(f);
+P('named',typeof frames.kid,frames.kid===document.getElementById('k').contentWindow,frames.length);
+var el=document.createElement('iframe');el.setAttribute('frameBorder','0');P('attr',el.getAttribute('frameborder'),el.getAttribute('FRAMEBORDER'),el.outerHTML);
+var ch=new MessageChannel;ch.port1.postMessage('early');
+setTimeout(function(){ch.port2.onmessage=function(e){P('queued',e.data);step2()}},20);
+var mc=new MessageChannel;
+function C(x,y){return function(){return x+y+arguments[0]}}
+function Ctor(a,b){this.a=a;this.b=b}
+var Bnd=Ctor.bind(null,1),obj=new Bnd(2);P('newbound',obj.a,obj.b,obj instanceof Ctor);
+function outer(){var inner=function(){return arguments.length};return arguments.length+':'+inner(1,2,3)}P('args',outer(9));
+function step2(){
+  var w=new Worker('w.js'),n=0;
+  w.onerror=function(e){P('worker error');finish()};
+  w.addEventListener('message',function(e){n++;P('listener',n,J(e.data))});
+  w.onmessage=function(e){
+    P('onmessage',J(e.data));
+    if(n===1){w.postMessage({port:1},[mc.port2]);mc.port1.onmessage=function(m){P('via port',m.data);if(m.data==='port ready')mc.port1.postMessage('hello');else w.postMessage('lib')};return}
+    if(String(e.data).indexOf('lib ran')===0){w.terminate();finish()}
+  };
+  w.postMessage('hi');
+}
+function finish(){setTimeout(function(){document.getElementById('out').textContent=R.join('\n');document.body.setAttribute('data-done','1')},50)}
+addEventListener('message',function(e){P('kid says',J(e.data))});
+</script></body></html>

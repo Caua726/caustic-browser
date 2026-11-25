@@ -1,0 +1,253 @@
+// core/relocate.cst — Phase 4: relocation resolution and application.
+// Extracted from linker.cst (imported as `linker` for linker.LinkerState, the global
+// symbol table, section accessors, and dynamic-symbol lookups).
+use "../readers/elf_reader.cst" as reader;
+use "linker.cst" as linker;
+use "../../src/codegen/target.cst" as tgt;
+
+fn resolve_reloc_sym(ls as *linker.LinkerState, obj as *reader.ObjFile, sym_idx as i32) as i64 {
+    if (sym_idx < 0 || sym_idx >= obj.sym_count) {
+        return 0;
+    }
+    let is *reader.ObjSym as sym = reader.sym_get(obj, sym_idx);
+
+    if (sym.sym_type == reader.STT_SECTION) {
+        return linker.resolve_sym_vaddr(ls, obj, sym.section, sym.value);
+    }
+
+    if (sym.binding == reader.STB_LOCAL && sym.section != 0) {
+        return linker.resolve_sym_vaddr(ls, obj, sym.section, sym.value);
+    }
+
+    if (sym.name_len > 0) {
+        // Check if this is a dynamic symbol first
+        if (linker.is_dynamic_sym(ls, sym.name, sym.name_len) == 1) {
+            return linker.get_plt_vaddr(ls, sym.name, sym.name_len);
+        }
+
+        let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+        let is i32 as gi = linker.gsym_find(gsyms, sym.name, sym.name_len);
+        if (gi >= 0) {
+            let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+            return g.vaddr;
+        }
+    }
+
+    return 0;
+}
+
+fn apply_relocations(ls as *linker.LinkerState) as void {
+    let is *reader.ByteBuffer as text_buf = linker.get_text(ls);
+    let is *reader.ByteBuffer as data_buf = linker.get_data(ls);
+    let is i32 as i with mut = 0;
+
+    while (i < ls.obj_count) {
+        let is *reader.ObjFile as obj = linker.get_obj(ls, i);
+        let is i32 as ri with mut = 0;
+
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+
+            let is i64 as S = resolve_reloc_sym(ls, obj, rel.sym_idx);
+            let is i64 as A = rel.addend;
+            let is i64 as P with mut = 0;
+            let is *u8 as target_data with mut = cast(*u8, 0);
+            let is i64 as buf_offset with mut = 0;
+
+            if (rel.section == reader.SECIDX_TEXT) {
+                P = ls.text_vaddr + obj.text_offset + rel.offset;
+                target_data = text_buf.data;
+                buf_offset = obj.text_offset + rel.offset;
+            }
+            else if (rel.section == reader.SECIDX_DATA) {
+                P = ls.data_vaddr + obj.data_offset + rel.offset;
+                target_data = data_buf.data;
+                buf_offset = obj.data_offset + rel.offset;
+            }
+            else if (rel.section > reader.SECIDX_BSS) {
+                // Match the canonical object-local custom id, then resolve
+                // to the merged section buffer and this object's offset.
+                let is *i32 as obj_csec_idx = cast(*i32, obj.csec_indices);
+                let is *i64 as obj_csec_offs = cast(*i64, obj.csec_offsets);
+                let is *i64 as cnp = cast(*i64, obj.csec_names);
+                let is *i32 as cnlp = cast(*i32, obj.csec_name_lens);
+                let is i32 as _rci with mut = 0;
+                while (_rci < obj.csec_count) {
+                    if (obj_csec_idx[_rci] == rel.section) {
+                        let is *i64 as ls_names = cast(*i64, ls.csec_names);
+                        let is *i32 as ls_nlens = cast(*i32, ls.csec_name_lens);
+                        let is *i64 as ls_vaddrs = cast(*i64, ls.csec_vaddrs);
+                        let is *reader.ByteBuffer as ls_bufs = cast(*reader.ByteBuffer, ls.csec_bufs);
+                        let is i32 as _mi with mut = 0;
+                        while (_mi < ls.csec_count) {
+                            if (ls_nlens[_mi] == cnlp[_rci] &&
+                                reader.streq(cast(*u8, cnp[_rci]), cnlp[_rci],
+                                             cast(*u8, ls_names[_mi]), ls_nlens[_mi]) == 1) {
+                                P = ls_vaddrs[_mi] + obj_csec_offs[_rci] + rel.offset;
+                                target_data = ls_bufs[_mi].data;
+                                buf_offset = obj_csec_offs[_rci] + rel.offset;
+                                _mi = ls.csec_count;  // break inner
+                            }
+                            _mi = _mi + 1;
+                        }
+                        _rci = obj.csec_count;  // break outer
+                    }
+                    _rci = _rci + 1;
+                }
+            }
+
+            if (cast(i64, target_data) != 0) {
+                let is i64 as rtype = rel.rtype;
+
+                if (tgt.target_get().arch == tgt.ARCH_AARCH64) {
+                    let is i64 as old = cast(i64, target_data[buf_offset])
+                        + (cast(i64, target_data[buf_offset + 1]) << 8)
+                        + (cast(i64, target_data[buf_offset + 2]) << 16)
+                        + (cast(i64, target_data[buf_offset + 3]) << 24);
+                    let is i64 as word with mut = old;
+
+                    if (rtype == reader.R_AARCH64_ABS64) {
+                        let is i64 as value = S + A;
+                        target_data[buf_offset]     = cast(u8, value & 255);
+                        target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                        target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                        target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                        target_data[buf_offset + 4] = cast(u8, (value >> 32) & 255);
+                        target_data[buf_offset + 5] = cast(u8, (value >> 40) & 255);
+                        target_data[buf_offset + 6] = cast(u8, (value >> 48) & 255);
+                        target_data[buf_offset + 7] = cast(u8, (value >> 56) & 255);
+                    }
+                    else if (rtype == reader.R_AARCH64_CALL26 || rtype == reader.R_AARCH64_JUMP26) {
+                        let is i64 as delta = S + A - P;
+                        let is i64 as imm = delta / 4;
+                        if (delta % 4 != 0 || imm < (0 - 33554432) || imm > 33554431) {
+                            reader.print_str("warning: AArch64 branch26 relocation overflow at ");
+                            reader.print_hex(P); reader.print_str("\n");
+                        }
+                        word = (old & 0xFC000000) | (imm & 0x03FFFFFF);
+                        target_data[buf_offset] = cast(u8, word & 255);
+                        target_data[buf_offset + 1] = cast(u8, (word >> 8) & 255);
+                        target_data[buf_offset + 2] = cast(u8, (word >> 16) & 255);
+                        target_data[buf_offset + 3] = cast(u8, (word >> 24) & 255);
+                    }
+                    else if (rtype == reader.R_AARCH64_CONDBR19) {
+                        let is i64 as delta = S + A - P;
+                        let is i64 as imm = delta / 4;
+                        if (delta % 4 != 0 || imm < (0 - 262144) || imm > 262143) {
+                            reader.print_str("warning: AArch64 condbr19 relocation overflow at ");
+                            reader.print_hex(P); reader.print_str("\n");
+                        }
+                        word = (old & 0xFF00001F) | ((imm & 0x7FFFF) << 5);
+                        target_data[buf_offset] = cast(u8, word & 255);
+                        target_data[buf_offset + 1] = cast(u8, (word >> 8) & 255);
+                        target_data[buf_offset + 2] = cast(u8, (word >> 16) & 255);
+                        target_data[buf_offset + 3] = cast(u8, (word >> 24) & 255);
+                    }
+                    else if (rtype == reader.R_AARCH64_ADR_PREL_PG_HI21) {
+                        let is i64 as page_delta = ((S + A) & (0 - 4096)) - (P & (0 - 4096));
+                        let is i64 as imm = page_delta / 4096;
+                        if (imm < (0 - 1048576) || imm > 1048575) {
+                            reader.print_str("warning: AArch64 ADRP relocation overflow at ");
+                            reader.print_hex(P); reader.print_str("\n");
+                        }
+                        word = (old & 0x9F00001F) | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5);
+                        target_data[buf_offset] = cast(u8, word & 255);
+                        target_data[buf_offset + 1] = cast(u8, (word >> 8) & 255);
+                        target_data[buf_offset + 2] = cast(u8, (word >> 16) & 255);
+                        target_data[buf_offset + 3] = cast(u8, (word >> 24) & 255);
+                    }
+                    else if (rtype == reader.R_AARCH64_ADD_ABS_LO12_NC) {
+                        let is i64 as lo12 = (S + A) & 4095;
+                        word = (old & 0xFFC003FF) | (lo12 << 10);
+                        target_data[buf_offset] = cast(u8, word & 255);
+                        target_data[buf_offset + 1] = cast(u8, (word >> 8) & 255);
+                        target_data[buf_offset + 2] = cast(u8, (word >> 16) & 255);
+                        target_data[buf_offset + 3] = cast(u8, (word >> 24) & 255);
+                    }
+                    else {
+                        reader.print_str("warning: unhandled AArch64 relocation type ");
+                        reader.print_int(rtype); reader.print_str(" at ");
+                        reader.print_hex(P); reader.print_str("\n");
+                    }
+                }
+                // R_X86_64_64 (type 1): 64-bit absolute — S + A
+                else if (rtype == reader.R_X86_64_64) {
+                    let is i64 as value = S + A;
+                    target_data[buf_offset]     = cast(u8, value & 255);
+                    target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                    target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                    target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                    target_data[buf_offset + 4] = cast(u8, (value >> 32) & 255);
+                    target_data[buf_offset + 5] = cast(u8, (value >> 40) & 255);
+                    target_data[buf_offset + 6] = cast(u8, (value >> 48) & 255);
+                    target_data[buf_offset + 7] = cast(u8, (value >> 56) & 255);
+                }
+                // R_X86_64_PC32 (type 2), R_X86_64_PLT32 (type 4): 32-bit PC-relative — S + A - P
+                else if (rtype == reader.R_X86_64_PC32 || rtype == reader.R_X86_64_PLT32) {
+                    let is i64 as value = S + A - P;
+                    if (value > 2147483647 || value < (0 - 2147483648)) {
+                        reader.print_str("warning: PC32 relocation overflow at ");
+                        reader.print_hex(P);
+                        reader.print_str("\n");
+                    }
+                    target_data[buf_offset]     = cast(u8, value & 255);
+                    target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                    target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                    target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                }
+                // R_X86_64_GOTPCREL (9), GOTPCRELX (41), REX_GOTPCRELX (42): GOT-relative
+                else if (rtype == reader.R_X86_64_GOTPCREL || rtype == reader.R_X86_64_GOTPCRELX || rtype == reader.R_X86_64_REX_GOTPCRELX) {
+                    if (cast(i64, ls.dynsyms) != 0) {
+                        let is *reader.ObjSym as sym = reader.sym_get(obj, rel.sym_idx);
+                        let is i64 as got_addr = linker.get_data_got_vaddr(ls, sym.name, sym.name_len);
+                        let is i64 as value = got_addr + A - P;
+                        target_data[buf_offset]     = cast(u8, value & 255);
+                        target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                        target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                        target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                    } else {
+                        reader.print_str("warning: GOTPCREL relocation in static mode at ");
+                        reader.print_hex(P);
+                        reader.print_str("\n");
+                    }
+                }
+                // R_X86_64_32 (type 10): 32-bit absolute zero-extended — S + A
+                else if (rtype == reader.R_X86_64_32) {
+                    let is i64 as value = S + A;
+                    if (value > 4294967295) {
+                        reader.print_str("warning: R_X86_64_32 overflow at ");
+                        reader.print_hex(P);
+                        reader.print_str("\n");
+                    }
+                    target_data[buf_offset]     = cast(u8, value & 255);
+                    target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                    target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                    target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                }
+                // R_X86_64_32S (type 11): 32-bit absolute sign-extended — S + A
+                else if (rtype == reader.R_X86_64_32S) {
+                    let is i64 as value = S + A;
+                    if (value > 2147483647 || value < (0 - 2147483648)) {
+                        reader.print_str("warning: R_X86_64_32S overflow at ");
+                        reader.print_hex(P);
+                        reader.print_str("\n");
+                    }
+                    target_data[buf_offset]     = cast(u8, value & 255);
+                    target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                    target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                    target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                }
+                else {
+                    reader.print_str("warning: unhandled relocation type ");
+                    reader.print_int(rtype);
+                    reader.print_str(" at ");
+                    reader.print_hex(P);
+                    reader.print_str("\n");
+                }
+            }
+
+            ri = ri + 1;
+        }
+        i = i + 1;
+    }
+}

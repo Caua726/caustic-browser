@@ -1,0 +1,1630 @@
+// elf_debug.cst — DWARF debug info for the ELF/Linux target.
+//
+// The compiler emits `.file n "<path>"` and `.loc n <line> 0` before each
+// instruction; the assembler collects them (plus .cstlocals/.cstsigs/
+// .cststructs) into `.cst*` custom sections of the .o, and this module turns
+// those into the four DWARF sections a debugger reads:
+//
+//   .debug_line    the line-number program (one sequence per function)
+//   .debug_info    the DIE tree (compile unit, subprograms, params, locals, types)
+//   .debug_abbrev  the abbreviation table .debug_info references
+//   .debug_str     the string table the DIEs point into
+//
+// The addresses in `.cstdebug` are object-local text offsets; the final vaddr
+// is ls.text_vaddr + obj.text_offset + offset, exactly as the PE writer
+// computes it for CodeView.
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../../src/ir/opt_mem.cst" as om;
+use "../../src/debug_proto.cst" as dbgproto;
+
+// --- DWARF constants (v4) ---
+let is i32 as DW_TAG_compile_unit with imut = 17;
+let is i32 as DW_TAG_subprogram with imut = 46;
+let is i32 as DW_TAG_formal_parameter with imut = 5;
+let is i32 as DW_TAG_variable with imut = 52;
+let is i32 as DW_TAG_base_type with imut = 36;
+let is i32 as DW_TAG_pointer_type with imut = 15;
+let is i32 as DW_TAG_structure_type with imut = 19;
+let is i32 as DW_TAG_member with imut = 13;
+let is i32 as DW_TAG_array_type with imut = 1;
+let is i32 as DW_TAG_enumeration_type with imut = 4;
+let is i32 as DW_TAG_enumerator with imut = 40;
+let is i32 as DW_TAG_union_type with imut = 23;
+
+let is i32 as DW_AT_name with imut = 3;
+let is i32 as DW_AT_location with imut = 2;
+let is i32 as DW_AT_byte_size with imut = 11;
+let is i32 as DW_AT_const_value with imut = 28;
+let is i32 as DW_AT_stmt_list with imut = 16;
+let is i32 as DW_AT_low_pc with imut = 17;
+let is i32 as DW_AT_high_pc with imut = 18;
+let is i32 as DW_AT_language with imut = 19;
+let is i32 as DW_AT_comp_dir with imut = 27;
+let is i32 as DW_AT_producer with imut = 37;
+let is i32 as DW_AT_data_member_location with imut = 56;
+let is i32 as DW_AT_decl_file with imut = 58;
+let is i32 as DW_AT_decl_line with imut = 59;
+let is i32 as DW_AT_declaration with imut = 60;
+let is i32 as DW_AT_encoding with imut = 62;
+let is i32 as DW_AT_external with imut = 63;
+let is i32 as DW_AT_type with imut = 73;
+let is i32 as DW_AT_frame_base with imut = 64;
+
+let is i32 as DW_FORM_addr with imut = 1;
+let is i32 as DW_FORM_data1 with imut = 11;
+let is i32 as DW_FORM_data8 with imut = 7;
+let is i32 as DW_FORM_udata with imut = 15;
+let is i32 as DW_FORM_strp with imut = 14;
+let is i32 as DW_FORM_ref4 with imut = 19;
+let is i32 as DW_FORM_flag_present with imut = 25;
+let is i32 as DW_FORM_exprloc with imut = 24;
+let is i32 as DW_FORM_sec_offset with imut = 23;
+
+let is i32 as DW_CHILDREN_no with imut = 0;
+let is i32 as DW_CHILDREN_yes with imut = 1;
+
+let is i32 as DW_LANG_C99 with imut = 12;
+
+// DWARF expression opcodes
+let is i32 as DW_OP_fbreg with imut = 145;   // 0x91
+let is i32 as DW_OP_reg6 with imut = 86;     // 0x56 — rbp
+
+// Line program
+let is i32 as DW_LNS_copy with imut = 1;
+let is i32 as DW_LNS_advance_pc with imut = 2;
+let is i32 as DW_LNS_advance_line with imut = 3;
+let is i32 as DW_LNE_end_sequence with imut = 1;
+let is i32 as DW_LNE_set_address with imut = 2;
+
+// === byte helpers ===
+
+fn _read_u32_at(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off])
+         + (cast(i64, p[off + 1]) << 8)
+         + (cast(i64, p[off + 2]) << 16)
+         + (cast(i64, p[off + 3]) << 24);
+}
+
+fn _uleb(b as *reader.ByteBuffer, v_in as i64) as void {
+    let is i64 as v with mut = v_in;
+    while (v >= 128) {
+        reader.buf_emit8(b, cast(i32, (v & 127) | 128));
+        v = v >> 7;
+    }
+    reader.buf_emit8(b, cast(i32, v & 127));
+}
+
+fn _sleb(b as *reader.ByteBuffer, v_in as i64) as void {
+    let is i64 as v with mut = v_in;
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        let is i32 as byte with mut = cast(i32, v & 127);
+        v = v >> 7;                         // arithmetic shift
+        if ((v == 0 && (byte & 64) == 0) || (v == 0 - 1 && (byte & 64) != 0)) {
+            more = 0;
+        } else {
+            byte = byte | 128;
+        }
+        reader.buf_emit8(b, byte);
+    }
+}
+
+fn _patch_u32(b as *reader.ByteBuffer, off as i64, val as i64) as void {
+    let is *u8 as d = b.data;
+    d[off]     = cast(u8, val & 255);
+    d[off + 1] = cast(u8, (val >> 8) & 255);
+    d[off + 2] = cast(u8, (val >> 16) & 255);
+    d[off + 3] = cast(u8, (val >> 24) & 255);
+}
+
+// Append a NUL-terminated string, return its offset in b.
+fn _put_str(b as *reader.ByteBuffer, s as *u8, len as i32) as i64 {
+    let is i64 as off = b.len;
+    let is i32 as i with mut = 0;
+    while (i < len) { reader.buf_emit8(b, cast(i32, s[i])); i = i + 1; }
+    reader.buf_emit8(b, 0);
+    return off;
+}
+
+// === .cstdebug locator (same format the PE writer reads) ===
+
+fn _find_cstdebug(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 9 && reader.streq(nm, 9, ".cstdebug", 9) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _sort_fn_idx(idx as *i32, vaddrs as *i64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is i32 as ci = idx[i];
+        let is i64 as cv = vaddrs[i];
+        let is i32 as j with mut = i - 1;
+        while (j >= 0 && vaddrs[j] > cv) {
+            idx[j + 1] = idx[j];
+            vaddrs[j + 1] = vaddrs[j];
+            j = j - 1;
+        }
+        idx[j + 1] = ci;
+        vaddrs[j + 1] = cv;
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// .debug_line
+// ============================================================
+
+// Build the DWARF v4 line-number program. `src`/`src_len` is the source path;
+// the loc table is (vaddr, line) already sorted by vaddr; funcs give the
+// per-function sequences.
+fn _build_line(out as *reader.ByteBuffer,
+               loc_v as *i64, loc_l as *i64, loc_f as *i32, nloc as i32,
+               fn_start as *i64, fn_end as *i64, fn_file as *i32, nfn as i32,
+               pend_v as *i64, npend as i32,
+               srcs as *i64, src_lens as *i32, nsrc as i32) as void {
+    reader.buf_emit32_le(out, 0);                 // unit_length (patched)
+    let is i64 as len_off = out.len - 4;
+    reader.buf_emit16_le(out, 4);                 // version
+    reader.buf_emit32_le(out, 0);                 // header_length (patched)
+    let is i64 as hlen_off = out.len - 4;
+    reader.buf_emit8(out, 1);                     // minimum_instruction_length
+    reader.buf_emit8(out, 1);                     // maximum_operations_per_instruction
+    reader.buf_emit8(out, 1);                     // default_is_stmt
+    reader.buf_emit8(out, 251);                   // line_base = -5
+    reader.buf_emit8(out, 14);                    // line_range
+    reader.buf_emit8(out, 13);                    // opcode_base
+    // standard_opcode_lengths[1..12]
+    let is [12]u8 as sl;
+    sl[0] = 0; sl[1] = 1; sl[2] = 1; sl[3] = 1; sl[4] = 1; sl[5] = 0;
+    sl[6] = 0; sl[7] = 0; sl[8] = 1; sl[9] = 0; sl[10] = 0; sl[11] = 1;
+    let is i32 as si with mut = 0;
+    while (si < 12) { reader.buf_emit8(out, cast(i32, sl[si])); si = si + 1; }
+    // include_directories: empty
+    reader.buf_emit8(out, 0);
+    // file_names: one entry per source (dir=0, mtime=0, length=0), then the
+    // terminator. A single-file link has nsrc == 1.
+    let is i32 as sfi with mut = 0;
+    while (sfi < nsrc) {
+        let is *u8 as sp = cast(*u8, srcs[sfi]);
+        let is i32 as slen = src_lens[sfi];
+        let is i32 as fi with mut = 0;
+        while (fi < slen) { reader.buf_emit8(out, cast(i32, sp[fi])); fi = fi + 1; }
+        reader.buf_emit8(out, 0);
+        _uleb(out, 0);
+        _uleb(out, 0);
+        _uleb(out, 0);
+        sfi = sfi + 1;
+    }
+    reader.buf_emit8(out, 0);
+    _patch_u32(out, hlen_off, out.len - hlen_off - 4);
+
+    // Program: one sequence per function.
+    let is i32 as f with mut = 0;
+    while (f < nfn) {
+        let is i64 as start = fn_start[f];
+        let is i64 as end = fn_end[f];
+        // DW_LNE_set_address
+        reader.buf_emit8(out, 0);
+        _uleb(out, 9);
+        reader.buf_emit8(out, cast(i32, DW_LNE_set_address));
+        reader.buf_emit64_le(out, start);
+        // Each sequence belongs to one source file; the state machine resets
+        // at end_sequence, so the file is set once, up front.
+        if (fn_file[f] != 0) {
+            reader.buf_emit8(out, 4);                          // DW_LNS_set_file
+            _uleb(out, cast(i64, fn_file[f] + 1));
+        }
+        let is i64 as cur_addr with mut = start;
+        let is i64 as cur_line with mut = 1;
+        let is i32 as li with mut = 0;
+        while (li < nloc) {
+            let is i64 as a = loc_v[li];
+            let is i64 as l = loc_l[li];
+            if (a >= start && a < end) {
+                if (a != cur_addr) {
+                    reader.buf_emit8(out, cast(i32, DW_LNS_advance_pc));
+                    _uleb(out, a - cur_addr);
+                    cur_addr = a;
+                }
+                if (l != cur_line) {
+                    reader.buf_emit8(out, cast(i32, DW_LNS_advance_line));
+                    _sleb(out, l - cur_line);
+                    cur_line = l;
+                }
+                // Flag the row at the prologue end so a debugger skips to it
+                // when setting a breakpoint on the function (parameters are in
+                // their stack slots past this point).
+                let is i32 as pj with mut = 0;
+                while (pj < npend) {
+                    if (pend_v[pj] == a) { reader.buf_emit8(out, 10); pj = npend; }  // DW_LNS_set_prologue_end
+                    else { pj = pj + 1; }
+                }
+                reader.buf_emit8(out, cast(i32, DW_LNS_copy));
+            }
+            li = li + 1;
+        }
+        // Extend the sequence to the function's end, so its last row covers a
+        // real range — a single-line function has one row and would otherwise
+        // end where it starts, leaving the debugger with no line for the
+        // function's address.
+        if (cur_addr < end) {
+            reader.buf_emit8(out, cast(i32, DW_LNS_advance_pc));
+            _uleb(out, end - cur_addr);
+            cur_addr = end;
+        }
+        // DW_LNE_end_sequence
+        reader.buf_emit8(out, 0);
+        _uleb(out, 1);
+        reader.buf_emit8(out, cast(i32, DW_LNE_end_sequence));
+        f = f + 1;
+    }
+    _patch_u32(out, len_off, out.len - len_off - 4);
+}
+
+// ============================================================
+// .debug_abbrev
+// ============================================================
+
+fn _abbrev_attr(b as *reader.ByteBuffer, at as i32, form as i32) as void {
+    _uleb(b, cast(i64, at));
+    _uleb(b, cast(i64, form));
+}
+
+// DWARF type/attribute constants for the type tree.
+let is i32 as DW_ATE_signed with imut = 5;
+let is i32 as DW_ATE_unsigned with imut = 7;
+let is i32 as DW_ATE_float with imut = 4;
+let is i32 as DW_ATE_boolean with imut = 2;
+let is i32 as DW_ATE_signed_char with imut = 6;
+let is i32 as DW_AT_count with imut = 55;
+let is i32 as DW_TAG_subrange_type with imut = 33;
+
+// --- Collected debug tables (module-level: the linker runs single-threaded) ---
+// Structs, flattened: per struct a slice of the field arrays.
+let is i32 as _ns with mut = 0;
+let is *i64 as _s_name_ptr with mut;
+let is *i32 as _s_name_len with mut;
+let is *i32 as _s_size with mut;
+let is *i32 as _s_fstart with mut;
+let is *i32 as _s_nf with mut;
+let is i32 as _nfl with mut = 0;
+let is *i64 as _f_name_ptr with mut;
+let is *i32 as _f_name_len with mut;
+let is *i32 as _f_off with mut;
+let is *i32 as _f_kind with mut;
+let is *i32 as _f_extra with mut;
+let is *i64 as _s_noff with mut;      // struct name offset in .debug_str
+let is *i64 as _f_noff with mut;      // field name offset in .debug_str
+let is *i64 as _s_dieoff with mut;    // struct DIE offset in .debug_info
+
+// Enums, flattened: per enum a slice of the variant arrays. A plain enum is a
+// DW_TAG_enumeration_type; a tagged union is a structure holding the tag (an
+// enumeration) and the payload (a union of the variants that carry data).
+let is i32 as _ne with mut = 0;
+let is *i64 as _e_name_ptr with mut;
+let is *i32 as _e_name_len with mut;
+let is *i32 as _e_size with mut;
+let is *i32 as _e_poff with mut;
+let is *i32 as _e_vstart with mut;
+let is *i32 as _e_nv with mut;
+let is i32 as _nvl with mut = 0;
+let is *i64 as _v_name_ptr with mut;
+let is *i32 as _v_name_len with mut;
+let is *i32 as _v_disc with mut;
+let is *i32 as _v_kind with mut;
+let is *i32 as _v_extra with mut;
+let is *i64 as _e_noff with mut;      // enum name offset in .debug_str
+let is *i64 as _v_noff with mut;      // variant name offset in .debug_str
+let is *i64 as _e_dieoff with mut;    // enum/structure DIE offset
+let is *i64 as _e_tagoff with mut;    // tag enumeration DIE offset (tagged union)
+let is *i64 as _e_unioff with mut;    // payload union DIE offset (tagged union)
+let is *i32 as _eobj_base with mut;   // per-object enum index base
+
+// Locals (params + lets), flattened across functions.
+let is i32 as _nl with mut = 0;
+let is i32 as _lcap with mut = 0;
+let is *i64 as _l_fn_ptr with mut;
+let is *i32 as _l_fn_len with mut;
+let is *i64 as _l_name_ptr with mut;
+let is *i32 as _l_name_len with mut;
+let is *i64 as _l_noff with mut;
+let is *i32 as _l_voff with mut;
+let is *i32 as _l_kind with mut;
+let is *i32 as _l_extra with mut;
+
+// Composite types (pointer / array / fn-ptr) needed by members and locals.
+let is i32 as _nc with mut = 0;
+let is i32 as _ccap with mut = 0;
+let is *i32 as _c_kind with mut;
+let is *i32 as _c_extra with mut;
+let is *i64 as _c_dieoff with mut;
+
+// Base-type DIE offsets, indexed by primitive kind (0..12).
+let is *i64 as _base_dieoff with mut;
+
+fn _build_abbrev(b as *reader.ByteBuffer) as void {
+    // 1: compile_unit, children
+    _uleb(b, 1);
+    _uleb(b, cast(i64, DW_TAG_compile_unit));
+    reader.buf_emit8(b, DW_CHILDREN_yes);
+    _abbrev_attr(b, DW_AT_producer, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_language, DW_FORM_data1);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_comp_dir, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_low_pc, DW_FORM_addr);
+    _abbrev_attr(b, DW_AT_high_pc, DW_FORM_data8);
+    _abbrev_attr(b, DW_AT_stmt_list, DW_FORM_sec_offset);
+    _uleb(b, 0); _uleb(b, 0);
+    // 2: subprogram, children (frame base = rbp)
+    _uleb(b, 2);
+    _uleb(b, cast(i64, DW_TAG_subprogram));
+    reader.buf_emit8(b, DW_CHILDREN_yes);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_low_pc, DW_FORM_addr);
+    _abbrev_attr(b, DW_AT_high_pc, DW_FORM_data8);
+    _abbrev_attr(b, DW_AT_external, DW_FORM_flag_present);
+    _abbrev_attr(b, DW_AT_decl_file, DW_FORM_udata);
+    _abbrev_attr(b, DW_AT_decl_line, DW_FORM_udata);
+    _abbrev_attr(b, DW_AT_frame_base, DW_FORM_exprloc);
+    _uleb(b, 0); _uleb(b, 0);
+    // 3: formal_parameter
+    _uleb(b, 3);
+    _uleb(b, cast(i64, DW_TAG_formal_parameter));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    _abbrev_attr(b, DW_AT_location, DW_FORM_exprloc);
+    _uleb(b, 0); _uleb(b, 0);
+    // 4: variable
+    _uleb(b, 4);
+    _uleb(b, cast(i64, DW_TAG_variable));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    _abbrev_attr(b, DW_AT_location, DW_FORM_exprloc);
+    _uleb(b, 0); _uleb(b, 0);
+    // 5: base_type
+    _uleb(b, 5);
+    _uleb(b, cast(i64, DW_TAG_base_type));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _abbrev_attr(b, DW_AT_encoding, DW_FORM_data1);
+    _uleb(b, 0); _uleb(b, 0);
+    // 6: pointer_type
+    _uleb(b, 6);
+    _uleb(b, cast(i64, DW_TAG_pointer_type));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 7: pointer_type with no referent (void*)
+    _uleb(b, 7);
+    _uleb(b, cast(i64, DW_TAG_pointer_type));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 8: structure_type, children
+    _uleb(b, 8);
+    _uleb(b, cast(i64, DW_TAG_structure_type));
+    reader.buf_emit8(b, DW_CHILDREN_yes);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 9: member
+    _uleb(b, 9);
+    _uleb(b, cast(i64, DW_TAG_member));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    _abbrev_attr(b, DW_AT_data_member_location, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 10: array_type, children
+    _uleb(b, 10);
+    _uleb(b, cast(i64, DW_TAG_array_type));
+    reader.buf_emit8(b, DW_CHILDREN_yes);
+    _abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 11: subrange_type
+    _uleb(b, 11);
+    _uleb(b, cast(i64, DW_TAG_subrange_type));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_count, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 12: variable with no type
+    _uleb(b, 12);
+    _uleb(b, cast(i64, DW_TAG_variable));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_location, DW_FORM_exprloc);
+    _uleb(b, 0); _uleb(b, 0);
+    // 13: formal_parameter with no type
+    _uleb(b, 13);
+    _uleb(b, cast(i64, DW_TAG_formal_parameter));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_location, DW_FORM_exprloc);
+    _uleb(b, 0); _uleb(b, 0);
+    // 14: member with no type
+    _uleb(b, 14);
+    _uleb(b, cast(i64, DW_TAG_member));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_data_member_location, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 15: formal_parameter with a location list (DW_FORM_sec_offset)
+    _uleb(b, 15);
+    _uleb(b, cast(i64, DW_TAG_formal_parameter));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_type, DW_FORM_ref4);
+    _abbrev_attr(b, DW_AT_location, DW_FORM_sec_offset);
+    _uleb(b, 0); _uleb(b, 0);
+    // 16: enumeration_type, children
+    _uleb(b, 16);
+    _uleb(b, cast(i64, DW_TAG_enumeration_type));
+    reader.buf_emit8(b, DW_CHILDREN_yes);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 17: enumerator
+    _uleb(b, 17);
+    _uleb(b, cast(i64, DW_TAG_enumerator));
+    reader.buf_emit8(b, DW_CHILDREN_no);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_const_value, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // 18: union_type, children
+    _uleb(b, 18);
+    _uleb(b, cast(i64, DW_TAG_union_type));
+    reader.buf_emit8(b, DW_CHILDREN_yes);
+    _abbrev_attr(b, DW_AT_name, DW_FORM_strp);
+    _abbrev_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    _uleb(b, 0); _uleb(b, 0);
+    // terminator
+    _uleb(b, 0);
+}
+
+// ============================================================
+// Type model
+// ============================================================
+
+fn _base_name(kind as i32) as *u8 {
+    if (kind == 1) { return "i8"; }
+    if (kind == 2) { return "i16"; }
+    if (kind == 3) { return "i32"; }
+    if (kind == 4) { return "i64"; }
+    if (kind == 5) { return "u8"; }
+    if (kind == 6) { return "u16"; }
+    if (kind == 7) { return "u32"; }
+    if (kind == 8) { return "u64"; }
+    if (kind == 9) { return "f32"; }
+    if (kind == 10) { return "f64"; }
+    if (kind == 11) { return "bool"; }
+    if (kind == 12) { return "char"; }
+    return "?";
+}
+fn _base_name_len(kind as i32) as i32 {
+    if (kind == 1) { return 2; }
+    if (kind == 2) { return 3; }
+    if (kind == 3) { return 3; }
+    if (kind == 4) { return 3; }
+    if (kind == 5) { return 2; }
+    if (kind == 6) { return 3; }
+    if (kind == 7) { return 3; }
+    if (kind == 8) { return 3; }
+    if (kind == 9) { return 3; }
+    if (kind == 10) { return 3; }
+    if (kind == 11) { return 4; }
+    if (kind == 12) { return 4; }
+    return 1;
+}
+fn _base_size(kind as i32) as i32 {
+    if (kind == 1 || kind == 5 || kind == 11 || kind == 12) { return 1; }
+    if (kind == 2 || kind == 6) { return 2; }
+    if (kind == 3 || kind == 7 || kind == 9) { return 4; }
+    return 8;
+}
+fn _base_enc(kind as i32) as i32 {
+    if (kind == 1 || kind == 2 || kind == 3 || kind == 4) { return DW_ATE_signed; }
+    if (kind == 5 || kind == 6 || kind == 7 || kind == 8) { return DW_ATE_unsigned; }
+    if (kind == 9 || kind == 10) { return DW_ATE_float; }
+    if (kind == 11) { return DW_ATE_boolean; }
+    return DW_ATE_signed_char;
+}
+
+fn _sleb_len(v_in as i64) as i32 {
+    let is i64 as v with mut = v_in;
+    let is i32 as n with mut = 1;
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        let is i32 as byte = cast(i32, v & 127);
+        v = v >> 7;
+        if ((v == 0 && (byte & 64) == 0) || (v == 0 - 1 && (byte & 64) != 0)) { more = 0; }
+        else { n = n + 1; }
+    }
+    return n;
+}
+
+// exprloc: DW_OP_fbreg <sleb -voff>
+fn _emit_loc(out as *reader.ByteBuffer, voff as i32) as void {
+    let is i64 as neg = 0 - cast(i64, voff);
+    _uleb(out, cast(i64, 1 + _sleb_len(neg)));
+    reader.buf_emit8(out, DW_OP_fbreg);
+    _sleb(out, neg);
+}
+
+// exprloc: DW_OP_reg6 (rbp) — the frame base
+fn _emit_frame_base(out as *reader.ByteBuffer) as void {
+    _uleb(out, 1);
+    reader.buf_emit8(out, DW_OP_reg6);
+}
+
+// Dedup-add a composite (kind, extra); returns its index.
+fn _comp_add(kind as i32, extra as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < _nc) {
+        if (_c_kind[i] == kind && _c_extra[i] == extra) { return i; }
+        i = i + 1;
+    }
+    if (_nc >= _ccap) {
+        let is i32 as ncap with mut = _ccap * 2;
+        if (ncap < 8) { ncap = 8; }
+        let is *i32 as nk = cast(*i32, om.opt_alloc(cast(i64, ncap) * 4));
+        let is *i32 as ne = cast(*i32, om.opt_alloc(cast(i64, ncap) * 4));
+        let is *i64 as no = cast(*i64, om.opt_alloc(cast(i64, ncap) * 8));
+        let is i32 as c with mut = 0;
+        while (c < _nc) { nk[c] = _c_kind[c]; ne[c] = _c_extra[c]; no[c] = _c_dieoff[c]; c = c + 1; }
+        _c_kind = nk; _c_extra = ne; _c_dieoff = no; _ccap = ncap;
+    }
+    _c_kind[_nc] = kind;
+    _c_extra[_nc] = extra;
+    _c_dieoff[_nc] = 0;
+    _nc = _nc + 1;
+    return _nc - 1;
+}
+
+fn _comp_find(kind as i32, extra as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < _nc) {
+        if (_c_kind[i] == kind && _c_extra[i] == extra) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Collect the composites a (kind, extra) type pair needs, recursively.
+fn _comp_collect(kind as i32, extra as i32) as void {
+    if (kind == 300) { return; }                        // struct: handled by _s_dieoff
+    if (kind == 600) { return; }                        // enum: handled by _e_dieoff
+    if (kind >= 0 && kind <= 12) { return; }            // base
+    if (kind == 13) { _comp_add(13, 0); return; }
+    if (kind == 400) { _comp_add(400, 0); return; }
+    if (kind == 500) { _comp_add(500, extra); return; }
+    if (kind >= 100 && kind <= 113) { _comp_add(kind, 0); return; }
+    if (kind >= 200 && kind <= 213) { _comp_add(kind, extra); return; }
+}
+
+// Whether a type pair resolves to a real DIE. Pass-independent, so the
+// abbrev chosen (with or without DW_AT_type) is the same in both passes.
+fn _has_type(kind as i32, extra as i32) as i32 {
+    if (kind >= 1 && kind <= 12) { return 1; }
+    if (kind == 300) {
+        if (extra >= 0 && extra < _ns) { return 1; }
+        return 0;
+    }
+    if (kind == 600) {
+        if (extra >= 0 && extra < _ne) { return 1; }
+        return 0;
+    }
+    if (kind == 0) { return 0; }
+    if (_comp_find(kind, extra) >= 0) { return 1; }
+    return 0;
+}
+
+// CU-relative offset of a type pair. `assign` = 1 reads the assigned maps.
+fn _type_off(kind as i32, extra as i32, assign as i32) as i64 {
+    if (assign == 0) { return 0; }
+    if (kind >= 0 && kind <= 12) { return _base_dieoff[kind]; }
+    if (kind == 300) {
+        if (extra >= 0 && extra < _ns) { return _s_dieoff[extra]; }
+        return 0;
+    }
+    if (kind == 600) {
+        if (extra >= 0 && extra < _ne) { return _e_dieoff[extra]; }
+        return 0;
+    }
+    let is i32 as ci = _comp_find(kind, extra);
+    if (ci < 0) { return 0; }
+    return _c_dieoff[ci];
+}
+
+// Emit one composite DIE. Records its offset when assign == 0.
+fn _emit_composite(out as *reader.ByteBuffer, idx as i32, assign as i32) as void {
+    let is i32 as kind = _c_kind[idx];
+    let is i32 as extra = _c_extra[idx];
+    if (assign == 0) { _c_dieoff[idx] = out.len; }
+    if (kind == 400) {
+        _uleb(out, 7);
+        _uleb(out, 8);
+        return;
+    }
+    if (kind == 500) {
+        _uleb(out, 6);
+        reader.buf_emit32_le(out, _type_off(300, extra, assign));
+        _uleb(out, 8);
+        return;
+    }
+    if (kind == 13) {
+        _uleb(out, 6);
+        reader.buf_emit32_le(out, _type_off(5, 0, assign));   // u8
+        _uleb(out, 8);
+        return;
+    }
+    if (kind == 100) {
+        _uleb(out, 7);                                        // void*
+        _uleb(out, 8);
+        return;
+    }
+    if (kind >= 101 && kind <= 113) {
+        _uleb(out, 6);
+        reader.buf_emit32_le(out, _type_off(kind - 100, 0, assign));
+        _uleb(out, 8);
+        return;
+    }
+    if (kind >= 200 && kind <= 213) {
+        let is i32 as prim = kind - 200;
+        _uleb(out, 10);
+        reader.buf_emit32_le(out, _type_off(prim, 0, assign));
+        _uleb(out, cast(i64, _base_size(prim) * extra));
+        _uleb(out, 11);                                       // subrange child
+        _uleb(out, cast(i64, extra));                         // count
+        _uleb(out, 0);                                        // end children
+        return;
+    }
+    // Unknown composite: emit an empty structure so offsets stay valid.
+    _uleb(out, 8);
+    _uleb(out, 0);
+    _uleb(out, 0);
+    _uleb(out, 0);
+}
+
+// ============================================================
+// .debug_info — two passes: assign DIE offsets, then emit referents
+// ============================================================
+
+fn _emit_info_body(out as *reader.ByteBuffer, producer_off as i64, name_off as i64,
+                   dir_off as i64, low_pc as i64, high_pc as i64,
+                   assign as i32) as void {
+    reader.buf_emit32_le(out, 0);                 // unit_length (patched)
+    let is i64 as len_off = out.len - 4;
+    reader.buf_emit16_le(out, 4);                 // version
+    reader.buf_emit32_le(out, 0);                 // debug_abbrev_offset
+    reader.buf_emit8(out, 8);                     // address_size
+
+    // DW_TAG_compile_unit
+    _uleb(out, 1);
+    reader.buf_emit32_le(out, producer_off);
+    reader.buf_emit8(out, DW_LANG_C99);
+    reader.buf_emit32_le(out, name_off);
+    reader.buf_emit32_le(out, dir_off);
+    reader.buf_emit64_le(out, low_pc);
+    reader.buf_emit64_le(out, high_pc - low_pc);
+    reader.buf_emit32_le(out, 0);                 // stmt_list
+
+    // Base types (kinds 1..12).
+    let is i32 as k with mut = 1;
+    while (k <= 12) {
+        if (assign == 0) { _base_dieoff[k] = out.len; }
+        _uleb(out, 5);
+        reader.buf_emit32_le(out, _strp_off(_base_name(k), _base_name_len(k)));
+        _uleb(out, cast(i64, _base_size(k)));
+        reader.buf_emit8(out, _base_enc(k));
+        k = k + 1;
+    }
+
+    // Struct types.
+    let is i32 as si with mut = 0;
+    while (si < _ns) {
+        if (assign == 0) { _s_dieoff[si] = out.len; }
+        _uleb(out, 8);
+        reader.buf_emit32_le(out, _s_noff[si]);
+        _uleb(out, cast(i64, _s_size[si]));
+        let is i32 as fj with mut = _s_fstart[si];
+        let is i32 as fe = _s_fstart[si] + _s_nf[si];
+        while (fj < fe) {
+            if (_has_type(_f_kind[fj], _f_extra[fj]) == 1) {
+                _uleb(out, 9);
+                reader.buf_emit32_le(out, _f_noff[fj]);
+                reader.buf_emit32_le(out, _type_off(_f_kind[fj], _f_extra[fj], assign));
+                _uleb(out, cast(i64, _f_off[fj]));
+            } else {
+                _uleb(out, 14);
+                reader.buf_emit32_le(out, _f_noff[fj]);
+                _uleb(out, cast(i64, _f_off[fj]));
+            }
+            fj = fj + 1;
+        }
+        _uleb(out, 0);                            // end struct children
+        si = si + 1;
+    }
+
+    // Enum types. A plain enum is one enumeration_type; a tagged union is a
+    // structure whose tag is an enumeration and whose payload is a union of
+    // the variants that carry data.
+    let is i32 as ei with mut = 0;
+    while (ei < _ne) {
+        let is i32 as vs = _e_vstart[ei];
+        let is i32 as ve = _e_vstart[ei] + _e_nv[ei];
+        if (_e_poff[ei] == 0) {
+            if (assign == 0) { _e_dieoff[ei] = out.len; }
+            _uleb(out, 16);
+            reader.buf_emit32_le(out, _e_noff[ei]);
+            _uleb(out, cast(i64, _e_size[ei]));
+            let is i32 as vi with mut = vs;
+            while (vi < ve) {
+                _uleb(out, 17);
+                reader.buf_emit32_le(out, _v_noff[vi]);
+                _uleb(out, cast(i64, _v_disc[vi]));
+                vi = vi + 1;
+            }
+            _uleb(out, 0);
+        } else {
+            if (assign == 0) { _e_tagoff[ei] = out.len; }
+            _uleb(out, 16);
+            reader.buf_emit32_le(out, _e_noff[ei]);
+            _uleb(out, 8);                            // the tag is an i64
+            let is i32 as vi with mut = vs;
+            while (vi < ve) {
+                _uleb(out, 17);
+                reader.buf_emit32_le(out, _v_noff[vi]);
+                _uleb(out, cast(i64, _v_disc[vi]));
+                vi = vi + 1;
+            }
+            _uleb(out, 0);
+            if (assign == 0) { _e_unioff[ei] = out.len; }
+            _uleb(out, 18);
+            reader.buf_emit32_le(out, _e_noff[ei]);
+            _uleb(out, cast(i64, _e_size[ei] - _e_poff[ei]));
+            vi = vs;
+            while (vi < ve) {
+                if (cast(i64, _v_kind[vi]) != 0) {
+                    if (_has_type(_v_kind[vi], _v_extra[vi]) == 1) {
+                        _uleb(out, 9);
+                        reader.buf_emit32_le(out, _v_noff[vi]);
+                        reader.buf_emit32_le(out, _type_off(_v_kind[vi], _v_extra[vi], assign));
+                        _uleb(out, 0);
+                    } else {
+                        _uleb(out, 14);
+                        reader.buf_emit32_le(out, _v_noff[vi]);
+                        _uleb(out, 0);
+                    }
+                }
+                vi = vi + 1;
+            }
+            _uleb(out, 0);
+            if (assign == 0) { _e_dieoff[ei] = out.len; }
+            _uleb(out, 8);
+            reader.buf_emit32_le(out, _e_noff[ei]);
+            _uleb(out, cast(i64, _e_size[ei]));
+            _uleb(out, 9);
+            reader.buf_emit32_le(out, _strp_off("tag", 3));
+            reader.buf_emit32_le(out, cast(i64, _e_tagoff[ei]));
+            _uleb(out, 0);
+            _uleb(out, 9);
+            reader.buf_emit32_le(out, _strp_off("payload", 7));
+            reader.buf_emit32_le(out, cast(i64, _e_unioff[ei]));
+            _uleb(out, cast(i64, _e_poff[ei]));
+            _uleb(out, 0);
+        }
+        ei = ei + 1;
+    }
+
+    // Composite types.
+    let is i32 as ci with mut = 0;
+    while (ci < _nc) {
+        _emit_composite(out, ci, assign);
+        ci = ci + 1;
+    }
+
+    // Subprograms (with their locals).
+    let is i32 as f with mut = 0;
+    while (f < _nfn) {
+        let is *linker.GlobalSym as g = linker.gsym_get(_gsyms, _fn_idx[f]);
+        _uleb(out, 2);
+        reader.buf_emit32_le(out, _fn_noff[f]);
+        reader.buf_emit64_le(out, _fn_low[f]);
+        reader.buf_emit64_le(out, _fn_end[f] - _fn_low[f]);
+        // external: flag_present, no bytes
+        _uleb(out, cast(i64, _fn_file[f] + 1));   // decl_file
+        _uleb(out, 1);                            // decl_line
+        _emit_frame_base(out);
+        // Locals belonging to this function.
+        let is i32 as li with mut = 0;
+        let is i32 as k with mut = 0;
+        while (li < _nl) {
+            if (_l_fn_len[li] == g.name_len && _name_eq(cast(*u8, _l_fn_ptr[li]), _l_fn_len[li], g.name, g.name_len) == 1) {
+                if (k < _fn_nargs[f] && _l_locoff[li] >= 0 && _has_type(_l_kind[li], _l_extra[li]) == 1) {
+                    _uleb(out, 15);                    // DW_TAG_formal_parameter, location list
+                    reader.buf_emit32_le(out, _l_noff[li]);
+                    reader.buf_emit32_le(out, _type_off(_l_kind[li], _l_extra[li], assign));
+                    reader.buf_emit32_le(out, cast(i64, _l_locoff[li]));   // into .debug_loc
+                } else if (_has_type(_l_kind[li], _l_extra[li]) == 1) {
+                    if (k < _fn_nargs[f]) { _uleb(out, 3); }   // DW_TAG_formal_parameter
+                    else { _uleb(out, 4); }                    // DW_TAG_variable
+                    reader.buf_emit32_le(out, _l_noff[li]);
+                    reader.buf_emit32_le(out, _type_off(_l_kind[li], _l_extra[li], assign));
+                    _emit_loc(out, _l_voff[li]);
+                } else {
+                    if (k < _fn_nargs[f]) { _uleb(out, 13); }
+                    else { _uleb(out, 12); }
+                    reader.buf_emit32_le(out, _l_noff[li]);
+                    _emit_loc(out, _l_voff[li]);
+                }
+                k = k + 1;
+            }
+            li = li + 1;
+        }
+        _uleb(out, 0);                            // end subprogram children
+        f = f + 1;
+    }
+
+    _uleb(out, 0);                                // end CU children
+    _patch_u32(out, len_off, out.len - len_off - 4);
+}
+
+// SysV integer argument register (DWARF number) for parameter index i, or -1.
+fn _arg_reg(i as i32) as i32 {
+    if (i == 0) { return 5; }   // rdi
+    if (i == 1) { return 4; }   // rsi
+    if (i == 2) { return 1; }   // rdx
+    if (i == 3) { return 2; }   // rcx
+    if (i == 4) { return 8; }   // r8
+    if (i == 5) { return 9; }   // r9
+    return 0 - 1;
+}
+
+// Build .debug_loc: one location list per parameter. Before the prologue ends
+// a scalar parameter still lives in its incoming register; after, in its stack
+// slot. A debugger that stops at the function entry (past the frame setup but
+// before the spill) then reads the register instead of an uninitialized slot.
+// Only scalar, non-sret, register-passed parameters get the register range;
+// anything else keeps the plain frame slot.
+fn _build_loc(out as *reader.ByteBuffer) as void {
+    let is i32 as f with mut = 0;
+    while (f < _nfn) {
+        let is *linker.GlobalSym as g = linker.gsym_get(_gsyms, _fn_idx[f]);
+        let is i32 as nargs = _fn_nargs[f];
+        let is i32 as shift with mut = 0;
+        if (_fn_rkind[f] == 300 && _fn_rextra[f] >= 0 && _fn_rextra[f] < _ns) {
+            if (_s_size[_fn_rextra[f]] > 8) { shift = 1; }
+        }
+        let is i64 as pstart = _fn_start[f];
+        let is i64 as pend = _fn_pend[f];
+        let is i64 as fend = _fn_end[f];
+        let is i32 as li with mut = 0;
+        let is i32 as k with mut = 0;
+        while (li < _nl && k < nargs) {
+            if (_l_fn_len[li] == g.name_len
+                && _name_eq(cast(*u8, _l_fn_ptr[li]), _l_fn_len[li], g.name, g.name_len) == 1) {
+                let is i32 as tk = _l_kind[li];
+                let is i32 as reg with mut = 0 - 1;
+                // Scalar, pointer, fn-pointer and pointer-to-struct parameters
+                // are their value in the register until the spill. A struct or
+                // array passed by value is a pointer to a copy, so its register
+                // does not describe the local.
+                let is i32 as scalar with mut = 0;
+                if (tk >= 0 && tk <= 13) { scalar = 1; }
+                if (tk >= 100 && tk <= 113) { scalar = 1; }
+                if (tk == 400 || tk == 500) { scalar = 1; }
+                if (tk == 600) { scalar = 1; }   // enum: register-passed like a scalar
+                if (scalar == 1 && (k + shift) < 6) { reg = _arg_reg(k + shift); }
+                let is i32 as voff = _l_voff[li];
+                // A location list needs a prologue-end marker to split the
+                // register and frame-slot ranges; without one (a single-line
+                // function) fall back to the plain frame slot.
+                if (reg >= 0 && pend > pstart && pend < fend) {
+                    _l_locoff[li] = cast(i32, out.len);
+                    reader.buf_emit64_le(out, pstart - _loc_base);   // [entry, prologue end)
+                    reader.buf_emit64_le(out, pend - _loc_base);
+                    reader.buf_emit16_le(out, 1);             // expr length
+                    reader.buf_emit8(out, 80 + reg);          // DW_OP_reg0 + reg
+                    reader.buf_emit64_le(out, pend - _loc_base);  // [prologue end, end)
+                    reader.buf_emit64_le(out, fend - _loc_base);
+                    let is i64 as neg = 0 - cast(i64, voff);
+                    reader.buf_emit16_le(out, 1 + _sleb_len(neg));
+                    reader.buf_emit8(out, DW_OP_fbreg);
+                    _sleb(out, neg);
+                    reader.buf_emit64_le(out, 0);             // terminator
+                    reader.buf_emit64_le(out, 0);
+                } else {
+                    _l_locoff[li] = 0 - 1;
+                }
+                k = k + 1;
+            }
+            li = li + 1;
+        }
+        f = f + 1;
+    }
+}
+
+
+let is i32 as _nfn with mut = 0;
+let is *i32 as _fn_idx with mut;
+let is *i64 as _fn_start with mut;
+let is *i64 as _fn_end with mut;
+let is *i64 as _fn_low with mut;
+let is *i64 as _fn_noff with mut;
+let is *i32 as _fn_nargs with mut;
+let is *i32 as _fn_rkind with mut;
+let is *i32 as _fn_rextra with mut;
+let is *i64 as _fn_pend with mut;
+let is *i32 as _fn_file with mut;     // per-function line-table file index
+let is i32 as _nsrc with mut = 0;     // number of source files in the line table
+let is *i64 as _srcs with mut;        // per-file source path pointers
+let is *i32 as _src_lens with mut;    // per-file source path lengths
+// Per-local .debug_loc offset (parameters only; -1 for locals without one).
+let is *i32 as _l_locoff with mut;
+let is reader.ByteBuffer as _dbg_loc with mut;
+// The CU's DW_AT_low_pc — the base a location list's addresses are relative to.
+let is i64 as _loc_base with mut = 0;
+let is *linker.GlobalSymTab as _gsyms with mut;
+
+// The strtab is built before both passes; _strp_off looks an already-written
+// string up by content.
+let is *reader.ByteBuffer as _strtab with mut;
+
+fn _strp_off(s as *u8, len as i32) as i64 {
+    // Linear scan of the built strtab for a matching NUL-terminated entry.
+    let is *u8 as d = _strtab.data;
+    let is i64 as i with mut = 0;
+    while (i < _strtab.len) {
+        let is i64 as start = i;
+        while (i < _strtab.len && d[i] != cast(u8, 0)) { i = i + 1; }
+        let is i64 as l = i - start;
+        if (cast(i32, l) == len && _name_eq(cast(*u8, cast(i64, d) + start), cast(i32, l), s, len) == 1) {
+            return start;
+        }
+        i = i + 1;                                // skip the NUL
+    }
+    return _put_str(_strtab, s, len);             // not found: append
+}
+
+fn _name_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// Entry point
+// ============================================================
+
+// ============================================================
+// Collection: structs and locals from the .cst* sections
+// ============================================================
+
+let is *i32 as _obj_base with mut;   // global struct ordinal base per object
+
+fn _find_cststructs(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 11 && reader.streq(nm, 11, ".cststructs", 11) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _find_cstenums(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 9 && reader.streq(nm, 9, ".cstenums", 9) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _find_cstlocals(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 10 && reader.streq(nm, 10, ".cstlocals", 10) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _find_cstsigs(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 8 && reader.streq(nm, 8, ".cstsigs", 8) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+// Argument count of a function's .cstsigs record, or -1 if absent.
+fn _fn_num_args(ls as *linker.LinkerState, name as *u8, name_len as i32,
+                out_rkind as *i32, out_rextra as *i32) as i32 {
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstsigs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 8 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off);
+                if (off + 4 + nl + 4 > ss.size) { off = ss.size; continue; }
+                let is i64 as na = _read_u32_at(p, off + 4 + nl);
+                let is i64 as rend = off + 4 + nl + 4 + (1 + na) * 8;
+                if (rend > ss.size) { off = ss.size; continue; }
+                if (cast(i32, nl) == name_len
+                    && _name_eq(cast(*u8, cast(i64, p) + off + 4), cast(i32, nl), name, name_len) == 1) {
+                    let is i64 as poff = off + 4 + nl + 4;
+                    *out_rkind = cast(i32, _read_u32_at(p, poff));
+                    *out_rextra = cast(i32, _read_u32_at(p, poff + 4));
+                    return cast(i32, na);
+                }
+                off = rend;
+            }
+        }
+        oi = oi + 1;
+    }
+    *out_rkind = 0 - 1;
+    *out_rextra = 0;
+    return 0 - 1;
+}
+
+fn _collect_structs(ls as *linker.LinkerState) as void {
+    let is i32 as total with mut = 0;
+    let is i32 as ftotal with mut = 0;
+    _obj_base = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        _obj_base[oi] = total;
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cststructs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 12 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+                off = off + nl;
+                off = off + 4;                              // size_bytes
+                let is i64 as nf = _read_u32_at(p, off); off = off + 4;
+                total = total + 1;
+                ftotal = ftotal + cast(i32, nf);
+                let is i64 as fi with mut = 0;
+                while (fi < nf && off + 4 <= ss.size) {
+                    let is i64 as fnl = _read_u32_at(p, off); off = off + 4;
+                    off = off + fnl + 12;
+                    fi = fi + 1;
+                }
+            }
+        }
+        oi = oi + 1;
+    }
+    _obj_base[ls.obj_count] = total;
+    _ns = total;
+    _nfl = 0;
+    _s_name_ptr = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _s_name_len = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _s_size = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _s_fstart = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _s_nf = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _s_noff = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _s_dieoff = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _f_name_ptr = cast(*i64, om.opt_alloc(cast(i64, ftotal + 1) * 8));
+    _f_name_len = cast(*i32, om.opt_alloc(cast(i64, ftotal + 1) * 4));
+    _f_off = cast(*i32, om.opt_alloc(cast(i64, ftotal + 1) * 4));
+    _f_kind = cast(*i32, om.opt_alloc(cast(i64, ftotal + 1) * 4));
+    _f_extra = cast(*i32, om.opt_alloc(cast(i64, ftotal + 1) * 4));
+    _f_noff = cast(*i64, om.opt_alloc(cast(i64, ftotal + 1) * 8));
+
+    let is i32 as idx with mut = 0;
+    let is i32 as fidx with mut = 0;
+    oi = 0;
+    while (oi < ls.obj_count) {
+        let is i32 as base = _obj_base[oi];
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cststructs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 12 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+                _s_name_ptr[idx] = cast(i64, cast(*u8, cast(i64, p) + off));
+                _s_name_len[idx] = cast(i32, nl);
+                off = off + nl;
+                _s_size[idx] = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                let is i64 as nf = _read_u32_at(p, off); off = off + 4;
+                _s_fstart[idx] = fidx;
+                _s_nf[idx] = cast(i32, nf);
+                let is i64 as fi with mut = 0;
+                while (fi < nf && off + 4 <= ss.size) {
+                    let is i64 as fnl = _read_u32_at(p, off); off = off + 4;
+                    _f_name_ptr[fidx] = cast(i64, cast(*u8, cast(i64, p) + off));
+                    _f_name_len[fidx] = cast(i32, fnl);
+                    off = off + fnl;
+                    _f_off[fidx] = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    let is i32 as fk = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    let is i32 as fex with mut = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    if (fk == 300 || fk == 500) { fex = fex + base; }
+                    _f_kind[fidx] = fk;
+                    _f_extra[fidx] = fex;
+                    _comp_collect(fk, fex);
+                    fidx = fidx + 1;
+                    fi = fi + 1;
+                }
+                idx = idx + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+    _nfl = fidx;
+}
+
+// Collect .cstenums across the objects, flattened. Struct indices in a
+// variant payload are rebased with the STRUCT base and enum indices with the
+// ENUM base, because the two tables are numbered per object independently.
+fn _collect_enums(ls as *linker.LinkerState) as void {
+    let is i32 as total with mut = 0;
+    let is i32 as vtotal with mut = 0;
+    _eobj_base = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        _eobj_base[oi] = total;
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstenums(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 16 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+                off = off + nl + 8;                      // name, size, payload_offset
+                let is i64 as nv = _read_u32_at(p, off); off = off + 4;
+                total = total + 1;
+                vtotal = vtotal + cast(i32, nv);
+                let is i64 as vi with mut = 0;
+                while (vi < nv && off + 4 <= ss.size) {
+                    let is i64 as vnl = _read_u32_at(p, off); off = off + 4;
+                    off = off + vnl + 12;
+                    vi = vi + 1;
+                }
+            }
+        }
+        oi = oi + 1;
+    }
+    _eobj_base[ls.obj_count] = total;
+    _ne = total;
+    _nvl = 0;
+    _e_name_ptr = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _e_name_len = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _e_size = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _e_poff = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _e_vstart = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _e_nv = cast(*i32, om.opt_alloc(cast(i64, total + 1) * 4));
+    _e_noff = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _e_dieoff = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _e_tagoff = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _e_unioff = cast(*i64, om.opt_alloc(cast(i64, total + 1) * 8));
+    _v_name_ptr = cast(*i64, om.opt_alloc(cast(i64, vtotal + 1) * 8));
+    _v_name_len = cast(*i32, om.opt_alloc(cast(i64, vtotal + 1) * 4));
+    _v_disc = cast(*i32, om.opt_alloc(cast(i64, vtotal + 1) * 4));
+    _v_kind = cast(*i32, om.opt_alloc(cast(i64, vtotal + 1) * 4));
+    _v_extra = cast(*i32, om.opt_alloc(cast(i64, vtotal + 1) * 4));
+    _v_noff = cast(*i64, om.opt_alloc(cast(i64, vtotal + 1) * 8));
+
+    let is i32 as idx with mut = 0;
+    let is i32 as vidx with mut = 0;
+    oi = 0;
+    while (oi < ls.obj_count) {
+        let is i32 as sbase = _obj_base[oi];
+        let is i32 as ebase = _eobj_base[oi];
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstenums(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 16 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+                _e_name_ptr[idx] = cast(i64, cast(*u8, cast(i64, p) + off));
+                _e_name_len[idx] = cast(i32, nl);
+                off = off + nl;
+                _e_size[idx] = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                _e_poff[idx] = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                let is i64 as nv = _read_u32_at(p, off); off = off + 4;
+                _e_vstart[idx] = vidx;
+                _e_nv[idx] = cast(i32, nv);
+                let is i64 as vi with mut = 0;
+                while (vi < nv && off + 4 <= ss.size) {
+                    let is i64 as vnl = _read_u32_at(p, off); off = off + 4;
+                    _v_name_ptr[vidx] = cast(i64, cast(*u8, cast(i64, p) + off));
+                    _v_name_len[vidx] = cast(i32, vnl);
+                    off = off + vnl;
+                    _v_disc[vidx] = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    let is i32 as vk = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    let is i32 as vex with mut = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    if (vk == 300 || vk == 500) { vex = vex + sbase; }
+                    if (vk == 600) { vex = vex + ebase; }
+                    _v_kind[vidx] = vk;
+                    _v_extra[vidx] = vex;
+                    _comp_collect(vk, vex);
+                    vidx = vidx + 1;
+                    vi = vi + 1;
+                }
+                idx = idx + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+    _nvl = vidx;
+}
+
+fn _collect_locals(ls as *linker.LinkerState) as void {
+    let is i32 as total with mut = 0;
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstlocals(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 8 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off);
+                if (off + 4 + nl + 4 > ss.size) { off = ss.size; continue; }
+                let is i64 as nlc = _read_u32_at(p, off + 4 + nl);
+                let is i64 as cur with mut = off + 4 + nl + 4;
+                let is i64 as li with mut = 0;
+                while (li < nlc && cur + 4 <= ss.size) {
+                    let is i64 as lnl = _read_u32_at(p, cur);
+                    if (cur + 4 + lnl + 12 > ss.size) { li = nlc; cur = ss.size; continue; }
+                    total = total + 1;
+                    cur = cur + 4 + lnl + 12;
+                    li = li + 1;
+                }
+                off = cur;
+            }
+        }
+        oi = oi + 1;
+    }
+    _nl = 0;
+    _lcap = total + 1;
+    _l_fn_ptr = cast(*i64, om.opt_alloc(cast(i64, _lcap) * 8));
+    _l_fn_len = cast(*i32, om.opt_alloc(cast(i64, _lcap) * 4));
+    _l_name_ptr = cast(*i64, om.opt_alloc(cast(i64, _lcap) * 8));
+    _l_name_len = cast(*i32, om.opt_alloc(cast(i64, _lcap) * 4));
+    _l_noff = cast(*i64, om.opt_alloc(cast(i64, _lcap) * 8));
+    _l_voff = cast(*i32, om.opt_alloc(cast(i64, _lcap) * 4));
+    _l_kind = cast(*i32, om.opt_alloc(cast(i64, _lcap) * 4));
+    _l_extra = cast(*i32, om.opt_alloc(cast(i64, _lcap) * 4));
+
+    oi = 0;
+    while (oi < ls.obj_count) {
+        let is i32 as base = _obj_base[oi];
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstlocals(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 8 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off);
+                if (off + 4 + nl + 4 > ss.size) { off = ss.size; continue; }
+                let is *u8 as fnp = cast(*u8, cast(i64, p) + off + 4);
+                let is i64 as nlc = _read_u32_at(p, off + 4 + nl);
+                let is i64 as cur with mut = off + 4 + nl + 4;
+                let is i64 as li with mut = 0;
+                while (li < nlc && cur + 4 <= ss.size) {
+                    let is i64 as lnl = _read_u32_at(p, cur);
+                    if (cur + 4 + lnl + 12 > ss.size) { li = nlc; cur = ss.size; continue; }
+                    cur = cur + 4;
+                    _l_fn_ptr[_nl] = cast(i64, fnp);
+                    _l_fn_len[_nl] = cast(i32, nl);
+                    _l_name_ptr[_nl] = cast(i64, cast(*u8, cast(i64, p) + cur));
+                    _l_name_len[_nl] = cast(i32, lnl);
+                    cur = cur + lnl;
+                    _l_voff[_nl] = cast(i32, _read_u32_at(p, cur)); cur = cur + 4;
+                    let is i32 as tk = cast(i32, _read_u32_at(p, cur)); cur = cur + 4;
+                    let is i32 as tex with mut = cast(i32, _read_u32_at(p, cur)); cur = cur + 4;
+                    if (tk == 300 || tk == 500) { tex = tex + base; }
+                    _l_kind[_nl] = tk;
+                    _l_extra[_nl] = tex;
+                    _comp_collect(tk, tex);
+                    _nl = _nl + 1;
+                    li = li + 1;
+                }
+                off = cur;
+            }
+        }
+        oi = oi + 1;
+    }
+}
+
+fn debug_loc() as *reader.ByteBuffer { return &_dbg_loc; }
+
+// Build all four DWARF sections into the caller's buffers. Returns 1 if
+// anything was emitted.
+fn build_debug(ls as *linker.LinkerState,
+               out_line as *reader.ByteBuffer, out_info as *reader.ByteBuffer,
+               out_abbrev as *reader.ByteBuffer, out_str as *reader.ByteBuffer) as i32 {
+    if (ls.obj_count == 0) { return 0; }
+
+    // 1. Merge .cstdebug from every object into (vaddr, line, file) arrays.
+    let is i32 as cap with mut = 4096;
+    let is *i64 as loc_v with mut = cast(*i64, om.opt_alloc(cast(i64, cap) * 8));
+    let is *i64 as loc_l with mut = cast(*i64, om.opt_alloc(cast(i64, cap) * 8));
+    let is *i32 as loc_f with mut = cast(*i32, om.opt_alloc(cast(i64, cap) * 4));
+    let is i32 as nloc with mut = 0;
+    let is i32 as pcap with mut = 256;
+    let is *i64 as pend_v with mut = cast(*i64, om.opt_alloc(cast(i64, pcap) * 8));
+    let is i32 as npend with mut = 0;
+    let is *u8 as src with mut = cast(*u8, 0);
+    let is i32 as src_len with mut = 0;
+    // One file-table entry per object that carries a source path, so a
+    // multi-file link keeps every source in the line table (each object's
+    // rows name their own file).
+    let is i32 as scap with mut = 16;
+    let is *i64 as srcs with mut = cast(*i64, om.opt_alloc(cast(i64, scap) * 8));
+    let is *i32 as src_lens with mut = cast(*i32, om.opt_alloc(cast(i64, scap) * 4));
+    let is i32 as nsrc with mut = 0;
+
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ds = _find_cstdebug(o);
+        if (cast(i64, ds) != 0 && ds.size >= 16) {
+            let is *u8 as db = ds.data;
+            if (_read_u32_at(db, 0) == dbgproto.CSTDEBUG_MAGIC) {
+                let is i64 as sl = _read_u32_at(db, 8);
+                let is i32 as cur_file with mut = 0;
+                if (sl > 0) {
+                    if (src_len == 0) {
+                        src = cast(*u8, cast(i64, db) + 12);
+                        src_len = cast(i32, sl);
+                    }
+                    if (nsrc >= scap) {
+                        let is i32 as nc = scap * 2;
+                        let is *i64 as np = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+                        let is *i32 as nl2 = cast(*i32, om.opt_alloc(cast(i64, nc) * 4));
+                        let is i32 as ci with mut = 0;
+                        while (ci < nsrc) { np[ci] = srcs[ci]; nl2[ci] = src_lens[ci]; ci = ci + 1; }
+                        srcs = np; src_lens = nl2; scap = nc;
+                    }
+                    cur_file = nsrc;
+                    srcs[nsrc] = cast(i64, cast(*u8, cast(i64, db) + 12));
+                    src_lens[nsrc] = cast(i32, sl);
+                    nsrc = nsrc + 1;
+                }
+                let is i64 as lo with mut = 12 + sl;
+                while ((lo & 3) != 0) { lo = lo + 1; }
+                let is i64 as n = _read_u32_at(db, lo);
+                let is i64 as base = lo + 4;
+                let is i64 as tbase = ls.text_vaddr + o.text_offset;
+                let is i64 as k with mut = 0;
+                while (k < n) {
+                    if (nloc >= cap) {
+                        let is i32 as nc = cap * 2;
+                        let is *i64 as nv = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+                        let is *i64 as nl2 = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+                        let is *i32 as nf2 = cast(*i32, om.opt_alloc(cast(i64, nc) * 4));
+                        let is i32 as ci with mut = 0;
+                        while (ci < nloc) { nv[ci] = loc_v[ci]; nl2[ci] = loc_l[ci]; nf2[ci] = loc_f[ci]; ci = ci + 1; }
+                        loc_v = nv; loc_l = nl2; loc_f = nf2; cap = nc;
+                    }
+                    loc_v[nloc] = tbase + _read_u32_at(db, base + k * 8);
+                    loc_l[nloc] = _read_u32_at(db, base + k * 8 + 4);
+                    loc_f[nloc] = cur_file;
+                    nloc = nloc + 1;
+                    k = k + 1;
+                }
+                // Prologue-end offsets, appended after the loc table.
+                let is i64 as pbase = base + n * 8;
+                if (pbase + 4 <= ds.size) {
+                    let is i64 as np = _read_u32_at(db, pbase);
+                    let is i64 as k2 with mut = 0;
+                    while (k2 < np && pbase + 4 + k2 * 4 + 4 <= ds.size) {
+                        if (npend >= pcap) {
+                            let is i32 as nc = pcap * 2;
+                            let is *i64 as nv = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+                            let is i32 as ci with mut = 0;
+                            while (ci < npend) { nv[ci] = pend_v[ci]; ci = ci + 1; }
+                            pend_v = nv; pcap = nc;
+                        }
+                        pend_v[npend] = tbase + _read_u32_at(db, pbase + 4 + k2 * 4);
+                        npend = npend + 1;
+                        k2 = k2 + 1;
+                    }
+                }
+            }
+        }
+        oi = oi + 1;
+    }
+    if (src_len == 0) { return 0; }
+
+    // 2. Function ranges from the text-section globals, sorted by vaddr.
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as ntext with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) { ntext = ntext + 1; }
+        gi = gi + 1;
+    }
+    if (ntext < 1) { return 0; }
+    let is *i32 as fn_idx = cast(*i32, om.opt_alloc(cast(i64, ntext) * 4));
+    let is *i64 as fn_start = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is i32 as nfn with mut = 0;
+    gi = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) {
+            fn_idx[nfn] = gi;
+            fn_start[nfn] = g.vaddr;
+            nfn = nfn + 1;
+        }
+        gi = gi + 1;
+    }
+    _sort_fn_idx(fn_idx, fn_start, nfn);
+    let is *i64 as fn_end = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is *i64 as fn_low = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is i32 as f with mut = 0;
+    while (f < nfn) {
+        let is i64 as e with mut = ls.text_vaddr + ls.text_size;
+        if (f + 1 < nfn) { e = fn_start[f + 1]; }
+        fn_end[f] = e;
+        // The DIE's low_pc is the function's start; the prologue is skipped by
+        // the line table's DW_LNS_set_prologue_end flag (see _build_line), so
+        // the parameters are valid where a breakpoint on the function lands.
+        fn_low[f] = fn_start[f];
+        f = f + 1;
+    }
+
+    _gsyms = gsyms;
+    _fn_idx = fn_idx;
+    _fn_start = fn_start;
+    _fn_end = fn_end;
+    _fn_low = fn_low;
+    _nfn = nfn;
+    _fn_noff = cast(*i64, om.opt_alloc(cast(i64, nfn + 1) * 8));
+    _fn_nargs = cast(*i32, om.opt_alloc(cast(i64, nfn + 1) * 4));
+    _fn_rkind = cast(*i32, om.opt_alloc(cast(i64, nfn + 1) * 4));
+    _fn_rextra = cast(*i32, om.opt_alloc(cast(i64, nfn + 1) * 4));
+    _fn_pend = cast(*i64, om.opt_alloc(cast(i64, nfn + 1) * 8));
+    // Prologue end per function: the marker inside [start, end), else the end.
+    f = 0;
+    while (f < nfn) {
+        let is i64 as p with mut = fn_end[f];
+        let is i32 as j with mut = 0;
+        while (j < npend) {
+            if (pend_v[j] >= fn_start[f] && pend_v[j] < fn_end[f]) { p = pend_v[j]; j = npend; }
+            else { j = j + 1; }
+        }
+        _fn_pend[f] = p;
+        f = f + 1;
+    }
+
+    // The file each function belongs to: the file of the first line entry in
+    // its range (a multi-file link puts each object's functions in its own).
+    let is *i32 as fn_file = cast(*i32, om.opt_alloc(cast(i64, nfn + 1) * 4));
+    f = 0;
+    while (f < nfn) {
+        let is i32 as ff with mut = 0;
+        let is i32 as jj with mut = 0;
+        let is i32 as done with mut = 0;
+        while (jj < nloc && done == 0) {
+            if (loc_v[jj] >= fn_start[f] && loc_v[jj] < fn_end[f]) { ff = loc_f[jj]; done = 1; }
+            else { jj = jj + 1; }
+        }
+        fn_file[f] = ff;
+        f = f + 1;
+    }
+    _fn_file = fn_file;
+    _nsrc = nsrc;
+    _srcs = srcs;
+    _src_lens = src_lens;
+
+    // Collect struct/local metadata (fills the module tables and the composite
+    // set), then build .debug_str with every name the DIEs reference.
+    _collect_structs(ls);
+    _collect_enums(ls);
+    _collect_locals(ls);
+
+    _strtab = out_str;
+    reader.buf_emit8(out_str, 0);                 // offset 0 = the empty string
+    let is i64 as producer_off = _strp_off("Caustic", 7);
+    let is i64 as name_off = _strp_off(src, src_len);
+    let is i64 as dir_off = 0;                    // DW_AT_comp_dir = ""
+    let is i32 as i2 with mut = 1;
+    while (i2 <= 12) { _strp_off(_base_name(i2), _base_name_len(i2)); i2 = i2 + 1; }
+    i2 = 0;
+    while (i2 < _ns) { _s_noff[i2] = _strp_off(cast(*u8, _s_name_ptr[i2]), _s_name_len[i2]); i2 = i2 + 1; }
+    i2 = 0;
+    while (i2 < _nfl) { _f_noff[i2] = _strp_off(cast(*u8, _f_name_ptr[i2]), _f_name_len[i2]); i2 = i2 + 1; }
+    i2 = 0;
+    while (i2 < _ne) { _e_noff[i2] = _strp_off(cast(*u8, _e_name_ptr[i2]), _e_name_len[i2]); i2 = i2 + 1; }
+    i2 = 0;
+    while (i2 < _nvl) { _v_noff[i2] = _strp_off(cast(*u8, _v_name_ptr[i2]), _v_name_len[i2]); i2 = i2 + 1; }
+    i2 = 0;
+    _strp_off("tag", 3);
+    _strp_off("payload", 7);
+    while (i2 < _nl) { _l_noff[i2] = _strp_off(cast(*u8, _l_name_ptr[i2]), _l_name_len[i2]); i2 = i2 + 1; }
+    i2 = 0;
+    while (i2 < _nfn) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, fn_idx[i2]);
+        _fn_noff[i2] = _strp_off(g.name, g.name_len);
+        let is i32 as rk with mut = 0;
+        let is i32 as rex with mut = 0;
+        _fn_nargs[i2] = _fn_num_args(ls, g.name, g.name_len, &rk, &rex);
+        if (_fn_nargs[i2] < 0) { _fn_nargs[i2] = 0; }
+        _fn_rkind[i2] = rk;
+        _fn_rextra[i2] = rex;
+        i2 = i2 + 1;
+    }
+
+    let is i64 as low_pc = ls.text_vaddr;
+    let is i64 as high_pc = ls.text_vaddr + ls.text_size;
+
+    // Parameter location lists. Every local starts with -1 (no list); the
+    // builder overwrites the parameters' entries.
+    _l_locoff = cast(*i32, om.opt_alloc(cast(i64, _nl + 1) * 4));
+    i2 = 0;
+    while (i2 < _nl) { _l_locoff[i2] = 0 - 1; i2 = i2 + 1; }
+    _dbg_loc = reader.buf_init(512);
+    _loc_base = ls.text_vaddr;
+    _build_loc(&_dbg_loc);
+
+    _build_line(out_line, loc_v, loc_l, loc_f, nloc, fn_low, fn_end, fn_file, nfn, pend_v, npend,
+                _srcs, _src_lens, _nsrc);
+    _build_abbrev(out_abbrev);
+
+    _base_dieoff = cast(*i64, om.opt_alloc(13 * 8));
+    let is i32 as z with mut = 0;
+    while (z < 13) { _base_dieoff[z] = 0; z = z + 1; }
+
+    // Pass 1 assigns every DIE's CU-relative offset in a scratch buffer; pass 2
+    // emits the real one, resolving the (forward) referents from those offsets.
+    let is reader.ByteBuffer as scratch = reader.buf_init(256);
+    _emit_info_body(&scratch, producer_off, name_off, dir_off, low_pc, high_pc, 0);
+    _emit_info_body(out_info, producer_off, name_off, dir_off, low_pc, high_pc, 1);
+    return 1;
+}

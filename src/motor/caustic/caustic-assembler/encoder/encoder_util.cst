@@ -1,0 +1,372 @@
+use "../../std/mem.cst" as mem;
+use "../core/asm_defs.cst" as def;
+use "../core/buf.cst" as buf;
+
+// Sentinel returned by a family encoder when the instruction is not its own.
+// Valid x86 encodings are 1..15 bytes and 0 is reserved for "unknown
+// encoding", so any value far outside that range is an unambiguous sentinel.
+let is i32 as ENC_SKIP with imut = 65535;
+
+// === Register helpers ===
+
+fn reg_code(id as i32) as i32 {
+    if (id >= 64) { return (id - 64) % 8; }
+    return id % 8;
+}
+
+fn reg_ext(id as i32) as i32 {
+    if (id < 0 || id >= 128 || id == def.REG_RIP) { return 0; }
+    if (id >= 64) {
+        if ((id - 64) >= 8) { return 1; }
+        return 0;
+    }
+    if ((id % 16) >= 8) { return 1; }
+    return 0;
+}
+
+fn reg_size(id as i32) as i32 {
+    if (id < 0) { return 0; }
+    if (id < 16) { return 64; }
+    if (id < 32) { return 32; }
+    if (id < 48) { return 16; }
+    if (id < 64) { return 8; }
+    return 128;
+}
+
+fn needs_rex_for_8bit(id as i32) as i32 {
+    if (id >= 52 && id <= 55) { return 1; }
+    return 0;
+}
+
+// True iff id names an XMM register (64..79). Distinct from reg_size()==128,
+// which also returns 128 for REG_NONE(255); SSE encoders use this to reject a
+// GP register where an XMM operand is required (e.g. `pxor rax, rbx`).
+fn is_xmm(id as i32) as i32 {
+    if (id >= 64 && id <= 79) { return 1; }
+    return 0;
+}
+
+// === String helpers ===
+fn streq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn streq_lit(a as *u8, alen as i32, lit as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (lit[i] != 0) {
+        if (i >= alen) { return 0; }
+        if (a[i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, i == alen);
+}
+
+// === Instruction lookup (byte dispatch, no streq_lit) ===
+fn lookup_instruction(ptr as *u8, len as i32) as i32 {
+    let is u8 as c0 = ptr[0];
+    if (len == 2) {
+        if (c0 == 111 && ptr[1] == 114) { return def.INST_OR; } // or
+        if (c0 == 106) { // jx
+            let is u8 as c1 = ptr[1];
+            if (c1 == 122) { return def.INST_JZ; } if (c1 == 101) { return def.INST_JE; }
+            if (c1 == 108) { return def.INST_JL; } if (c1 == 103) { return def.INST_JG; }
+            if (c1 == 97) { return def.INST_JA; } if (c1 == 98) { return def.INST_JB; }
+            if (c1 == 112) { return def.INST_JP; } // jp
+        }
+    }
+    else if (len == 3) {
+        let is u8 as c1 = ptr[1];
+        let is u8 as c2 = ptr[2];
+        if (c0 == 109) { // mov, mul
+            if (c1 == 111 && c2 == 118) { return def.INST_MOV; }
+            if (c1 == 117 && c2 == 108) { return def.INST_MUL; }
+        }
+        else if (c0 == 108 && c1 == 101 && c2 == 97) { return def.INST_LEA; } // lea
+        else if (c0 == 97 && c1 == 100 && c2 == 100) { return def.INST_ADD; } // add
+        else if (c0 == 115) { // s
+            if (c1 == 117 && c2 == 98) { return def.INST_SUB; } // sub
+            if (c1 == 104) { if (c2 == 108) { return def.INST_SHL; } if (c2 == 114) { return def.INST_SHR; } } // shl shr
+            if (c1 == 97 && c2 == 114) { return def.INST_SAR; } // sar
+            if (c1 == 116 && c2 == 105) { return def.INST_STI; } // sti
+        }
+        else if (c0 == 100 && c1 == 105 && c2 == 118) { return def.INST_DIV; } // div
+        else if (c0 == 99) { // c
+            if (c1 == 113 && c2 == 111) { return def.INST_CQO; } // cqo
+            if (c1 == 100 && c2 == 113) { return def.INST_CDQ; } // cdq
+            if (c1 == 109 && c2 == 112) { return def.INST_CMP; } // cmp
+            if (c1 == 108 && c2 == 100) { return def.INST_CLD; } // cld
+            if (c1 == 108 && c2 == 105) { return def.INST_CLI; } // cli
+        }
+        else if (c0 == 104 && c1 == 108 && c2 == 116) { return def.INST_HLT; } // hlt
+        else if (c0 == 110) { // n
+            if (c1 == 101 && c2 == 103) { return def.INST_NEG; } // neg
+            if (c1 == 111 && c2 == 116) { return def.INST_NOT; } // not
+            if (c1 == 111 && c2 == 112) { return def.INST_NOP; } // nop
+        }
+        else if (c0 == 97 && c1 == 110 && c2 == 100) { return def.INST_AND; } // and
+        else if (c0 == 120 && c1 == 111 && c2 == 114) { return def.INST_XOR; } // xor
+        else if (c0 == 114 && c1 == 101) { // re
+            if (c2 == 116) { return def.INST_RET; } // ret
+            if (c2 == 112) { return def.INST_REP; } // rep
+        }
+        else if (c0 == 114 && c1 == 111) { // ro
+            if (c2 == 108) { return def.INST_ROL; } // rol
+            if (c2 == 114) { return def.INST_ROR; } // ror
+        }
+        else if (c0 == 106) { // j
+            if (c1 == 109 && c2 == 112) { return def.INST_JMP; } // jmp
+            if (c1 == 110) { if (c2 == 122) { return def.INST_JNZ; } if (c2 == 101) { return def.INST_JNE; } } // jnz jne
+            if (c1 == 108 && c2 == 101) { return def.INST_JLE; } // jle
+            if (c1 == 103 && c2 == 101) { return def.INST_JGE; } // jge
+            if (c1 == 97 && c2 == 101) { return def.INST_JAE; } // jae
+            if (c1 == 98 && c2 == 101) { return def.INST_JBE; } // jbe
+            if (c1 == 110 && c2 == 112) { return def.INST_JNP; } // jnp
+        }
+        else if (c0 == 112 && c1 == 111 && c2 == 112) { return def.INST_POP; } // pop
+    }
+    else if (len == 4) {
+        let is u8 as c1 = ptr[1];
+        if (c0 == 112 && c1 == 117 && ptr[2] == 115 && ptr[3] == 104) { return def.INST_PUSH; } // push
+        if (c0 == 112 && c1 == 120 && ptr[2] == 111 && ptr[3] == 114) { return def.INST_PXOR; } // pxor
+        if (c0 == 105) { // imul idiv
+            if (c1 == 109 && ptr[2] == 117 && ptr[3] == 108) { return def.INST_IMUL; }
+            if (c1 == 100 && ptr[2] == 105 && ptr[3] == 118) { return def.INST_IDIV; }
+        }
+        if (c0 == 116 && c1 == 101 && ptr[2] == 115 && ptr[3] == 116) { return def.INST_TEST; } // test
+        if (c0 == 115 && c1 == 101 && ptr[2] == 116) { // setX
+            let is u8 as c3 = ptr[3];
+            if (c3 == 101) { return def.INST_SETE; } if (c3 == 108) { return def.INST_SETL; }
+            if (c3 == 103) { return def.INST_SETG; } if (c3 == 98) { return def.INST_SETB; }
+            if (c3 == 97) { return def.INST_SETA; }
+            if (c3 == 112) { return def.INST_SETP; }
+        }
+        if (c0 == 99 && c1 == 97 && ptr[2] == 108 && ptr[3] == 108) { return def.INST_CALL; } // call
+        if (c0 == 109 && c1 == 111 && ptr[2] == 118) { // movq
+            if (ptr[3] == 113) { return def.INST_MOVQ; }
+        }
+    }
+    else if (len == 5) {
+        let is u8 as c1 = ptr[1];
+        if (c0 == 99 && c1 == 109 && ptr[2] == 111 && ptr[3] == 118) { // cmove cmovl cmovg cmovb cmova
+            let is u8 as c4 = ptr[4];
+            if (c4 == 101) { return def.INST_CMOVE; } if (c4 == 108) { return def.INST_CMOVL; }
+            if (c4 == 103) { return def.INST_CMOVG; } if (c4 == 98) { return def.INST_CMOVB; }
+            if (c4 == 97) { return def.INST_CMOVA; }
+        }
+        if (c0 == 109 && c1 == 111 && ptr[2] == 118) { // movsb movsx movzx
+            if (ptr[3] == 115) { if (ptr[4] == 98) { return def.INST_MOVSB; } if (ptr[4] == 120) { return def.INST_MOVSX; } }
+            if (ptr[3] == 122 && ptr[4] == 120) { return def.INST_MOVZX; }
+        }
+        if (c0 == 115 && c1 == 101 && ptr[2] == 116) { // setXX
+            let is u8 as c3 = ptr[3]; let is u8 as c4 = ptr[4];
+            if (c3 == 110 && c4 == 101) { return def.INST_SETNE; }
+            if (c3 == 108 && c4 == 101) { return def.INST_SETLE; }
+            if (c3 == 103 && c4 == 101) { return def.INST_SETGE; }
+            if (c3 == 98 && c4 == 101) { return def.INST_SETBE; }
+            if (c3 == 97 && c4 == 101) { return def.INST_SETAE; }
+            if (c3 == 110 && c4 == 112) { return def.INST_SETNP; }
+        }
+        if (c0 == 97 && c1 == 100 && ptr[2] == 100 && ptr[3] == 115 && ptr[4] == 100) { return def.INST_ADDSD; } // addsd
+        if (c0 == 115 && c1 == 117 && ptr[2] == 98 && ptr[3] == 115 && ptr[4] == 100) { return def.INST_SUBSD; } // subsd
+        if (c0 == 109 && c1 == 117 && ptr[2] == 108 && ptr[3] == 115 && ptr[4] == 100) { return def.INST_MULSD; } // mulsd
+        if (c0 == 100 && c1 == 105 && ptr[2] == 118 && ptr[3] == 115 && ptr[4] == 100) { return def.INST_DIVSD; } // divsd
+        if (c0 == 97 && c1 == 100 && ptr[2] == 100 && ptr[3] == 115 && ptr[4] == 115) { return def.INST_ADDSS; } // addss
+        if (c0 == 115 && c1 == 117 && ptr[2] == 98 && ptr[3] == 115 && ptr[4] == 115) { return def.INST_SUBSS; } // subss
+        if (c0 == 109 && c1 == 117 && ptr[2] == 108 && ptr[3] == 115 && ptr[4] == 115) { return def.INST_MULSS; } // mulss
+        if (c0 == 100 && c1 == 105 && ptr[2] == 118 && ptr[3] == 115 && ptr[4] == 115) { return def.INST_DIVSS; } // divss
+        if (c0 == 120 && c1 == 111 && ptr[2] == 114 && ptr[3] == 112 && ptr[4] == 100) { return def.INST_XORPD; } // xorpd
+        if (c0 == 97 && c1 == 100 && ptr[2] == 100 && ptr[3] == 112 && ptr[4] == 100) { return def.INST_ADDPD; } // addpd
+        if (c0 == 115 && c1 == 117 && ptr[2] == 98 && ptr[3] == 112 && ptr[4] == 100) { return def.INST_SUBPD; } // subpd
+        if (c0 == 109 && c1 == 117 && ptr[2] == 108 && ptr[3] == 112 && ptr[4] == 100) { return def.INST_MULPD; } // mulpd
+        if (c0 == 100 && c1 == 105 && ptr[2] == 118 && ptr[3] == 112 && ptr[4] == 100) { return def.INST_DIVPD; } // divpd
+        if (c0 == 112 && c1 == 97 && ptr[2] == 100 && ptr[3] == 100 && ptr[4] == 100) { return def.INST_PADDD; } // paddd
+        if (c0 == 112 && c1 == 97 && ptr[2] == 100 && ptr[3] == 100 && ptr[4] == 113) { return def.INST_PADDQ; } // paddq
+        if (c0 == 112 && c1 == 115 && ptr[2] == 117 && ptr[3] == 98 && ptr[4] == 100) { return def.INST_PSUBD; } // psubd
+        if (c0 == 112 && c1 == 115 && ptr[2] == 117 && ptr[3] == 98 && ptr[4] == 113) { return def.INST_PSUBQ; } // psubq
+    }
+    else if (len == 6 && c0 == 115) { // sqrtsd / sqrtss
+        if (ptr[1] == 113 && ptr[2] == 114 && ptr[3] == 116 && ptr[4] == 115) {
+            if (ptr[5] == 100) { return def.INST_SQRTSD; }
+            if (ptr[5] == 115) { return def.INST_SQRTSS; }
+        }
+    }
+    else if (len == 6 && c0 == 109) { // movsxd / movupd / movdqu
+        if (ptr[1] == 111 && ptr[2] == 118 && ptr[3] == 115 && ptr[4] == 120 && ptr[5] == 100) { return def.INST_MOVSXD; }
+        if (ptr[1] == 111 && ptr[2] == 118 && ptr[3] == 117 && ptr[4] == 112 && ptr[5] == 100) { return def.INST_MOVUPD; }
+        if (ptr[1] == 111 && ptr[2] == 118 && ptr[3] == 100 && ptr[4] == 113 && ptr[5] == 117) { return def.INST_MOVDQU; }
+    }
+    else if (len == 6 && c0 == 99) { // cmovne cmovge cmovle cmovae cmovbe
+        if (ptr[1] == 109 && ptr[2] == 111 && ptr[3] == 118 && ptr[5] == 101) {
+            if (ptr[4] == 110) { return def.INST_CMOVNE; }
+            if (ptr[4] == 103) { return def.INST_CMOVGE; }
+            if (ptr[4] == 108) { return def.INST_CMOVLE; }
+            if (ptr[4] == 97) { return def.INST_CMOVAE; }
+            if (ptr[4] == 98) { return def.INST_CMOVBE; }
+        }
+    }
+    else if (len == 6 && c0 == 112) { // psrldq
+        if (ptr[1] == 115 && ptr[2] == 114 && ptr[3] == 108 && ptr[4] == 100 && ptr[5] == 113) { return def.INST_PSRLDQ; }
+    }
+    else if (len == 7 && c0 == 115) { // syscall
+        if (ptr[1] == 121 && ptr[2] == 115 && ptr[3] == 99 && ptr[4] == 97 && ptr[5] == 108 && ptr[6] == 108) { return def.INST_SYSCALL; }
+    }
+    else if (len == 8 && c0 == 99) { // cvtsi2sd, cvtsd2ss, cvtss2sd
+        if (ptr[1] == 118 && ptr[2] == 116 && ptr[3] == 115 && ptr[4] == 105 && ptr[5] == 50 && ptr[6] == 115 && ptr[7] == 100) { return def.INST_CVTSI2SD; }
+        if (ptr[1] == 118 && ptr[2] == 116 && ptr[3] == 115 && ptr[4] == 105 && ptr[5] == 50 && ptr[6] == 115 && ptr[7] == 115) { return def.INST_CVTSI2SS; }
+        if (ptr[1] == 118 && ptr[2] == 116 && ptr[3] == 115 && ptr[4] == 100 && ptr[5] == 50 && ptr[6] == 115 && ptr[7] == 115) { return def.INST_CVTSD2SS; }
+        if (ptr[1] == 118 && ptr[2] == 116 && ptr[3] == 115 && ptr[4] == 115 && ptr[5] == 50 && ptr[6] == 115 && ptr[7] == 100) { return def.INST_CVTSS2SD; }
+    }
+    else if (len == 9 && c0 == 99) { // cvttsd2si
+        if (ptr[1] == 118 && ptr[2] == 116 && ptr[3] == 116 && ptr[4] == 115 && ptr[5] == 100 && ptr[6] == 50 && ptr[7] == 115 && ptr[8] == 105) { return def.INST_CVTTSD2SI; }
+    }
+    return def.INST_NONE;
+}
+
+// === Encoding helpers ===
+fn make_modrm(m as i32, reg as i32, rm as i32) as i32 {
+    return ((m % 4) * 64) + ((reg % 8) * 8) + (rm % 8);
+}
+
+fn make_sib(scale as i32, idx as i32, base as i32) as i32 {
+    return ((scale % 4) * 64) + ((idx % 8) * 8) + (base % 8);
+}
+
+fn make_rex(w as i32, r as i32, x as i32, b as i32) as i32 {
+    return 64 + w * 8 + r * 4 + x * 2 + b;
+}
+
+fn disp_is8(disp as i64) as i32 {
+    if (disp >= (0 - 128) && disp <= 127) { return 1; }
+    return 0;
+}
+
+fn imm_is8(v as i64) as i32 {
+    if (v >= (0 - 128) && v <= 127) { return 1; }
+    return 0;
+}
+
+fn imm_is32(v as i64) as i32 {
+    if (v >= (0 - 2147483648) && v <= 2147483647) { return 1; }
+    return 0;
+}
+
+// Where the disp32 of the last [rip+label] operand was written (b.len before
+// it), or -1. The caller turns it into the relocation: the bytes after the
+// disp32 (an immediate) decide the addend, and only the encoder knows them.
+let is i64 as rip_disp_at with mut = 0 - 1;
+
+// Emit memory operand ModR/M (+ optional SIB + displacement)
+fn emit_mem_modrm(b as *buf.ByteBuffer, reg_field as i32, base_id as i32, disp as i64) as void {
+    // [rip+label]: mod=00 rm=101 and a disp32 the relocation fills in.
+    if (base_id == def.REG_RIP) {
+        buf.buf_emit8(b, make_modrm(0, reg_field, 5));
+        rip_disp_at = b.len;
+        buf.buf_emit32_le(b, 0);
+        return;
+    }
+    // No base: [disp32]. In long mode mod=00 rm=101 means [rip+disp32], so an
+    // absolute address takes the SIB form with neither base nor index.
+    if (base_id == def.REG_NONE) {
+        buf.buf_emit8(b, make_modrm(0, reg_field, 4));
+        buf.buf_emit8(b, make_sib(0, 4, 5));
+        buf.buf_emit32_le(b, disp);
+        return;
+    }
+    let is i32 as base_code = reg_code(base_id);
+    let is i32 as need_sib with mut = 0;
+    if (base_code == 4) { need_sib = 1; }
+
+    if (disp == 0 && base_code != 5) {
+        // mod=00 [base]
+        buf.buf_emit8(b, make_modrm(0, reg_field, base_code));
+        if (need_sib == 1) {
+            buf.buf_emit8(b, make_sib(0, 4, base_code));
+        }
+    } else if (disp_is8(disp) == 1) {
+        // mod=01 [base+disp8]
+        buf.buf_emit8(b, make_modrm(1, reg_field, base_code));
+        if (need_sib == 1) {
+            buf.buf_emit8(b, make_sib(0, 4, base_code));
+        }
+        buf.buf_emit8(b, cast(i32, disp));
+    } else {
+        // mod=10 [base+disp32]
+        buf.buf_emit8(b, make_modrm(2, reg_field, base_code));
+        if (need_sib == 1) {
+            buf.buf_emit8(b, make_sib(0, 4, base_code));
+        }
+        buf.buf_emit32_le(b, disp);
+    }
+}
+
+// Calculate memory operand size (ModR/M + SIB + disp)
+fn mem_modrm_size(base_id as i32, disp as i64) as i32 {
+    if (base_id == def.REG_NONE) { return 6; }          // ModR/M + SIB + disp32
+    if (base_id == def.REG_RIP) { return 5; }           // ModR/M + disp32
+    let is i32 as base_code = reg_code(base_id);
+    let is i32 as sib with mut = 0;
+    if (base_code == 4) { sib = 1; }
+
+    if (disp == 0 && base_code != 5) {
+        return 1 + sib;
+    } else if (disp_is8(disp) == 1) {
+        return 2 + sib;
+    } else {
+        return 5 + sib;
+    }
+}
+
+// Emit SIB memory operand: [base + index * scale + disp]
+fn emit_mem_modrm_sib(b as *buf.ByteBuffer, reg_field as i32, base_id as i32, index_id as i32, scale as i32, disp as i64) as void {
+    let is i32 as base_code = reg_code(base_id);
+    let is i32 as index_code = reg_code(index_id);
+    let is i32 as ss with mut = 0;
+    if (scale == 2) { ss = 1; }
+    else if (scale == 4) { ss = 2; }
+    else if (scale == 8) { ss = 3; }
+
+    if (disp == 0 && base_code != 5) {
+        buf.buf_emit8(b, make_modrm(0, reg_field, 4));
+        buf.buf_emit8(b, make_sib(ss, index_code, base_code));
+    } else if (disp_is8(disp) == 1) {
+        buf.buf_emit8(b, make_modrm(1, reg_field, 4));
+        buf.buf_emit8(b, make_sib(ss, index_code, base_code));
+        buf.buf_emit8(b, cast(i32, disp));
+    } else {
+        buf.buf_emit8(b, make_modrm(2, reg_field, 4));
+        buf.buf_emit8(b, make_sib(ss, index_code, base_code));
+        buf.buf_emit32_le(b, disp);
+    }
+}
+
+fn mem_modrm_sib_size(base_id as i32, disp as i64) as i32 {
+    let is i32 as base_code = reg_code(base_id);
+    if (disp == 0 && base_code != 5) {
+        return 2;
+    } else if (disp_is8(disp) == 1) {
+        return 3;
+    } else {
+        return 6;
+    }
+}
+
+// The segment override prefix the instruction needs, 0 for none: whichever of
+// its operands is the memory one carries it.
+fn seg_prefix(op1 as *def.Operand, op2 as *def.Operand) as i32 {
+    if (op1.kind == def.OP_MEM && op1.mem_seg != 0) { return op1.mem_seg; }
+    if (op2.kind == def.OP_MEM && op2.mem_seg != 0) { return op2.mem_seg; }
+    return 0;
+}
+
+fn has_sib(op as *def.Operand) as i32 {
+    if (op.kind == def.OP_MEM && op.mem_index != def.REG_NONE) { return 1; }
+    return 0;
+}
+
+// === Main encoding function ===

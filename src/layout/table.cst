@@ -261,8 +261,25 @@ fn _widths(c as *bx.Ctx, t as *bx.Box) as void {
         if (x.kind == bx.B_CAPTION) { lo = _max(lo, flow.outer_min(c, x)); }
         x = x.next;
     }
+    // A column that takes a share of the table can only have its content if the table is big
+    // enough for that share, and the rest has to fit in what the shares leave.
+    let is f64 as share with mut = 0.0;
+    let is f64 as rest with mut = _spacing_total(&g);
+    let is f64 as need with mut = hi;
+    k = 0;
+    while (k < g.ncols) {
+        let is *Col as col = &g.cols[k];
+        if (col.pct > 0.0) {
+            share = share + col.pct;
+            need = _max(need, col.hi * 100.0 / col.pct);
+        } else {
+            rest = rest + col.hi;
+        }
+        k = k + 1;
+    }
+    if (share > 0.0 && share < 100.0) { need = _max(need, rest * 100.0 / (100.0 - share)); }
     t.min_cw = lo;
-    t.max_cw = _max(hi, lo);
+    t.max_cw = _max(need, lo);
 }
 
 // Shares out the table's width among its columns.

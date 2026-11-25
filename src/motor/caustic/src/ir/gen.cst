@@ -1,0 +1,431 @@
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../lexer/tokens.cst" as tok;
+use "defs.cst" as d;
+use "../codegen/target.cst" as tgt;
+
+// === Debug info: token list for line number resolution ===
+let is *u8 as ir_tl with mut;
+
+fn tok_line(tidx as i32) as i32 {
+    if (cast(i64, ir_tl) == 0 || tidx <= 0) { return 0; }
+    let is *tok.TokenList as tl = cast(*tok.TokenList, ir_tl);
+    let is *tok.Token as t = tok.tl_get(tl, tidx);
+    return t.line;
+}
+
+// === Context ===
+let is *d.IRFunction as ctx_func with mut;
+let is *d.IRInst as ctx_head with mut;
+let is *d.IRInst as ctx_tail with mut;
+let is i32 as ctx_vreg with mut;
+let is i32 as ctx_label with mut;
+let is i32 as ctx_loop_depth with mut;
+let is i32 as ctx_has_sret with mut;
+let is i32 as ctx_sret_vreg with mut;
+let is i32 as ctx_has_returned with mut;
+// Loop stack: 3 i32 per entry (start, end, continue). Grown on demand — it was
+// a fixed [384]u8 (32 entries) and push_loop silently returned past the 32nd,
+// so a loop nested deeper than that compiled with the wrong break/continue
+// target and no diagnostic.
+let is *u8 as loop_stack with mut = cast(*u8, 0);
+let is i32 as loop_cap with mut = 0;
+// Defer stack: *Node pointers, 8 bytes each. Grown on demand — it was a fixed
+// [512]u8 (64 entries) and push_defer silently returned past the 64th, so the
+// 65th deferred call in one scope never ran.
+let is *u8 as defer_stack with mut = cast(*u8, 0);
+let is i32 as defer_cap with mut = 0;
+let is i32 as defer_count with mut;
+// String registry
+let is *d.StringEntry as string_head with mut;
+let is i32 as string_id_count with mut;
+// gen_ir recursion depth
+let is i32 as ir_depth with mut;
+// Module dedup: bodies of `use`d modules already processed by gen_ir. Grown on
+// demand — it was a fixed [2048]u8 (256 modules) and the caller's
+// `ir_done_count < 256` guard made the dedup check fail open past that, so a
+// module was walked a second time.
+let is *u8 as ir_done_bodies with mut = cast(*u8, 0);
+let is i32 as ir_done_cap with mut = 0;
+let is i32 as ir_done_count with mut;
+
+fn ir_reset() as void {
+    ir_tl = cast(*u8, 0);
+    ctx_func = cast(*d.IRFunction, 0);
+    ctx_head = cast(*d.IRInst, 0);
+    ctx_tail = cast(*d.IRInst, 0);
+    ctx_vreg = 0;
+    ctx_label = 0;
+    ctx_loop_depth = 0;
+    ctx_has_sret = 0;
+    ctx_sret_vreg = 0;
+    ctx_has_returned = 0;
+    // The three growable stacks keep their storage across functions and across
+    // input files: one allocation for the whole process, reset to empty here.
+    // Their capacity fields are deliberately not touched.
+    defer_count = 0;
+    string_head = cast(*d.StringEntry, 0);
+    string_id_count = 0;
+    _str_ht_ready = 0;
+    ir_depth = 0;
+    ir_done_count = 0;
+}
+
+fn is_float_kind(kind as i32) as i32 {
+    if (kind == ast.TY_F32 || kind == ast.TY_F64) { return 1; }
+    return 0;
+}
+
+// === Emit helpers ===
+
+fn emit(inst as *d.IRInst) as void {
+    if (cast(i64, ctx_head) == 0) {
+        ctx_head = inst;
+        ctx_tail = inst;
+    } else {
+        ctx_tail.next = inst;
+        ctx_tail = inst;
+    }
+}
+
+fn new_vreg() as i32 {
+    let is i32 as v = ctx_vreg;
+    ctx_vreg = ctx_vreg + 1;
+    return v;
+}
+
+fn new_label() as i32 {
+    let is i32 as l = ctx_label;
+    ctx_label = ctx_label + 1;
+    return l;
+}
+
+fn emit_imm(val as i64, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_IMM);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_imm(val);
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+fn emit_binary(op as i32, lhs as i32, rhs as i32, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(op);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_vreg(lhs);
+    i.src2 = d.op_vreg(rhs);
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+fn emit_cast_from(src as i32, from_ty as *u8, to_ty as *u8, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_CAST);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_vreg(src);
+    i.cast_to = to_ty;
+    i.cast_from = from_ty;
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+
+fn emit_call(name_ptr as *u8, name_len as i32, is_variadic as i32, is_extern as i32, ret_type as *u8, xmm_count as i32, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_CALL);
+    i.dest = d.op_vreg(dest);
+    i.call_name_ptr = d.str_dup(name_ptr, name_len);
+    i.call_name_len = cast(i16, name_len);
+    i.is_variadic_call = cast(i8, is_variadic);
+    i.is_extern_call = cast(i8, is_extern);
+    i.src1 = d.op_imm(cast(i64, xmm_count));
+    i.cast_to = ret_type;
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+fn emit_call_indirect(target as i32, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_CALL_INDIRECT);
+    i.dest = d.op_vreg(dest);
+    i.src2 = d.op_vreg(target);
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+// Like emit_call, but emits IR_FFI_CALL with the DLL name attached
+// (in asm_str_ptr/asm_str_len — overloaded since IR_FFI_CALL doesn't use
+// IR_ASM's text). Codegen lowers this to a Microsoft x64 ABI call sequence
+// (reordered arg regs, 32-byte shadow space) targeting an IAT slot, and
+// emits a `.cstimport "<dll>" <name>` directive into the assembly so the
+// assembler+linker can build the PE import table.
+// arg_count is the TOTAL number of arguments (rides on src2.imm) so codegen
+// knows which SysV→MS register moves to emit.
+fn emit_ffi_call(name_ptr as *u8, name_len as i32, dll_ptr as *u8, dll_len as i32,
+                 is_variadic as i32, ret_type as *u8, xmm_count as i32, arg_count as i32, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_FFI_CALL);
+    i.dest = d.op_vreg(dest);
+    i.call_name_ptr = d.str_dup(name_ptr, name_len);
+    i.call_name_len = cast(i16, name_len);
+    i.asm_str_ptr = d.str_dup(dll_ptr, dll_len);
+    i.asm_str_len = dll_len;
+    i.is_variadic_call = cast(i8, is_variadic);
+    i.is_extern_call = 1;
+    i.src1 = d.op_imm(cast(i64, xmm_count));
+    i.src2 = d.op_imm(cast(i64, arg_count));
+    i.cast_to = ret_type;
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+fn emit_set_arg(idx as i32, src as i32, arg_type as *u8, line as i32) as void {
+    let is *d.IRInst as i = d.new_inst(d.IR_SET_ARG);
+    i.dest = d.op_imm(cast(i64, idx));
+    i.src1 = d.op_vreg(src);
+    i.cast_to = arg_type;
+    i.line = line;
+    emit(i);
+}
+
+fn emit_get_arg(idx as i32, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_GET_ARG);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_imm(cast(i64, idx));
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+// === Float arguments in xmm registers (x86_64) ===
+//
+// On x86_64 a non-variadic call between Caustic functions passes its float
+// arguments the System V way: ints in rdi, rsi, rdx, rcx, r8, r9, floats in
+// xmm0-xmm7, the rest on the stack in argument order; a float result comes
+// back in xmm0. SET_ARG and GET_ARG keep the argument's position as their
+// index (what inlining and tail calls match on) and carry its physical place
+// in src2: 0-5 a general register, 100+k xmm k, 6+s stack slot s. Only calls
+// and functions with a float argument get src2; without one, the position is
+// the place, as before. Other targets keep every argument in general
+// registers.
+fn xmm_args_abi() as i32 {
+    if (tgt.target_get().arch == tgt.ARCH_X86_64) { return 1; }
+    return 0;
+}
+
+// The physical places (see above) of `n` arguments, one byte per argument in
+// `is_flt`. Returns how many go on the stack.
+fn abi_codes(is_flt as *u8, n as i32, codes as *i32) as i32 {
+    let is i32 as gi with mut = 0;
+    let is i32 as xi with mut = 0;
+    let is i32 as st with mut = 0;
+    let is i32 as j with mut = 0;
+    while (j < n) {
+        let is *i32 as cp = cast(*i32, cast(i64, codes) + cast(i64, j) * 4);
+        if (is_flt[j] == cast(u8, 1) && xi < 8) { *cp = 100 + xi; xi = xi + 1; }
+        else if (is_flt[j] == cast(u8, 0) && gi < 6) { *cp = gi; gi = gi + 1; }
+        else { *cp = 6 + st; st = st + 1; }
+        j = j + 1;
+    }
+    return st;
+}
+
+fn emit_set_arg_at(idx as i32, code as i32, src as i32, line as i32) as void {
+    let is *d.IRInst as i = d.new_inst(d.IR_SET_ARG);
+    i.dest = d.op_imm(cast(i64, idx));
+    i.src1 = d.op_vreg(src);
+    i.src2 = d.op_imm(cast(i64, code));
+    i.line = line;
+    emit(i);
+}
+
+fn emit_get_arg_at(idx as i32, code as i32, line as i32) as i32 {
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_GET_ARG);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_imm(cast(i64, idx));
+    i.src2 = d.op_imm(cast(i64, code));
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+// The float return type of the function being generated when its result
+// goes back in xmm0 (x86_64), else null; emit_return puts it on the RET.
+let is *u8 as ctx_ret_float with mut = cast(*u8, 0);
+
+fn set_ret_float(ret_type as *ast.Type) as void {
+    ctx_ret_float = cast(*u8, 0);
+    if (cast(i64, ret_type) != 0 && is_float_kind(ret_type.kind) == 1 && xmm_args_abi() == 1) {
+        ctx_ret_float = cast(*u8, ret_type);
+    }
+}
+
+fn emit_return(src as i32, line as i32) as void {
+    let is *d.IRInst as i = d.new_inst(d.IR_RET);
+    if (src != cast(i32, 0 - 1)) {
+        i.src1 = d.op_vreg(src);
+        i.cast_to = ctx_ret_float;
+    }
+    i.line = line;
+    emit(i);
+}
+
+fn push_loop(start as i32, end_l as i32, cont as i32) as void {
+    if (ctx_loop_depth >= loop_cap) {
+        let is i32 as nc with mut = loop_cap * 2;
+        if (nc < 16) { nc = 16; }
+        let is *u8 as nb = d.opt_alloc(cast(i64, nc) * 12);
+        let is i32 as ne = loop_cap * 3;
+        let is i32 as ci with mut = 0;
+        while (ci < ne) {
+            let is *i32 as dp = cast(*i32, cast(i64, nb) + cast(i64, ci) * 4);
+            let is *i32 as sp = cast(*i32, cast(i64, loop_stack) + cast(i64, ci) * 4);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(loop_stack);
+        loop_stack = nb;
+        loop_cap = nc;
+    }
+    let is i64 as off = cast(i64, ctx_loop_depth) * 12;
+    let is *i32 as p = cast(*i32, cast(i64, loop_stack) + off);
+    *p = start;
+    let is *i32 as p2 = cast(*i32, cast(i64, loop_stack) + off + 4);
+    *p2 = end_l;
+    let is *i32 as p3 = cast(*i32, cast(i64, loop_stack) + off + 8);
+    *p3 = cont;
+    ctx_loop_depth = ctx_loop_depth + 1;
+}
+
+fn pop_loop() as void {
+    if (ctx_loop_depth > 0) { ctx_loop_depth = ctx_loop_depth - 1; }
+}
+
+fn get_loop_end() as i32 {
+    let is i64 as off = cast(i64, ctx_loop_depth - 1) * 12 + 4;
+    let is *i32 as p = cast(*i32, cast(i64, loop_stack) + off);
+    return *p;
+}
+
+fn get_loop_continue() as i32 {
+    let is i64 as off = cast(i64, ctx_loop_depth - 1) * 12 + 8;
+    let is *i32 as p = cast(*i32, cast(i64, loop_stack) + off);
+    return *p;
+}
+
+fn push_defer(node as *u8) as void {
+    if (defer_count >= defer_cap) {
+        let is i32 as nc with mut = defer_cap * 2;
+        if (nc < 16) { nc = 16; }
+        let is *u8 as nb = d.opt_alloc(cast(i64, nc) * 8);
+        let is i32 as ci with mut = 0;
+        while (ci < defer_count) {
+            let is *i64 as dp = cast(*i64, cast(i64, nb) + cast(i64, ci) * 8);
+            let is *i64 as sp = cast(*i64, cast(i64, defer_stack) + cast(i64, ci) * 8);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(defer_stack);
+        defer_stack = nb;
+        defer_cap = nc;
+    }
+    let is i64 as off = cast(i64, defer_count) * 8;
+    let is *i64 as p = cast(*i64, cast(i64, defer_stack) + off);
+    *p = cast(i64, node);
+    defer_count = defer_count + 1;
+}
+
+fn get_defer(idx as i32) as *u8 {
+    let is i64 as off = cast(i64, idx) * 8;
+    let is *i64 as p = cast(*i64, cast(i64, defer_stack) + off);
+    return cast(*u8, *p);
+}
+
+// Record that a `use`d module's body has been walked by gen_ir. Returns 1 when
+// the caller should walk it (first time), 0 when it already has been — the
+// whole dedup, including the growth, lives next to the table it maintains.
+fn note_done_body(body as *u8) as i32 {
+    let is i64 as body_ptr = cast(i64, body);
+    let is i32 as di with mut = 0;
+    while (di < ir_done_count) {
+        let is *i64 as dp = cast(*i64, cast(i64, ir_done_bodies) + cast(i64, di) * 8);
+        if (*dp == body_ptr) { return 0; }
+        di = di + 1;
+    }
+    if (ir_done_count >= ir_done_cap) {
+        let is i32 as nc with mut = ir_done_cap * 2;
+        if (nc < 256) { nc = 256; }
+        let is *u8 as nb = d.opt_alloc(cast(i64, nc) * 8);
+        let is i32 as ci with mut = 0;
+        while (ci < ir_done_count) {
+            let is *i64 as dp = cast(*i64, cast(i64, nb) + cast(i64, ci) * 8);
+            let is *i64 as sp = cast(*i64, cast(i64, ir_done_bodies) + cast(i64, ci) * 8);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(ir_done_bodies);
+        ir_done_bodies = nb;
+        ir_done_cap = nc;
+    }
+    let is *i64 as dp2 = cast(*i64, cast(i64, ir_done_bodies) + cast(i64, ir_done_count) * 8);
+    *dp2 = body_ptr;
+    ir_done_count = ir_done_count + 1;
+    return 1;
+}
+
+// String dedup hash table (256 buckets, chained)
+let is [256]i64 as _str_ht;
+let is i32 as _str_ht_ready with mut = 0;
+
+fn _str_hash(ptr as *u8, len as i32) as i32 {
+    let is i32 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < len) {
+        h = h * 33 + cast(i32, ptr[i]);
+        i = i + 1;
+    }
+    return (h & 255);
+}
+
+fn register_string(ptr as *u8, len as i32) as i32 {
+    // Init hash table on first use
+    if (_str_ht_ready == 0) {
+        let is i32 as hi with mut = 0;
+        while (hi < 256) { _str_ht[hi] = 0; hi = hi + 1; }
+        _str_ht_ready = 1;
+    }
+    // O(1) dedup via hash
+    let is i32 as h = _str_hash(ptr, len);
+    let is *d.StringEntry as cur with mut = cast(*d.StringEntry, _str_ht[h]);
+    while (cast(i64, cur) != 0) {
+        if (cur.len == len && mem.memcmp(cur.ptr, ptr, cast(i64, len)) == 0) {
+            return cur.id;
+        }
+        cur = cur.ht_next;
+    }
+    let is i32 as id = string_id_count;
+    let is *d.StringEntry as s = d.new_string_entry();
+    s.id = id;
+    s.ptr = d.str_dup(ptr, len);
+    s.len = len;
+    s.next = string_head;
+    string_head = s;
+    d.str_table_put(id, s);
+    // Insert into hash table
+    s.ht_next = cast(*d.StringEntry, _str_ht[h]);
+    _str_ht[h] = cast(i64, s);
+    string_id_count = string_id_count + 1;
+    return id;
+}
+
+

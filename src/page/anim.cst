@@ -86,6 +86,7 @@ struct Anim {
     next_x1 as f64;
     next_y1 as f64;
     known as i64;     // there is a frame before this one to speak of
+    holding as i64;   // this round does not free the last one's frame
     lasting as i64;   // what is written now is not gone with the frame
 }
 
@@ -102,6 +103,7 @@ fn init(a as *Anim, e as *style.Engine) as void {
     a.empty = 1;
     a.known = 0;
     a.lasting = 0;
+    a.holding = 0;
 }
 
 fn free(a as *Anim) as void {
@@ -530,7 +532,10 @@ fn after_restyle(a as *Anim, d as *dom.Document, now as i64) as void {
         i = i + 1;
     }
     a.n = w;
+    // The boxes there are still have what is in the frame until they are made again.
+    a.holding = 1;
     tick(a, now);
+    a.holding = 0;
 }
 
 // The boxes have been made again.
@@ -640,7 +645,7 @@ fn _visible(r as *Run, sy as f64, vh as f64) as i64 {
 
 fn tick(a as *Anim, now as i64) as void {
     a.now = now;
-    arena.free(&a.frame);
+    if (a.holding == 0) { arena.free(&a.frame); }
     a.full = 0;
     a.empty = 1;
     // Everything is written before anything is measured: a style may still hold a value

@@ -1,0 +1,35 @@
+<!DOCTYPE html><html><head><title>F</title></head><body><pre id="out"></pre>
+<iframe id="a" width="200" height="100"></iframe>
+<iframe id="s" srcdoc="<!DOCTYPE html><body><script>parent.postMessage({srcdoc:1,top:top===parent},'*')</script>" width="50" height="50"></iframe>
+<iframe id="b" width="50" height="50"></iframe>
+<iframe id="d1" src="child-deny.html"></iframe>
+<iframe id="d2" src="child-csp.html"></iframe>
+<iframe id="d3" src="child-csp-self.html"></iframe>
+<script>
+var R=[],M=[],L=[];function P(){R.push(Array.prototype.join.call(arguments,' '))}
+var other=location.protocol+'//'+location.hostname+':'+(+location.port===5193?5194:5193);
+var a=document.getElementById('a');
+a.addEventListener('load',function(){L.push('a')});
+document.getElementById('s').onload=function(){L.push('s')};
+addEventListener('message',function(e){
+  var who=e.source===a.contentWindow?'a':e.source===document.getElementById('s').contentWindow?'s':e.source===window?'self':'?';
+  M.push(who+' '+e.origin.replace(/\d+$/,'P')+' '+JSON.stringify(e.data));
+  if(e.data&&e.data.hello){
+    a.contentWindow.postMessage({echo:'wrong'},'http://nobody.example');
+    a.contentWindow.postMessage({echo:'star'},'*');
+    a.contentWindow.postMessage({echo:'right'},other);
+  }
+});
+a.src=other+'/child.html';
+postMessage({own:1},'*');
+P(window===top,window===parent,window.length,frames[0]===a.contentWindow,typeof a.contentWindow.postMessage,a.contentDocument===null||a.contentDocument!==undefined,window.frameElement);
+var dyn=document.createElement('iframe');dyn.width=20;dyn.height=20;dyn.src=other+'/child.html';dyn.onload=function(){L.push('dyn')};document.body.appendChild(dyn);
+P(window.length,typeof dyn.contentWindow);
+var waited=0,iv=setInterval(function(){if(++waited<400&&(M.length<10||L.length<3))return;clearInterval(iv);setTimeout(finish,300)},50);
+function finish(){
+  M.sort();P(M.join('\n'));L.sort();P(L.join());
+  P(a.getBoundingClientRect().width,a.getBoundingClientRect().height,a.offsetWidth);
+  document.body.removeChild(dyn);
+  setTimeout(function(){P(window.length);document.getElementById('out').textContent=R.join('\n');document.body.setAttribute('data-done','1')},100);
+}
+</script></body></html>

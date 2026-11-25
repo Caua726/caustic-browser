@@ -1,0 +1,245 @@
+// =======================================================
+// std/os/windows.cst — Raw Win32 bindings
+//
+// Caustic equivalent of <windows.h>: bare extern declarations of Windows
+// DLL functions matching kernel32 / ws2_32 / bcrypt signatures. User code
+// can import this directly for low-level access; portable stdlib wrappers
+// (io.cst, mem.cst, net.cst) sit on top.
+//
+// Common STD_HANDLE values for GetStdHandle. Stored as i64 because
+// global init in Caustic doesn't currently accept narrowing of negative
+// integer literals or cast() expressions; callers pass these directly
+// to GetStdHandle which auto-narrows (the int<->i32 arg passing path
+// already handles negative narrowing properly).
+let is i64 as STD_INPUT_HANDLE  with imut = 0 - 10;
+let is i64 as STD_OUTPUT_HANDLE with imut = 0 - 11;
+let is i64 as STD_ERROR_HANDLE  with imut = 0 - 12;
+
+// CreateFileA dwDesiredAccess flags:
+let is u32 as GENERIC_READ    with imut = 2147483648; // 0x80000000
+let is u32 as GENERIC_WRITE   with imut = 1073741824; // 0x40000000
+let is u32 as GENERIC_EXECUTE with imut = 536870912;  // 0x20000000
+
+// CreateFileA dwShareMode flags:
+let is u32 as FILE_SHARE_READ   with imut = 1;
+let is u32 as FILE_SHARE_WRITE  with imut = 2;
+let is u32 as FILE_SHARE_DELETE with imut = 4;
+
+// CreateFileA dwCreationDisposition values:
+let is u32 as CREATE_NEW        with imut = 1;
+let is u32 as CREATE_ALWAYS     with imut = 2;
+let is u32 as OPEN_EXISTING     with imut = 3;
+let is u32 as OPEN_ALWAYS       with imut = 4;
+let is u32 as TRUNCATE_EXISTING with imut = 5;
+
+// FILE_ATTRIBUTE_NORMAL — pass to CreateFileA's dwFlagsAndAttributes for
+// a regular file with no special attributes.
+let is u32 as FILE_ATTRIBUTE_NORMAL with imut = 128;
+
+// VirtualAlloc flAllocationType + flProtect:
+let is u32 as MEM_COMMIT    with imut = 4096;     // 0x1000
+let is u32 as MEM_RESERVE   with imut = 8192;     // 0x2000
+let is u32 as MEM_RELEASE   with imut = 32768;    // 0x8000
+let is u32 as PAGE_READONLY with imut = 2;
+let is u32 as PAGE_READWRITE with imut = 4;
+let is u32 as PAGE_EXECUTE  with imut = 16;
+let is u32 as PAGE_EXECUTE_READ with imut = 32;
+let is u32 as PAGE_EXECUTE_READWRITE with imut = 64;
+
+// INVALID_HANDLE_VALUE: returned by CreateFileA on failure (and others).
+let is i64 as INVALID_HANDLE_VALUE with imut = 0 - 1;
+
+// === kernel32.dll — process, I/O, memory, console ===
+
+extern "kernel32.dll" fn GetStdHandle(which as i64) as i64;
+extern "kernel32.dll" fn WriteFile(handle as i64, buf as *u8, n as u32,
+                                   written as *u32, overlapped as *u8) as i32;
+extern "kernel32.dll" fn ReadFile(handle as i64, buf as *u8, n as u32,
+                                  got as *u32, overlapped as *u8) as i32;
+extern "kernel32.dll" fn CloseHandle(handle as i64) as i32;
+extern "kernel32.dll" fn CreateFileA(name as *u8, access as u32, share as u32,
+                                     sec as *u8, disp as u32, attrs as u32,
+                                     templ as i64) as i64;
+extern "kernel32.dll" fn SetFilePointerEx(handle as i64, dist as i64,
+                                          newpos as *i64, method as u32) as i32;
+extern "kernel32.dll" fn GetFileSizeEx(handle as i64, size as *i64) as i32;
+extern "kernel32.dll" fn DeleteFileA(name as *u8) as i32;
+extern "kernel32.dll" fn MoveFileA(src as *u8, dst as *u8) as i32;
+extern "kernel32.dll" fn MoveFileExA(src as *u8, dst as *u8, flags as u32) as i32;
+let is u32 as MOVEFILE_REPLACE_EXISTING with imut = 1;
+extern "kernel32.dll" fn CreateDirectoryA(name as *u8, sec as *u8) as i32;
+extern "kernel32.dll" fn RemoveDirectoryA(name as *u8) as i32;
+
+extern "kernel32.dll" fn VirtualAlloc(addr as *u8, size as i64,
+                                      alloc_type as u32, protect as u32) as *u8;
+extern "kernel32.dll" fn VirtualFree(addr as *u8, size as i64, free_type as u32) as i32;
+extern "kernel32.dll" fn VirtualProtect(addr as *u8, size as i64,
+                                        protect as u32, old as *u32) as i32;
+
+extern "kernel32.dll" fn GetSystemTimeAsFileTime(ft as *i64) as void;
+extern "kernel32.dll" fn Sleep(ms as u32) as void;
+extern "kernel32.dll" fn QueryPerformanceCounter(c as *i64) as i32;
+extern "kernel32.dll" fn QueryPerformanceFrequency(f as *i64) as i32;
+
+extern "kernel32.dll" fn ExitProcess(code as u32) as void;
+extern "kernel32.dll" fn GetCurrentProcessId() as u32;
+extern "kernel32.dll" fn GetCommandLineA() as *u8;
+extern "kernel32.dll" fn GetEnvironmentVariableA(name as *u8, buf as *u8, size as u32) as u32;
+extern "kernel32.dll" fn GetModuleFileNameA(mod as i64, buf as *u8, size as u32) as u32;
+extern "kernel32.dll" fn GetLastError() as u32;
+
+// === Directory enumeration (FindFirstFile/FindNext iterator model) ===
+// WIN32_FIND_DATAA is a 320-byte struct. Callers pass a *u8 buffer of at
+// least 320 bytes; FindFirstFileA writes the first entry's metadata there.
+extern "kernel32.dll" fn FindFirstFileA(name as *u8, data as *u8) as i64;
+extern "kernel32.dll" fn FindNextFileA(handle as i64, data as *u8) as i32;
+extern "kernel32.dll" fn FindClose(handle as i64) as i32;
+
+// Attributes-only query (no handle). GetFileAttributesA returns
+// INVALID_FILE_ATTRIBUTES on failure; a set FILE_ATTRIBUTE_DIRECTORY bit
+// means the path is a directory.
+extern "kernel32.dll" fn GetFileAttributesA(name as *u8) as u32;
+let is u32 as FILE_ATTRIBUTE_DIRECTORY with imut = 16;
+let is u32 as INVALID_FILE_ATTRIBUTES with imut = 4294967295;
+
+// nBufferLength first, then the buffer — the Win32 order.
+extern "kernel32.dll" fn GetCurrentDirectoryA(size as u32, buf as *u8) as u32;
+
+// stat() / fstat() equivalent — info_level 0 = GetFileExInfoStandard,
+// writes a WIN32_FILE_ATTRIBUTE_DATA (36 bytes).
+extern "kernel32.dll" fn GetFileAttributesExA(name as *u8, info_level as i32,
+                                              info as *u8) as i32;
+let is i32 as GetFileExInfoStandard with imut = 0;
+
+// === Console mode (raw mode / colors) ===
+// dwMode bits relevant for raw terminal control:
+let is u32 as ENABLE_PROCESSED_INPUT       with imut = 1;
+let is u32 as ENABLE_LINE_INPUT            with imut = 2;
+let is u32 as ENABLE_ECHO_INPUT            with imut = 4;
+let is u32 as ENABLE_VIRTUAL_TERMINAL_INPUT with imut = 512;   // 0x0200
+let is u32 as ENABLE_PROCESSED_OUTPUT      with imut = 1;
+let is u32 as ENABLE_WRAP_AT_EOL_OUTPUT    with imut = 2;
+let is u32 as ENABLE_VIRTUAL_TERMINAL_PROCESSING with imut = 4;
+extern "kernel32.dll" fn GetConsoleMode(handle as i64, mode as *u32) as i32;
+extern "kernel32.dll" fn SetConsoleMode(handle as i64, mode as u32) as i32;
+// CONSOLE_SCREEN_BUFFER_INFO is 22 bytes; callers pass a *u8 buffer ≥ 22.
+extern "kernel32.dll" fn GetConsoleScreenBufferInfo(handle as i64, info as *u8) as i32;
+
+// === Process creation / waiting ===
+// CreateProcessA has 10 args; STARTUPINFOA is 104 bytes, PROCESS_INFORMATION
+// is 24 bytes — callers allocate both as byte buffers.
+extern "kernel32.dll" fn CreateProcessA(app_name as *u8, cmd_line as *u8,
+                                        proc_attrs as *u8, thread_attrs as *u8,
+                                        inherit_handles as i32, creation_flags as u32,
+                                        environment as *u8, current_dir as *u8,
+                                        startup_info as *u8, proc_info as *u8) as i32;
+extern "kernel32.dll" fn WaitForSingleObject(handle as i64, ms as u32) as u32;
+extern "kernel32.dll" fn GetExitCodeProcess(handle as i64, code as *u32) as i32;
+
+// === Threads (B3) ===
+// CreateThread: the OS owns the stack (loader/SEH/kernel assume it; never
+// VirtualAlloc a thread stack on Windows). lpStartAddress is the entry; the
+// thread proc receives its param in rcx (MS x64) — the shim in
+// std/thread/windows.cst reverses MS→SysV. flags=0x10000 makes dwStackSize a
+// reservation (STACK_SIZE_PARAM_IS_A_RESERVATION).
+extern "kernel32.dll" fn CreateThread(sec as *u8, stack_size as i64, start as *u8,
+                                      param as *u8, flags as u32, tid as *u32) as i64;
+extern "kernel32.dll" fn GetCurrentThreadId() as u32;
+extern "kernel32.dll" fn GetExitCodeThread(handle as i64, code as *u32) as i32;
+extern "kernel32.dll" fn SwitchToThread() as i32;
+extern "kernel32.dll" fn ExitThread(code as u32) as void;
+let is u32 as STACK_SIZE_PARAM_IS_A_RESERVATION with imut = 65536;  // 0x10000
+
+// ntdll futex equivalents (always present; cleaner for our PE importer than the
+// api-ms-win-core-synch apiset). Same shape as Linux futex_wait/wake.
+// RtlWaitOnAddress(addr, &compare_value, size, timeout_ptr_or_null):
+//   blocks while *addr == *compare; size is 1/2/4/8; timeout is a *i64
+//   (100ns units, negative = relative) or NULL for infinite.
+extern "ntdll.dll" fn RtlWaitOnAddress(addr as *u8, cmp as *u8, size as i64, timeout as *u8) as i32;
+extern "ntdll.dll" fn RtlWakeAddressSingle(addr as *u8) as void;
+extern "ntdll.dll" fn RtlWakeAddressAll(addr as *u8) as void;
+
+// === Anonymous pipe (for capture()) ===
+// SECURITY_ATTRIBUTES (24 bytes): nLength(u32) + lpSecurityDescriptor(*u8) +
+//   bInheritHandle(i32). Pass &sa with bInheritHandle=1 to CreatePipe so the
+//   child inherits the write end. lpPipeAttributes can also be NULL.
+extern "kernel32.dll" fn CreatePipe(read as *i64, write as *i64,
+                                    sa as *u8, size as u32) as i32;
+// flag = 1 (HANDLE_FLAG_INHERIT); mask must be 1 to set it.
+extern "kernel32.dll" fn SetHandleInformation(handle as i64, mask as u32,
+                                              flags as u32) as i32;
+let is u32 as HANDLE_FLAG_INHERIT  with imut = 1;
+let is u32 as STARTF_USESTDHANDLES with imut = 256;  // 0x100
+let is u32 as INFINITE        with imut = 4294967295;  // 0xFFFFFFFF
+let is u32 as WAIT_OBJECT_0   with imut = 0;
+let is u32 as WAIT_TIMEOUT    with imut = 258;          // 0x102
+let is u32 as WAIT_FAILED     with imut = 4294967295;   // 0xFFFFFFFF
+
+// === ws2_32.dll — Winsock 2 ===
+// User MUST call WSAStartup(0x0202, &wsadata) (or net.init()) before any
+// other socket call; programs that never call any ws2_32 function don't
+// pay the DLL-load cost (function-level DCE in IR).
+
+// Address families:
+let is i32 as W_AF_UNSPEC with imut = 0;
+let is i32 as W_AF_INET   with imut = 2;
+let is i32 as W_AF_INET6  with imut = 23;
+
+// Socket types:
+let is i32 as W_SOCK_STREAM with imut = 1;
+let is i32 as W_SOCK_DGRAM  with imut = 2;
+
+// Protocols:
+let is i32 as W_IPPROTO_TCP with imut = 6;
+let is i32 as W_IPPROTO_UDP with imut = 17;
+
+// setsockopt levels / opts:
+let is i32 as W_SOL_SOCKET   with imut = 65535;  // 0xFFFF
+let is i32 as W_SO_REUSEADDR with imut = 4;
+let is i32 as W_SO_KEEPALIVE with imut = 8;
+let is i32 as W_SO_BROADCAST with imut = 32;
+
+// ioctlsocket cmd for non-blocking:
+let is u32 as W_FIONBIO with imut = 2147772030;  // 0x8004667E
+
+// INVALID_SOCKET = (SOCKET)(~0); SOCKET is UINT_PTR — on x64 a u64 but kept
+// as i64 here for consistency with handle-style returns.
+let is i64 as INVALID_SOCKET with imut = 0 - 1;
+let is i64 as SOCKET_ERROR   with imut = 0 - 1;
+
+extern "ws2_32.dll" fn WSAStartup(version as u32, wsadata as *u8) as i32;
+extern "ws2_32.dll" fn WSACleanup() as i32;
+extern "ws2_32.dll" fn WSAGetLastError() as i32;
+extern "ws2_32.dll" fn WSASocketA(af as i32, sock_type as i32, proto as i32,
+                                  info as *u8, group as u32, flags as u32) as i64;
+extern "ws2_32.dll" fn bind(s as i64, addr as *u8, len as i32) as i32;
+extern "ws2_32.dll" fn listen(s as i64, backlog as i32) as i32;
+extern "ws2_32.dll" fn accept(s as i64, addr as *u8, addrlen as *i32) as i64;
+extern "ws2_32.dll" fn connect(s as i64, addr as *u8, len as i32) as i32;
+extern "ws2_32.dll" fn send(s as i64, buf as *u8, len as i32, flags as i32) as i32;
+extern "ws2_32.dll" fn recv(s as i64, buf as *u8, len as i32, flags as i32) as i32;
+// Datagram forms. send/recv only carry a payload — on an UNCONNECTED socket
+// they have no destination and no way to report the sender, which is the normal
+// case for UDP. These are what net.cst's udp_send/udp_recv need.
+extern "ws2_32.dll" fn sendto(s as i64, buf as *u8, len as i32, flags as i32,
+                              to as *u8, tolen as i32) as i32;
+extern "ws2_32.dll" fn recvfrom(s as i64, buf as *u8, len as i32, flags as i32,
+                                from as *u8, fromlen as *i32) as i32;
+extern "ws2_32.dll" fn setsockopt(s as i64, level as i32, opt as i32,
+                                  val as *u8, len as i32) as i32;
+extern "ws2_32.dll" fn getsockopt(s as i64, level as i32, opt as i32,
+                                  val as *u8, len as *i32) as i32;
+extern "ws2_32.dll" fn closesocket(s as i64) as i32;
+extern "ws2_32.dll" fn ioctlsocket(s as i64, cmd as u32, arg as *u32) as i32;
+extern "ws2_32.dll" fn WSAPoll(fds as *u8, nfds as u32, timeout as i32) as i32;
+extern "ws2_32.dll" fn htons(host as u32) as u32;
+extern "ws2_32.dll" fn htonl(host as u32) as u32;
+extern "ws2_32.dll" fn ntohs(net as u32) as u32;
+extern "ws2_32.dll" fn ntohl(net as u32) as u32;
+
+// === bcrypt.dll — entropy ===
+// Pass alg = 0 to get system-provided RNG (BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+// in dwFlags). Returns 0 on success, NTSTATUS on failure.
+let is u32 as BCRYPT_USE_SYSTEM_PREFERRED_RNG with imut = 2;
+extern "bcrypt.dll" fn BCryptGenRandom(alg as i64, buf as *u8, len as u32,
+                                       flags as u32) as i32;

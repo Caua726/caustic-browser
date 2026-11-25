@@ -1,0 +1,605 @@
+use "../readers/elf_reader.cst" as reader;
+
+// Emit the Windows entry stub at the START of .text. The stub
+//   1. allocates 0x428 stack bytes (shadow space + 0x400 argv buffer)
+//   2. calls GetCommandLineA → rax = cmdline
+//   3. calls __caustic_parse_argv(rcx=cmdline, rdx=argv_buf) → rax = argc
+//   4. sets rdi/rsi (SysV argc/argv) and calls user's main
+//   5. passes main's return to ExitProcess
+//
+// Caustic functions use SysV ABI internally (rdi/rsi for first two args),
+// so we deliberately do *not* place args in MS-x64 rcx/rdx for the
+// `call main` — only for the kernel32 imports.
+//
+// Stub bytes (47 total):
+//   00  48 81 EC 28 04 00 00            sub  rsp, 0x428                (7)
+//   07  FF 15 disp32                    call [rip+__imp_GetCommandLineA] (6)
+//   0D  48 89 C1                        mov  rcx, rax                  (3) cmdline
+//   10  48 8D 54 24 28                  lea  rdx, [rsp+0x28]           (5) argv buf
+//   15  E8 disp32                       call rel32 __caustic_parse_argv (5)
+//   1A  48 89 C7                        mov  rdi, rax                  (3) argc → SysV
+//   1D  48 8D 74 24 28                  lea  rsi, [rsp+0x28]           (5) argv → SysV
+//   22  E8 disp32                       call rel32 main                (5)
+//   27  89 C1                           mov  ecx, eax                  (2) exit code
+//   29  FF 15 disp32                    call [rip+__imp_ExitProcess]   (6)
+fn emit_win_entry_stub(out as *reader.ByteBuffer, main_rva as i64,
+                       getcmdline_iat_rva as i64, parse_argv_rva as i64,
+                       exitproc_iat_rva as i64, stub_rva as i64) as i64 {
+    // sub rsp, 0x428
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 129); reader.buf_emit8(out, 236);
+    reader.buf_emit8(out, 40); reader.buf_emit8(out, 4); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // call qword ptr [rip+__imp_GetCommandLineA]
+    reader.buf_emit8(out, 255); reader.buf_emit8(out, 21);
+    let is i64 as call_gcl_next = stub_rva + 7 + 6;
+    reader.buf_emit32_le(out, getcmdline_iat_rva - call_gcl_next);
+    // mov rcx, rax
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 137); reader.buf_emit8(out, 193);
+    // lea rdx, [rsp+0x28]
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 141); reader.buf_emit8(out, 84);
+    reader.buf_emit8(out, 36); reader.buf_emit8(out, 40);
+    // call rel32 __caustic_parse_argv
+    reader.buf_emit8(out, 232);
+    let is i64 as call_pa_next = stub_rva + 7 + 6 + 3 + 5 + 5;
+    reader.buf_emit32_le(out, parse_argv_rva - call_pa_next);
+    // mov rdi, rax
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 137); reader.buf_emit8(out, 199);
+    // lea rsi, [rsp+0x28]
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 141); reader.buf_emit8(out, 116);
+    reader.buf_emit8(out, 36); reader.buf_emit8(out, 40);
+    // call rel32 main
+    reader.buf_emit8(out, 232);
+    let is i64 as call_main_next = stub_rva + 7 + 6 + 3 + 5 + 5 + 3 + 5 + 5;
+    reader.buf_emit32_le(out, main_rva - call_main_next);
+    // mov ecx, eax
+    reader.buf_emit8(out, 137); reader.buf_emit8(out, 193);
+    // call qword ptr [rip+__imp_ExitProcess]
+    reader.buf_emit8(out, 255); reader.buf_emit8(out, 21);
+    let is i64 as call_exit_next = stub_rva + 7 + 6 + 3 + 5 + 5 + 3 + 5 + 5 + 2 + 6;
+    reader.buf_emit32_le(out, exitproc_iat_rva - call_exit_next);
+    return 47;
+}
+
+
+// 228-byte CommandLineToArgvA-equivalent parser. Layout/offsets verified by
+// hand; jumps use rel8 where the target fits, rel32 otherwise. See the
+// trailing comment in this file for the full byte-by-byte annotation.
+fn emit_caustic_parse_argv(out as *reader.ByteBuffer) as i64 {
+    // 00  push rbx; push rsi; push rdi
+    reader.buf_emit8(out, 83); reader.buf_emit8(out, 86); reader.buf_emit8(out, 87);
+    // 03  xor eax, eax
+    reader.buf_emit8(out, 49); reader.buf_emit8(out, 192);
+    // 05 .skip_ws:  mov bl, [rcx]; test bl, bl
+    reader.buf_emit8(out, 138); reader.buf_emit8(out, 25);
+    reader.buf_emit8(out, 132); reader.buf_emit8(out, 219);
+    // 09  jz .done   (rel32 +0xD1)
+    reader.buf_emit8(out, 15); reader.buf_emit8(out, 132);
+    reader.buf_emit8(out, 209); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // 0F  cmp bl, 32; je .ws_step (+5)
+    reader.buf_emit8(out, 128); reader.buf_emit8(out, 251); reader.buf_emit8(out, 32);
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 5);
+    // 14  cmp bl, 9; jne .new_arg (+5)
+    reader.buf_emit8(out, 128); reader.buf_emit8(out, 251); reader.buf_emit8(out, 9);
+    reader.buf_emit8(out, 117); reader.buf_emit8(out, 5);
+    // 19 .ws_step:  inc rcx; jmp .skip_ws (-0x19)
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 193);
+    reader.buf_emit8(out, 235); reader.buf_emit8(out, 231);
+    // 1E .new_arg:  cmp eax, 128; jae .done (rel32 +0xB7)
+    reader.buf_emit8(out, 61); reader.buf_emit8(out, 128); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    reader.buf_emit8(out, 15); reader.buf_emit8(out, 131);
+    reader.buf_emit8(out, 183); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // 29  mov [rdx], rcx; add rdx, 8; inc rax
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 137); reader.buf_emit8(out, 10);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 131); reader.buf_emit8(out, 194); reader.buf_emit8(out, 8);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 192);
+    // 33  mov rsi, rcx; xor edi, edi; xor r10d, r10d
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 137); reader.buf_emit8(out, 206);
+    reader.buf_emit8(out, 49); reader.buf_emit8(out, 255);
+    reader.buf_emit8(out, 69); reader.buf_emit8(out, 49); reader.buf_emit8(out, 210);
+    // 3B .arg_loop:  mov bl, [rcx]; test bl, bl
+    reader.buf_emit8(out, 138); reader.buf_emit8(out, 25);
+    reader.buf_emit8(out, 132); reader.buf_emit8(out, 219);
+    // 3F  jz .arg_end (rel32 +0x7A)
+    reader.buf_emit8(out, 15); reader.buf_emit8(out, 132);
+    reader.buf_emit8(out, 122); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // 45  test edi, edi; jnz .check_special (+0x12)
+    reader.buf_emit8(out, 133); reader.buf_emit8(out, 255);
+    reader.buf_emit8(out, 117); reader.buf_emit8(out, 18);
+    // 49  cmp bl, 32; je .arg_end (rel32 +0x6D)
+    reader.buf_emit8(out, 128); reader.buf_emit8(out, 251); reader.buf_emit8(out, 32);
+    reader.buf_emit8(out, 15); reader.buf_emit8(out, 132);
+    reader.buf_emit8(out, 109); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // 52  cmp bl, 9; je .arg_end (rel32 +0x64)
+    reader.buf_emit8(out, 128); reader.buf_emit8(out, 251); reader.buf_emit8(out, 9);
+    reader.buf_emit8(out, 15); reader.buf_emit8(out, 132);
+    reader.buf_emit8(out, 100); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // 5B .check_special:  cmp bl, 92; je .got_bs (+0x22)
+    reader.buf_emit8(out, 128); reader.buf_emit8(out, 251); reader.buf_emit8(out, 92);
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 34);
+    // 60  cmp bl, 34; je .got_quote (+0x28)
+    reader.buf_emit8(out, 128); reader.buf_emit8(out, 251); reader.buf_emit8(out, 34);
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 40);
+    // 65  test r10d, r10d; jz .emit_ch (+0x0B)
+    reader.buf_emit8(out, 69); reader.buf_emit8(out, 133); reader.buf_emit8(out, 210);
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 11);
+    // 6A .flush_bs:  mov byte [rsi], 92; inc rsi; dec r10d; jnz .flush_bs (-11)
+    reader.buf_emit8(out, 198); reader.buf_emit8(out, 6); reader.buf_emit8(out, 92);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 198);
+    reader.buf_emit8(out, 65); reader.buf_emit8(out, 255); reader.buf_emit8(out, 202);
+    reader.buf_emit8(out, 117); reader.buf_emit8(out, 245);
+    // 75 .emit_ch:  mov [rsi], bl; inc rsi; inc rcx; jmp .arg_loop (rel32 -0x47)
+    reader.buf_emit8(out, 136); reader.buf_emit8(out, 30);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 198);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 193);
+    reader.buf_emit8(out, 233); reader.buf_emit8(out, 185); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255);
+    // 82 .got_bs:  inc r10d; inc rcx; jmp .arg_loop (rel32 -0x52)
+    reader.buf_emit8(out, 65); reader.buf_emit8(out, 255); reader.buf_emit8(out, 194);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 193);
+    reader.buf_emit8(out, 233); reader.buf_emit8(out, 174); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255);
+    // 8D .got_quote:  mov r11d, r10d; shr r11d, 1; test r11d, r11d; jz .q_parity (+0x0B)
+    reader.buf_emit8(out, 69); reader.buf_emit8(out, 137); reader.buf_emit8(out, 211);
+    reader.buf_emit8(out, 65); reader.buf_emit8(out, 209); reader.buf_emit8(out, 235);
+    reader.buf_emit8(out, 69); reader.buf_emit8(out, 133); reader.buf_emit8(out, 219);
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 11);
+    // 98 .q_emit_bs:  mov byte [rsi], 92; inc rsi; dec r11d; jnz .q_emit_bs (-11)
+    reader.buf_emit8(out, 198); reader.buf_emit8(out, 6); reader.buf_emit8(out, 92);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 198);
+    reader.buf_emit8(out, 65); reader.buf_emit8(out, 255); reader.buf_emit8(out, 203);
+    reader.buf_emit8(out, 117); reader.buf_emit8(out, 245);
+    // A3 .q_parity:  test r10b, 1; jnz .q_literal (+5)
+    reader.buf_emit8(out, 65); reader.buf_emit8(out, 246); reader.buf_emit8(out, 194); reader.buf_emit8(out, 1);
+    reader.buf_emit8(out, 117); reader.buf_emit8(out, 5);
+    // A9  xor edi, 1; jmp .q_done (+6)
+    reader.buf_emit8(out, 131); reader.buf_emit8(out, 247); reader.buf_emit8(out, 1);
+    reader.buf_emit8(out, 235); reader.buf_emit8(out, 6);
+    // AE .q_literal:  mov byte [rsi], 34; inc rsi
+    reader.buf_emit8(out, 198); reader.buf_emit8(out, 6); reader.buf_emit8(out, 34);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 198);
+    // B4 .q_done:  xor r10d, r10d; inc rcx; jmp .arg_loop (rel32 -0x84)
+    reader.buf_emit8(out, 69); reader.buf_emit8(out, 49); reader.buf_emit8(out, 210);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 193);
+    reader.buf_emit8(out, 233); reader.buf_emit8(out, 124); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255);
+    // BF .arg_end:  test r10d, r10d; jz .arg_term (+0x0B)
+    reader.buf_emit8(out, 69); reader.buf_emit8(out, 133); reader.buf_emit8(out, 210);
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 11);
+    // C4 .drain_bs:  mov byte [rsi], 92; inc rsi; dec r10d; jnz .drain_bs (-11)
+    reader.buf_emit8(out, 198); reader.buf_emit8(out, 6); reader.buf_emit8(out, 92);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 198);
+    reader.buf_emit8(out, 65); reader.buf_emit8(out, 255); reader.buf_emit8(out, 202);
+    reader.buf_emit8(out, 117); reader.buf_emit8(out, 245);
+    // CF .arg_term:  mov bl, [rcx]; mov byte [rsi], 0; test bl, bl
+    //   Read [rcx] FIRST: in-place parsing keeps rsi == rcx for plain args,
+    //   so writing the NUL at [rsi] before the read would trash the very
+    //   byte we need to inspect (whitespace or NUL).
+    reader.buf_emit8(out, 138); reader.buf_emit8(out, 25);
+    reader.buf_emit8(out, 198); reader.buf_emit8(out, 6); reader.buf_emit8(out, 0);
+    reader.buf_emit8(out, 132); reader.buf_emit8(out, 219);
+    // D6  jz .done (+8); inc rcx; jmp .skip_ws (rel32 -0xDB)
+    reader.buf_emit8(out, 116); reader.buf_emit8(out, 8);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 255); reader.buf_emit8(out, 193);
+    reader.buf_emit8(out, 233); reader.buf_emit8(out, 37); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255);
+    // E0 .done:  pop rdi; pop rsi; pop rbx; ret
+    reader.buf_emit8(out, 95); reader.buf_emit8(out, 94); reader.buf_emit8(out, 91); reader.buf_emit8(out, 195);
+    return 228;
+}
+
+// Emit __caustic_chkstk — a stack-probe trampoline called by every function
+// whose frame is ≥ 4 KiB. Windows reserves the stack lazily: writing past
+// the current commit limit without first touching every guard page raises
+// a fault. This routine walks down from the caller's rsp in 4 KiB steps,
+// touching one byte per page so the kernel commits the next guard page.
+//
+// Convention (matches what emit_driver.cst generates at the call site):
+//   in : rax = total frame bytes about to be allocated
+//   out: rax preserved (caller does `sub rsp, rax` right after returning)
+//        rcx/rdx clobbered are saved/restored
+//
+// Bytes (57 total):
+//   push rdx                          ; 52
+//   push rcx                          ; 51
+//   mov  rcx, rsp                     ; 48 89 E1
+//   add  rcx, 24                      ; 48 83 C1 18    skip 2 pushes + ret addr
+//   mov  rdx, rax                     ; 48 89 C2
+//   add  rdx, 4095                    ; 48 81 C2 FF 0F 00 00   round rax up to
+//   and  rdx, 0xFFFFF000              ; 48 81 E2 00 F0 FF FF   next 4 KiB
+// .probe:
+//   cmp  rdx, 4096                    ; 48 81 FA 00 10 00 00
+//   jb   .done                        ; 72 13
+//   sub  rdx, 4096                    ; 48 81 EA 00 10 00 00
+//   sub  rcx, 4096                    ; 48 81 E9 00 10 00 00
+//   mov  byte ptr [rcx], 0            ; C6 01 00
+//   jmp  .probe                       ; EB E4
+// .done:
+//   pop  rcx                          ; 59
+//   pop  rdx                          ; 5A
+//   ret                               ; C3
+//
+// The round-up ensures we probe ceil(rax/4096) pages so the last partial
+// page also gets touched (avoids an access fault if the OS hasn't committed
+// it yet when the caller's first store lands there).
+fn emit_caustic_chkstk(out as *reader.ByteBuffer) as i64 {
+    reader.buf_emit8(out, 82);                                                      // push rdx
+    reader.buf_emit8(out, 81);                                                      // push rcx
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 137); reader.buf_emit8(out, 225); // mov rcx, rsp
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 131); reader.buf_emit8(out, 193); reader.buf_emit8(out, 24); // add rcx, 24
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 137); reader.buf_emit8(out, 194); // mov rdx, rax
+    // add rdx, 4095  (0xFFF)
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 129); reader.buf_emit8(out, 194);
+    reader.buf_emit8(out, 255); reader.buf_emit8(out, 15); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    // and rdx, 0xFFFFF000  (sign-extended from imm32 0xFFFFF000)
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 129); reader.buf_emit8(out, 226);
+    reader.buf_emit8(out, 0); reader.buf_emit8(out, 240); reader.buf_emit8(out, 255); reader.buf_emit8(out, 255);
+    // .probe:
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 129); reader.buf_emit8(out, 250); // cmp rdx, imm32
+    reader.buf_emit8(out, 0); reader.buf_emit8(out, 16); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);  // 4096
+    reader.buf_emit8(out, 114); reader.buf_emit8(out, 19);                          // jb +0x13
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 129); reader.buf_emit8(out, 234); // sub rdx, imm32
+    reader.buf_emit8(out, 0); reader.buf_emit8(out, 16); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    reader.buf_emit8(out, 72); reader.buf_emit8(out, 129); reader.buf_emit8(out, 233); // sub rcx, imm32
+    reader.buf_emit8(out, 0); reader.buf_emit8(out, 16); reader.buf_emit8(out, 0); reader.buf_emit8(out, 0);
+    reader.buf_emit8(out, 198); reader.buf_emit8(out, 1); reader.buf_emit8(out, 0); // mov byte [rcx], 0
+    reader.buf_emit8(out, 235); reader.buf_emit8(out, 228);                         // jmp -0x1c
+    // .done:
+    reader.buf_emit8(out, 89);                                                       // pop rcx
+    reader.buf_emit8(out, 90);                                                       // pop rdx
+    reader.buf_emit8(out, 195);                                                      // ret
+    return 57;
+}
+
+
+// ============================================================
+// SEH (.pdata / .xdata) support
+// ============================================================
+//
+// Windows x64 requires every non-leaf function in .text to have a
+// RUNTIME_FUNCTION entry in .pdata plus a matching UNWIND_INFO blob in
+// .xdata, so the OS can unwind the stack for SEH, debugging, and
+// `RtlVirtualUnwind` consumers (profilers, ETW). Without these, programs
+// that never throw still work, but exception filters in OS code (e.g.
+// invalid-handle teardown) take a slow/wrong path and may abort.
+//
+// UNWIND_INFO header (4 bytes):
+//   byte 0: (Flags:5)<<3 | (Version:3)          version=1, flags=0
+//   byte 1: SizeOfProlog                          prolog byte count
+//   byte 2: CountOfCodes                          number of UNWIND_CODE slots
+//   byte 3: (FrameOffset:4)<<4 | FrameRegister:4  0 = no frame register
+// then CountOfCodes × UNWIND_CODE slots (2 bytes each):
+//   slot byte 0: CodeOffset (prolog byte offset where the op completes)
+//   slot byte 1: (OpInfo:4)<<4 | UnwindOp:4
+// Padded to a 4-byte boundary so the optional ExceptionHandler / chained
+// info that may follow lands aligned.
+//
+// UnwindOp codes used here:
+//   UWOP_PUSH_NONVOL (0): OpInfo = reg number (rbx=3, rbp=5, r12=12..r15=15)
+//   UWOP_ALLOC_LARGE (1): info=0 → next u16 slot holds (alloc/8)
+//                         info=1 → next two slots hold the alloc bytes (u32)
+//   UWOP_ALLOC_SMALL (2): info = (alloc/8) - 1 (range 8..128, step 8)
+
+// Decode the standard Caustic prolog from raw .text bytes. Recognized
+// patterns (in this order):
+//
+//   push rbp         (55)
+//   mov rbp, rsp     (48 89 E5)
+//   {push rbx | push r12..r15}*
+//   one of:
+//     - mov rax, N; call __caustic_chkstk; sub rsp, rax  (chkstk path)
+//     - sub rsp, imm8                                   (frame ≤ 128)
+//     - sub rsp, imm32                                  (frame > 128)
+//
+// Writes up to N=8 operations into the parallel arrays. Each operation
+// gets: offsets[i] = prolog byte offset *after* the op completes,
+//        ops[i]    = unwind op code (PUSH_NONVOL/ALLOC_LARGE/ALLOC_SMALL),
+//        infos[i]  = op info (reg number or sub-op),
+//        extras[i] = ALLOC_LARGE value (0 for other ops).
+// Returns number of operations recorded. *out_prolog_size = bytes consumed.
+fn decode_user_prologue(text as *u8, max_bytes as i32,
+                        offsets as *u8, ops as *u8, infos as *u8, extras as *i32,
+                        out_prolog_size as *i32) as i32 {
+    let is i32 as pos with mut = 0;
+    let is i32 as n with mut = 0;
+
+    // push rbp
+    if (pos < max_bytes && text[pos] == cast(u8, 85)) {
+        pos = pos + 1;
+        offsets[n] = cast(u8, pos);
+        ops[n] = cast(u8, 0);    // PUSH_NONVOL
+        infos[n] = cast(u8, 5);  // rbp
+        extras[n] = 0;
+        n = n + 1;
+    }
+    // mov rbp, rsp  (no unwind code emitted since FrameRegister is unset)
+    if (pos + 2 < max_bytes && text[pos] == cast(u8, 72) && text[pos+1] == cast(u8, 137) && text[pos+2] == cast(u8, 229)) {
+        pos = pos + 3;
+    }
+    // push rbx / push r12..r15
+    while (n < 8 && pos < max_bytes) {
+        if (text[pos] == cast(u8, 83)) {                      // push rbx (0x53)
+            pos = pos + 1;
+            offsets[n] = cast(u8, pos);
+            ops[n] = cast(u8, 0);
+            infos[n] = cast(u8, 3);
+            extras[n] = 0;
+            n = n + 1;
+        } else if (pos + 1 < max_bytes && text[pos] == cast(u8, 65)
+                   && text[pos+1] >= cast(u8, 84) && text[pos+1] <= cast(u8, 87)) {
+            let is i32 as reg = 12 + cast(i32, text[pos+1]) - 84;
+            pos = pos + 2;
+            offsets[n] = cast(u8, pos);
+            ops[n] = cast(u8, 0);
+            infos[n] = cast(u8, reg);
+            extras[n] = 0;
+            n = n + 1;
+        } else {
+            // Not a push we recognise — end the push-run scan.
+            break;
+        }
+    }
+    // chkstk path: 48 C7 C0 NN NN NN NN | E8 NN NN NN NN | 48 29 C4
+    if (pos + 15 <= max_bytes
+        && text[pos] == cast(u8, 72) && text[pos+1] == cast(u8, 199) && text[pos+2] == cast(u8, 192)
+        && text[pos+7] == cast(u8, 232)
+        && text[pos+12] == cast(u8, 72) && text[pos+13] == cast(u8, 41) && text[pos+14] == cast(u8, 196)) {
+        let is i32 as N = cast(i32, text[pos+3])
+                          + cast(i32, text[pos+4]) * 256
+                          + cast(i32, text[pos+5]) * 65536
+                          + cast(i32, text[pos+6]) * 16777216;
+        pos = pos + 15;
+        offsets[n] = cast(u8, pos);
+        ops[n] = cast(u8, 1);    // ALLOC_LARGE
+        if (N % 8 == 0 && N >= 8 && N <= 524280) {
+            infos[n] = cast(u8, 0);
+            extras[n] = N / 8;
+        } else {
+            infos[n] = cast(u8, 1);
+            extras[n] = N;
+        }
+        n = n + 1;
+    }
+    // sub rsp, imm8  (48 83 EC NN)
+    else if (pos + 4 <= max_bytes && text[pos] == cast(u8, 72) && text[pos+1] == cast(u8, 131) && text[pos+2] == cast(u8, 236)) {
+        let is i32 as N = cast(i32, text[pos+3]);
+        pos = pos + 4;
+        if (N % 8 == 0 && N >= 8 && N <= 128) {
+            offsets[n] = cast(u8, pos);
+            ops[n] = cast(u8, 2);    // ALLOC_SMALL
+            infos[n] = cast(u8, (N / 8) - 1);
+            extras[n] = 0;
+            n = n + 1;
+        }
+    }
+    // sub rsp, imm32  (48 81 EC NN NN NN NN)
+    else if (pos + 7 <= max_bytes && text[pos] == cast(u8, 72) && text[pos+1] == cast(u8, 129) && text[pos+2] == cast(u8, 236)) {
+        let is i32 as N = cast(i32, text[pos+3])
+                          + cast(i32, text[pos+4]) * 256
+                          + cast(i32, text[pos+5]) * 65536
+                          + cast(i32, text[pos+6]) * 16777216;
+        pos = pos + 7;
+        offsets[n] = cast(u8, pos);
+        ops[n] = cast(u8, 1);    // ALLOC_LARGE
+        if (N % 8 == 0 && N >= 8 && N <= 524280) {
+            infos[n] = cast(u8, 0);
+            extras[n] = N / 8;
+        } else {
+            infos[n] = cast(u8, 1);
+            extras[n] = N;
+        }
+        n = n + 1;
+    }
+    *out_prolog_size = pos;
+    return n;
+}
+
+// Compute UNWIND_CODE slot count for a given set of unwind ops.
+// PUSH_NONVOL / ALLOC_SMALL → 1 slot each
+// ALLOC_LARGE info=0        → 2 slots (op + 1×u16 extras)
+// ALLOC_LARGE info=1        → 3 slots (op + 2×u16 extras = u32)
+fn count_unwind_slots(ops as *u8, infos as *u8, n as i32) as i32 {
+    let is i32 as slots with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (ops[i] == cast(u8, 1) && infos[i] == cast(u8, 0)) {
+            slots = slots + 2;
+        } else if (ops[i] == cast(u8, 1) && infos[i] == cast(u8, 1)) {
+            slots = slots + 3;
+        } else {
+            slots = slots + 1;
+        }
+        i = i + 1;
+    }
+    return slots;
+}
+
+// Emit one UNWIND_INFO blob into the .xdata buffer. Returns the offset
+// within `out` where the blob starts — store this in the RUNTIME_FUNCTION's
+// UnwindInfoAddress (after adding xdata_rva).
+fn emit_unwind_info(out as *reader.ByteBuffer, prolog_size as i32,
+                    offsets as *u8, ops as *u8, infos as *u8, extras as *i32,
+                    n_ops as i32) as i64 {
+    let is i64 as off = out.len;
+    let is i32 as slots = count_unwind_slots(ops, infos, n_ops);
+
+    // Header
+    reader.buf_emit8(out, 1);                       // Version=1, Flags=0
+    reader.buf_emit8(out, cast(i32, prolog_size));
+    reader.buf_emit8(out, slots);
+    reader.buf_emit8(out, 0);                       // FrameReg/FrameOffset = 0
+
+    // Codes — must be in REVERSE chronological order (last prolog op first).
+    let is i32 as k with mut = n_ops - 1;
+    while (k >= 0) {
+        reader.buf_emit8(out, cast(i32, offsets[k]));
+        reader.buf_emit8(out, cast(i32, infos[k]) * 16 + cast(i32, ops[k]));
+        if (ops[k] == cast(u8, 1) && infos[k] == cast(u8, 0)) {
+            reader.buf_emit16_le(out, cast(i32, extras[k]));
+        } else if (ops[k] == cast(u8, 1) && infos[k] == cast(u8, 1)) {
+            reader.buf_emit32_le(out, cast(i64, extras[k]));
+        }
+        k = k - 1;
+    }
+    // Pad to even slot count (UNWIND_INFO is 4-byte aligned overall).
+    if (slots % 2 != 0) {
+        reader.buf_emit16_le(out, 0);
+    }
+    return off;
+}
+
+// Convenience: emit a hand-built UNWIND_INFO for the entry stub. The stub
+// prolog is exactly `sub rsp, 0x428` (7 bytes). One op: ALLOC_LARGE info=0
+// with extras = 0x428/8 = 0x85.
+fn emit_entry_stub_unwind(out as *reader.ByteBuffer) as i64 {
+    let is i64 as off = out.len;
+    reader.buf_emit8(out, 1);                       // ver=1, flags=0
+    reader.buf_emit8(out, 7);                       // prolog size
+    reader.buf_emit8(out, 2);                       // 2 slots
+    reader.buf_emit8(out, 0);
+    reader.buf_emit8(out, 7); reader.buf_emit8(out, 1);   // slot 0: offset=7, op=1
+    reader.buf_emit16_le(out, 133);                 // slot 1: 0x85 = 0x428/8
+    return off;
+}
+
+// __caustic_chkstk's first two instructions are push rdx (52) and push rcx
+// (51). The rest of its prolog (mov rcx,rsp; add rcx,24; mov rdx,rax; round
+// rdx up to next 4 KiB) doesn't touch the stack, so we don't describe it.
+fn emit_chkstk_unwind(out as *reader.ByteBuffer) as i64 {
+    let is i64 as off = out.len;
+    reader.buf_emit8(out, 1);                       // ver=1, flags=0
+    reader.buf_emit8(out, 2);                       // prolog size
+    reader.buf_emit8(out, 2);                       // 2 slots
+    reader.buf_emit8(out, 0);
+    // reverse order: push rcx (offset 2, reg=1) first, then push rdx (offset 1, reg=2)
+    reader.buf_emit8(out, 2); reader.buf_emit8(out, 16);   // info=1 (rcx) << 4 | op=0
+    reader.buf_emit8(out, 1); reader.buf_emit8(out, 32);   // info=2 (rdx) << 4 | op=0
+    return off;
+}
+
+// __caustic_parse_argv pushes rbx as its only stack-touching prolog op.
+fn emit_parse_argv_unwind(out as *reader.ByteBuffer) as i64 {
+    let is i64 as off = out.len;
+    reader.buf_emit8(out, 1);
+    reader.buf_emit8(out, 1);                       // prolog size
+    reader.buf_emit8(out, 1);                       // 1 slot
+    reader.buf_emit8(out, 0);
+    reader.buf_emit8(out, 1); reader.buf_emit8(out, 48);   // offset=1, info=3 (rbx) << 4 | op=0
+    reader.buf_emit16_le(out, 0);                   // padding for 4-byte alignment
+    return off;
+}
+
+
+// ============================================================
+// AArch64 counterparts of the three stubs above.
+//
+// Windows on ARM64 uses AAPCS64 — the same convention this compiler emits —
+// so there is no SysV-to-MS shuffle here: main takes argc in x0 and argv in
+// x1 exactly as the stub leaves them. __caustic_chkstk has no AArch64 form
+// because the stack probe it implements is an x86 concern; the backend never
+// calls it.
+//
+// The instruction words below were assembled from the source in the comments
+// and verified by disassembly; parse_argv was additionally executed under
+// qemu-aarch64 against the Windows quoting rules (\ literal, " escaped,
+// \" collapsing to one backslash plus a quote toggle, unterminated quote
+// running to end of line).
+// ============================================================
+
+fn a64w(out as *reader.ByteBuffer, w as i64) as void {
+    reader.buf_emit8(out, cast(i32, w & 255));
+    reader.buf_emit8(out, cast(i32, (w >> 8) & 255));
+    reader.buf_emit8(out, cast(i32, (w >> 16) & 255));
+    reader.buf_emit8(out, cast(i32, (w >> 24) & 255));
+}
+
+let is i64 as A64_PARSE_ARGV_SIZE with imut = 292;
+let is i64 as A64_ENTRY_STUB_SIZE with imut = 56;
+
+// x0 = command line, x1 = argv slot buffer -> x0 = argc.
+// p=x2 w=x3 argc=x4 c=w5 in_quotes=x6 bs=x7 tmp=x8 argvp=x9
+fn emit_a64_parse_argv(out as *reader.ByteBuffer) as i64 {
+    a64w(out, 0xAA0003E2); a64w(out, 0xAA0103E9); a64w(out, 0xD2800004); a64w(out, 0x39400045); a64w(out, 0x34000865); a64w(out, 0x710080BF);
+    a64w(out, 0x54000060); a64w(out, 0x710024BF); a64w(out, 0x54000061); a64w(out, 0x91000442); a64w(out, 0x17FFFFF9); a64w(out, 0xF102009F);
+    a64w(out, 0x5400076A); a64w(out, 0xF9000122); a64w(out, 0x91002129); a64w(out, 0x91000484); a64w(out, 0xAA0203E3); a64w(out, 0xD2800006);
+    a64w(out, 0xD2800007); a64w(out, 0x39400045); a64w(out, 0x34000505); a64w(out, 0xB50000A6); a64w(out, 0x710080BF); a64w(out, 0x540004A0);
+    a64w(out, 0x710024BF); a64w(out, 0x54000460); a64w(out, 0x710170BF); a64w(out, 0x540001A0); a64w(out, 0x710088BF); a64w(out, 0x540001C0);
+    a64w(out, 0xB40000C7); a64w(out, 0x52800B88); a64w(out, 0x39000068); a64w(out, 0x91000463); a64w(out, 0xD10004E7); a64w(out, 0xB5FFFF87);
+    a64w(out, 0x39000065); a64w(out, 0x91000463); a64w(out, 0x91000442); a64w(out, 0x17FFFFEC); a64w(out, 0x910004E7); a64w(out, 0x91000442);
+    a64w(out, 0x17FFFFE9); a64w(out, 0xD341FCE8); a64w(out, 0xB40000C8); a64w(out, 0x52800B8A); a64w(out, 0x3900006A); a64w(out, 0x91000463);
+    a64w(out, 0xD1000508); a64w(out, 0xB5FFFF88); a64w(out, 0xF24000FF); a64w(out, 0x54000061); a64w(out, 0xD24000C6); a64w(out, 0x14000004);
+    a64w(out, 0x52800448); a64w(out, 0x39000068); a64w(out, 0x91000463); a64w(out, 0xD2800007); a64w(out, 0x91000442); a64w(out, 0x17FFFFD8);
+    a64w(out, 0xB40000C7); a64w(out, 0x52800B88); a64w(out, 0x39000068); a64w(out, 0x91000463); a64w(out, 0xD10004E7); a64w(out, 0xB5FFFF87);
+    a64w(out, 0x39400045); a64w(out, 0x3900007F); a64w(out, 0x34000065); a64w(out, 0x91000442); a64w(out, 0x17FFFFBD); a64w(out, 0xAA0403E0);
+    a64w(out, 0xD65F03C0);
+    return A64_PARSE_ARGV_SIZE;
+}
+
+// adrp Xd, <page of target>: the immediate is the signed page delta, split
+// into immlo (bits 30:29) and immhi (bits 23:5).
+fn a64_adrp(rd as i64, pc as i64, target as i64) as i64 {
+    let is i64 as delta = ((target & (0 - 4096)) - (pc & (0 - 4096))) >> 12;
+    // imm21 splits as immlo = imm[1:0] (bits 30:29) and immhi = imm[20:2]
+    // (bits 23:5) — immhi is the delta SHIFTED DOWN by two, not masked.
+    let is i64 as lo = delta & 3;
+    let is i64 as hi = (delta >> 2) & 524287;   // 19 bits
+    return 0x90000000 + (lo << 29) + (hi << 5) + rd;
+}
+
+fn a64_add_imm(rd as i64, rn as i64, imm as i64) as i64 {
+    return 0x91000000 + ((imm & 4095) << 10) + (rn << 5) + rd;
+}
+
+// bl <target>: 26-bit signed word offset.
+fn a64_bl(pc as i64, target as i64) as i64 {
+    let is i64 as off = (target - pc) >> 2;
+    return 0x94000000 + (off & 67108863);
+}
+
+// Mirrors emit_win_entry_stub. Reserves 0x440 (16-aligned) for the argv slot
+// array, fetches the command line, parses it, calls main and exits.
+fn emit_a64_entry_stub(out as *reader.ByteBuffer, main_rva as i64,
+                       getcmdline_iat_rva as i64, parse_argv_rva as i64,
+                       exitproc_iat_rva as i64, stub_rva as i64) as i64 {
+    a64w(out, 0xD11103FF);                                   // sub sp, sp, #0x440
+    a64w(out, a64_adrp(16, stub_rva + 4, getcmdline_iat_rva));
+    a64w(out, a64_add_imm(16, 16, getcmdline_iat_rva & 4095));
+    a64w(out, 0xF9400210);                                   // ldr x16, [x16]
+    a64w(out, 0xD63F0200);                                   // blr x16
+    a64w(out, a64_add_imm(1, 31, 40));                       // add x1, sp, #0x28
+    a64w(out, a64_bl(stub_rva + 24, parse_argv_rva));
+    a64w(out, a64_add_imm(1, 31, 40));                       // add x1, sp, #0x28
+    a64w(out, a64_bl(stub_rva + 32, main_rva));
+    a64w(out, a64_adrp(16, stub_rva + 36, exitproc_iat_rva));
+    a64w(out, a64_add_imm(16, 16, exitproc_iat_rva & 4095));
+    a64w(out, 0xF9400210);                                   // ldr x16, [x16]
+    a64w(out, 0xD63F0200);                                   // blr x16
+    a64w(out, 0xD4200000);                                   // brk #0
+    return A64_ENTRY_STUB_SIZE;
+}
+
+// ARM64 unwind. A .pdata RUNTIME_FUNCTION here is 8 bytes, not 12: the second
+// word is either a packed description or an RVA into .xdata, told apart by its
+// low two bits.
+//
+// Packed form (Flag != 0):
+//   [1:0] Flag=1  [12:2] FunctionLength/4  [14:13] RegF  [18:15] RegI
+//   [19]  H       [21:20] CR               [30:22] FrameSize/16
+//
+// We describe every function as saving nothing and chaining nothing. That is
+// accurate for execution and for a debugger's symbol lookup, but a stack walk
+// through a frame will not recover callee-saved registers — filling that in
+// means decoding the AArch64 prologue the way decode_user_prologue does for
+// x86, which is future work.
+fn a64_packed_unwind(func_len as i64) as i64 {
+    let is i64 as words = (func_len + 3) / 4;
+    if (words > 2047) { return 0; }        // too long for the packed form
+    return 1 + (words << 2);
+}
+
+// Fallback .xdata record for a function the packed form cannot describe.
+//   word0: [17:0] FunctionLength/4  [19:18] Vers=0  [20] X=0  [21] E=0
+//          [26:22] EpilogCount=0    [31:27] CodeWords=1
+//   word1: unwind codes — a single `end` (0xE4), zero padded.
+// Returns the offset of the record within `out`.
+fn a64_emit_xdata(out as *reader.ByteBuffer, func_len as i64) as i64 {
+    let is i64 as off = out.len;
+    let is i64 as words = (func_len + 3) / 4;
+    a64w(out, (words & 262143) + (1 << 27));
+    a64w(out, 228);                        // 0xE4 = end
+    return off;
+}

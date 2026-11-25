@@ -1,0 +1,682 @@
+// Native AArch64 assembler used by the linux-aarch64 compiler pipeline.
+//
+// This intentionally accepts the compact GNU-like dialect emitted by
+// src/codegen/aarch64/driver.cst, plus the scalar instructions allowed in
+// target-specific inline assembly.  It emits ELF64 RELA objects directly;
+// neither GNU binutils nor LLVM are part of the production path.
+
+use "../../std/io.cst" as io;
+use "../core/buf.cst" as buf;
+use "../encoder/encoder_util.cst" as enc;
+use "../output/elf.cst" as elf;
+use "../output/passes.cst" as passes;
+use "../parser/custom_sections.cst" as cs;
+use "../parser/cstimport.cst" as ci;
+use "../output/coff.cst" as coffw;
+use "../../src/codegen/target.cst" as tgt;
+use "../../src/ir/opt_mem.cst" as om;
+
+let is i64 as R_AARCH64_ABS64 with imut = 257;
+let is i64 as R_AARCH64_ADR_PREL_PG_HI21 with imut = 275;
+let is i64 as R_AARCH64_ADD_ABS_LO12_NC with imut = 277;
+let is i64 as R_AARCH64_CONDBR19 with imut = 280;
+let is i64 as R_AARCH64_JUMP26 with imut = 282;
+let is i64 as R_AARCH64_CALL26 with imut = 283;
+
+struct Slice {
+    ptr as *u8;
+    len as i32;
+}
+
+fn eq(s as *Slice, lit as *u8, n as i32) as i32 {
+    return enc.streq(s.ptr, s.len, lit, n);
+}
+
+fn make_slice(p as *u8, n as i32) as Slice {
+    let is Slice as s;
+    s.ptr = p; s.len = n;
+    return s;
+}
+
+fn clean_line(p as *u8, n as i32) as Slice {
+    let is i32 as a with mut = 0;
+    let is i32 as z with mut = n;
+    while (a < z && (p[a] == 32 || p[a] == 9 || p[a] == 13)) { a = a + 1; }
+    let is i32 as i with mut = a;
+    let is i32 as quoted with mut = 0;
+    while (i + 1 < z) {
+        if (p[i] == 34 && (i == 0 || p[i - 1] != 92)) { quoted = 1 - quoted; }
+        if (quoted == 0 && p[i] == 47 && p[i + 1] == 47) { z = i; break; }
+        i = i + 1;
+    }
+    while (z > a && (p[z - 1] == 32 || p[z - 1] == 9 || p[z - 1] == 13)) { z = z - 1; }
+    return make_slice(cast(*u8, cast(i64, p) + cast(i64, a)), z - a);
+}
+
+fn starts(s as *Slice, lit as *u8, n as i32) as i32 {
+    if (s.len < n) { return 0; }
+    return enc.streq(s.ptr, n, lit, n);
+}
+
+fn after_prefix(s as *Slice, n as i32) as Slice {
+    let is i32 as a with mut = n;
+    while (a < s.len && (s.ptr[a] == 32 || s.ptr[a] == 9)) { a = a + 1; }
+    let is i32 as z with mut = s.len;
+    while (z > a && (s.ptr[z - 1] == 32 || s.ptr[z - 1] == 9)) { z = z - 1; }
+    return make_slice(cast(*u8, cast(i64, s.ptr) + cast(i64, a)), z - a);
+}
+
+fn is_sep(c as u8) as i32 {
+    if (c == 0 || c == 32 || c == 9 || c == 44 || c == 91 || c == 93 || c == 35) { return 1; }
+    return 0;
+}
+
+fn next_tok(s as *Slice, pos as *i32) as Slice {
+    let is i32 as i with mut = *pos;
+    while (i < s.len && is_sep(s.ptr[i]) == 1) { i = i + 1; }
+    let is i32 as a = i;
+    while (i < s.len && is_sep(s.ptr[i]) == 0) { i = i + 1; }
+    *pos = i;
+    return make_slice(cast(*u8, cast(i64, s.ptr) + cast(i64, a)), i - a);
+}
+
+fn parse_num(s as *Slice, ok as *i32) as i64 {
+    *ok = 0;
+    if (s.len == 0) { return 0; }
+    let is i32 as i with mut = 0;
+    let is i64 as sign with mut = 1;
+    if (s.ptr[i] == 45) { sign = 0 - 1; i = i + 1; }
+    if (i >= s.len) { return 0; }
+    let is i64 as v with mut = 0;
+    let is i32 as base with mut = 10;
+    if (i + 1 < s.len && s.ptr[i] == 48 && (s.ptr[i + 1] == 120 || s.ptr[i + 1] == 88)) {
+        base = 16; i = i + 2;
+    }
+    let is i32 as any with mut = 0;
+    while (i < s.len) {
+        let is i32 as d with mut = 99;
+        if (s.ptr[i] >= 48 && s.ptr[i] <= 57) { d = cast(i32, s.ptr[i]) - 48; }
+        else if (s.ptr[i] >= 97 && s.ptr[i] <= 102) { d = cast(i32, s.ptr[i]) - 87; }
+        else if (s.ptr[i] >= 65 && s.ptr[i] <= 70) { d = cast(i32, s.ptr[i]) - 55; }
+        if (d >= base) { return 0; }
+        v = v * cast(i64, base) + cast(i64, d); any = 1; i = i + 1;
+    }
+    if (any == 1) { *ok = 1; }
+    return v * sign;
+}
+
+fn reg_num(s as *Slice) as i32 {
+    if (eq(s, "sp", 2) == 1 || eq(s, "xzr", 3) == 1 || eq(s, "wzr", 3) == 1) { return 31; }
+    if (s.len < 2) { return 99; }
+    let is u8 as k = s.ptr[0];
+    if (k != 120 && k != 119 && k != 100 && k != 115) { return 99; }
+    let is i32 as r with mut = 0;
+    let is i32 as i with mut = 1;
+    while (i < s.len) {
+        if (s.ptr[i] < 48 || s.ptr[i] > 57) { return 99; }
+        r = r * 10 + cast(i32, s.ptr[i]) - 48; i = i + 1;
+    }
+    if (r > 31) { return 99; }
+    return r;
+}
+
+fn is_w(s as *Slice) as i32 {
+    if (s.len > 0 && s.ptr[0] == 119) { return 1; }
+    return 0;
+}
+
+fn is_s(s as *Slice) as i32 {
+    if (s.len > 0 && s.ptr[0] == 115) { return 1; }
+    return 0;
+}
+
+fn cond_code(s as *Slice) as i32 {
+    if (eq(s, "eq", 2) == 1) { return 0; }
+    if (eq(s, "ne", 2) == 1) { return 1; }
+    if (eq(s, "hs", 2) == 1 || eq(s, "cs", 2) == 1) { return 2; }
+    if (eq(s, "lo", 2) == 1 || eq(s, "cc", 2) == 1) { return 3; }
+    if (eq(s, "mi", 2) == 1) { return 4; }
+    if (eq(s, "pl", 2) == 1) { return 5; }
+    if (eq(s, "vs", 2) == 1) { return 6; }
+    if (eq(s, "vc", 2) == 1) { return 7; }
+    if (eq(s, "hi", 2) == 1) { return 8; }
+    if (eq(s, "ls", 2) == 1) { return 9; }
+    if (eq(s, "ge", 2) == 1) { return 10; }
+    if (eq(s, "lt", 2) == 1) { return 11; }
+    if (eq(s, "gt", 2) == 1) { return 12; }
+    if (eq(s, "le", 2) == 1) { return 13; }
+    if (eq(s, "al", 2) == 1) { return 14; }
+    return 99;
+}
+
+fn current_off(section as i32, text_off as i64, data_off as i64, ro_off as i64,
+               bss_off as i64, csec_offs as *i64) as i64 {
+    if (section == cs.SECTION_TEXT) { return text_off; }
+    if (section == cs.SECTION_DATA) { return data_off; }
+    if (section == cs.SECTION_RODATA) { return ro_off; }
+    if (section == cs.SECTION_BSS) { return bss_off; }
+    return csec_offs[section - cs.SECTION_CUSTOM_BASE];
+}
+
+fn directive_size(s as *Slice) as i64 {
+    if (starts(s, ".string", 7) == 1 || starts(s, ".ascii", 6) == 1) {
+        let is i32 as n with mut = 7;
+        if (s.ptr[1] == 97) { n = 6; }
+        let is Slice as arg = after_prefix(s, n);
+        let is i32 as decoded_len with mut = 0;
+        passes.decode_string(arg.ptr, arg.len, &decoded_len);
+        if (starts(s, ".string", 7) == 1) { return cast(i64, decoded_len + 1); }
+        return cast(i64, decoded_len);
+    }
+    if (starts(s, ".byte", 5) == 1) {
+        let is Slice as a = after_prefix(s, 5);
+        let is i32 as count with mut = 0;
+        let is i32 as i with mut = 0;
+        while (i < a.len) { if (a.ptr[i] == 44) { count = count + 1; } i = i + 1; }
+        return cast(i64, count + 1);
+    }
+    if (starts(s, ".short", 6) == 1 || starts(s, ".word", 5) == 1) { return 2; }
+    if (starts(s, ".long", 5) == 1) { return 4; }
+    if (starts(s, ".quad", 5) == 1) { return 8; }
+    if (starts(s, ".zero", 5) == 1) {
+        let is Slice as a = after_prefix(s, 5); let is i32 as ok with mut = 0;
+        return parse_num(&a, &ok);
+    }
+    return 0;
+}
+
+fn select_section(s as *Slice, section as *i32) as i32 {
+    if (eq(s, ".text", 5) == 1) { *section = cs.SECTION_TEXT; return 1; }
+    if (eq(s, ".data", 5) == 1) { *section = cs.SECTION_DATA; return 1; }
+    if (eq(s, ".rodata", 7) == 1) { *section = cs.SECTION_RODATA; return 1; }
+    if (eq(s, ".bss", 4) == 1) { *section = cs.SECTION_BSS; return 1; }
+    if (starts(s, ".section", 8) == 1) {
+        let is Slice as name = after_prefix(s, 8);
+        let is i32 as n with mut = 0;
+        while (n < name.len && name.ptr[n] != 44 && name.ptr[n] != 32 && name.ptr[n] != 9) { n = n + 1; }
+        let is Slice as bare = make_slice(name.ptr, n);
+        if (eq(&bare, ".text", 5) == 1) { *section = cs.SECTION_TEXT; }
+        else if (eq(&bare, ".data", 5) == 1) { *section = cs.SECTION_DATA; }
+        else if (eq(&bare, ".rodata", 7) == 1) { *section = cs.SECTION_RODATA; }
+        else if (eq(&bare, ".bss", 4) == 1) { *section = cs.SECTION_BSS; }
+        else { *section = cs.SECTION_CUSTOM_BASE + cs.csec_find_or_add(bare.ptr, bare.len); }
+        return 1;
+    }
+    return 0;
+}
+
+fn pass1(src as *u8, size as i64, st as *elf.SymbolTable) as i32 {
+    let is i64 as text_off with mut = 0;
+    let is i64 as data_off with mut = 0;
+    let is i64 as ro_off with mut = 0;
+    let is i64 as bss_off with mut = 0;
+    // Sections are discovered during this scan, so the count is not known yet;
+    // MAX_CUSTOM_SECTIONS bounds every index csec_find_or_add can hand out. This
+    // was a [32], indexed past its end by a 33rd custom section.
+    let is i64 as ncs = cast(i64, cs.MAX_CUSTOM_SECTIONS) + 1;
+    let is *i64 as csec_offs = cast(*i64, om.opt_alloc(ncs * 8));
+    let is i64 as zi with mut = 0; while (zi < ncs) { csec_offs[zi] = 0; zi = zi + 1; }
+    let is i32 as section with mut = cs.SECTION_TEXT;
+    let is i64 as p with mut = 0;
+    while (p < size) {
+        let is i64 as a = p;
+        while (p < size && src[p] != 10) { p = p + 1; }
+        let is Slice as line = clean_line(cast(*u8, cast(i64, src) + a), cast(i32, p - a));
+        p = p + 1;
+        if (line.len == 0) { continue; }
+        if (select_section(&line, &section) == 1) { continue; }
+        if (starts(&line, ".globl", 6) == 1 || starts(&line, ".global", 7) == 1) {
+            let is i32 as n with mut = 6; if (starts(&line, ".global", 7) == 1) { n = 7; }
+            let is Slice as name = after_prefix(&line, n);
+            elf.sym_find_or_add(st, name.ptr, name.len, cs.SECTION_UNDEF, 0, 1);
+            continue;
+        }
+        if (line.ptr[line.len - 1] == 58) {
+            let is Slice as name = make_slice(line.ptr, line.len - 1);
+            let is i64 as off = current_off(section, text_off, data_off, ro_off, bss_off, csec_offs);
+            elf.sym_find_or_add(st, name.ptr, name.len, section, off, 0);
+            continue;
+        }
+        let is i64 as add with mut = 4;
+        if (line.ptr[0] == 46) { add = directive_size(&line); }
+        if (section == cs.SECTION_TEXT) { text_off = text_off + add; }
+        else if (section == cs.SECTION_DATA) { data_off = data_off + add; }
+        else if (section == cs.SECTION_RODATA) { ro_off = ro_off + add; }
+        else if (section == cs.SECTION_BSS) { bss_off = bss_off + add; }
+        else { csec_offs[section - cs.SECTION_CUSTOM_BASE] = csec_offs[section - cs.SECTION_CUSTOM_BASE] + add; }
+    }
+    return 0;
+}
+
+fn label_delta(st as *elf.SymbolTable, name as *Slice, pc as i64, scale as i64, ok as *i32) as i64 {
+    let is i32 as si = elf.sym_find(st, name.ptr, name.len);
+    if (si == 99999) { *ok = 0; return 0; }
+    let is *elf.Symbol as sym = elf.sym_get(st, si);
+    if (sym.section != cs.SECTION_TEXT || sym.is_global == 1) { *ok = 0; return 0; }
+    *ok = 1;
+    return (sym.offset - pc) / scale;
+}
+
+fn add_reloc(st as *elf.SymbolTable, rl as *elf.RelocList, name as *Slice,
+             off as i64, kind as i64, addend as i64) as void {
+    let is i32 as si with mut = elf.sym_find(st, name.ptr, name.len);
+    if (si == 99999) {
+        si = elf.sym_find_or_add(st, name.ptr, name.len, cs.SECTION_UNDEF, 0, 1);
+        elf.sym_get(st, si).is_global = 1;
+    }
+    elf.reloc_add(rl, off, cast(i64, si), kind, addend);
+}
+
+fn encode_inst(line as *Slice, pc as i64, st as *elf.SymbolTable,
+               relocs as *elf.RelocList, out as *buf.ByteBuffer) as i32 {
+    let is [8]Slice as t;
+    let is i32 as pos with mut = 0;
+    let is i32 as nt with mut = 0;
+    while (nt < 8) {
+        t[nt] = next_tok(line, &pos);
+        if (t[nt].len == 0) { break; }
+        nt = nt + 1;
+    }
+    if (nt == 0) { return 0; }
+    let is i32 as rd with mut = 0; let is i32 as rn with mut = 0; let is i32 as rm with mut = 0;
+    if (nt > 1) { rd = reg_num(&t[1]); } if (nt > 2) { rn = reg_num(&t[2]); } if (nt > 3) { rm = reg_num(&t[3]); }
+    let is i32 as nok with mut = 0;
+    let is i64 as imm with mut = 0;
+    if (nt > 2) { imm = parse_num(&t[nt - 1], &nok); }
+    let is i64 as ins with mut = 0;
+
+    if (eq(&t[0], "mov", 3) == 1) {
+        if (eq(&t[1], "sp", 2) == 1 || eq(&t[2], "sp", 2) == 1) {
+            ins = 0x91000000 + cast(i64, rn << 5) + cast(i64, rd);
+        } else {
+            // `mov Rd, #imm` is an alias for movz when the value fits one
+            // 16-bit field. Without this branch the numeric operand was read
+            // as a register, so `mov x0, 0` encoded as a wrong `mvn` and
+            // silently produced ~x3 — the compiler only ever emits movz/movk,
+            // which is why it went unnoticed until hand-written asm used it.
+            let is i32 as iok with mut = 0;
+            let is i64 as iv = parse_num(&t[2], &iok);
+            if (iok == 1) {
+                let is i64 as sh with mut = 0;
+                let is i32 as placed with mut = 0;
+                if (iv >= 0) {
+                    if ((iv & 65535) == iv) { sh = 0; placed = 1; }
+                    else if ((iv & 4294901760) == iv) { sh = 16; placed = 1; }
+                    else if ((iv & 281470681743360) == iv) { sh = 32; placed = 1; }
+                    else if ((iv & 281474976710655) == 0) { sh = 48; placed = 1; }
+                }
+                // A value that is not one 16-bit field needs movz/movk; reject
+                // it rather than encode something else.
+                if (placed == 0) { return 1; }
+                ins = 0xD2800000 + (sh / 16) * 0x200000 + ((iv >> sh) & 65535) * 32 + cast(i64, rd);
+                if (is_w(&t[1]) == 1) { ins = ins - 0x80000000; }
+            } else {
+                ins = 0xAA0003E0 + cast(i64, rn << 16) + cast(i64, rd);
+                if (is_w(&t[1]) == 1) { ins = ins - 0x80000000; }
+            }
+        }
+    }
+    else if (eq(&t[0], "movz", 4) == 1 || eq(&t[0], "movk", 4) == 1) {
+        let is i32 as ok2 with mut = 0; let is i64 as val = parse_num(&t[2], &ok2);
+        let is i64 as sh with mut = 0;
+        if (nt >= 5) { sh = parse_num(&t[4], &ok2); }
+        if (eq(&t[0], "movz", 4) == 1) { ins = 0xD2800000; } else { ins = 0xF2800000; }
+        ins = ins + (sh / 16) * 0x200000 + (val & 65535) * 32 + cast(i64, rd);
+    }
+    else if (eq(&t[0], "addlsl", 6) == 1) {
+        let is i32 as ok2 with mut = 0; let is i64 as sh = parse_num(&t[4], &ok2);
+        ins = 0x8B000000 + cast(i64, rm << 16) + sh * 1024 + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "addlo", 5) == 1) {
+        ins = 0x91000000 + cast(i64, rn << 5) + cast(i64, rd);
+        add_reloc(st, relocs, &t[3], pc, R_AARCH64_ADD_ABS_LO12_NC, 0);
+    }
+    else if (eq(&t[0], "adrp", 4) == 1) {
+        ins = 0x90000000 + cast(i64, rd);
+        add_reloc(st, relocs, &t[2], pc, R_AARCH64_ADR_PREL_PG_HI21, 0);
+    }
+    else if (eq(&t[0], "add", 3) == 1 || eq(&t[0], "sub", 3) == 1) {
+        if (nok == 1) {
+            if (eq(&t[0], "add", 3) == 1) { ins = 0x91000000; } else { ins = 0xD1000000; }
+            ins = ins + (imm & 4095) * 1024 + cast(i64, rn << 5) + cast(i64, rd);
+        } else {
+            // SP is encoded through the extended-register form (UXTX), not
+            // the shifted-register form where register 31 means XZR.
+            if (rd == 31 || rn == 31) {
+                if (eq(&t[0], "add", 3) == 1) { ins = 0x8B206000; } else { ins = 0xCB206000; }
+            } else {
+                if (eq(&t[0], "add", 3) == 1) { ins = 0x8B000000; } else { ins = 0xCB000000; }
+                if (is_w(&t[1]) == 1) { ins = ins - 0x80000000; }
+            }
+            ins = ins + cast(i64, rm << 16) + cast(i64, rn << 5) + cast(i64, rd);
+        }
+    }
+    else if (eq(&t[0], "mul", 3) == 1) { ins = 0x9B007C00 + cast(i64, rm << 16) + cast(i64, rn << 5) + cast(i64, rd); }
+    else if (eq(&t[0], "sdiv", 4) == 1 || eq(&t[0], "udiv", 4) == 1) {
+        if (eq(&t[0], "sdiv", 4) == 1) { ins = 0x9AC00C00; } else { ins = 0x9AC00800; }
+        ins = ins + cast(i64, rm << 16) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "msub", 4) == 1) {
+        let is i32 as ra = reg_num(&t[4]);
+        ins = 0x9B008000 + cast(i64, rm << 16) + cast(i64, ra << 10) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "neg", 3) == 1 || eq(&t[0], "mvn", 3) == 1) {
+        if (eq(&t[0], "neg", 3) == 1) { ins = 0xCB0003E0; } else { ins = 0xAA2003E0; }
+        ins = ins + cast(i64, rn << 16) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "and", 3) == 1 || eq(&t[0], "orr", 3) == 1 || eq(&t[0], "eor", 3) == 1) {
+        if (eq(&t[0], "and", 3) == 1) { ins = 0x8A000000; }
+        else if (eq(&t[0], "orr", 3) == 1) { ins = 0xAA000000; } else { ins = 0xCA000000; }
+        ins = ins + cast(i64, rm << 16) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "lslv", 4) == 1 || eq(&t[0], "lsrv", 4) == 1 || eq(&t[0], "asrv", 4) == 1) {
+        if (eq(&t[0], "lslv", 4) == 1) { ins = 0x9AC02000; }
+        else if (eq(&t[0], "lsrv", 4) == 1) { ins = 0x9AC02400; } else { ins = 0x9AC02800; }
+        ins = ins + cast(i64, rm << 16) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "cmp", 3) == 1) {
+        if (nok == 1) { ins = 0xF100001F + (imm & 4095) * 1024 + cast(i64, rd << 5); }
+        else {
+            ins = 0xEB00001F + cast(i64, rn << 16) + cast(i64, rd << 5);
+            if (is_w(&t[1]) == 1) { ins = ins - 0x80000000; }
+        }
+    }
+    else if (eq(&t[0], "cset", 4) == 1) {
+        let is i32 as cc = cond_code(&t[2]);
+        ins = 0x9A9F07E0 + cast(i64, (cc ^ 1) << 12) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "csel", 4) == 1) {
+        let is i32 as cc = cond_code(&t[4]);
+        ins = 0x9A800000 + cast(i64, rm << 16) + cast(i64, cc << 12) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "stur", 4) == 1 || eq(&t[0], "ldur", 4) == 1) {
+        let is i32 as ok2 with mut = 0; let is i64 as off = parse_num(&t[3], &ok2);
+        if (ok2 == 0 || off < (0 - 256) || off > 255) { return 1; }
+        if (eq(&t[0], "stur", 4) == 1) { ins = 0xF8000000; } else { ins = 0xF8400000; }
+        ins = ins + ((off & 511) << 12) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "ldr", 3) == 1 || eq(&t[0], "str", 3) == 1
+          || eq(&t[0], "ldrb", 4) == 1 || eq(&t[0], "strb", 4) == 1
+          || eq(&t[0], "ldrh", 4) == 1 || eq(&t[0], "strh", 4) == 1
+          || eq(&t[0], "ldrsb", 5) == 1 || eq(&t[0], "ldrsh", 5) == 1 || eq(&t[0], "ldrsw", 5) == 1) {
+        let is i64 as off with mut = 0; if (nt > 3) { let is i32 as ok2 with mut = 0; off = parse_num(&t[3], &ok2); }
+        let is i64 as scale with mut = 8;
+        if (eq(&t[0], "ldrb", 4) == 1 || eq(&t[0], "strb", 4) == 1 || eq(&t[0], "ldrsb", 5) == 1) { scale = 1; }
+        else if (eq(&t[0], "ldrh", 4) == 1 || eq(&t[0], "strh", 4) == 1 || eq(&t[0], "ldrsh", 5) == 1) { scale = 2; }
+        else if (is_w(&t[1]) == 1 || is_s(&t[1]) == 1 || eq(&t[0], "ldrsw", 5) == 1) { scale = 4; }
+        if (eq(&t[0], "ldr", 3) == 1) {
+            if (is_s(&t[1]) == 1) { ins = 0xBD400000; } else if (t[1].ptr[0] == 100) { ins = 0xFD400000; }
+            else if (is_w(&t[1]) == 1) { ins = 0xB9400000; } else { ins = 0xF9400000; }
+        } else if (eq(&t[0], "str", 3) == 1) {
+            if (is_s(&t[1]) == 1) { ins = 0xBD000000; } else if (t[1].ptr[0] == 100) { ins = 0xFD000000; }
+            else if (is_w(&t[1]) == 1) { ins = 0xB9000000; } else { ins = 0xF9000000; }
+        } else if (eq(&t[0], "ldrb", 4) == 1) { ins = 0x39400000; }
+        else if (eq(&t[0], "strb", 4) == 1) { ins = 0x39000000; }
+        else if (eq(&t[0], "ldrh", 4) == 1) { ins = 0x79400000; }
+        else if (eq(&t[0], "strh", 4) == 1) { ins = 0x79000000; }
+        else if (eq(&t[0], "ldrsb", 5) == 1) { ins = 0x39800000; }
+        else if (eq(&t[0], "ldrsh", 5) == 1) { ins = 0x79800000; }
+        else { ins = 0xB9800000; }
+        if (off < 0 || off % scale != 0 || off / scale > 4095) { return 1; }
+        ins = ins + (off / scale) * 1024 + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "fmov", 4) == 1) {
+        if (t[1].ptr[0] == 100) { ins = 0x9E670000; } else { ins = 0x9E660000; }
+        ins = ins + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "fadd", 4) == 1 || eq(&t[0], "fsub", 4) == 1 || eq(&t[0], "fmul", 4) == 1 || eq(&t[0], "fdiv", 4) == 1) {
+        if (eq(&t[0], "fadd", 4) == 1) { ins = 0x1E602800; }
+        else if (eq(&t[0], "fsub", 4) == 1) { ins = 0x1E603800; }
+        else if (eq(&t[0], "fmul", 4) == 1) { ins = 0x1E600800; } else { ins = 0x1E601800; }
+        if (is_s(&t[1]) == 1) { ins = ins - 0x400000; }
+        ins = ins + cast(i64, rm << 16) + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "fneg", 4) == 1 || eq(&t[0], "fsqrt", 5) == 1) {
+        if (eq(&t[0], "fneg", 4) == 1) { ins = 0x1E614000; } else { ins = 0x1E61C000; }
+        if (is_s(&t[1]) == 1) { ins = ins - 0x400000; }
+        ins = ins + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "fcmp", 4) == 1) { ins = 0x1E602000 + cast(i64, rn << 16) + cast(i64, rd << 5); }
+    else if (eq(&t[0], "fcvt", 4) == 1) {
+        if (is_s(&t[1]) == 1) { ins = 0x1E624000; } else { ins = 0x1E22C000; }
+        ins = ins + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "scvtf", 5) == 1 || eq(&t[0], "ucvtf", 5) == 1
+          || eq(&t[0], "fcvtzs", 6) == 1 || eq(&t[0], "fcvtzu", 6) == 1) {
+        if (eq(&t[0], "scvtf", 5) == 1) { ins = 0x9E620000; }
+        else if (eq(&t[0], "ucvtf", 5) == 1) { ins = 0x9E630000; }
+        else if (eq(&t[0], "fcvtzs", 6) == 1) { ins = 0x9E780000; } else { ins = 0x9E790000; }
+        if ((eq(&t[0], "scvtf", 5) == 1 || eq(&t[0], "ucvtf", 5) == 1) && is_s(&t[1]) == 1) {
+            ins = ins - 0x400000;
+        } else if ((eq(&t[0], "fcvtzs", 6) == 1 || eq(&t[0], "fcvtzu", 6) == 1) && is_s(&t[2]) == 1) {
+            ins = ins - 0x400000;
+        }
+        ins = ins + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "sxtb", 4) == 1 || eq(&t[0], "sxth", 4) == 1 || eq(&t[0], "sxtw", 4) == 1
+          || eq(&t[0], "uxtb", 4) == 1 || eq(&t[0], "uxth", 4) == 1) {
+        if (eq(&t[0], "sxtb", 4) == 1) { ins = 0x93401C00; }
+        else if (eq(&t[0], "sxth", 4) == 1) { ins = 0x93403C00; }
+        else if (eq(&t[0], "sxtw", 4) == 1) { ins = 0x93407C00; }
+        else if (eq(&t[0], "uxtb", 4) == 1) { ins = 0x53001C00; } else { ins = 0x53003C00; }
+        ins = ins + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "b", 1) == 1 || eq(&t[0], "bl", 2) == 1) {
+        let is i32 as local with mut = 0; let is i64 as d = label_delta(st, &t[1], pc, 4, &local);
+        if (eq(&t[0], "bl", 2) == 1) { ins = 0x94000000; } else { ins = 0x14000000; }
+        if (local == 1) { ins = ins + (d & 0x3FFFFFF); }
+        else {
+            let is i64 as rk with mut = R_AARCH64_JUMP26; if (eq(&t[0], "bl", 2) == 1) { rk = R_AARCH64_CALL26; }
+            add_reloc(st, relocs, &t[1], pc, rk, 0);
+        }
+    }
+    else if (starts(&t[0], "b.", 2) == 1) {
+        let is Slice as cn = make_slice(cast(*u8, cast(i64, t[0].ptr) + 2), t[0].len - 2);
+        let is i32 as cc = cond_code(&cn);
+        let is i32 as local with mut = 0; let is i64 as d = label_delta(st, &t[1], pc, 4, &local);
+        ins = 0x54000000 + cast(i64, cc);
+        if (local == 1) { ins = ins + ((d & 0x7FFFF) << 5); }
+        else { add_reloc(st, relocs, &t[1], pc, R_AARCH64_CONDBR19, 0); }
+    }
+    else if (eq(&t[0], "cbz", 3) == 1 || eq(&t[0], "cbnz", 4) == 1) {
+        let is i32 as local with mut = 0; let is i64 as d = label_delta(st, &t[2], pc, 4, &local);
+        if (is_w(&t[1]) == 1) { ins = 0x34000000; } else { ins = 0xB4000000; }
+        if (eq(&t[0], "cbnz", 4) == 1) { ins = ins + 0x01000000; }
+        ins = ins + cast(i64, rd);
+        if (local == 1) { ins = ins + ((d & 0x7FFFF) << 5); }
+        else { add_reloc(st, relocs, &t[2], pc, R_AARCH64_CONDBR19, 0); }
+    }
+    else if (eq(&t[0], "blr", 3) == 1) { ins = 0xD63F0000 + cast(i64, rd << 5); }
+    else if (eq(&t[0], "ret", 3) == 1) { ins = 0xD65F03C0; }
+    else if (eq(&t[0], "svc", 3) == 1) { ins = 0xD4000001 + (imm & 65535) * 32; }
+    else if (eq(&t[0], "dmb", 3) == 1 && eq(&t[1], "ish", 3) == 1) { ins = 0xD5033BBF; }
+    else if (eq(&t[0], "yield", 5) == 1) { ins = 0xD503203F; }
+    else if (eq(&t[0], "brk", 3) == 1) { ins = 0xD4200000 + (imm & 65535) * 32; }
+    else if (eq(&t[0], "clrex", 5) == 1) { ins = 0xD5033F5F; }
+    else if (eq(&t[0], "ldar", 4) == 1 || eq(&t[0], "stlr", 4) == 1 || eq(&t[0], "ldaxr", 5) == 1) {
+        if (eq(&t[0], "ldar", 4) == 1) { if (is_w(&t[1]) == 1) { ins = 0x88DFFC00; } else { ins = 0xC8DFFC00; } }
+        else if (eq(&t[0], "stlr", 4) == 1) { if (is_w(&t[1]) == 1) { ins = 0x889FFC00; } else { ins = 0xC89FFC00; } }
+        else { if (is_w(&t[1]) == 1) { ins = 0x885FFC00; } else { ins = 0xC85FFC00; } }
+        ins = ins + cast(i64, rn << 5) + cast(i64, rd);
+    }
+    else if (eq(&t[0], "stlxr", 5) == 1) {
+        let is i32 as rs = rd; let is i32 as rt = rn; let is i32 as base = reg_num(&t[3]);
+        if (is_w(&t[2]) == 1) { ins = 0x8800FC00; } else { ins = 0xC800FC00; }
+        ins = ins + cast(i64, rs << 16) + cast(i64, base << 5) + cast(i64, rt);
+    }
+    else { return 1; }
+
+    buf.buf_emit32_le(out, ins);
+    return 0;
+}
+
+fn emit_data(line as *Slice, target as *buf.ByteBuffer, section as i32,
+             bss_size as *i64, st as *elf.SymbolTable, relocs as *elf.RelocList) as i32 {
+    // `.cstimport "<dll>" <symbol>` — emitted by the backend beside every FFI
+    // call. Unknown directives fall through this function returning 0, so before
+    // this the AArch64 path dropped them silently and no import table was built.
+    if (starts(line, ".cstimport", 10) == 1) {
+        let is Slice as a = after_prefix(line, 10);
+        let is i32 as p with mut = 0;
+        let is Slice as dll = next_tok(&a, &p);
+        let is Slice as sym = next_tok(&a, &p);
+        if (dll.len == 0 || sym.len == 0) { return 1; }
+        let is *u8 as dp with mut = dll.ptr;
+        let is i32 as dlen with mut = dll.len;
+        if (dlen >= 2 && dp[0] == 34 && dp[dlen - 1] == 34) {
+            dp = cast(*u8, cast(i64, dp) + 1);
+            dlen = dlen - 2;
+        }
+        ci.cstimport_add(dp, dlen, sym.ptr, sym.len);
+        return 0;
+    }
+    if (starts(line, ".string", 7) == 1 || starts(line, ".ascii", 6) == 1) {
+        let is i32 as n with mut = 7; if (starts(line, ".ascii", 6) == 1) { n = 6; }
+        let is Slice as a = after_prefix(line, n); let is i32 as dl with mut = 0;
+        let is *u8 as decoded = passes.decode_string(a.ptr, a.len, &dl);
+        if (section != cs.SECTION_BSS) { buf.buf_append(target, decoded, cast(i64, dl)); }
+        if (starts(line, ".string", 7) == 1 && section != cs.SECTION_BSS) { buf.buf_emit8(target, 0); }
+        if (section == cs.SECTION_BSS) { *bss_size = *bss_size + cast(i64, dl); }
+        return 0;
+    }
+    let is i32 as n with mut = 0;
+    if (starts(line, ".byte", 5) == 1) { n = 5; }
+    else if (starts(line, ".short", 6) == 1) { n = 6; }
+    else if (starts(line, ".word", 5) == 1) { n = 5; }
+    else if (starts(line, ".long", 5) == 1) { n = 5; }
+    else if (starts(line, ".quad", 5) == 1) { n = 5; }
+    else if (starts(line, ".zero", 5) == 1) { n = 5; }
+    else { return 0; }
+    let is Slice as a = after_prefix(line, n);
+    if (starts(line, ".byte", 5) == 1) {
+        let is i32 as p with mut = 0;
+        while (p < a.len) {
+            let is Slice as x = next_tok(&a, &p); if (x.len == 0) { break; }
+            let is i32 as ok with mut = 0; let is i64 as v = parse_num(&x, &ok);
+            if (ok == 0) { return 1; }
+            if (section == cs.SECTION_BSS) { *bss_size = *bss_size + 1; } else { buf.buf_emit8(target, cast(i32, v)); }
+        }
+        return 0;
+    }
+    let is i32 as ok with mut = 0; let is i64 as v = parse_num(&a, &ok);
+    if (starts(line, ".zero", 5) == 1) {
+        if (section == cs.SECTION_BSS) { *bss_size = *bss_size + v; }
+        else { let is i64 as i with mut = 0; while (i < v) { buf.buf_emit8(target, 0); i = i + 1; } }
+    } else if (starts(line, ".quad", 5) == 1 && ok == 0) {
+        add_reloc(st, relocs, &a, target.len, R_AARCH64_ABS64, 0); buf.buf_emit64_le(target, 0);
+    } else if (ok == 0) { return 1; }
+    else if (starts(line, ".short", 6) == 1 || starts(line, ".word", 5) == 1) { buf.buf_emit16_le(target, cast(i32, v)); }
+    else if (starts(line, ".long", 5) == 1) { buf.buf_emit32_le(target, v); }
+    else { buf.buf_emit64_le(target, v); }
+    return 0;
+}
+
+// `.cfi_*` directives from the AArch64 codegen. They feed the shared CFI
+// collector (passes.cfi_*), which the ELF writer turns into .cstcfi. AArch64
+// register numbers are already DWARF numbers (x0..x30 = 0..30, sp = 31).
+// Returns 1 when the line is not a .cfi_ directive.
+fn emit_cfi(line as *Slice, off as i64) as i32 {
+    if (starts(line, ".cfi_startproc", 14) == 1) {
+        let is Slice as a = after_prefix(line, 14);
+        let is i32 as p with mut = 0;
+        let is Slice as nm = next_tok(&a, &p);
+        passes.cfi_begin(nm.ptr, nm.len, off);
+        return 0;
+    }
+    if (starts(line, ".cfi_endproc", 12) == 1) { passes.cfi_end(off); return 0; }
+    if (starts(line, ".cfi_def_cfa_offset", 19) == 1) {
+        let is Slice as a = after_prefix(line, 19);
+        let is i32 as p with mut = 0;
+        let is Slice as n = next_tok(&a, &p);
+        let is i32 as ok with mut = 0;
+        passes.cfi_def_cfa_offset(off, parse_num(&n, &ok));
+        return 0;
+    }
+    if (starts(line, ".cfi_def_cfa_register", 21) == 1) {
+        let is Slice as a = after_prefix(line, 21);
+        let is i32 as p with mut = 0;
+        let is Slice as r = next_tok(&a, &p);
+        passes.cfi_def_cfa_register(off, reg_num(&r));
+        return 0;
+    }
+    if (starts(line, ".cfi_offset", 11) == 1) {
+        let is Slice as a = after_prefix(line, 11);
+        let is i32 as p with mut = 0;
+        let is Slice as r = next_tok(&a, &p);
+        let is Slice as n = next_tok(&a, &p);
+        let is i32 as ok with mut = 0;
+        passes.cfi_offset(off, reg_num(&r), parse_num(&n, &ok));
+        return 0;
+    }
+    return 1;
+}
+
+fn pass2(src as *u8, size as i64, st as *elf.SymbolTable, text as *buf.ByteBuffer,
+         data as *buf.ByteBuffer, rodata as *buf.ByteBuffer, bss_size as *i64,
+         text_relocs as *elf.RelocList, data_relocs as *elf.RelocList) as i32 {
+    let is i32 as section with mut = cs.SECTION_TEXT;
+    let is i64 as p with mut = 0;
+    while (p < size) {
+        let is i64 as a = p; while (p < size && src[p] != 10) { p = p + 1; }
+        let is Slice as line = clean_line(cast(*u8, cast(i64, src) + a), cast(i32, p - a)); p = p + 1;
+        if (line.len == 0 || select_section(&line, &section) == 1 || line.ptr[line.len - 1] == 58
+            || starts(&line, ".globl", 6) == 1 || starts(&line, ".global", 7) == 1) { continue; }
+        let is *buf.ByteBuffer as target with mut = text;
+        let is *elf.RelocList as rl with mut = text_relocs;
+        if (section == cs.SECTION_DATA) { target = data; rl = data_relocs; }
+        else if (section == cs.SECTION_RODATA) { target = rodata; }
+        else if (section >= cs.SECTION_CUSTOM_BASE) {
+            let is *i64 as bp = cast(*i64, cs.csec_buf_ptrs); target = cast(*buf.ByteBuffer, bp[section - cs.SECTION_CUSTOM_BASE]);
+            let is *i64 as rp = cast(*i64, cs.csec_reloc_ptrs); rl = cast(*elf.RelocList, rp[section - cs.SECTION_CUSTOM_BASE]);
+        }
+        let is i32 as bad with mut = 0;
+        if (line.ptr[0] == 46) {
+            if (starts(&line, ".cfi_", 5) == 1) { bad = emit_cfi(&line, target.len); }
+            else { bad = emit_data(&line, target, section, bss_size, st, rl); }
+        }
+        else { bad = encode_inst(&line, target.len, st, rl, target); }
+        if (bad != 0) {
+            io.eprint_str("caustic-as: unsupported or invalid AArch64 line: ");
+            io._write_fd(io.STDERR, line.ptr, cast(i64, line.len)); io.eprint_str("\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn assemble_buf(src as *u8, size as i64, obj_path as *u8) as i32 {
+    cs.csec_init();
+    ci.cstimport_init();
+    let is elf.SymbolTable as st = elf.sym_init();
+    if (pass1(src, size, &st) != 0) { return 1; }
+    let is buf.ByteBuffer as text = buf.buf_init(65536);
+    let is buf.ByteBuffer as data = buf.buf_init(4096);
+    let is buf.ByteBuffer as rodata = buf.buf_init(4096);
+    let is i64 as bss_size with mut = 0;
+    let is elf.RelocList as text_relocs = elf.reloc_init();
+    let is elf.RelocList as data_relocs = elf.reloc_init();
+    defer elf.sym_free(&st);          // the compiler assembles every module in one process
+    defer buf.buf_free(&text);
+    defer buf.buf_free(&data);
+    defer buf.buf_free(&rodata);
+    defer elf.reloc_free(&text_relocs);
+    defer elf.reloc_free(&data_relocs);
+    passes.cfi_init(4);                          // AArch64: 4-byte instruction units
+    if (pass2(src, size, &st, &text, &data, &rodata, &bss_size, &text_relocs, &data_relocs) != 0) { return 1; }
+    passes.cfi_flush();
+    // Serialize any .cstimport entries into the custom section the linker reads.
+    ci.cstimport_emit_section();
+    let is i64 as fd = io._open_write(obj_path);
+    if (fd < 0) { io.eprint_str("caustic-as: cannot create output\n"); return 1; }
+    // A Windows target wants a COFF .obj; everything else gets ELF.
+    if (tgt.target_get().object_format == 2) {
+        coffw.write_coff(fd, &text, &data, &rodata, bss_size, &st, &text_relocs, &data_relocs,
+                         cs.csec_buf_ptrs, cs.csec_name_ptrs, cs.csec_name_lens, cs.csec_reloc_ptrs, cs.csec_count);
+        io._close_fd(fd);
+        return 0;
+    }
+    elf.write_elf(fd, &text, &data, &rodata, bss_size, &st, &text_relocs, &data_relocs,
+                  cs.csec_buf_ptrs, cs.csec_name_ptrs, cs.csec_name_lens, cs.csec_reloc_ptrs, cs.csec_count);
+    io._close_fd(fd);
+    return 0;
+}

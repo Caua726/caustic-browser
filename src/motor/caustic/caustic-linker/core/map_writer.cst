@@ -1,0 +1,76 @@
+// core/map_writer.cst — link map output (--map). Extracted from linker.cst,
+// which stays the base module (imported as `linker`) holding linker.LinkerState and
+// the global symbol table.
+use "../../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../../src/ir/opt_mem.cst" as om;
+use "../readers/elf_reader.cst" as reader;
+use "linker.cst" as linker;
+
+fn write_map(ls as *linker.LinkerState, output_path as *u8) as void {
+    let is i64 as path_len = reader.strlen(output_path);
+    let is *u8 as map_path = om.opt_alloc(path_len + 5);
+    mem.memcpy(map_path, output_path, path_len);
+    map_path[path_len] = 46;
+    map_path[path_len + 1] = 109;
+    map_path[path_len + 2] = 97;
+    map_path[path_len + 3] = 112;
+    map_path[path_len + 4] = 0;
+
+    let is i64 as fd = io._open_write(map_path);
+    if (fd < 0) {
+        reader.print_str("warning: cannot create map file\n");
+        om.opt_free(map_path);
+        return;
+    }
+
+    io._write_fd(fd, "Address            Type  Name\n", 30);
+    io._write_fd(fd, "----------------------------------------------\n", 47);
+
+    write_map_entry(fd, ls.text_vaddr, 84, "_start");
+
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1) {
+            let is i32 as type_char with mut = 84;
+            if (g.section == reader.SECIDX_DATA) { type_char = 68; }
+            if (g.section == reader.SECIDX_RODATA) { type_char = 82; }
+            if (g.section == reader.SECIDX_BSS) { type_char = 66; }
+            write_map_entry(fd, g.vaddr, type_char, g.name);
+        }
+        gi = gi + 1;
+    }
+
+    io._close_fd(fd);
+    om.opt_free(map_path);
+}
+
+fn write_hex_to_fd(fd as i64, val as i64) as void {
+    let is *u8 as hex = "0123456789abcdef";
+    let is [18]u8 as buf;
+    buf[0] = 48;
+    buf[1] = 120;
+    let is i64 as vi with mut = 0;
+    let is i64 as v with mut = val;
+    while (vi < 16) {
+        buf[17 - vi] = hex[v & 15];
+        v = v >> 4;
+        vi = vi + 1;
+    }
+    io._write_fd(fd, &buf[0], 18);
+}
+
+fn write_map_entry(fd as i64, addr as i64, type_char as i32, name as *u8) as void {
+    write_hex_to_fd(fd, addr);
+    io._write_fd(fd, "  ", 2);
+    let is u8 as tc = cast(u8, type_char);
+    io._write_fd(fd, &tc, 1);
+    io._write_fd(fd, "     ", 5);
+    io._write_fd(fd, name, reader.strlen(name));
+    io._write_fd(fd, "\n", 1);
+}
+
+// ============================================================
+// Dynamic linking support

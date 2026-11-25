@@ -1,0 +1,158 @@
+// =======================================================
+// csl_reader.cst — read a .csl (CSL_) shared library's EXPORT table.
+//
+// Written for the multi-library path. With a single library every undefined
+// symbol necessarily came from it, so nothing ever had to open the file: the
+// linker recorded the name and the CSE writer hardcoded "libcaustic.csl". With
+// several, "which library defines this symbol" is a real question, and the
+// only honest answer is the one the library itself gives — its export table.
+//
+// Used by BOTH ends of the toolchain, and that is the point:
+//   - the compiler, to decide which function bodies NOT to emit (they will be
+//     imported at run time). That replaces guessing by the `_std_` prefix,
+//     which could only ever describe one library.
+//   - the linker, to tag each import with the index of the library that
+//     exports it, so the loader knows where to look.
+//
+// Format, as emitted by cse/cse_writer.cst:cse_emit_csl_image (v2, 44-byte
+// header). v1 was 32 bytes and had no kimport fields, so reading a v2 image at
+// the v1 offsets lands inside kimport_off — the version gate is load-bearing,
+// not a formality.
+//
+//   0x00 4  magic "CSL_"
+//   0x04 2  version = 2
+//   0x06 1  arch (1 = x86_64, 2 = aarch64)
+//   0x07 1  flags (bit0: 0 = pure, 1 = compat polyglot)
+//   0x08 8  base_addr
+//   0x10 4  seg_count
+//   0x14 4  export_count
+//   0x18 8  export_off
+//   0x20 8  kimport_off
+//   0x28 4  kimport_count
+//   0x2C    segment table: seg_count * 24 (vaddr, file_off, file_size,
+//           mem_size, perms), then the packed segment bytes.
+//   @export_off: export_count * 12 (name_off u32, vaddr u64), then a packed
+//           NUL-terminated string blob. name_off is an ABSOLUTE file offset.
+// =======================================================
+
+use "../../std/io.cst" as io;
+use "../../std/mem/core.cst" as core;
+
+let is i64 as CSL_HDR_SIZE with imut = 44;
+let is i64 as CSL_VERSION  with imut = 2;
+let is i64 as CSL_EXPORT_ENTRY with imut = 12;
+
+// Every scalar is i64: this struct is passed by pointer across modules and
+// mixed-width fields have aliased neighbours here before.
+struct CslLib {
+    buf as *u8;            // the whole image, in memory
+    size as i64;
+    export_off as i64;
+    export_count as i64;
+    arch as i64;
+    ok as i64;             // 1 = loaded and validated
+}
+
+fn _u32(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) + (cast(i64, p[off+1]) << 8)
+         + (cast(i64, p[off+2]) << 16) + (cast(i64, p[off+3]) << 24);
+}
+
+fn _u64(p as *u8, off as i64) as i64 {
+    return _u32(p, off) + (_u32(p, off + 4) << 32);
+}
+
+// csl_read — slurp `path` and validate it as a CSL_ v2 image for `arch`.
+// Returns 0 on success, or a negative code:
+//   -1 open failed          -2 too small / short read      -3 bad magic
+//   -4 wrong version        -5 wrong arch                  -6 table out of bounds
+fn csl_read(path as *u8, arch as i64, out as *CslLib) as i32 {
+    out.ok = 0;
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(i32, 0 - 1); }
+    let is i64 as sz = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (sz < CSL_HDR_SIZE) { io._close_fd(fd); return cast(i32, 0 - 2); }
+
+    // mmap, NOT the IR arena. The image has to outlive compilation: the
+    // compiler destroys that arena once the last file is compiled
+    // (main.cst's opt_bins_destroy), and the linker reads this table AFTER
+    // that, when it writes the import table. Allocating from the arena made
+    // every symbol look unexported at link time — every import silently
+    // attributed to library 0 — which is correct-looking output for a
+    // single-library link and wrong for every other one.
+    let is *u8 as buf = core.mmap_anon(sz);
+    if (cast(i64, buf) <= 0) { io._close_fd(fd); return cast(i32, 0 - 2); }
+    // read() is allowed to come up short on a regular file; loop until the
+    // whole image is in rather than trusting one call.
+    let is i64 as got with mut = 0;
+    while (got < sz) {
+        let is i64 as n = io._read_fd(fd, cast(*u8, cast(i64, buf) + got), sz - got);
+        if (n <= 0) { io._close_fd(fd); return cast(i32, 0 - 2); }
+        got = got + n;
+    }
+    io._close_fd(fd);
+
+    if (buf[0] != 67 || buf[1] != 83 || buf[2] != 76 || buf[3] != 95) {   // "CSL_"
+        return cast(i32, 0 - 3);
+    }
+    let is i64 as ver = cast(i64, buf[4]) + (cast(i64, buf[5]) << 8);
+    if (ver != CSL_VERSION) { return cast(i32, 0 - 4); }
+    let is i64 as img_arch = cast(i64, buf[6]);
+    if (img_arch != arch) { return cast(i32, 0 - 5); }
+
+    let is i64 as ecount = _u32(buf, 20);
+    let is i64 as eoff   = _u64(buf, 24);
+    // A truncated or hand-edited image must be refused here rather than read
+    // past its end while resolving a symbol.
+    if (eoff < CSL_HDR_SIZE || eoff + ecount * CSL_EXPORT_ENTRY > sz) {
+        return cast(i32, 0 - 6);
+    }
+
+    out.buf = buf;
+    out.size = sz;
+    out.export_off = eoff;
+    out.export_count = ecount;
+    out.arch = img_arch;
+    out.ok = 1;
+    return 0;
+}
+
+// The name of export `i`, NUL-terminated inside the image. name_off is an
+// absolute file offset, so the string blob needs no separate base.
+fn csl_export_name(lib as *CslLib, i as i64) as *u8 {
+    if (lib.ok != 1 || i < 0 || i >= lib.export_count) { return cast(*u8, 0); }
+    let is i64 as noff = _u32(lib.buf, lib.export_off + i * CSL_EXPORT_ENTRY);
+    if (noff <= 0 || noff >= lib.size) { return cast(*u8, 0); }
+    return cast(*u8, cast(i64, lib.buf) + noff);
+}
+
+fn csl_export_vaddr(lib as *CslLib, i as i64) as i64 {
+    if (lib.ok != 1 || i < 0 || i >= lib.export_count) { return 0 - 1; }
+    return _u64(lib.buf, lib.export_off + i * CSL_EXPORT_ENTRY + 4);
+}
+
+fn _name_eq(a as *u8, b as *u8, b_len as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < b_len) {
+        if (a[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[b_len] != 0) { return 0; }
+    return 1;
+}
+
+// csl_find — the vaddr this library exports `name` at, or -1. Linear: an export
+// table is a few hundred entries and this runs once per undefined symbol.
+fn csl_find(lib as *CslLib, name as *u8, name_len as i64) as i64 {
+    if (lib.ok != 1) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < lib.export_count) {
+        let is *u8 as nm = csl_export_name(lib, i);
+        if (cast(i64, nm) != 0) {
+            if (_name_eq(nm, name, name_len) == 1) { return csl_export_vaddr(lib, i); }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}

@@ -1,0 +1,2143 @@
+// pe_debug.cst — PE CodeView debug-info + .pdb stream synthesis.
+// Extracted from pe_writer.cst: builds the CodeView module symbol stream,
+// publics (GSI), TPI/IPI type streams, and patches IMAGE_DEBUG_DIRECTORY, from
+// the .cstdebug/.cstsigs/.cststructs/.cstlocals sections the compiler emits.
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../../src/ir/opt_mem.cst" as om;
+use "../../src/debug_proto.cst" as dbgproto;
+
+// CodeView debug directory + .pdb sidecar
+// ============================================================
+// Layout written into the trailing slice of .rdata:
+//
+//   IMAGE_DEBUG_DIRECTORY (28 bytes):
+//     u32 Characteristics  = 0
+//     u32 TimeDateStamp    = 0
+//     u16 MajorVersion     = 0
+//     u16 MinorVersion     = 0
+//     u32 Type             = 2 (IMAGE_DEBUG_TYPE_CODEVIEW)
+//     u32 SizeOfData       = size of the CodeView record below
+//     u32 AddressOfRawData = RVA of CodeView record (patched after layout)
+//     u32 PointerToRawData = file offset of CodeView record (patched)
+//
+//   CodeView "RSDS" record (24 + path_len + 1 bytes):
+//     u32 Signature        = 0x53445352 ("RSDS")
+//     u8[16] GUID
+//     u32 Age              = 1
+//     u8[] Path            = null-terminated PDB path
+//
+// DataDirectory[6] is set to (debug_dir_rva, 28). The PDB path is what
+// the loader/debugger uses to find the sidecar; the GUID + Age must match
+// the .pdb's PDB Info stream for the debugger to accept the symbols.
+
+let is i32 as DEBUG_DIR_SIZE with imut = 28;
+
+// FNV-1a 64-bit hash of (path) used to seed a deterministic GUID. Reproducible
+// builds get the same GUID for the same output path; matching .pdb is
+// generated against the same hash so the two always agree.
+fn _fnv64(s as *u8, len as i64) as i64 {
+    let is i64 as h with mut = 0 - 3750763034362895579;  // 0xcbf29ce484222325 as signed
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        h = h ^ cast(i64, s[i]);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+// Compute a deterministic 16-byte GUID from output_path's basename. Hashing
+// the basename (not the full path) keeps reproducible builds reproducible:
+// the same `-o foo.exe` from any cwd yields the same GUID. EXE-side and
+// PDB-side both call this helper so they always agree.
+fn _compute_guid(out_buf as *u8, output_path as *u8) as void {
+    let is i64 as plen with mut = 0;
+    while (output_path[plen] != cast(u8, 0)) { plen = plen + 1; }
+    let is i64 as base_start with mut = 0;
+    let is i64 as si2 with mut = plen - 1;
+    while (si2 >= 0) {
+        if (output_path[si2] == 47 || output_path[si2] == 92) {
+            base_start = si2 + 1;
+            si2 = 0 - 1;
+        } else {
+            si2 = si2 - 1;
+        }
+    }
+    let is *u8 as base_ptr = cast(*u8, cast(i64, output_path) + base_start);
+    let is i64 as base_len = plen - base_start;
+    let is i64 as h1 = _fnv64(base_ptr, base_len);
+    // Salt by appending one byte for second half — gives a distinct hash.
+    let is *u8 as scratch = om.opt_alloc(base_len + 1);
+    let is i64 as si with mut = 0;
+    while (si < base_len) { scratch[si] = base_ptr[si]; si = si + 1; }
+    scratch[base_len] = cast(u8, 1);
+    let is i64 as h2 = _fnv64(scratch, base_len + 1);
+
+    // Microsoft GUID on-disk encoding: Data1 (u32 LE), Data2 (u16 LE),
+    // Data3 (u16 LE), Data4 (u8[8] BE). Storing all 16 bytes as one big LE
+    // blob works for binding (both EXE-side and PDB-side mirror the same
+    // bytes), but tools like dumpbin/llvm-pdbutil display a different-looking
+    // GUID — emit mixed-endian so the displayed string matches reality.
+    // Data1 = low 32 bits of h1, Data2 = next 16, Data3 = next 16,
+    // Data4 = high 16 of h1 + 6 bytes of h2 (taken big-endian).
+    out_buf[0]  = cast(u8, h1 & 255);
+    out_buf[1]  = cast(u8, (h1 >> 8) & 255);
+    out_buf[2]  = cast(u8, (h1 >> 16) & 255);
+    out_buf[3]  = cast(u8, (h1 >> 24) & 255);
+    out_buf[4]  = cast(u8, (h1 >> 32) & 255);
+    out_buf[5]  = cast(u8, (h1 >> 40) & 255);
+    out_buf[6]  = cast(u8, (h1 >> 48) & 255);
+    out_buf[7]  = cast(u8, (h1 >> 56) & 255);
+    // Data4 big-endian: byte 0 is high byte of h2.
+    out_buf[8]  = cast(u8, (h2 >> 56) & 255);
+    out_buf[9]  = cast(u8, (h2 >> 48) & 255);
+    out_buf[10] = cast(u8, (h2 >> 40) & 255);
+    out_buf[11] = cast(u8, (h2 >> 32) & 255);
+    out_buf[12] = cast(u8, (h2 >> 24) & 255);
+    out_buf[13] = cast(u8, (h2 >> 16) & 255);
+    out_buf[14] = cast(u8, (h2 >> 8) & 255);
+    out_buf[15] = cast(u8, h2 & 255);
+}
+
+// Derive PDB path from output_path: keep the directory prefix, replace a
+// trailing ".exe" with ".pdb". The PDB lands next to the .exe, and the RSDS
+// record carries this same path so a debugger can find it. Returns a
+// freshly-allocated null-terminated buffer; out_len receives its length
+// (not counting the null).
+fn _compute_pdb_path(output_path as *u8, out_len as *i32) as *u8 {
+    let is i32 as plen with mut = 0;
+    while (output_path[plen] != cast(u8, 0)) { plen = plen + 1; }
+    // Keep everything up to and including the last '/' or '\\'.
+    let is i32 as dir_len with mut = 0;
+    let is i32 as si with mut = plen - 1;
+    while (si >= 0) {
+        if (output_path[si] == 47 || output_path[si] == 92) {
+            dir_len = si + 1;
+            si = cast(i32, 0 - 1);
+        } else {
+            si = si - 1;
+        }
+    }
+    let is i32 as base_len with mut = plen - dir_len;
+    if (base_len >= 4) {
+        let is i32 as tail = dir_len + base_len - 4;
+        if (output_path[tail] == 46
+            && (output_path[tail + 1] == 101 || output_path[tail + 1] == 69)
+            && (output_path[tail + 2] == 120 || output_path[tail + 2] == 88)
+            && (output_path[tail + 3] == 101 || output_path[tail + 3] == 69)) {
+            base_len = base_len - 4;
+        }
+    }
+    let is i32 as total = dir_len + base_len + 4;
+    let is *u8 as buf = om.opt_alloc(cast(i64, total + 1));
+    let is i32 as i with mut = 0;
+    while (i < dir_len + base_len) { buf[i] = output_path[i]; i = i + 1; }
+    buf[total - 4] = cast(u8, 46);   // '.'
+    buf[total - 3] = cast(u8, 112);  // 'p'
+    buf[total - 2] = cast(u8, 100);  // 'd'
+    buf[total - 1] = cast(u8, 98);   // 'b'
+    buf[total]     = cast(u8, 0);
+    *out_len = total;
+    return buf;
+}
+
+// Append IMAGE_DEBUG_DIRECTORY + RSDS to rodata_buf. RVA/file fields written
+// as placeholder zeros; _patch_debug_dir fills them once rodata's final
+// position is known. Returns the rsds_size (used for SizeOfData later).
+//
+// Side effect: out_guid is filled with the 16-byte GUID so the PDB writer
+// can use the same value.
+fn _emit_debug_entries(rodata_buf as *reader.ByteBuffer,
+                       output_path as *u8,
+                       out_dir_off as *i64,
+                       out_rsds_off as *i64,
+                       out_guid as *u8,
+                       out_pdb_path as **u8,
+                       out_pdb_path_len as *i32) as i32 {
+    *out_dir_off = rodata_buf.len;
+    // IMAGE_DEBUG_DIRECTORY (28 bytes) — AddressOfRawData / PointerToRawData
+    // are placeholders; _patch_debug_dir patches them after layout.
+    reader.buf_emit32_le(rodata_buf, 0);                  // Characteristics
+    reader.buf_emit32_le(rodata_buf, 0);                  // TimeDateStamp
+    reader.buf_emit16_le(rodata_buf, 0);                  // MajorVersion
+    reader.buf_emit16_le(rodata_buf, 0);                  // MinorVersion
+    reader.buf_emit32_le(rodata_buf, 2);                  // Type = CODEVIEW
+    reader.buf_emit32_le(rodata_buf, 0);                  // SizeOfData (patched)
+    reader.buf_emit32_le(rodata_buf, 0);                  // AddressOfRawData (patched)
+    reader.buf_emit32_le(rodata_buf, 0);                  // PointerToRawData (patched)
+
+    *out_rsds_off = rodata_buf.len;
+    // RSDS record
+    _compute_guid(out_guid, output_path);
+    let is i32 as pdb_path_len with mut = 0;
+    let is *u8 as pdb_path = _compute_pdb_path(output_path, &pdb_path_len);
+    *out_pdb_path = pdb_path;
+    *out_pdb_path_len = pdb_path_len;
+
+    reader.buf_emit8(rodata_buf, 82);                     // 'R'
+    reader.buf_emit8(rodata_buf, 83);                     // 'S'
+    reader.buf_emit8(rodata_buf, 68);                     // 'D'
+    reader.buf_emit8(rodata_buf, 83);                     // 'S'
+    let is i32 as gi with mut = 0;
+    while (gi < 16) {
+        reader.buf_emit8(rodata_buf, cast(i32, out_guid[gi]));
+        gi = gi + 1;
+    }
+    reader.buf_emit32_le(rodata_buf, 1);                  // Age = 1
+    let is i32 as pi with mut = 0;
+    while (pi < pdb_path_len) {
+        reader.buf_emit8(rodata_buf, cast(i32, pdb_path[pi]));
+        pi = pi + 1;
+    }
+    reader.buf_emit8(rodata_buf, 0);                      // null terminator
+
+    // 4-byte align so subsequent rodata content stays aligned.
+    while ((rodata_buf.len & 3) != 0) { reader.buf_emit8(rodata_buf, 0); }
+
+    let is i32 as rsds_size = 24 + pdb_path_len + 1;
+    return rsds_size;
+}
+
+// ============================================================
+// PDB Publics builders
+// ============================================================
+// Walk the linker's global symbol table and produce two buffers:
+//
+//   symrec_buf  — sequence of S_PUB32 records, each 4-byte aligned with
+//                 padding bytes 0xF1/0xF2/0xF3. This is the "Symbol
+//                 Records Stream" referenced by the DBI header's
+//                 SymRecordStream field.
+//
+//   publics_buf — PSGSI header (28B) + an empty GSI hash header (16B,
+//                 NumBuckets=0 so the on-disk format has no buckets
+//                 or hash records) + an address map: u32[N] of offsets
+//                 into symrec_buf, sorted by RVA. This is what
+//                 PublicStreamIndex points at.
+//
+// We deliberately ship an empty hash table — name-based lookup falls
+// back to a linear scan of the address map. Sufficient for v1; the
+// IPHR_HASH bucket layout is intricate enough that getting it right
+// deserves its own pass.
+
+let is i64 as S_PUB32 with imut = 4366;     // 0x110E
+let is i64 as PUB32_FLAG_FUNCTION with imut = 2;
+let is i64 as GSI_HEADER_VERSIG with imut = 4294967295;     // -1 as u32
+let is i64 as GSI_HEADER_VERHDR with imut = 4046391578;     // 0xeffe0000 + 19990810 = 0xF12F091A
+
+// CodeView/PDB GSI V1 hash function. Folds the byte string four-bytes-at-
+// a-time into a 32-bit accumulator, masks to lowercase ASCII, mixes, and
+// reduces mod IPHR_HASH (4096). Matches MS PDB toolchain hashStringV1.
+let is i64 as IPHR_HASH with imut = 4096;
+let is i64 as MASK32   with imut = 4294967295;       // 0xFFFFFFFF
+let is i64 as TOLOWER  with imut = 538976288;        // 0x20202020
+
+fn _gsi_hash_v1(name as *u8, len as i32) as i32 {
+    let is i64 as result with mut = 0;
+    let is i32 as size with mut = len;
+    let is i32 as i with mut = 0;
+    while (size >= 4) {
+        let is i64 as chunk = cast(i64, name[i])
+                            + (cast(i64, name[i + 1]) << 8)
+                            + (cast(i64, name[i + 2]) << 16)
+                            + (cast(i64, name[i + 3]) << 24);
+        result = (result ^ chunk) & MASK32;
+        i = i + 4;
+        size = size - 4;
+    }
+    if (size >= 2) {
+        let is i64 as chunk = cast(i64, name[i])
+                            + (cast(i64, name[i + 1]) << 8);
+        result = (result ^ chunk) & MASK32;
+        i = i + 2;
+        size = size - 2;
+    }
+    if (size > 0) {
+        result = (result ^ cast(i64, name[i])) & MASK32;
+    }
+    result = (result | TOLOWER) & MASK32;
+    result = (result ^ (result >> 11)) & MASK32;
+    result = (result ^ (result >> 16)) & MASK32;
+    return cast(i32, result & 4095);
+}
+
+// Insertion-sort the i-th and j-th elements of three parallel arrays so
+// that buckets[] is non-decreasing. Stable — preserves the relative order
+// of equal-bucket records (which arrive in VA order, the address map's
+// invariant).
+fn _sort_by_bucket(buckets as *i32, offsets as *i32, vaddrs as *i64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is i32 as cur_b = buckets[i];
+        let is i32 as cur_o = offsets[i];
+        let is i64 as cur_v = vaddrs[i];
+        let is i32 as j with mut = i - 1;
+        while (j >= 0 && buckets[j] > cur_b) {
+            buckets[j + 1] = buckets[j];
+            offsets[j + 1] = offsets[j];
+            vaddrs[j + 1]  = vaddrs[j];
+            j = j - 1;
+        }
+        buckets[j + 1] = cur_b;
+        offsets[j + 1] = cur_o;
+        vaddrs[j + 1]  = cur_v;
+        i = i + 1;
+    }
+}
+
+// Sort an array of (vaddr, symrec_offset) pairs by vaddr ascending.
+// Used to build the publics address map in monotonic order.
+fn _sort_addr_map(vaddrs as *i64, offsets as *i32, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is i64 as cur_v = vaddrs[i];
+        let is i32 as cur_o = offsets[i];
+        let is i32 as j with mut = i - 1;
+        while (j >= 0 && vaddrs[j] > cur_v) {
+            vaddrs[j + 1] = vaddrs[j];
+            offsets[j + 1] = offsets[j];
+            j = j - 1;
+        }
+        vaddrs[j + 1] = cur_v;
+        offsets[j + 1] = cur_o;
+        i = i + 1;
+    }
+}
+
+// Build the Symbol Records + Publics buffers from the linker's gsyms.
+// Returns the number of functions emitted; the caller uses this to set
+// AddrMap byte size in the PSGSI header.
+fn build_publics_buffers(ls as *linker.LinkerState,
+                         text_section_va as i64,
+                         out_symrec as *reader.ByteBuffer,
+                         out_publics as *reader.ByteBuffer) as i32 {
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+
+    // First pass: count + capture (vaddr, symrec_off) per text-section gsym.
+    let is *i64 as vaddrs = cast(*i64, om.opt_alloc(8192));   // up to 1024 entries
+    let is *i32 as offsets = cast(*i32, om.opt_alloc(4096));
+    let is i32 as count with mut = 0;
+
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT && count < 1024) {
+            // Total record size: 14 fixed header bytes (incl. RecLen) + name
+            // + nul, aligned up to 4. RecLen value reports total-minus-RecLen
+            // field (2 bytes), so the consumer reads `RecLen` bytes following
+            // the RecLen field itself.
+            let is i32 as total_unaligned = 14 + g.name_len + 1;
+            let is i32 as total with mut = total_unaligned;
+            while ((total & 3) != 0) { total = total + 1; }
+
+            let is i32 as symrec_off = cast(i32, out_symrec.len);
+            reader.buf_emit16_le(out_symrec, total - 2);
+            reader.buf_emit16_le(out_symrec, S_PUB32);
+            reader.buf_emit32_le(out_symrec, PUB32_FLAG_FUNCTION);
+            reader.buf_emit32_le(out_symrec, g.vaddr - text_section_va);
+            reader.buf_emit16_le(out_symrec, 1);              // segment = .text
+            let is i32 as ni with mut = 0;
+            while (ni < g.name_len) {
+                reader.buf_emit8(out_symrec, cast(i32, g.name[ni]));
+                ni = ni + 1;
+            }
+            reader.buf_emit8(out_symrec, 0);
+            // Pad with the CV pad bytes 0xF1, 0xF2, 0xF3 (incremented per byte).
+            let is i32 as pad_byte with mut = 241;  // 0xF1
+            while ((cast(i32, out_symrec.len) & 3) != 0) {
+                reader.buf_emit8(out_symrec, pad_byte);
+                pad_byte = pad_byte + 1;
+            }
+
+            vaddrs[count] = g.vaddr;
+            offsets[count] = symrec_off;
+            count = count + 1;
+        }
+        gi = gi + 1;
+    }
+
+    _sort_addr_map(vaddrs, offsets, count);
+
+    // Build the GSI hash table for name-based symbol lookup. Records are
+    // grouped by bucket (the GSI hash mod IPHR_HASH=4096), then within
+    // each bucket kept in VA order. The on-disk layout is:
+    //
+    //   GSIHashHeader (16B) — VerSig | VerHdr | HrSize | NumBuckets
+    //   HashRecord[count]   — { u32 Off; u32 CRef } per record, sorted by bucket
+    //   PresentBitmap       — u32[129] (4097 bits + slack zero)
+    //   BucketOffsets       — u32 per set bucket, value = first_record_in_bucket * 12
+    //                         (the 12 is an MSVC compat quirk — records are 8 bytes
+    //                          on disk but offsets are scaled by 12).
+    //
+    // For 0 records we keep the empty form (HrSize=0, NumBuckets=0) — the
+    // GSIHashHeader still emits since the consumer always reads it.
+    let is *i32 as buckets   = cast(*i32, om.opt_alloc(cast(i64, count) * 4));
+    let is *i32 as hr_offs   = cast(*i32, om.opt_alloc(cast(i64, count) * 4));
+    let is *i64 as hr_vaddrs = cast(*i64, om.opt_alloc(cast(i64, count) * 8));
+
+    // Recover (name, vaddr) for each record so we can hash. Walk gsyms in
+    // VA-sorted order — that's the order the records were emitted.
+    let is *i32 as sorted_vaddr_to_gsym = cast(*i32, om.opt_alloc(cast(i64, count) * 4));
+    let is i32 as si with mut = 0;
+    while (si < count) {
+        let is i32 as gj with mut = 0;
+        while (gj < gsyms.count) {
+            let is *linker.GlobalSym as gg = linker.gsym_get(gsyms, gj);
+            if (gg.defined == 1 && gg.section == reader.SECIDX_TEXT
+                && gg.vaddr == vaddrs[si]) {
+                sorted_vaddr_to_gsym[si] = gj;
+                gj = gsyms.count;
+            }
+            gj = gj + 1;
+        }
+        let is *linker.GlobalSym as gh = linker.gsym_get(gsyms, sorted_vaddr_to_gsym[si]);
+        buckets[si]   = _gsi_hash_v1(gh.name, gh.name_len);
+        hr_offs[si]   = offsets[si];
+        hr_vaddrs[si] = vaddrs[si];
+        si = si + 1;
+    }
+    _sort_by_bucket(buckets, hr_offs, hr_vaddrs, count);
+
+    // Count distinct buckets and build present bitmap. PresentBitmap is
+    // 129 u32 words (covers 4128 bits, of which 4097 are meaningful).
+    let is [129]i64 as bitmap;
+    let is i32 as bi with mut = 0;
+    while (bi < 129) { bitmap[bi] = 0; bi = bi + 1; }
+    let is i32 as num_used_buckets with mut = 0;
+    let is i32 as last_bucket with mut = 0;
+    last_bucket = last_bucket - 1;
+    let is i32 as bj with mut = 0;
+    while (bj < count) {
+        if (buckets[bj] != last_bucket) {
+            last_bucket = buckets[bj];
+            bitmap[last_bucket / 32] = bitmap[last_bucket / 32]
+                                       | (cast(i64, 1) << (last_bucket & 31));
+            num_used_buckets = num_used_buckets + 1;
+        }
+        bj = bj + 1;
+    }
+
+    let is i32 as hr_size = count * 8;
+    let is i32 as buckets_size with mut = 0;
+    if (count > 0) { buckets_size = 516 + num_used_buckets * 4; }
+    let is i32 as sym_hash_size = 16 + hr_size + buckets_size;
+    let is i32 as addr_map_size = count * 4;
+
+    // PSGSI header
+    reader.buf_emit32_le(out_publics, cast(i64, sym_hash_size));
+    reader.buf_emit32_le(out_publics, cast(i64, addr_map_size));
+    reader.buf_emit32_le(out_publics, 0);                 // NumThunks
+    reader.buf_emit32_le(out_publics, 0);                 // SizeOfThunk
+    reader.buf_emit16_le(out_publics, 0);                 // ISectThunkTable
+    reader.buf_emit16_le(out_publics, 0);                 // Padding
+    reader.buf_emit32_le(out_publics, 0);                 // OffThunkTable
+    reader.buf_emit32_le(out_publics, 0);                 // NumSections
+
+    // GSI hash header (16B)
+    reader.buf_emit32_le(out_publics, GSI_HEADER_VERSIG);
+    reader.buf_emit32_le(out_publics, GSI_HEADER_VERHDR);
+    reader.buf_emit32_le(out_publics, cast(i64, hr_size));
+    reader.buf_emit32_le(out_publics, cast(i64, buckets_size));
+
+    // HashRecord array (8 bytes each, sorted by bucket).
+    let is i32 as hi with mut = 0;
+    while (hi < count) {
+        reader.buf_emit32_le(out_publics, cast(i64, hr_offs[hi] + 1));     // Off (1-based)
+        reader.buf_emit32_le(out_publics, 1);                              // CRef
+        hi = hi + 1;
+    }
+
+    if (count > 0) {
+        // PresentBitmap: 129 u32s (516 bytes).
+        let is i32 as bw with mut = 0;
+        while (bw < 129) {
+            reader.buf_emit32_le(out_publics, bitmap[bw]);
+            bw = bw + 1;
+        }
+
+        // Bucket offsets in ascending bucket order. value = first-record-
+        // index * 12 (MSVC compat — see header comment).
+        last_bucket = 0;
+        last_bucket = last_bucket - 1;
+        let is i32 as bk with mut = 0;
+        while (bk < count) {
+            if (buckets[bk] != last_bucket) {
+                reader.buf_emit32_le(out_publics, cast(i64, bk * 12));
+                last_bucket = buckets[bk];
+            }
+            bk = bk + 1;
+        }
+    }
+
+    // Address map: sorted offsets into symrec stream.
+    let is i32 as ai with mut = 0;
+    while (ai < count) {
+        reader.buf_emit32_le(out_publics, cast(i64, offsets[ai]));
+        ai = ai + 1;
+    }
+
+    return count;
+}
+
+// ============================================================
+// CodeView module symbol stream builder (line tables)
+// ============================================================
+// The assembler emitted a `.cstdebug` custom section per .obj with
+// (text_offset, line_number) records captured from `.loc` directives.
+// Here we read that data back, correlate with the sorted gsym table to
+// determine per-function line ranges, and emit a CodeView module
+// symbol stream:
+//
+//   u32 CV_SIGNATURE_C13 = 4
+//   Subsection SYMBOLS (0xF1):
+//     S_OBJNAME (0x1101)
+//     S_COMPILE3 (0x113C)
+//     per function:
+//       S_GPROC32 (0x1110) + S_FRAMEPROC (0x1012) + S_END (0x0006)
+//   Subsection LINES (0xF2) per function:
+//     header { offCon, segCon, flags, cbCon }
+//     file block { offFile, nLines, cbBlock }
+//     line entries { offset, flags = line | 0x80000000 (statement) }
+//   Subsection STRINGTABLE (0xF3): null-term strings (just the source path)
+//   Subsection FILECHKSMS (0xF4): one entry (offFile=0, cbChecksum=0, kind=0)
+//
+// Output is one buffer the PDB writer drops into its module stream.
+
+let is i32 as CV_SIGNATURE_C13 with imut = 4;
+let is i32 as DEBUG_S_SYMBOLS with imut = 241;       // 0xF1
+let is i32 as DEBUG_S_LINES   with imut = 242;       // 0xF2
+let is i32 as DEBUG_S_STRINGTABLE with imut = 243;   // 0xF3
+let is i32 as DEBUG_S_FILECHKSMS with imut = 244;    // 0xF4
+let is i32 as S_END         with imut = 6;
+let is i32 as S_FRAMEPROC   with imut = 4114;        // 0x1012
+let is i32 as S_OBJNAME     with imut = 4353;        // 0x1101
+let is i32 as S_GPROC32     with imut = 4368;        // 0x1110
+let is i32 as S_GPROC32_ID  with imut = 4423;        // 0x1147
+let is i32 as S_COMPILE3    with imut = 4412;        // 0x113C
+let is i32 as S_BUILDINFO   with imut = 4428;        // 0x114C
+let is i32 as S_LOCAL       with imut = 4414;        // 0x113E
+let is i32 as S_DEFRANGE_FPR with imut = 4418;       // 0x1142  S_DEFRANGE_FRAMEPOINTER_REL
+let is i32 as LF_POINTER    with imut = 4098;        // 0x1002
+let is i32 as LF_ARRAY      with imut = 5379;        // 0x1503
+let is i32 as LF_STRUCTURE  with imut = 5381;        // 0x1505
+let is i32 as LF_FIELDLIST  with imut = 4611;        // 0x1203
+let is i32 as LF_MEMBER     with imut = 5389;        // 0x150D
+let is i32 as LF_ENUM       with imut = 5383;        // 0x1507
+let is i32 as LF_ENUMERATE  with imut = 5378;        // 0x1502
+let is i32 as LF_ARGLIST    with imut = 4609;        // 0x1201
+let is i32 as LF_PROCEDURE  with imut = 4104;        // 0x1008
+let is i32 as LF_FUNC_ID    with imut = 5633;        // 0x1601
+let is i32 as LF_BUILDINFO  with imut = 5635;        // 0x1603
+let is i32 as LF_STRING_ID  with imut = 5637;        // 0x1605
+let is i32 as TYPE_INDEX_BEGIN_LINKER with imut = 4096;   // 0x1000
+
+// CV PointerAttributes for 64-bit near data pointer:
+//   PtrType=0x0C (Near64) | Size=8 (in field starting at bit 13).
+let is i32 as CV_PTR_ATTR_NEAR64 with imut = 65548;  // 0x1000C
+// TPI type index of the universal int(*)() LF_PROCEDURE pdb_writer publishes
+// at TYPE_INDEX_BEGIN+1. Must match the layout in caustic-linker/pdb_writer.cst.
+let is i32 as TYPE_IDX_UNIVERSAL_FN with imut = 4097;  // 0x1001
+// IPI item indices start here; the i-th defined TEXT gsym (in VA-sorted order)
+// gets index IPI_INDEX_BEGIN + i. S_GPROC32_ID records reference these.
+let is i32 as IPI_INDEX_BEGIN with imut = 4096;       // 0x1000
+// CSTDEBUG_MAGIC lives in caustic-shared/debug_proto.cst — assembler writes
+// it, linker reads it; centralizing prevents silent drift.
+
+// Locate .cstdebug section in this obj. Returns the section pointer or null.
+fn _find_cstdebug(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 9 && reader.streq(nm, 9, ".cstdebug", 9) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _read_u32_at(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off])
+         + (cast(i64, p[off + 1]) << 8)
+         + (cast(i64, p[off + 2]) << 16)
+         + (cast(i64, p[off + 3]) << 24);
+}
+
+// Insertion-sort indices by gsym vaddr. Used to walk text-section gsyms in
+// ascending RVA order so we can derive function sizes as
+// (next_func_vaddr - this_func_vaddr).
+fn _sort_indices(idx as *i32, vaddrs as *i64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is i32 as cur_idx = idx[i];
+        let is i64 as cur_v = vaddrs[i];
+        let is i32 as j with mut = i - 1;
+        while (j >= 0 && vaddrs[j] > cur_v) {
+            idx[j + 1] = idx[j];
+            vaddrs[j + 1] = vaddrs[j];
+            j = j - 1;
+        }
+        idx[j + 1] = cur_idx;
+        vaddrs[j + 1] = cur_v;
+        i = i + 1;
+    }
+}
+
+// Emit a CodeView subsection header: u32 kind, u32 size, then payload.
+// Caller writes the payload and we patch the size field at the end via
+// _patch_subsec_size.
+fn _start_subsec(out as *reader.ByteBuffer, kind as i32) as i64 {
+    reader.buf_emit32_le(out, cast(i64, kind));
+    let is i64 as size_off = out.len;
+    reader.buf_emit32_le(out, 0);                  // size placeholder
+    return size_off;
+}
+
+fn _patch_subsec_size(out as *reader.ByteBuffer, size_off as i64) as void {
+    // CodeView subsections are 4-byte aligned AND the Length field counts the
+    // padding (`alignTo(DataSize, alignOf(Container))` in LLVM's builder), so
+    // pad first and write the size afterwards. Writing the unpadded size made
+    // the reader advance into the pad bytes and read a garbage next header —
+    // `llvm-pdbutil dump --modules` reported "stream too short".
+    while ((out.len & 3) != 0) { reader.buf_emit8(out, 0); }
+    let is i64 as size = out.len - size_off - 4;
+    let is *u8 as p = out.data;
+    p[size_off]     = cast(u8, size & 255);
+    p[size_off + 1] = cast(u8, (size >> 8) & 255);
+    p[size_off + 2] = cast(u8, (size >> 16) & 255);
+    p[size_off + 3] = cast(u8, (size >> 24) & 255);
+}
+
+// Emit a CodeView symbol record: u16 len, u16 kind, payload, then 0xF1 pad.
+// Returns the offset where the length field was written so the caller can
+// patch it once the payload is complete.
+fn _start_sym(out as *reader.ByteBuffer, kind as i32) as i64 {
+    let is i64 as len_off = out.len;
+    reader.buf_emit16_le(out, 0);                  // length placeholder
+    reader.buf_emit16_le(out, cast(i32, kind));
+    return len_off;
+}
+
+fn _patch_sym_size(out as *reader.ByteBuffer, len_off as i64) as void {
+    // CodeView RecordLen must include the pad bytes — consumers compute the
+    // next record's offset as (current + RecLen + 2), so pad first and only
+    // then write the length so it accounts for the padding.
+    _emit_pad(out);
+    let is i64 as total = out.len - len_off;
+    let is i64 as len_val = total - 2;
+    let is *u8 as p = out.data;
+    p[len_off]     = cast(u8, len_val & 255);
+    p[len_off + 1] = cast(u8, (len_val >> 8) & 255);
+}
+
+// Build the per-module symbol stream blob. Returns 0 if no .cstdebug data
+// is present (out_buf left empty); caller treats it as "no line info".
+// Stream layout (per LLVM PDB spec):
+//   u32 Signature = CV_SIGNATURE_C13 (4)
+//   u8[SymByteSize - 4] raw symbol records (no subsection wrapper)
+//   u8[C11ByteSize=0]
+//   u8[C13ByteSize] DEBUG_S_* subsections (LINES, STRINGTABLE, FILECHKSMS)
+//   u32 GlobalRefsSize = 0
+//
+// out_sym_size / out_c13_size are filled in so the DBI ModuleInfo header
+// can describe the layout boundaries.
+fn build_module_stream(ls as *linker.LinkerState,
+                       obj_sel as i32,
+                       text_section_va as i64,
+                       out_buf as *reader.ByteBuffer,
+                       out_source as **u8, out_source_len as *i32,
+                       out_sym_size as *i32, out_c13_size as *i32,
+                       struct_indices as *i32, num_structs as i32,
+                       typemap_keys as *i64, typemap_vals as *i32,
+                       typemap_count as i32, obj_base as *i32) as i32 {
+    // 1. Read .cstdebug from EVERY .obj and merge into a single loc table.
+    //    Each .cstdebug entry's text_offset is obj-local; we add the obj's
+    //    final text_offset so all entries live in the merged-.text frame the
+    //    gsym vaddrs use. The first obj's source filename becomes the
+    //    module's reported source (multi-source-file support would require
+    //    a STRINGTABLE/FILECHKSMS rewrite — tracked separately).
+    // 1. Read .cstdebug from THIS object only — one module per object, so each
+    //    module carries just its own line table and its own source. Each entry
+    //    is in the object's .text frame; add the object's final text_offset so
+    //    it lines up with the merged .text the gsym vaddrs use.
+    if (ls.obj_count == 0) { return 0; }
+    if (obj_sel < 0 || obj_sel >= ls.obj_count) { return 0; }
+    let is *reader.ObjFile as o_sel = linker.get_obj(ls, obj_sel);
+    let is *reader.ObjSection as d_sel = _find_cstdebug(o_sel);
+    if (cast(i64, d_sel) == 0 || d_sel.size < 16) { return 0; }
+    if (_read_u32_at(d_sel.data, 0) != dbgproto.CSTDEBUG_MAGIC) { return 0; }
+    let is i32 as total_locs with mut = 0;
+    {
+        let is *u8 as bc = d_sel.data;
+        let is i64 as sl = _read_u32_at(bc, 8);
+        let is i64 as lo with mut = 12 + sl;
+        while ((lo & 3) != 0) { lo = lo + 1; }
+        total_locs = cast(i32, _read_u32_at(bc, lo));
+    }
+    if (total_locs < 1) { total_locs = 1; }
+    let is *i32 as merged_offsets = cast(*i32, om.opt_alloc(cast(i64, total_locs) * 4));
+    let is *i32 as merged_lines   = cast(*i32, om.opt_alloc(cast(i64, total_locs) * 4));
+    let is i32 as merged_count with mut = 0;
+    *out_source = cast(*u8, 0);
+    *out_source_len = 0;
+
+    {
+        let is *u8 as dbg_b = d_sel.data;
+        let is i64 as src_len_b = _read_u32_at(dbg_b, 8);
+        if (src_len_b > 0) {
+            *out_source = cast(*u8, cast(i64, dbg_b) + 12);
+            *out_source_len = cast(i32, src_len_b);
+        }
+        let is i64 as loff with mut = 12 + src_len_b;
+        while ((loff & 3) != 0) { loff = loff + 1; }
+        let is i64 as n_b = _read_u32_at(dbg_b, loff);
+        let is i64 as base_b = loff + 4;
+        let is i64 as t_off_b = o_sel.text_offset;
+        let is i64 as li_b with mut = 0;
+        while (li_b < n_b) {
+            let is i64 as local_b = _read_u32_at(dbg_b, base_b + li_b * 8);
+            let is i64 as line_b  = _read_u32_at(dbg_b, base_b + li_b * 8 + 4);
+            merged_offsets[merged_count] = cast(i32, t_off_b + local_b);
+            merged_lines[merged_count]   = cast(i32, line_b);
+            merged_count = merged_count + 1;
+            li_b = li_b + 1;
+        }
+    }
+
+    if (*out_source_len == 0) { return 0; }
+    let is i64 as num_locs = cast(i64, merged_count);
+
+    // 2. Collect text-section gsyms sorted by vaddr.
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as ntext with mut = 0;
+    let is i32 as gc with mut = 0;
+    while (gc < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gc);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) { ntext = ntext + 1; }
+        gc = gc + 1;
+    }
+    if (ntext < 1) { ntext = 1; }
+    let is *i32 as idx_arr = cast(*i32, om.opt_alloc(cast(i64, ntext) * 4));
+    let is *i64 as va_arr  = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is i32 as func_count with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) {
+            idx_arr[func_count] = gi;
+            va_arr[func_count] = g.vaddr;
+            func_count = func_count + 1;
+        }
+        gi = gi + 1;
+    }
+    _sort_indices(idx_arr, va_arr, func_count);
+
+    // 3. Emit CV_SIGNATURE_C13 then raw symbol records (no subsection wrapper).
+    reader.buf_emit32_le(out_buf, cast(i64, CV_SIGNATURE_C13));
+
+    // S_OBJNAME
+    let is i64 as obj_sym = _start_sym(out_buf, S_OBJNAME);
+    reader.buf_emit32_le(out_buf, 0);                // signature
+    let is i32 as si with mut = 0;
+    while (si < *out_source_len) {
+        reader.buf_emit8(out_buf, cast(i32, (*out_source)[si]));
+        si = si + 1;
+    }
+    reader.buf_emit8(out_buf, 0);
+    _patch_sym_size(out_buf, obj_sym);
+
+    // S_COMPILE3 — minimal: machine=0xD0 (AMD64), language=0 (C)
+    let is i64 as compile_sym = _start_sym(out_buf, S_COMPILE3);
+    reader.buf_emit32_le(out_buf, 0);                // flags + language byte (lang=0 C)
+    reader.buf_emit16_le(out_buf, 208);              // CV_CFL_X64 = 0xD0
+    reader.buf_emit16_le(out_buf, 0); reader.buf_emit16_le(out_buf, 0);
+    reader.buf_emit16_le(out_buf, 0); reader.buf_emit16_le(out_buf, 0);
+    reader.buf_emit16_le(out_buf, 0); reader.buf_emit16_le(out_buf, 0);
+    reader.buf_emit16_le(out_buf, 0); reader.buf_emit16_le(out_buf, 0);
+    let is *u8 as cstr = "Caustic 0.1";
+    let is i32 as ci with mut = 0;
+    while (ci < 11) { reader.buf_emit8(out_buf, cast(i32, cstr[ci])); ci = ci + 1; }
+    reader.buf_emit8(out_buf, 0);
+    _patch_sym_size(out_buf, compile_sym);
+
+    // S_BUILDINFO — references LF_BUILDINFO in IPI at known slot. Layout:
+    // u16 RecLen, u16 Kind, u32 BuildId. Total 8 bytes (4-aligned, no pad).
+    let is i64 as bi_sym = _start_sym(out_buf, S_BUILDINFO);
+    reader.buf_emit32_le(out_buf, cast(i64, buildinfo_ipi_index(func_count)));
+    _patch_sym_size(out_buf, bi_sym);
+
+    // S_GPROC32 + S_FRAMEPROC + S_END per function
+    let is i32 as fi with mut = 0;
+    while (fi < func_count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx_arr[fi]);
+        // Only this module's functions; `fi` stays the GLOBAL ordinal so the
+        // IPI item index and the next-function sizing stay consistent.
+        if (g.obj_idx != obj_sel) { fi = fi + 1; continue; }
+        let is i64 as fn_off = g.vaddr - text_section_va;
+        let is i64 as fn_end with mut = ls.text_vaddr + cast(i64, ls.text_size);
+        if (fi + 1 < func_count) {
+            let is *linker.GlobalSym as ng = linker.gsym_get(gsyms, idx_arr[fi + 1]);
+            fn_end = ng.vaddr;
+        }
+        let is i64 as fn_size = fn_end - g.vaddr;
+
+        // S_GPROC32_ID uses an IPI item index (LF_FUNC_ID) — one per
+        // function in VA-sorted order, allocated sequentially from
+        // IPI_INDEX_BEGIN. `fi` is exactly that ordinal.
+        let is i64 as proc_sym = _start_sym(out_buf, S_GPROC32_ID);
+        reader.buf_emit32_le(out_buf, 0);             // pParent
+        reader.buf_emit32_le(out_buf, 0);             // pEnd (patched later, leave 0)
+        reader.buf_emit32_le(out_buf, 0);             // pNext
+        reader.buf_emit32_le(out_buf, fn_size);       // codeSize
+        reader.buf_emit32_le(out_buf, 0);             // dbgStart
+        reader.buf_emit32_le(out_buf, fn_size);       // dbgEnd
+        reader.buf_emit32_le(out_buf, cast(i64, IPI_INDEX_BEGIN + fi));  // funcIdIndex → LF_FUNC_ID
+        reader.buf_emit32_le(out_buf, fn_off);        // offset
+        reader.buf_emit16_le(out_buf, 1);             // segment = .text
+        reader.buf_emit8(out_buf, 0);                 // flags
+        let is i32 as ni with mut = 0;
+        while (ni < g.name_len) {
+            reader.buf_emit8(out_buf, cast(i32, g.name[ni]));
+            ni = ni + 1;
+        }
+        reader.buf_emit8(out_buf, 0);
+        _patch_sym_size(out_buf, proc_sym);
+
+        // S_FRAMEPROC (minimal) — struct layout per LLVM FrameProcSym:
+        // 4*u32 (frame metrics) + u32 ehOffset + u16 ehSection + u16 pad +
+        // u32 flags = 28 bytes. Missing the pad u16 makes the consumer
+        // mis-parse the next record's header.
+        let is i64 as fp_sym = _start_sym(out_buf, S_FRAMEPROC);
+        reader.buf_emit32_le(out_buf, fn_size);       // total frame size (approx)
+        reader.buf_emit32_le(out_buf, 0);             // padSize
+        reader.buf_emit32_le(out_buf, 0);             // padOff
+        reader.buf_emit32_le(out_buf, 0);             // saveRegsCount
+        reader.buf_emit32_le(out_buf, 0);             // ehOffset
+        reader.buf_emit16_le(out_buf, 0);             // ehSection
+        reader.buf_emit16_le(out_buf, 0);             // pad
+        reader.buf_emit32_le(out_buf, 0);             // flags
+        _patch_sym_size(out_buf, fp_sym);
+
+        // S_LOCAL + S_DEFRANGE_FRAMEPOINTER_REL per local from .cstlocals.
+        // Locals (params + lets) live at [rbp - var_offset]; the debugger
+        // wants the offset relative to the frame pointer (rbp here), so we
+        // negate. The defrange covers the function's whole code span.
+        let is *reader.ObjSection as loc_sec = cast(*reader.ObjSection, 0);
+        let is i64 as loc_off with mut = 0;
+        let is i32 as loc_obj with mut = 0;
+        if (_lookup_locals(ls, g.name, g.name_len, &loc_sec, &loc_off, &loc_obj) == 1) {
+            let is i32 as lbase = obj_base[loc_obj];
+            let is *u8 as lp = loc_sec.data;
+            let is i64 as num_locals = _read_u32_at(lp, loc_off);
+            let is i64 as cursor with mut = loc_off + 4;
+            let is i64 as li2 with mut = 0;
+            while (li2 < num_locals && cursor + 4 <= loc_sec.size) {
+                let is i64 as lnl = _read_u32_at(lp, cursor);
+                if (cursor + 4 + lnl + 12 > loc_sec.size) { li2 = num_locals; continue; }
+                cursor = cursor + 4;
+                let is *u8 as lname = cast(*u8, cast(i64, lp) + cursor);
+                cursor = cursor + lnl;
+                let is i64 as voff = _read_u32_at(lp, cursor);            cursor = cursor + 4;
+                let is i32 as tk   = cast(i32, _read_u32_at(lp, cursor)); cursor = cursor + 4;
+                let is i32 as te   = cast(i32, _read_u32_at(lp, cursor)); cursor = cursor + 4;
+
+                // S_LOCAL: u16 RecLen, u16 Kind, u32 TypeIndex, u16 Flags,
+                //          name + null + pad. TypeIndex resolution:
+                //   primitive  → built-in CV index
+                //   void*      → T_PVOID
+                //   struct     → struct_indices[extra]
+                //   composite  → typemap lookup (pre-built by build_tpi_body)
+                //   otherwise  → T_NOTYPE (name/offset still display)
+                let is i32 as lcv with mut = 0;
+                let is i32 as tex = _tr_struct(tk, te, lbase, _pe_ebase[loc_obj]);
+                if (tk >= 0 && tk <= 13) { lcv = _prim_to_cv(tk); }
+                else if (tk == 400) { lcv = 1539; }
+                else if (tk == 300) {
+                    if (tex >= 0 && tex < num_structs) { lcv = struct_indices[tex]; }
+                } else if (tk == 600) {
+                    if (tex >= 0 && tex < _pe_nenums) { lcv = _pe_edefs[tex]; }
+                } else {
+                    let is i64 as tk_key = (cast(i64, tk) * 4294967296) + cast(i64, tex);
+                    let is i32 as found = _typemap_find(typemap_keys, typemap_count, tk_key);
+                    if (found >= 0) { lcv = typemap_vals[found]; }
+                }
+                let is i64 as local_sym = _start_sym(out_buf, S_LOCAL);
+                reader.buf_emit32_le(out_buf, cast(i64, lcv));
+                reader.buf_emit16_le(out_buf, 0);              // flags (0 = local var)
+                let is i32 as lni with mut = 0;
+                while (lni < cast(i32, lnl)) {
+                    reader.buf_emit8(out_buf, cast(i32, lname[lni]));
+                    lni = lni + 1;
+                }
+                reader.buf_emit8(out_buf, 0);
+                _patch_sym_size(out_buf, local_sym);
+
+                // S_DEFRANGE_FRAMEPOINTER_REL: u16 RecLen, u16 Kind,
+                //   u32 OffsetFP (i32 = -var_offset),
+                //   u32 OffsetStart, u16 ISectStart, u16 Range.
+                // Range is u16 — clamp giant function bodies so the field
+                // doesn't wrap to a small value and tell the debugger the
+                // local stops being visible early.
+                let is i64 as def_sym = _start_sym(out_buf, S_DEFRANGE_FPR);
+                let is i64 as neg_off = 0 - voff;
+                let is i64 as range_val with mut = fn_size;
+                if (range_val > 65535) { range_val = 65535; }
+                reader.buf_emit32_le(out_buf, neg_off);
+                reader.buf_emit32_le(out_buf, fn_off);          // section-rel start
+                reader.buf_emit16_le(out_buf, 1);               // .text segment
+                reader.buf_emit16_le(out_buf, cast(i32, range_val));
+                _patch_sym_size(out_buf, def_sym);
+
+                li2 = li2 + 1;
+            }
+        }
+
+        // S_END
+        let is i64 as end_sym = _start_sym(out_buf, S_END);
+        _patch_sym_size(out_buf, end_sym);
+
+        fi = fi + 1;
+    }
+    *out_sym_size = cast(i32, out_buf.len);
+
+    // 3b. LINES subsection per function. .cstdebug uses obj-text frame
+    //     (offset 0 = start of obj's .text); gsym vaddrs use section frame
+    //     (text_section_va + STUB_SIZE shift). Match in obj-text frame.
+    fi = 0;
+    while (fi < func_count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx_arr[fi]);
+        if (g.obj_idx != obj_sel) { fi = fi + 1; continue; }
+        let is i64 as fn_section_off = g.vaddr - text_section_va;
+        let is i64 as fn_obj_off = g.vaddr - ls.text_vaddr;       // may be < 0 for stub fns
+        let is i64 as fn_obj_end with mut = cast(i64, ls.text_size);
+        if (fi + 1 < func_count) {
+            let is *linker.GlobalSym as ng = linker.gsym_get(gsyms, idx_arr[fi + 1]);
+            fn_obj_end = ng.vaddr - ls.text_vaddr;
+        }
+        let is i64 as fn_size = fn_obj_end - fn_obj_off;
+
+        // Count lines in [fn_obj_off, fn_obj_end). Linker-emitted helpers
+        // (e.g. __caustic_chkstk) sit at negative obj offsets so the
+        // window excludes them — no .cstdebug entries map there.
+        let is *i32 as line_idx = cast(*i32, om.opt_alloc(4096 * 4));
+        let is i32 as line_count with mut = 0;
+        let is i64 as li with mut = 0;
+        while (li < num_locs) {
+            let is i64 as e_off = cast(i64, merged_offsets[li]);
+            if (e_off >= fn_obj_off && e_off < fn_obj_end && line_count < 4096) {
+                line_idx[line_count] = cast(i32, li);
+                line_count = line_count + 1;
+            }
+            li = li + 1;
+        }
+        if (line_count == 0) { fi = fi + 1; continue; }
+
+        let is i64 as ln_sub = _start_subsec(out_buf, DEBUG_S_LINES);
+        reader.buf_emit32_le(out_buf, fn_section_off); // offCon
+        reader.buf_emit16_le(out_buf, 1);             // segCon = .text
+        reader.buf_emit16_le(out_buf, 0);             // flags
+        reader.buf_emit32_le(out_buf, fn_size);       // cbCon
+        // offFile: offset of the file name in this module's STRINGTABLE
+        // subsection (1 — past the leading empty string). 0 named the empty
+        // string, so the debugger could not attribute the lines to a source.
+        reader.buf_emit32_le(out_buf, 1);             // offFile
+        reader.buf_emit32_le(out_buf, cast(i64, line_count));
+        // BlockSize counts the block header (NumLines + BlockSize = 8) plus the
+        // line entries — LLVM's `LineBlockFragmentHeader + NumLines *
+        // sizeof(LineNumberEntry)`. 12 was 4 too many.
+        reader.buf_emit32_le(out_buf, cast(i64, 8 + line_count * 8));    // cbBlock
+        let is i32 as lj with mut = 0;
+        while (lj < line_count) {
+            let is i64 as src_idx = cast(i64, line_idx[lj]);
+            let is i64 as e_off  = cast(i64, merged_offsets[src_idx]);
+            let is i64 as e_line = cast(i64, merged_lines[src_idx]);
+            // offset relative to function start (merged-text frame minus
+            // function's start offset in the same frame).
+            reader.buf_emit32_le(out_buf, e_off - fn_obj_off);
+            // flags = line | (1 << 31) (statement bit)
+            reader.buf_emit32_le(out_buf, (e_line & 16777215) + 2147483648);
+            lj = lj + 1;
+        }
+        _patch_subsec_size(out_buf, ln_sub);
+
+        fi = fi + 1;
+    }
+
+    // 3c. STRINGTABLE — single empty initial string followed by source path.
+    let is i64 as str_sub = _start_subsec(out_buf, DEBUG_S_STRINGTABLE);
+    reader.buf_emit8(out_buf, 0);                     // empty string at offset 0
+    let is i32 as ssi with mut = 0;
+    while (ssi < *out_source_len) {
+        reader.buf_emit8(out_buf, cast(i32, (*out_source)[ssi]));
+        ssi = ssi + 1;
+    }
+    reader.buf_emit8(out_buf, 0);
+    _patch_subsec_size(out_buf, str_sub);
+
+    // 3d. FILECHKSMS — one entry pointing at the source string (offset 1).
+    let is i64 as chk_sub = _start_subsec(out_buf, DEBUG_S_FILECHKSMS);
+    reader.buf_emit32_le(out_buf, 1);                 // offset into strtab
+    reader.buf_emit8(out_buf, 0);                     // cbChecksum
+    reader.buf_emit8(out_buf, 0);                     // checksumKind = None
+    reader.buf_emit16_le(out_buf, 0);                 // pad
+    _patch_subsec_size(out_buf, chk_sub);
+
+    *out_c13_size = cast(i32, out_buf.len - cast(i64, *out_sym_size));
+
+    // GlobalRefsSize — 0 means no global refs follow. LLVM's reloadSerialize
+    // reads this 4-byte count from the module stream AFTER the C13 line info
+    // and then reads that many bytes of global refs, so it must be present and
+    // must sit outside C13Bytes (which ends here).
+    reader.buf_emit32_le(out_buf, 0);
+
+    return cast(i32, out_buf.len);
+}
+
+// Locate .cstlocals section in an obj. Per-function records of:
+//   u32 name_len, byte[name_len] name, u32 num_locals,
+//   per local: u32 name_len, byte[name_len] name, u32 var_offset,
+//              u32 type_kind, u32 type_extra
+fn _find_cstlocals(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 10 && reader.streq(nm, 10, ".cstlocals", 10) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+// Find a function's locals in any obj's .cstlocals. Returns 1 on hit;
+// out_section is set to the section, out_record_off to the start of the
+// function's record (just past name+name_len), so the caller can read
+// num_locals and iterate.
+fn _lookup_locals(ls as *linker.LinkerState, name as *u8, name_len as i32,
+                  out_section as **reader.ObjSection, out_record_off as *i64,
+                  out_obj as *i32) as i32 {
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstlocals(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 8 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off);
+                if (off + 4 + nl + 4 > ss.size) { off = ss.size; continue; }
+                let is i64 as nl_off = off + 4;
+                let is i64 as num_locals_off = nl_off + nl;
+                let is i64 as num_locals = _read_u32_at(p, num_locals_off);
+
+                // Compute end of this function's record (locals are variable-
+                // length: 4+namelen + 12 each). A malformed lnl could overflow
+                // ss.size — guard the advance so we never read past the
+                // section boundary.
+                let is i64 as li with mut = 0;
+                let is i64 as cur with mut = num_locals_off + 4;
+                while (li < num_locals && cur + 4 <= ss.size) {
+                    let is i64 as lnl = _read_u32_at(p, cur);
+                    if (cur + 4 + lnl + 12 > ss.size) { cur = ss.size; li = num_locals; continue; }
+                    cur = cur + 4 + lnl + 12;
+                    li = li + 1;
+                }
+
+                if (cast(i32, nl) == name_len) {
+                    let is i32 as k with mut = 0;
+                    let is i32 as eq with mut = 1;
+                    while (k < name_len) {
+                        let is *u8 as np = cast(*u8, cast(i64, p) + nl_off + cast(i64, k));
+                        if (*np != name[k]) { eq = 0; k = name_len; }
+                        k = k + 1;
+                    }
+                    if (eq == 1) {
+                        *out_section = ss;
+                        *out_record_off = num_locals_off;
+                        *out_obj = oi;
+                        return 1;
+                    }
+                }
+                off = cur;
+            }
+        }
+        oi = oi + 1;
+    }
+    return 0;
+}
+
+// Locate .cststructs section in an obj. Format documented in
+// src/codegen/emit_driver.cst:emit_cststructs.
+fn _find_cststructs(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 11 && reader.streq(nm, 11, ".cststructs", 11) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+// Emit LF_NUMERIC-encoded unsigned size. For values < 0x8000 just a u16;
+// otherwise LF_ULONG (0x8004) + u32. Returns bytes written.
+fn _emit_lf_numeric(out_buf as *reader.ByteBuffer, value as i32) as i32 {
+    if (value >= 0 && value < 32768) {
+        reader.buf_emit16_le(out_buf, cast(i32, value));
+        return 2;
+    }
+    reader.buf_emit16_le(out_buf, 32772);                    // LF_ULONG
+    reader.buf_emit32_le(out_buf, cast(i64, value));
+    return 6;
+}
+
+// Type records are built from the .cststructs sections of every object.
+// A struct field whose type is composite (pointer, array, nested struct)
+// needs a TPI index of its own, so the whole table is materialised first and
+// pointers memoise the composite records.
+struct DbgField {
+    name_ptr as *u8;
+    name_len as i32;
+    var_offset as i32;
+    kind as i32;
+    extra as i32;
+}
+
+struct DbgStruct {
+    name_ptr as *u8;
+    name_len as i32;
+    size_bytes as i32;
+    nfields as i32;
+    fields as *DbgField;
+}
+
+struct DbgVariant {
+    name_ptr as *u8;
+    name_len as i32;
+    disc as i32;
+    kind as i32;
+    extra as i32;
+}
+
+// An enum: a plain enum is one LF_ENUM; a tagged union is an LF_STRUCTURE
+// holding the tag (an LF_ENUM) and the payload (an LF_UNION of the variants
+// that carry data). poff is 0 for a plain enum.
+struct DbgEnum {
+    name_ptr as *u8;
+    name_len as i32;
+    size_bytes as i32;
+    poff as i32;
+    nvariants as i32;
+    variants as *DbgVariant;
+}
+
+// The enum table is module-level: the linker is single-threaded, and the
+// (kind=600, ordinal) pairs reach _resolve_type_full from both the struct
+// records and the module symbol stream.
+let is i32 as _pe_nenums with mut = 0;
+let is *i32 as _pe_edefs with mut;    // global ordinal -> TPI definition index
+let is *i32 as _pe_efwd with mut;     // global ordinal -> TPI forward index
+let is *i32 as _pe_ebase with mut;    // per-object enum ordinal base
+
+// Pad a sub-record to a 4-byte boundary. The fill bytes count DOWN:
+// 1 byte → 0xF1, 2 → 0xF2 0xF1, 3 → 0xF3 0xF2 0xF1. This is the canonical
+// MSVC layout; an ascending run (0xF1 0xF2) desynchronises any consumer's
+// record walker.
+fn _emit_pad(out as *reader.ByteBuffer) as void {
+    let is i32 as k with mut = cast(i32, (0 - cast(i64, out.len)) & 3);
+    while (k > 0) {
+        reader.buf_emit8(out, 240 | k);
+        k = k - 1;
+    }
+}
+
+// Count the structs in one .cststructs section by walking its records.
+fn _count_cststructs(ss as *reader.ObjSection) as i32 {
+    let is i32 as total with mut = 0;
+    let is *u8 as p = ss.data;
+    let is i64 as off with mut = 0;
+    while (off + 12 <= ss.size) {
+        let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+        off = off + nl;                              // name
+        off = off + 4;                               // size_bytes
+        let is i64 as nf = _read_u32_at(p, off); off = off + 4;
+        total = total + 1;
+        let is i64 as fi with mut = 0;
+        while (fi < nf && off + 4 <= ss.size) {
+            let is i64 as fnl = _read_u32_at(p, off); off = off + 4;
+            off = off + fnl + 12;                    // name + offset + kind + extra
+            fi = fi + 1;
+        }
+    }
+    return total;
+}
+
+// Materialise every object's .cststructs into one global table. obj_base[oi]
+// is the global ordinal of the first struct contributed by object oi; the
+// per-object ordinals in .cstsigs/.cstlocals are translated with it.
+fn _collect_structs(ls as *linker.LinkerState, out_arr as **DbgStruct,
+                    out_count as *i32, out_obj_base as **i32) as void {
+    let is *i32 as obj_base = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is i32 as total with mut = 0;
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        obj_base[oi] = total;
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cststructs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) { total = total + _count_cststructs(ss); }
+        oi = oi + 1;
+    }
+    obj_base[ls.obj_count] = total;
+
+    let is *DbgStruct as arr = cast(*DbgStruct, om.opt_alloc(cast(i64, total + 1) * sizeof(DbgStruct)));
+    let is i32 as idx with mut = 0;
+    oi = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cststructs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is i32 as base = obj_base[oi];
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 12 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+                let is *u8 as sname = cast(*u8, cast(i64, p) + off); off = off + nl;
+                let is i64 as size_bytes = _read_u32_at(p, off); off = off + 4;
+                let is i64 as num_fields = _read_u32_at(p, off); off = off + 4;
+                let is *DbgStruct as st = cast(*DbgStruct, cast(i64, arr) + cast(i64, idx) * sizeof(DbgStruct));
+                st.name_ptr = sname;
+                st.name_len = cast(i32, nl);
+                st.size_bytes = cast(i32, size_bytes);
+                st.nfields = cast(i32, num_fields);
+                let is i32 as fcap with mut = cast(i32, num_fields);
+                if (fcap < 1) { fcap = 1; }
+                let is *DbgField as fld = cast(*DbgField, om.opt_alloc(cast(i64, fcap) * sizeof(DbgField)));
+                let is i64 as fi with mut = 0;
+                while (fi < num_fields && off + 4 <= ss.size) {
+                    let is i64 as fnl = _read_u32_at(p, off); off = off + 4;
+                    let is *DbgField as fp = cast(*DbgField, cast(i64, fld) + fi * sizeof(DbgField));
+                    fp.name_ptr = cast(*u8, cast(i64, p) + off);
+                    fp.name_len = cast(i32, fnl);
+                    off = off + fnl;
+                    fp.var_offset = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    fp.kind = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    let is i32 as fx with mut = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    // Struct ordinals in kinds 300 (by value) and 500
+                    // (pointer) are object-local; translate to the global
+                    // ordinal so cross-object references resolve.
+                    if (fp.kind == 300 || fp.kind == 500) { fx = fx + base; }
+                    fp.extra = fx;
+                    fi = fi + 1;
+                }
+                st.fields = fld;
+                idx = idx + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+    *out_arr = arr;
+    *out_count = total;
+    *out_obj_base = obj_base;
+}
+
+fn _find_cstenums(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 9 && reader.streq(nm, 9, ".cstenums", 9) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _count_cstenums(ss as *reader.ObjSection) as i32 {
+    let is i32 as total with mut = 0;
+    let is *u8 as p = ss.data;
+    let is i64 as off with mut = 0;
+    while (off + 16 <= ss.size) {
+        let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+        off = off + nl + 8;                              // name, size, payload_offset
+        let is i64 as nv = _read_u32_at(p, off); off = off + 4;
+        total = total + 1;
+        let is i64 as vi with mut = 0;
+        while (vi < nv && off + 4 <= ss.size) {
+            let is i64 as vnl = _read_u32_at(p, off); off = off + 4;
+            off = off + vnl + 12;                        // name + discriminant + kind + extra
+            vi = vi + 1;
+        }
+    }
+    return total;
+}
+
+fn _collect_enums(ls as *linker.LinkerState, out_arr as **DbgEnum,
+                  out_count as *i32, out_obj_base as **i32,
+                  sbase_arr as *i32) as void {
+    let is *i32 as obj_base = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is i32 as total with mut = 0;
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        obj_base[oi] = total;
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstenums(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) { total = total + _count_cstenums(ss); }
+        oi = oi + 1;
+    }
+    obj_base[ls.obj_count] = total;
+
+    let is *DbgEnum as arr = cast(*DbgEnum, om.opt_alloc(cast(i64, total + 1) * sizeof(DbgEnum)));
+    let is i32 as idx with mut = 0;
+    oi = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstenums(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is i32 as sbase = sbase_arr[oi];
+            let is i32 as ebase = obj_base[oi];
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 16 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off); off = off + 4;
+                let is *u8 as ename = cast(*u8, cast(i64, p) + off); off = off + nl;
+                let is i64 as size_bytes = _read_u32_at(p, off); off = off + 4;
+                let is i64 as poff = _read_u32_at(p, off); off = off + 4;
+                let is i64 as nv = _read_u32_at(p, off); off = off + 4;
+                let is *DbgEnum as en = cast(*DbgEnum, cast(i64, arr) + cast(i64, idx) * sizeof(DbgEnum));
+                en.name_ptr = ename;
+                en.name_len = cast(i32, nl);
+                en.size_bytes = cast(i32, size_bytes);
+                en.poff = cast(i32, poff);
+                en.nvariants = cast(i32, nv);
+                let is i32 as vcap with mut = cast(i32, nv);
+                if (vcap < 1) { vcap = 1; }
+                let is *DbgVariant as varr = cast(*DbgVariant, om.opt_alloc(cast(i64, vcap) * sizeof(DbgVariant)));
+                let is i64 as vi with mut = 0;
+                while (vi < nv && off + 4 <= ss.size) {
+                    let is i64 as vnl = _read_u32_at(p, off); off = off + 4;
+                    let is *DbgVariant as vp = cast(*DbgVariant, cast(i64, varr) + vi * sizeof(DbgVariant));
+                    vp.name_ptr = cast(*u8, cast(i64, p) + off);
+                    vp.name_len = cast(i32, vnl);
+                    off = off + vnl;
+                    vp.disc = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    vp.kind = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    let is i32 as vx with mut = cast(i32, _read_u32_at(p, off)); off = off + 4;
+                    if (vp.kind == 300 || vp.kind == 500) { vx = vx + sbase; }
+                    if (vp.kind == 600) { vx = vx + ebase; }
+                    vp.extra = vx;
+                    vi = vi + 1;
+                }
+                en.variants = varr;
+                idx = idx + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+    *out_arr = arr;
+    *out_count = total;
+    *out_obj_base = obj_base;
+}
+
+fn _patch_rec_len(out_buf as *reader.ByteBuffer, start as i64) as void {
+    let is *u8 as d = out_buf.data;
+    let is i32 as rec_len = cast(i32, out_buf.len) - cast(i32, start) - 2;
+    d[start]     = cast(u8, rec_len & 255);
+    d[start + 1] = cast(u8, (rec_len >> 8) & 255);
+}
+
+// Forward declaration: LF_STRUCTURE with Count=0, Property=ForwardRef (0x0080)
+// and no field list. Emitting one per struct up front makes every `*T` and
+// by-value `T` reference resolvable before any field list exists.
+fn _emit_struct_fwd(out_buf as *reader.ByteBuffer, st as *DbgStruct) as void {
+    let is i64 as st_start = out_buf.len;
+    reader.buf_emit16_le(out_buf, 0);                        // RecLen placeholder
+    reader.buf_emit16_le(out_buf, cast(i32, LF_STRUCTURE));
+    reader.buf_emit16_le(out_buf, 0);                        // Count = 0
+    reader.buf_emit16_le(out_buf, 128);                      // Property = ForwardRef
+    reader.buf_emit32_le(out_buf, 0);                        // FieldList
+    reader.buf_emit32_le(out_buf, 0);                        // DerivedFrom
+    reader.buf_emit32_le(out_buf, 0);                        // VShape
+    _emit_lf_numeric(out_buf, 0);                            // Size = 0
+    let is i32 as ni with mut = 0;
+    while (ni < st.name_len) { reader.buf_emit8(out_buf, cast(i32, st.name_ptr[ni])); ni = ni + 1; }
+    reader.buf_emit8(out_buf, 0);
+    _emit_pad(out_buf);
+    _patch_rec_len(out_buf, st_start);
+}
+
+// The real definition: LF_STRUCTURE with the member count, the field-list
+// index and the byte size.
+fn _emit_struct_def(out_buf as *reader.ByteBuffer, st as *DbgStruct, fieldlist_idx as i32) as void {
+    let is i64 as st_start = out_buf.len;
+    reader.buf_emit16_le(out_buf, 0);                        // RecLen placeholder
+    reader.buf_emit16_le(out_buf, cast(i32, LF_STRUCTURE));
+    reader.buf_emit16_le(out_buf, st.nfields);               // Count
+    reader.buf_emit16_le(out_buf, 0);                        // Property
+    reader.buf_emit32_le(out_buf, cast(i64, fieldlist_idx));
+    reader.buf_emit32_le(out_buf, 0);                        // DerivedFrom
+    reader.buf_emit32_le(out_buf, 0);                        // VShape
+    _emit_lf_numeric(out_buf, st.size_bytes);
+    let is i32 as ni with mut = 0;
+    while (ni < st.name_len) { reader.buf_emit8(out_buf, cast(i32, st.name_ptr[ni])); ni = ni + 1; }
+    reader.buf_emit8(out_buf, 0);
+    _emit_pad(out_buf);
+    _patch_rec_len(out_buf, st_start);
+}
+
+// Forward declaration: LF_ENUM with Count=0 and Property=ForwardRef.
+fn _emit_enum_fwd(out_buf as *reader.ByteBuffer, en as *DbgEnum) as void {
+    let is i64 as st_start = out_buf.len;
+    reader.buf_emit16_le(out_buf, 0);
+    reader.buf_emit16_le(out_buf, cast(i32, LF_ENUM));
+    reader.buf_emit16_le(out_buf, 0);                        // Count
+    reader.buf_emit16_le(out_buf, 128);                      // Property = ForwardRef
+    reader.buf_emit32_le(out_buf, 116);                      // UnderlyingType = T_INT4
+    reader.buf_emit32_le(out_buf, 0);                        // FieldList
+    let is i32 as ni with mut = 0;
+    while (ni < en.name_len) { reader.buf_emit8(out_buf, cast(i32, en.name_ptr[ni])); ni = ni + 1; }
+    reader.buf_emit8(out_buf, 0);
+    _emit_pad(out_buf);
+    _patch_rec_len(out_buf, st_start);
+}
+
+// The real definition: LF_ENUM with the enumerator count, the underlying type
+// (i32 for a plain enum, i64 for the 8-byte tag of a tagged union) and the
+// field-list index holding the LF_ENUMERATE entries.
+fn _emit_enum_def(out_buf as *reader.ByteBuffer, en as *DbgEnum, fieldlist_idx as i32) as void {
+    let is i64 as st_start = out_buf.len;
+    reader.buf_emit16_le(out_buf, 0);
+    reader.buf_emit16_le(out_buf, cast(i32, LF_ENUM));
+    reader.buf_emit16_le(out_buf, en.nvariants);
+    reader.buf_emit16_le(out_buf, 0);                        // Property
+    if (en.poff == 0) { reader.buf_emit32_le(out_buf, 116); }   // T_INT4
+    else { reader.buf_emit32_le(out_buf, 19); }                 // T_QUAD
+    reader.buf_emit32_le(out_buf, cast(i64, fieldlist_idx));
+    let is i32 as ni with mut = 0;
+    while (ni < en.name_len) { reader.buf_emit8(out_buf, cast(i32, en.name_ptr[ni])); ni = ni + 1; }
+    reader.buf_emit8(out_buf, 0);
+    _emit_pad(out_buf);
+    _patch_rec_len(out_buf, st_start);
+}
+
+// Emit the enum TPI records: a forward declaration for each, then a field
+// list of enumerators and the real LF_ENUM. Must run AFTER the struct forward
+// declarations (a variant payload can name a struct) and BEFORE the struct
+// definitions (a struct field can name an enum).
+fn build_enum_records(ls as *linker.LinkerState, out_buf as *reader.ByteBuffer,
+                      next_index as *i32, sbase_arr as *i32) as void {
+    let is *DbgEnum as arr with mut = cast(*DbgEnum, 0);
+    let is i32 as count with mut = 0;
+    let is *i32 as eobj_base with mut = cast(*i32, 0);
+    _collect_enums(ls, &arr, &count, &eobj_base, sbase_arr);
+    _pe_nenums = count;
+    _pe_ebase = eobj_base;
+    let is i32 as alloc_n with mut = count;
+    if (alloc_n < 1) { alloc_n = 1; }
+    let is *i32 as fwd  = cast(*i32, om.opt_alloc(cast(i64, alloc_n) * 4));
+    let is *i32 as defs = cast(*i32, om.opt_alloc(cast(i64, alloc_n) * 4));
+    _pe_efwd = fwd;
+    _pe_edefs = defs;
+
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is *DbgEnum as en = cast(*DbgEnum, cast(i64, arr) + cast(i64, i) * sizeof(DbgEnum));
+        fwd[i] = *next_index;
+        *next_index = *next_index + 1;
+        _emit_enum_fwd(out_buf, en);
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < count) {
+        let is *DbgEnum as en = cast(*DbgEnum, cast(i64, arr) + cast(i64, i) * sizeof(DbgEnum));
+        let is i64 as fl_start = out_buf.len;
+        reader.buf_emit16_le(out_buf, 0);                    // RecLen placeholder
+        reader.buf_emit16_le(out_buf, cast(i32, LF_FIELDLIST));
+        let is i32 as vi with mut = 0;
+        while (vi < en.nvariants) {
+            let is *DbgVariant as v = cast(*DbgVariant, cast(i64, en.variants) + cast(i64, vi) * sizeof(DbgVariant));
+            reader.buf_emit16_le(out_buf, cast(i32, LF_ENUMERATE));
+            reader.buf_emit16_le(out_buf, 3);                // public
+            _emit_lf_numeric(out_buf, v.disc);
+            let is i32 as ni with mut = 0;
+            while (ni < v.name_len) { reader.buf_emit8(out_buf, cast(i32, v.name_ptr[ni])); ni = ni + 1; }
+            reader.buf_emit8(out_buf, 0);
+            _emit_pad(out_buf);
+            vi = vi + 1;
+        }
+        _patch_rec_len(out_buf, fl_start);
+        let is i32 as fl_idx = *next_index;
+        *next_index = fl_idx + 1;
+        defs[i] = *next_index;
+        *next_index = *next_index + 1;
+        _emit_enum_def(out_buf, en, fl_idx);
+        i = i + 1;
+    }
+}
+
+// Emit an LF_POINTER record (referent is a TPI index) and return its index.
+fn _emit_lf_pointer(out_buf as *reader.ByteBuffer, next_index as *i32, referent as i32) as i32 {
+    reader.buf_emit16_le(out_buf, 10);
+    reader.buf_emit16_le(out_buf, cast(i32, LF_POINTER));
+    reader.buf_emit32_le(out_buf, cast(i64, referent));
+    reader.buf_emit32_le(out_buf, cast(i64, CV_PTR_ATTR_NEAR64));
+    let is i32 as idx = *next_index;
+    *next_index = idx + 1;
+    return idx;
+}
+
+fn _prim_elem_size(prim as i32) as i32 {
+    if (prim == 0) { return 0; }
+    if (prim == 1 || prim == 5 || prim == 11 || prim == 12) { return 1; }
+    if (prim == 2 || prim == 6) { return 2; }
+    if (prim == 3 || prim == 7 || prim == 9) { return 4; }
+    return 8;
+}
+
+// Emit an LF_ARRAY record (IndexType = T_UQUAD, matching MSVC's array
+// encoding) and return its index. `count` is the element count.
+fn _emit_lf_array(out_buf as *reader.ByteBuffer, next_index as *i32, prim as i32, count as i32) as i32 {
+    let is i32 as elem_cv = _prim_to_cv(prim);
+    let is i32 as total_bytes = _prim_elem_size(prim) * count;
+    let is i32 as size_field_bytes with mut = 2;
+    if (total_bytes >= 32768) { size_field_bytes = 6; }
+    let is i32 as payload = 11 + size_field_bytes;
+    let is i32 as total with mut = 2 + payload;
+    while ((total & 3) != 0) { total = total + 1; }
+    reader.buf_emit16_le(out_buf, total - 2);
+    reader.buf_emit16_le(out_buf, cast(i32, LF_ARRAY));
+    reader.buf_emit32_le(out_buf, cast(i64, elem_cv));
+    reader.buf_emit32_le(out_buf, 35);                       // IndexType = T_UQUAD
+    if (size_field_bytes == 2) {
+        reader.buf_emit16_le(out_buf, total_bytes);
+    } else {
+        reader.buf_emit16_le(out_buf, 32772);                // LF_ULONG
+        reader.buf_emit32_le(out_buf, cast(i64, total_bytes));
+    }
+    reader.buf_emit8(out_buf, 0);                            // empty name
+    _emit_pad(out_buf);
+    let is i32 as idx = *next_index;
+    *next_index = idx + 1;
+    return idx;
+}
+
+// Resolve a (kind, extra) type pair to a TPI index, emitting composite
+// records as needed. `fwd`/`defs` are the global struct tables; `extra` for
+// struct kinds (300/500) is a global ordinal. `use_fwd` selects the forward
+// declaration index for by-value struct references (canonical for members).
+// Built-in pointer types MSVC collapses: void*→T_PVOID, u8*→T_PUCHAR.
+fn _resolve_type_full(kind as i32, extra as i32,
+                      out_buf as *reader.ByteBuffer, next_index as *i32,
+                      fwd as *i32, defs as *i32, nstructs as i32,
+                      use_fwd as i32) as i32 {
+    if (kind >= 0 && kind <= 13) { return _prim_to_cv(kind); }
+    if (kind == 400) { return 1539; }                        // fn ptr → T_PVOID
+    if (kind == 300) {
+        if (extra >= 0 && extra < nstructs) {
+            if (use_fwd == 1) { return fwd[extra]; }
+            return defs[extra];
+        }
+        return 0;
+    }
+    if (kind == 500) {
+        let is i32 as ref with mut = 0;
+        if (extra >= 0 && extra < nstructs) { ref = fwd[extra]; }
+        return _emit_lf_pointer(out_buf, next_index, ref);
+    }
+    if (kind == 600) {
+        if (extra >= 0 && extra < _pe_nenums) {
+            if (use_fwd == 1) { return _pe_efwd[extra]; }
+            return _pe_edefs[extra];
+        }
+        return 0;
+    }
+    if (kind == 100) { return 1539; }                        // void* → T_PVOID
+    if (kind == 105) { return 1568; }                        // u8*   → T_PUCHAR
+    if (kind >= 101 && kind <= 113) {
+        return _emit_lf_pointer(out_buf, next_index, _prim_to_cv(kind - 100));
+    }
+    if (kind >= 200 && kind <= 213) {
+        return _emit_lf_array(out_buf, next_index, kind - 200, extra);
+    }
+    return 0;
+}
+
+// Emit the TPI type records for every struct. Two passes:
+//   1. forward declaration for each struct (so any cross-reference is valid);
+//   2. per struct, the composite records its members need, then the
+//      LF_FIELDLIST, then the real LF_STRUCTURE.
+// Fills defs[ordinal] (definition index) and fwd[ordinal] (forward index) and
+// returns the struct count.
+fn build_struct_records(ls as *linker.LinkerState,
+                        out_buf as *reader.ByteBuffer, next_index as *i32,
+                        out_struct_indices as **i32, out_num_structs as *i32,
+                        out_struct_fwd as **i32, out_obj_base as **i32) as i32 {
+    let is *DbgStruct as arr with mut = cast(*DbgStruct, 0);
+    let is i32 as count with mut = 0;
+    let is *i32 as obj_base with mut = cast(*i32, 0);
+    _collect_structs(ls, &arr, &count, &obj_base);
+
+    let is i32 as alloc_n with mut = count;
+    if (alloc_n < 1) { alloc_n = 1; }
+    let is *i32 as fwd  = cast(*i32, om.opt_alloc(cast(i64, alloc_n) * 4));
+    let is *i32 as defs = cast(*i32, om.opt_alloc(cast(i64, alloc_n) * 4));
+
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is *DbgStruct as st = cast(*DbgStruct, cast(i64, arr) + cast(i64, i) * sizeof(DbgStruct));
+        fwd[i] = *next_index;
+        *next_index = *next_index + 1;
+        _emit_struct_fwd(out_buf, st);
+        i = i + 1;
+    }
+
+    // Enums sit between the struct forward declarations and the struct
+    // definitions: a variant payload can name a struct, and a struct field
+    // can name an enum.
+    build_enum_records(ls, out_buf, next_index, obj_base);
+
+    let is i32 as maxf with mut = 1;
+    i = 0;
+    while (i < count) {
+        let is *DbgStruct as st = cast(*DbgStruct, cast(i64, arr) + cast(i64, i) * sizeof(DbgStruct));
+        if (st.nfields > maxf) { maxf = st.nfields; }
+        i = i + 1;
+    }
+    let is *i32 as fcv = cast(*i32, om.opt_alloc(cast(i64, maxf) * 4));
+
+    i = 0;
+    while (i < count) {
+        let is *DbgStruct as st = cast(*DbgStruct, cast(i64, arr) + cast(i64, i) * sizeof(DbgStruct));
+        // Compound records first — the field list may only reference indices.
+        let is i32 as fi with mut = 0;
+        while (fi < st.nfields) {
+            let is *DbgField as f = cast(*DbgField, cast(i64, st.fields) + cast(i64, fi) * sizeof(DbgField));
+            fcv[fi] = _resolve_type_full(f.kind, f.extra, out_buf, next_index, fwd, defs, count, 1);
+            fi = fi + 1;
+        }
+        let is i64 as fl_start = out_buf.len;
+        reader.buf_emit16_le(out_buf, 0);                    // RecLen placeholder
+        reader.buf_emit16_le(out_buf, cast(i32, LF_FIELDLIST));
+        fi = 0;
+        while (fi < st.nfields) {
+            let is *DbgField as f = cast(*DbgField, cast(i64, st.fields) + cast(i64, fi) * sizeof(DbgField));
+            reader.buf_emit16_le(out_buf, cast(i32, LF_MEMBER));
+            reader.buf_emit16_le(out_buf, 3);                // public
+            reader.buf_emit32_le(out_buf, cast(i64, fcv[fi]));
+            _emit_lf_numeric(out_buf, f.var_offset);
+            let is i32 as ni with mut = 0;
+            while (ni < f.name_len) { reader.buf_emit8(out_buf, cast(i32, f.name_ptr[ni])); ni = ni + 1; }
+            reader.buf_emit8(out_buf, 0);
+            _emit_pad(out_buf);
+            fi = fi + 1;
+        }
+        _patch_rec_len(out_buf, fl_start);
+        let is i32 as fl_idx = *next_index;
+        *next_index = fl_idx + 1;
+        defs[i] = *next_index;
+        *next_index = *next_index + 1;
+        _emit_struct_def(out_buf, st, fl_idx);
+        i = i + 1;
+    }
+
+    *out_struct_indices = defs;
+    *out_num_structs = count;
+    *out_struct_fwd = fwd;
+    *out_obj_base = obj_base;
+    return count;
+}
+
+// Locate .cstsigs section in an obj. Format: per-function records of
+//   u32 name_len, byte[name_len] name, u32 return_type, u32 num_args
+// Records run back-to-back until end of section; no padding.
+fn _find_cstsigs(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 8 && reader.streq(nm, 8, ".cstsigs", 8) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+// Find a function's signature in any obj's .cstsigs. Linear scan; N is
+// small. .cstsigs v2 per-function record:
+//   u32 name_len, byte[name_len] name, u32 num_args,
+//   (u32 kind, u32 extra)[1 + num_args]   ; ret first, then args
+//
+// On hit: fills *out_num_args; copies (1 + num_args) (kind, extra) pairs
+// into the caller's out_pairs buffer (size = 2 * (1 + num_args) i32s), and
+// writes the object index the record came from into *out_obj (struct
+// ordinals in the pairs are object-local).
+fn _lookup_sig(ls as *linker.LinkerState, name as *u8, name_len as i32,
+               out_num_args as *i32, out_pairs as *i32, out_obj as *i32) as i32 {
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstsigs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 8 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off);
+                if (off + 4 + nl + 4 > ss.size) { off = ss.size; continue; }
+                let is i64 as na_off = off + 4 + nl;
+                let is i64 as num_args = _read_u32_at(p, na_off);
+                let is i64 as type_pairs_off = na_off + 4;
+                let is i64 as record_end = type_pairs_off + (1 + num_args) * 8;
+                if (record_end > ss.size) { off = ss.size; continue; }
+                if (cast(i32, nl) == name_len) {
+                    let is i32 as k with mut = 0;
+                    let is i32 as eq with mut = 1;
+                    while (k < name_len) {
+                        let is *u8 as np = cast(*u8, cast(i64, p) + off + 4 + cast(i64, k));
+                        if (*np != name[k]) { eq = 0; k = name_len; }
+                        k = k + 1;
+                    }
+                    if (eq == 1) {
+                        *out_num_args = cast(i32, num_args);
+                        *out_obj = oi;
+                        let is i32 as pi with mut = 0;
+                        while (pi < cast(i32, 2 * (1 + num_args))) {
+                            out_pairs[pi] = cast(i32,
+                                _read_u32_at(p, type_pairs_off + cast(i64, pi) * 4));
+                            pi = pi + 1;
+                        }
+                        return 1;
+                    }
+                }
+                off = record_end;
+            }
+        }
+        oi = oi + 1;
+    }
+    return 0;
+}
+
+// Map a primitive Caustic type kind (TY_*) to a CV built-in type index.
+fn _prim_to_cv(kind as i32) as i32 {
+    if (kind == 0)  { return 3; }       // void → T_VOID
+    if (kind == 1)  { return 104; }     // i8 → T_INT1 (0x68)
+    if (kind == 2)  { return 17; }      // i16 → T_SHORT
+    if (kind == 3)  { return 116; }     // i32 → T_INT4 (0x74)
+    if (kind == 4)  { return 19; }      // i64 → T_QUAD
+    if (kind == 5)  { return 32; }      // u8 → T_UCHAR
+    if (kind == 6)  { return 33; }      // u16 → T_USHORT
+    if (kind == 7)  { return 117; }     // u32 → T_UINT4 (0x75)
+    if (kind == 8)  { return 35; }      // u64 → T_UQUAD
+    if (kind == 9)  { return 64; }      // f32 → T_REAL32
+    if (kind == 10) { return 65; }      // f64 → T_REAL64
+    if (kind == 11) { return 48; }      // bool → T_BOOL08
+    if (kind == 12) { return 112; }     // char → T_RCHAR
+    if (kind == 13) { return 1568; }    // string → T_PUCHAR (0x620)
+    return 116;                         // fallback T_INT4
+}
+
+// Build TPI body. For each defined TEXT-section gsym (VA-sorted), resolve
+// return + arg types (may emit LF_POINTER / LF_ARRAY), then emit one
+// LF_ARGLIST + LF_PROCEDURE per function. proc_indices[i] receives the CV
+// TPI index of function i's LF_PROCEDURE so build_ipi_body's LF_FUNC_ID can
+// reference it. Returns the count of records written (used by the TPI
+// header's TypeIndexEnd field).
+// Memoization map for composite-type CV indices. Keys are packed
+// (kind << 32) | extra; values are the assigned TPI index. Built during
+// build_tpi_body and consulted by S_LOCAL emission in build_module_stream
+// so locals reference real LF_POINTER/LF_ARRAY records (rather than the
+// T_NOTYPE fallback that was visible to the debugger before).
+fn _typemap_find(keys as *i64, count as i32, key as i64) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        if (keys[i] == key) { return i; }
+        i = i + 1;
+    }
+    let is i32 as neg with mut = 0;
+    neg = neg - 1;
+    return neg;
+}
+
+// Translate an object-local ordinal to the global ordinal: struct kinds (300
+// by-value and 500 pointer) with the struct base, kind 600 with the enum base;
+// other kinds pass through unchanged.
+fn _tr_struct(kind as i32, extra as i32, sbase as i32, ebase as i32) as i32 {
+    if (kind == 300 || kind == 500) { return extra + sbase; }
+    if (kind == 600) { return extra + ebase; }
+    return extra;
+}
+
+// Return the argument count of a function's .cstsigs record, or -1 if absent.
+// Used to size the type-pair buffer before the real lookup copies into it.
+fn _sig_num_args(ls as *linker.LinkerState, name as *u8, name_len as i32) as i32 {
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstsigs(o);
+        if (cast(i64, ss) != 0 && ss.size > 0) {
+            let is *u8 as p = ss.data;
+            let is i64 as off with mut = 0;
+            while (off + 8 <= ss.size) {
+                let is i64 as nl = _read_u32_at(p, off);
+                if (off + 4 + nl + 4 > ss.size) { off = ss.size; continue; }
+                let is i64 as na_off = off + 4 + nl;
+                let is i64 as num_args = _read_u32_at(p, na_off);
+                let is i64 as record_end = na_off + 4 + (1 + num_args) * 8;
+                if (record_end > ss.size) { off = ss.size; continue; }
+                if (cast(i32, nl) == name_len) {
+                    let is i32 as k with mut = 0;
+                    let is i32 as eq with mut = 1;
+                    while (k < name_len) {
+                        let is *u8 as np = cast(*u8, cast(i64, p) + off + 4 + cast(i64, k));
+                        if (*np != name[k]) { eq = 0; k = name_len; }
+                        k = k + 1;
+                    }
+                    if (eq == 1) { return cast(i32, num_args); }
+                }
+                off = record_end;
+            }
+        }
+        oi = oi + 1;
+    }
+    return 0 - 1;
+}
+
+fn build_tpi_body(ls as *linker.LinkerState, out_buf as *reader.ByteBuffer,
+                  proc_indices as *i32,
+                  out_struct_indices as **i32, out_num_structs as *i32,
+                  out_struct_fwd as **i32, out_obj_base as **i32,
+                  out_typemap_keys as **i64, out_typemap_vals as **i32,
+                  out_typemap_count as *i32) as i32 {
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+
+    // Count text-section gsyms, then size the arrays by the real count — no
+    // silent 1024 cap.
+    let is i32 as ntext with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) { ntext = ntext + 1; }
+        gi = gi + 1;
+    }
+    if (ntext < 1) { ntext = 1; }
+    let is *i32 as idx_arr = cast(*i32, om.opt_alloc(cast(i64, ntext) * 4));
+    let is *i64 as va_arr  = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is i32 as fcount with mut = 0;
+    gi = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) {
+            idx_arr[fcount] = gi;
+            va_arr[fcount] = g.vaddr;
+            fcount = fcount + 1;
+        }
+        gi = gi + 1;
+    }
+    _sort_indices(idx_arr, va_arr, fcount);
+
+    let is i32 as next_index with mut = TYPE_INDEX_BEGIN_LINKER;
+
+    // Struct records first, so function signatures and locals can reference
+    // them; struct_indices[ordinal] → definition TPI index, struct_fwd[ordinal]
+    // → forward-declaration index, obj_base[obj] → first global ordinal from
+    // that object (used to translate object-local struct ordinals).
+    let is *i32 as struct_indices with mut = cast(*i32, 0);
+    let is *i32 as struct_fwd with mut = cast(*i32, 0);
+    let is *i32 as obj_base with mut = cast(*i32, 0);
+    let is i32 as num_structs with mut = 0;
+    build_struct_records(ls, out_buf, &next_index,
+        &struct_indices, &num_structs, &struct_fwd, &obj_base);
+
+    let is i32 as fi with mut = 0;
+    while (fi < fcount) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx_arr[fi]);
+        let is i32 as num_args with mut = 0;
+        let is i32 as sig_obj with mut = 0;
+        let is i32 as na = _sig_num_args(ls, g.name, g.name_len);
+        let is i32 as pcap with mut = na + 1;
+        if (pcap < 1) { pcap = 1; }
+        let is *i32 as pairs = cast(*i32, om.opt_alloc(cast(i64, 2 * pcap) * 4));
+        let is i32 as found = _lookup_sig(ls, g.name, g.name_len, &num_args, pairs, &sig_obj);
+        let is i32 as sbase with mut = 0;
+        let is i32 as ebase with mut = 0;
+        if (found == 1) { sbase = obj_base[sig_obj]; ebase = _pe_ebase[sig_obj]; }
+
+        // Resolve return type (pair index 0) and each arg (pairs 1..1+num_args).
+        // Missing .cstsigs entry (linker-emitted helper) → void return, 0 args.
+        let is i32 as ret_cv with mut = 3;     // T_VOID default
+        if (found == 1) {
+            ret_cv = _resolve_type_full(pairs[0], _tr_struct(pairs[0], pairs[1], sbase, ebase),
+                                        out_buf, &next_index, struct_fwd, struct_indices, num_structs, 0);
+        }
+        let is *i32 as arg_cv = cast(*i32, om.opt_alloc(cast(i64, pcap) * 4));
+        let is i32 as ai with mut = 0;
+        while (ai < num_args) {
+            let is i32 as kpos = 2 * (1 + ai);
+            arg_cv[ai] = _resolve_type_full(pairs[kpos], _tr_struct(pairs[kpos], pairs[kpos + 1], sbase, ebase),
+                                            out_buf, &next_index, struct_fwd, struct_indices, num_structs, 0);
+            ai = ai + 1;
+        }
+
+        // LF_ARGLIST: u32 numArgs + numArgs * u32 arg CV indices
+        let is i32 as arglist_raw = 8 + 4 * num_args;
+        let is i32 as arglist_total with mut = arglist_raw;
+        while ((arglist_total & 3) != 0) { arglist_total = arglist_total + 1; }
+        reader.buf_emit16_le(out_buf, cast(i32, arglist_total - 2));
+        reader.buf_emit16_le(out_buf, cast(i32, LF_ARGLIST));
+        reader.buf_emit32_le(out_buf, cast(i64, num_args));
+        ai = 0;
+        while (ai < num_args) {
+            reader.buf_emit32_le(out_buf, cast(i64, arg_cv[ai]));
+            ai = ai + 1;
+        }
+        while ((cast(i32, out_buf.len) & 3) != 0) { reader.buf_emit8(out_buf, 0); }
+        let is i32 as arglist_idx = next_index;
+        next_index = next_index + 1;
+
+        // LF_PROCEDURE
+        reader.buf_emit16_le(out_buf, 14);
+        reader.buf_emit16_le(out_buf, cast(i32, LF_PROCEDURE));
+        reader.buf_emit32_le(out_buf, cast(i64, ret_cv));
+        reader.buf_emit8(out_buf, 0);                   // CallConv NEAR_C
+        reader.buf_emit8(out_buf, 0);                   // FuncAttr
+        reader.buf_emit16_le(out_buf, cast(i32, num_args));
+        reader.buf_emit32_le(out_buf, cast(i64, arglist_idx));
+        let is i32 as proc_idx = next_index;
+        next_index = next_index + 1;
+
+        proc_indices[fi] = proc_idx;
+        fi = fi + 1;
+    }
+
+    // Pre-scan .cstlocals across all objs so S_LOCAL records can reference
+    // real CV types instead of T_NOTYPE. For each unique composite (kind,
+    // extra) pair seen in locals, emit the matching LF_POINTER/LF_ARRAY and
+    // memoize the assigned CV index. Grows without a fixed cap.
+    let is i32 as tm_cap with mut = 64;
+    let is *i64 as tm_keys with mut = cast(*i64, om.opt_alloc(cast(i64, tm_cap) * 8));
+    let is *i32 as tm_vals with mut = cast(*i32, om.opt_alloc(cast(i64, tm_cap) * 4));
+    let is i32 as tm_count with mut = 0;
+    let is i32 as oi2 with mut = 0;
+    while (oi2 < ls.obj_count) {
+        let is i32 as lbase = obj_base[oi2];
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi2);
+        let is *reader.ObjSection as ls_sec = _find_cstlocals(o);
+        if (cast(i64, ls_sec) != 0 && ls_sec.size > 0) {
+            let is *u8 as lp = ls_sec.data;
+            let is i64 as off with mut = 0;
+            while (off + 4 <= ls_sec.size) {
+                let is i64 as fnl = _read_u32_at(lp, off);
+                if (off + 4 + fnl + 4 > ls_sec.size) { off = ls_sec.size; continue; }
+                off = off + 4 + fnl;
+                let is i64 as nlc = _read_u32_at(lp, off);
+                off = off + 4;
+                let is i64 as lj with mut = 0;
+                while (lj < nlc) {
+                    let is i64 as lnl = _read_u32_at(lp, off);
+                    if (off + 4 + lnl + 12 > ls_sec.size) { lj = nlc; off = ls_sec.size; continue; }
+                    off = off + 4 + lnl + 4;                       // skip name + var_offset
+                    let is i32 as tk = cast(i32, _read_u32_at(lp, off)); off = off + 4;
+                    let is i32 as te = cast(i32, _read_u32_at(lp, off)); off = off + 4;
+                    let is i32 as needs_emit with mut = 0;
+                    if (tk >= 100 && tk <= 113) { needs_emit = 1; }
+                    else if (tk >= 200 && tk <= 213) { needs_emit = 1; }
+                    else if (tk == 500) { needs_emit = 1; }
+                    if (needs_emit == 1) {
+                        let is i32 as tex = _tr_struct(tk, te, lbase, _pe_ebase[oi2]);
+                        let is i64 as key = (cast(i64, tk) * 4294967296) + cast(i64, tex);
+                        if (_typemap_find(tm_keys, tm_count, key) < 0) {
+                            let is i32 as cv = _resolve_type_full(tk, tex, out_buf, &next_index,
+                                                             struct_fwd, struct_indices, num_structs, 0);
+                            if (tm_count >= tm_cap) {
+                                let is i32 as nc = tm_cap * 2;
+                                let is *i64 as nk = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+                                let is *i32 as nv = cast(*i32, om.opt_alloc(cast(i64, nc) * 4));
+                                let is i32 as ci with mut = 0;
+                                while (ci < tm_count) { nk[ci] = tm_keys[ci]; nv[ci] = tm_vals[ci]; ci = ci + 1; }
+                                tm_keys = nk; tm_vals = nv; tm_cap = nc;
+                            }
+                            tm_keys[tm_count] = key;
+                            tm_vals[tm_count] = cv;
+                            tm_count = tm_count + 1;
+                        }
+                    }
+                    lj = lj + 1;
+                }
+            }
+        }
+        oi2 = oi2 + 1;
+    }
+
+    *out_struct_indices = struct_indices;
+    *out_num_structs = num_structs;
+    *out_struct_fwd = struct_fwd;
+    *out_obj_base = obj_base;
+    *out_typemap_keys = tm_keys;
+    *out_typemap_vals = tm_vals;
+    *out_typemap_count = tm_count;
+    return next_index - TYPE_INDEX_BEGIN_LINKER;
+}
+
+// Emit one LF_STRING_ID record. Returns nothing — record always advances
+// out_buf.len; callers track index assignment positionally.
+fn _emit_lf_string_id(out_buf as *reader.ByteBuffer, s as *u8, slen as i32) as void {
+    // Layout: u16 RecLen, u16 Kind, u32 ParentId=0, string name+null, pad.
+    // Raw size before pad: 2 + 2 + 4 + slen + 1 = 9 + slen. RecLen value =
+    // total - 2 in post-pad form.
+    let is i32 as raw = 9 + slen;
+    let is i32 as total with mut = raw;
+    while ((total & 3) != 0) { total = total + 1; }
+    reader.buf_emit16_le(out_buf, cast(i32, total - 2));
+    reader.buf_emit16_le(out_buf, cast(i32, LF_STRING_ID));
+    reader.buf_emit32_le(out_buf, 0);                              // ParentId
+    let is i32 as i with mut = 0;
+    while (i < slen) {
+        reader.buf_emit8(out_buf, cast(i32, s[i]));
+        i = i + 1;
+    }
+    reader.buf_emit8(out_buf, 0);
+    _emit_pad(out_buf);
+}
+
+// Emit one LF_FUNC_ID per defined TEXT-section gsym, in VA-sorted order, so
+// the i-th LF_FUNC_ID lives at IPI index IPI_INDEX_BEGIN+i — matching what
+// the S_GPROC32_ID records in build_module_stream reference. Sorts gsyms
+// independently of build_module_stream; both pipelines must produce the
+// same order, so the sort key (vaddr) and predicate (defined && TEXT) are
+// identical between them.
+//
+// After LF_FUNC_IDs, this also emits 5 LF_STRING_IDs followed by 1
+// LF_BUILDINFO, in that fixed order. Final IPI layout (with N functions):
+//   [0..N)            LF_FUNC_ID
+//   [N..N+5)          LF_STRING_ID (cwd, tool, src, pdb, args)
+//   N+5               LF_BUILDINFO
+fn build_ipi_body(ls as *linker.LinkerState, out_buf as *reader.ByteBuffer,
+                  src_path as *u8, src_path_len as i32,
+                  pdb_path as *u8, pdb_path_len as i32,
+                  proc_indices as *i32) as i32 {
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as ntext with mut = 0;
+    let is i32 as gc with mut = 0;
+    while (gc < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gc);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) { ntext = ntext + 1; }
+        gc = gc + 1;
+    }
+    if (ntext < 1) { ntext = 1; }
+    let is *i32 as idx_arr = cast(*i32, om.opt_alloc(cast(i64, ntext) * 4));
+    let is *i64 as va_arr  = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is i32 as fcount with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) {
+            idx_arr[fcount] = gi;
+            va_arr[fcount] = g.vaddr;
+            fcount = fcount + 1;
+        }
+        gi = gi + 1;
+    }
+    _sort_indices(idx_arr, va_arr, fcount);
+
+    let is i32 as fi with mut = 0;
+    while (fi < fcount) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx_arr[fi]);
+        // LF_FUNC_ID layout: u16 RecLen, u16 Kind, u32 scopeId, u32 typeId,
+        //                    string name (null-term, padded with 0xF1/F2/F3).
+        // typeId points at the per-function LF_PROCEDURE in TPI (2 type
+        // indices per function: arglist at 2*i, procedure at 2*i+1).
+        let is i32 as raw = 12 + g.name_len + 1;
+        let is i32 as total with mut = raw;
+        while ((total & 3) != 0) { total = total + 1; }
+        let is i32 as proc_idx = proc_indices[fi];
+        reader.buf_emit16_le(out_buf, cast(i32, total - 2));
+        reader.buf_emit16_le(out_buf, cast(i32, LF_FUNC_ID));
+        reader.buf_emit32_le(out_buf, 0);                              // scopeId
+        reader.buf_emit32_le(out_buf, cast(i64, proc_idx));            // typeId
+        let is i32 as ni with mut = 0;
+        while (ni < g.name_len) {
+            reader.buf_emit8(out_buf, cast(i32, g.name[ni]));
+            ni = ni + 1;
+        }
+        reader.buf_emit8(out_buf, 0);
+        _emit_pad(out_buf);
+        fi = fi + 1;
+    }
+
+    // 5 LF_STRING_ID records — order is fixed by LF_BUILDINFO contract:
+    //   0 CurrentDirectory, 1 BuildTool, 2 SourceFile, 3 Pdb, 4 Args.
+    // We don't have getcwd or argv in the linker, so cwd/args are empty.
+    let is *u8 as tool_name = "caustic";
+    _emit_lf_string_id(out_buf, "", 0);                          // cwd
+    _emit_lf_string_id(out_buf, tool_name, 7);                   // build tool
+    _emit_lf_string_id(out_buf, src_path, src_path_len);         // source file
+    _emit_lf_string_id(out_buf, pdb_path, pdb_path_len);         // pdb path
+    _emit_lf_string_id(out_buf, "", 0);                          // command args
+
+    // LF_BUILDINFO: u16 RecLen, u16 Kind, u16 NumArgs=5, u32[5] StringIds.
+    // Raw = 2 + 2 + 2 + 5*4 = 26. Pad to 28. RecLen value = 26.
+    let is i32 as bi_first = IPI_INDEX_BEGIN + fcount;
+    reader.buf_emit16_le(out_buf, 26);
+    reader.buf_emit16_le(out_buf, cast(i32, LF_BUILDINFO));
+    reader.buf_emit16_le(out_buf, 5);                              // NumArgs
+    reader.buf_emit32_le(out_buf, cast(i64, bi_first + 0));
+    reader.buf_emit32_le(out_buf, cast(i64, bi_first + 1));
+    reader.buf_emit32_le(out_buf, cast(i64, bi_first + 2));
+    reader.buf_emit32_le(out_buf, cast(i64, bi_first + 3));
+    reader.buf_emit32_le(out_buf, cast(i64, bi_first + 4));
+    _emit_pad(out_buf);
+
+    // Total IPI records: fcount LF_FUNC_IDs + 5 LF_STRING_IDs + 1 LF_BUILDINFO.
+    return fcount + 6;
+}
+
+// Compute the IPI index where the LF_BUILDINFO will live, given the number of
+// LF_FUNC_IDs (= text-section gsyms) that precede it. Used so build_module_stream
+// can emit S_BUILDINFO with the right reference before build_ipi_body runs.
+fn buildinfo_ipi_index(num_funcs as i32) as i32 {
+    return IPI_INDEX_BEGIN + num_funcs + 5;
+}
+
+// Patch SizeOfData / AddressOfRawData / PointerToRawData in IMAGE_DEBUG_DIRECTORY
+// now that rodata_rva and rodata_file are known.
+fn _patch_debug_dir(rodata_buf as *reader.ByteBuffer,
+                    dir_off as i64, rsds_off as i64,
+                    rsds_size as i32,
+                    rodata_rva as i64, rodata_file as i64) as void {
+    let is *u8 as p = rodata_buf.data;
+    // SizeOfData at dir_off + 16
+    let is i64 as sz_off = dir_off + 16;
+    p[sz_off]     = cast(u8, rsds_size & 255);
+    p[sz_off + 1] = cast(u8, (rsds_size >> 8) & 255);
+    p[sz_off + 2] = cast(u8, (rsds_size >> 16) & 255);
+    p[sz_off + 3] = cast(u8, (rsds_size >> 24) & 255);
+    // AddressOfRawData at dir_off + 20
+    let is i64 as ar_off = dir_off + 20;
+    let is i64 as rsds_rva = rodata_rva + rsds_off;
+    p[ar_off]     = cast(u8, rsds_rva & 255);
+    p[ar_off + 1] = cast(u8, (rsds_rva >> 8) & 255);
+    p[ar_off + 2] = cast(u8, (rsds_rva >> 16) & 255);
+    p[ar_off + 3] = cast(u8, (rsds_rva >> 24) & 255);
+    // PointerToRawData at dir_off + 24
+    let is i64 as pr_off = dir_off + 24;
+    let is i64 as rsds_file = rodata_file + rsds_off;
+    p[pr_off]     = cast(u8, rsds_file & 255);
+    p[pr_off + 1] = cast(u8, (rsds_file >> 8) & 255);
+    p[pr_off + 2] = cast(u8, (rsds_file >> 16) & 255);
+    p[pr_off + 3] = cast(u8, (rsds_file >> 24) & 255);
+}

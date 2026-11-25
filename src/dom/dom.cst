@@ -175,16 +175,24 @@ fn init(d as *Document) as void {
     d.node = _node(d, DOCUMENT);
 }
 
-fn free(d as *Document) as void {
-    let is *Block as b with mut = d.blocks;
+fn free_blocks(first as *Block) as void {
+    let is *Block as b with mut = first;
     while (b != null) {
         let is *Block as next = b.next;
         mem.core.munmap(cast(*u8, b), b.size);
         b = next;
     }
+}
+// Its memory, for whoever is to free it later. The document is empty after this.
+fn take_blocks(d as *Document) as *Block {
+    let is *Block as b = d.blocks;
     d.blocks = cast(*Block, 0);
     d.node = cast(*Node, 0);
     d.left = 0;
+    return b;
+}
+fn free(d as *Document) as void {
+    free_blocks(take_blocks(d));
 }
 
 // --- making nodes --------------------------------------------------------

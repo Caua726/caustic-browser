@@ -1,0 +1,343 @@
+// === ASCII character constants ===
+
+let is u8 as CH_TAB    with imut = 9;
+let is u8 as CH_NL     with imut = 10;
+let is u8 as CH_CR     with imut = 13;
+let is u8 as CH_SPACE  with imut = 32;
+let is u8 as CH_BANG   with imut = 33;
+let is u8 as CH_DQUOTE with imut = 34;
+let is u8 as CH_HASH   with imut = 35;
+let is u8 as CH_PERCENT with imut = 37;
+let is u8 as CH_AMP    with imut = 38;
+let is u8 as CH_SQUOTE with imut = 39;
+let is u8 as CH_LPAREN with imut = 40;
+let is u8 as CH_RPAREN with imut = 41;
+let is u8 as CH_STAR   with imut = 42;
+let is u8 as CH_PLUS   with imut = 43;
+let is u8 as CH_COMMA  with imut = 44;
+let is u8 as CH_MINUS  with imut = 45;
+let is u8 as CH_DOT    with imut = 46;
+let is u8 as CH_SLASH  with imut = 47;
+let is u8 as CH_0      with imut = 48;
+let is u8 as CH_9      with imut = 57;
+let is u8 as CH_COLON  with imut = 58;
+let is u8 as CH_SEMI   with imut = 59;
+let is u8 as CH_LT     with imut = 60;
+let is u8 as CH_EQ     with imut = 61;
+let is u8 as CH_GT     with imut = 62;
+let is u8 as CH_A      with imut = 65;
+let is u8 as CH_B      with imut = 66;
+let is u8 as CH_F      with imut = 70;
+let is u8 as CH_O      with imut = 79;
+let is u8 as CH_X      with imut = 88;
+let is u8 as CH_Z      with imut = 90;
+let is u8 as CH_LBRACK with imut = 91;
+let is u8 as CH_BSLASH with imut = 92;
+let is u8 as CH_RBRACK with imut = 93;
+let is u8 as CH_CARET  with imut = 94;
+let is u8 as CH_UNDER  with imut = 95;
+let is u8 as CH_e      with imut = 101;
+let is u8 as CH_E      with imut = 69;
+let is u8 as CH_a      with imut = 97;
+let is u8 as CH_b      with imut = 98;
+let is u8 as CH_f      with imut = 102;
+let is u8 as CH_n      with imut = 110;
+let is u8 as CH_o      with imut = 111;
+let is u8 as CH_r      with imut = 114;
+let is u8 as CH_t      with imut = 116;
+let is u8 as CH_x      with imut = 120;
+let is u8 as CH_z      with imut = 122;
+let is u8 as CH_LBRACE with imut = 123;
+let is u8 as CH_PIPE   with imut = 124;
+let is u8 as CH_RBRACE with imut = 125;
+let is u8 as CH_TILDE  with imut = 126;
+
+// === Char classifiers ===
+
+fn is_alpha(c as u8) as i32 {
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c == 95) { return 1; }
+    return 0;
+}
+
+fn is_digit(c as u8) as i32 {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+fn is_alnum(c as u8) as i32 {
+    if (is_alpha(c) == 1) { return 1; }
+    if (is_digit(c) == 1) { return 1; }
+    return 0;
+}
+
+fn is_hex(c as u8) as i32 {
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c >= 97 && c <= 102) { return 1; }
+    if (c >= 65 && c <= 70) { return 1; }
+    return 0;
+}
+
+fn is_binary(c as u8) as i32 {
+    if (c == 48 || c == 49) { return 1; }
+    return 0;
+}
+
+fn is_octal(c as u8) as i32 {
+    if (c >= 48 && c <= 55) { return 1; }
+    return 0;
+}
+
+// === Number parsers ===
+
+fn parse_decimal(src as *u8, start as i64, end as i64) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        if (src[i] != CH_UNDER) { result = result * 10 + cast(i64, src[i]) - 48; }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn parse_hex_val(src as *u8, start as i64, end as i64) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        let is u8 as c = src[i];
+        if (c == CH_UNDER) { i = i + 1; }
+        else if (c >= 48 && c <= 57) {
+            result = result * 16 + cast(i64, c) - 48; i = i + 1;
+        } else if (c >= 97 && c <= 102) {
+            result = result * 16 + cast(i64, c) - 87; i = i + 1;
+        } else if (c >= 65 && c <= 70) {
+            result = result * 16 + cast(i64, c) - 55; i = i + 1;
+        } else { i = i + 1; }
+    }
+    return result;
+}
+
+fn parse_binary_val(src as *u8, start as i64, end as i64) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        if (src[i] != CH_UNDER) { result = result * 2 + cast(i64, src[i]) - 48; }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn parse_octal_val(src as *u8, start as i64, end as i64) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        if (src[i] != CH_UNDER) { result = result * 8 + cast(i64, src[i]) - 48; }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Binary64 midpoint decimals have fewer than 1024 significant digits.
+// Retain that prefix plus a sticky tail and round the exact rational once.
+// 160 limbs cover the prefix, the worst subnormal divisor and 53 quotient bits.
+struct DecimalInteger {
+    words as [160]u32;
+    used as i32;
+}
+
+fn _decimal_init(n as *DecimalInteger, value as u32) as void {
+    n.words[0] = value; n.used = 1;
+}
+
+fn _decimal_mul10(n as *DecimalInteger, digit as u32) as void {
+    let is u64 as carry with mut = cast(u64, digit);
+    let is i32 as i with mut = 0;
+    while (i < n.used) {
+        let is u64 as value = cast(u64, n.words[i]) * cast(u64, 10) + carry;
+        n.words[i] = cast(u32, value); carry = value >> 32;
+        i = i + 1;
+    }
+    if (carry != cast(u64, 0)) { n.words[n.used] = cast(u32, carry); n.used = n.used + 1; }
+}
+
+fn _decimal_bits(n as *DecimalInteger) as i32 {
+    let is u32 as top with mut = n.words[n.used - 1];
+    let is i32 as bits with mut = (n.used - 1) * 32;
+    while (top != cast(u32, 0)) { top = top >> 1; bits = bits + 1; }
+    return bits;
+}
+
+fn _decimal_shift_left(n as *DecimalInteger, shift as i32) as void {
+    let is i32 as whole = shift / 32;
+    let is i32 as part = shift % 32;
+    let is i32 as count = n.used + whole + 1;
+    let is i32 as i with mut = count - 1;
+    while (i >= 0) {
+        let is u64 as value with mut = cast(u64, 0);
+        let is i32 as source = i - whole;
+        if (source >= 0 && source < n.used) { value = cast(u64, n.words[source]) << part; }
+        if (part > 0 && source > 0 && source - 1 < n.used) {
+            value = value | (cast(u64, n.words[source - 1]) >> (32 - part));
+        }
+        n.words[i] = cast(u32, value);
+        i = i - 1;
+    }
+    n.used = count;
+    while (n.used > 1 && n.words[n.used - 1] == cast(u32, 0)) { n.used = n.used - 1; }
+}
+
+fn _decimal_shift_right(n as *DecimalInteger, shift as i32) as void {
+    let is i32 as whole = shift / 32;
+    let is i32 as part = shift % 32;
+    let is i32 as count = n.used - whole;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is u64 as value with mut = cast(u64, n.words[i + whole]) >> part;
+        if (part > 0 && i + whole + 1 < n.used) {
+            value = value | (cast(u64, n.words[i + whole + 1]) << (32 - part));
+        }
+        n.words[i] = cast(u32, value); i = i + 1;
+    }
+    n.used = count;
+    while (n.used > 1 && n.words[n.used - 1] == cast(u32, 0)) { n.used = n.used - 1; }
+}
+
+fn _decimal_compare(a as *DecimalInteger, b as *DecimalInteger) as i32 {
+    if (a.used > b.used) { return 1; }
+    if (a.used < b.used) { return 0 - 1; }
+    let is i32 as i with mut = a.used - 1;
+    while (i >= 0) {
+        if (a.words[i] > b.words[i]) { return 1; }
+        if (a.words[i] < b.words[i]) { return 0 - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _decimal_subtract(a as *DecimalInteger, b as *DecimalInteger) as void {
+    let is u64 as borrow with mut = cast(u64, 0);
+    let is i32 as i with mut = 0;
+    while (i < a.used) {
+        let is u64 as rhs with mut = borrow;
+        if (i < b.used) { rhs = rhs + cast(u64, b.words[i]); }
+        let is u64 as lhs = cast(u64, a.words[i]);
+        a.words[i] = cast(u32, lhs - rhs);
+        borrow = cast(u64, lhs < rhs);
+        i = i + 1;
+    }
+    while (a.used > 1 && a.words[a.used - 1] == cast(u32, 0)) { a.used = a.used - 1; }
+}
+
+fn parse_float(src as *u8, start as i64, end as i64) as f64 {
+    let is DecimalInteger as numerator with mut;
+    let is DecimalInteger as denominator with mut;
+    _decimal_init(&numerator, cast(u32, 0));
+    _decimal_init(&denominator, cast(u32, 1));
+    let is i32 as digits with mut = 0;
+    let is i32 as fractional with mut = 0;
+    let is i32 as sticky with mut = 0;
+    let is i64 as scale with mut = 0;
+    let is i64 as i with mut = start;
+    while (i < end && src[i] != CH_e && src[i] != CH_E) {
+        let is u8 as c = src[i];
+        if (c == 46) { fractional = 1; }
+        else if (c != CH_UNDER) {
+            if (fractional == 1) { scale = scale - 1; }
+            if (digits > 0 || c != 48) {
+                if (digits < 1024) {
+                    _decimal_mul10(&numerator, cast(u32, c) - cast(u32, 48));
+                    digits = digits + 1;
+                } else {
+                    scale = scale + 1;
+                    if (c != 48) { sticky = 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (i < end) {
+        i = i + 1;
+        let is i32 as negative with mut = 0;
+        if (i < end && src[i] == 45) { negative = 1; i = i + 1; }
+        else if (i < end && src[i] == 43) { i = i + 1; }
+        let is i64 as exponent with mut = 0;
+        while (i < end) {
+            if (src[i] != CH_UNDER && exponent < 100000) { exponent = exponent * 10 + cast(i64, src[i]) - 48; }
+            i = i + 1;
+        }
+        if (negative == 1) { scale = scale - exponent; } else { scale = scale + exponent; }
+    }
+    let is i64 as bits with mut = 0;
+    // Clinger's exact fast path: one hardware rounding when both the integer
+    // significand and power of ten are exactly representable in binary64.
+    if (sticky == 0 && _decimal_bits(&numerator) <= 53 && scale >= 0 - 22 && scale <= 22) {
+        let is i64 as small with mut = cast(i64, numerator.words[0]);
+        if (numerator.used == 2) { small = small | (cast(i64, numerator.words[1]) << 32); }
+        let is i64 as count with mut = scale;
+        if (count < 0) { count = 0 - count; }
+        let is f64 as power with mut = cast(f64, 1);
+        let is f64 as base with mut = cast(f64, 10);
+        while (count > 0) {
+            if ((count & 1) == 1) { power = power * base; }
+            count = count >> 1;
+            if (count > 0) { base = base * base; }
+        }
+        if (scale >= 0) { return cast(f64, small) * power; }
+        return cast(f64, small) / power;
+    }
+    if (digits == 0 || cast(i64, digits) + scale < 0 - 323) { return *cast(*f64, &bits); }
+    if (cast(i64, digits) + scale > 309) { bits = 0x7ff0000000000000; return *cast(*f64, &bits); }
+    while (scale > 0) { _decimal_mul10(&numerator, cast(u32, 0)); scale = scale - 1; }
+    while (scale < 0) { _decimal_mul10(&denominator, cast(u32, 0)); scale = scale + 1; }
+    let is i32 as exponent with mut = _decimal_bits(&numerator) - _decimal_bits(&denominator);
+    let is i32 as comparison with mut = 0;
+    if (exponent >= 0) {
+        _decimal_shift_left(&denominator, exponent);
+        comparison = _decimal_compare(&numerator, &denominator);
+        _decimal_shift_right(&denominator, exponent);
+    } else {
+        _decimal_shift_left(&numerator, 0 - exponent);
+        comparison = _decimal_compare(&numerator, &denominator);
+        _decimal_shift_right(&numerator, 0 - exponent);
+    }
+    if (comparison < 0) { exponent = exponent - 1; }
+    let is i32 as shift with mut = 52 - exponent;
+    if (exponent < 0 - 1022) { shift = 1074; }
+    if (shift >= 0) { _decimal_shift_left(&numerator, shift); }
+    else { _decimal_shift_left(&denominator, 0 - shift); }
+    _decimal_shift_left(&denominator, 52);
+    let is i32 as bit with mut = 52;
+    let is i64 as significand with mut = 0;
+    while (bit >= 0) {
+        if (_decimal_compare(&numerator, &denominator) >= 0) {
+            _decimal_subtract(&numerator, &denominator);
+            significand = significand | (cast(i64, 1) << bit);
+        }
+        if (bit > 0) { _decimal_shift_right(&denominator, 1); }
+        bit = bit - 1;
+    }
+    _decimal_shift_left(&numerator, 1);
+    comparison = _decimal_compare(&numerator, &denominator);
+    if (comparison > 0 || (comparison == 0 && (sticky == 1 || (significand & 1) == 1))) {
+        significand = significand + 1;
+    }
+    if (exponent < 0 - 1022) { bits = significand; }
+    else {
+        if (significand == (cast(i64, 1) << 53)) { significand = significand >> 1; exponent = exponent + 1; }
+        if (exponent > 1023) { bits = 0x7ff0000000000000; }
+        else { bits = (cast(i64, exponent + 1023) << 52) | (significand & 0xfffffffffffff); }
+    }
+    return *cast(*f64, &bits);
+}
+
+fn resolve_escape(c as u8) as i64 {
+    if (c == 110) { return 10; }
+    if (c == 116) { return 9; }
+    if (c == 114) { return 13; }
+    if (c == 48)  { return 0; }
+    if (c == 92)  { return 92; }
+    if (c == 39)  { return 39; }
+    if (c == 34)  { return 34; }
+    return cast(i64, c);
+}

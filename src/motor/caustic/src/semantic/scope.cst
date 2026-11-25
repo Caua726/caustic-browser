@@ -1,0 +1,945 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../lexer/tokens.cst" as tok;
+use "../lexer/lexer.cst" as lex;
+use "../codegen/target.cst" as tgt;
+
+// === Global state ===
+let is *d.Scope as all_scopes with mut;
+let is *d.Scope as current_scope with mut;
+let is *d.Scope as global_scope with mut;
+let is i32 as stack_offset with mut;
+let is *d.Function as function_table with mut;
+let is i32 as fn_count with mut = 0;
+let is i32 as loop_depth with mut;
+
+// === Function hash table (DJB2 + chaining) ===
+// Grown, never full: every function declared is found again. Its buckets are
+// half its room, all chains rebuilt when it doubles.
+let is i32 as fn_hash_buckets_n with mut = 4096;
+let is i32 as fn_hash_cap with mut = 8192;
+let is *i32 as fn_hash_buckets with mut;
+let is *i32 as fn_hash_next with mut;
+let is *i64 as fn_hash_ptrs with mut;
+
+fn fn_hash(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < prefix_len) {
+        h = h * 33 + cast(i64, prefix_ptr[i]);
+        i = i + 1;
+    }
+    if (prefix_len > 0) { h = h * 33 + 95; }
+    i = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    h = h & 9223372036854775807;
+    return cast(i32, h & cast(i64, fn_hash_buckets_n - 1));
+}
+
+fn _fn_hash_tables(cap as i32, buckets as i32) as void {
+    fn_hash_cap = cap;
+    fn_hash_buckets_n = buckets;
+    fn_hash_buckets = cast(*i32, d.sem_alloc(cast(i64, buckets) * 4));
+    fn_hash_next = cast(*i32, d.sem_alloc(cast(i64, cap) * 4));
+    fn_hash_ptrs = cast(*i64, d.sem_alloc(cast(i64, cap) * 8));
+    let is i32 as i with mut = 0;
+    while (i < buckets) {
+        fn_hash_buckets[i] = 0 - 1;
+        i = i + 1;
+    }
+}
+
+fn fn_hash_init() as void {
+    _fn_hash_tables(8192, 4096);
+    fn_count = 0;
+}
+
+// Room doubled: the entries keep their indices, chained again in the order
+// they were declared, so a chain still holds the latest first.
+fn _fn_hash_grow() as void {
+    let is i32 as was_cap = fn_hash_cap;
+    let is i32 as was_buckets = fn_hash_buckets_n;
+    let is *i32 as old_buckets = fn_hash_buckets;
+    let is *i32 as old_next = fn_hash_next;
+    let is *i64 as old_ptrs = fn_hash_ptrs;
+    _fn_hash_tables(was_cap * 2, was_buckets * 2);
+    let is i32 as idx with mut = 0;
+    while (idx < fn_count) {
+        let is *d.Function as f = cast(*d.Function, old_ptrs[idx]);
+        let is i32 as h = fn_hash(f.name_ptr, f.name_len, f.mod_prefix_ptr, f.mod_prefix_len);
+        fn_hash_ptrs[idx] = old_ptrs[idx];
+        fn_hash_next[idx] = fn_hash_buckets[h];
+        fn_hash_buckets[h] = idx;
+        idx = idx + 1;
+    }
+    d.sem_free(cast(*u8, old_buckets));
+    d.sem_free(cast(*u8, old_next));
+    d.sem_free(cast(*u8, old_ptrs));
+}
+
+let is *u8 as current_return_type with mut;
+let is *u8 as current_mod_prefix_ptr with mut;
+let is i32 as current_mod_prefix_len with mut;
+let is *u8 as current_source_dir_ptr with mut;
+let is i32 as current_source_dir_len with mut;
+
+// Stdlib system directory (resolved from binary location)
+let is *u8 as stdlib_dir_ptr with mut;
+let is i32 as stdlib_dir_len with mut;
+
+// Extra search paths (--path flag)
+let is [16]i64 as extra_search_paths with mut;
+let is i32 as extra_search_path_count with mut = 0;
+
+// Error reporting context
+let is *u8 as sem_src with mut;
+let is i64 as sem_src_len with mut;
+let is *u8 as sem_filename with mut;
+let is *u8 as sem_token_list with mut;
+
+// === LSP error accumulation ===
+let is i32 as lsp_mode with mut = 0;
+let is *u8 as lsp_errors with mut;
+let is i32 as lsp_error_count with mut = 0;
+let is i32 as lsp_had_error with mut = 0;
+
+struct LspError {
+    line as i32;
+    col as i32;
+    msg_ptr as *u8;
+    msg_len as i32;
+    severity as i32;
+    next as *u8;
+}
+
+fn _strlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}
+
+fn lsp_reset_errors() as void {
+    lsp_errors = cast(*u8, 0);
+    lsp_error_count = 0;
+    lsp_had_error = 0;
+}
+
+fn lsp_add_error(line as i32, col as i32, msg as *u8, msg_len as i32, severity as i32) as void {
+    let is *LspError as err = cast(*LspError, d.sem_alloc(48));
+    err.line = line;
+    err.col = col;
+    err.msg_ptr = d.sem_alloc(cast(i64, msg_len) + 1);
+    mem.memcpy(err.msg_ptr, msg, cast(i64, msg_len));
+    err.msg_ptr[msg_len] = cast(u8, 0);
+    err.msg_len = msg_len;
+    err.severity = severity;
+    err.next = lsp_errors;
+    lsp_errors = cast(*u8, err);
+    lsp_error_count = lsp_error_count + 1;
+    if (severity == 1) { lsp_had_error = 1; }
+}
+
+// === Scope management ===
+
+fn symtab_init() as void {
+    all_scopes = cast(*d.Scope, 0);
+    current_scope = cast(*d.Scope, 0);
+    function_table = cast(*d.Function, 0);
+    loop_depth = 0;
+    current_return_type = cast(*u8, 0);
+    current_mod_prefix_ptr = cast(*u8, 0);
+    current_mod_prefix_len = 0;
+    current_source_dir_ptr = cast(*u8, 0);
+    current_source_dir_len = 0;
+    sem_src = cast(*u8, 0);
+    sem_src_len = 0;
+    sem_filename = cast(*u8, 0);
+    sem_token_list = cast(*u8, 0);
+
+    fn_hash_init();
+
+    global_scope = d.new_scope();
+    global_scope.is_global = 1;
+    global_scope.next_all = all_scopes;
+    all_scopes = global_scope;
+    current_scope = global_scope;
+    stack_offset = 48;
+}
+
+fn enter_scope() as void {
+    let is *d.Scope as s = d.new_scope();
+    s.parent = current_scope;
+    s.next_all = all_scopes;
+    all_scopes = s;
+    current_scope = s;
+}
+
+fn exit_scope() as void {
+    if (cast(i64, current_scope) == 0) { return; }
+    current_scope = current_scope.parent;
+}
+
+// === Variable declaration / lookup ===
+// Per-scope hash table for global/module scopes (lazy alloc). DJB2 + chaining.
+// 128 buckets handles ~150 vars/scope with low collision rate; initial cap 64
+// grows by doubling on overflow.
+let is i32 as VAR_HASH_BUCKETS with imut = 128;
+let is i32 as VAR_HASH_CAP_INIT with imut = 64;
+
+fn var_hash(name_ptr as *u8, name_len as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    h = h & 9223372036854775807;
+    return cast(i32, h & cast(i64, VAR_HASH_BUCKETS - 1));
+}
+
+fn vh_init(s as *d.Scope) as void {
+    s.vh_buckets = cast(*i32, d.sem_alloc(cast(i64, VAR_HASH_BUCKETS) * 4));
+    s.vh_cap = VAR_HASH_CAP_INIT;
+    s.vh_ptrs = cast(*i64, d.sem_alloc(cast(i64, s.vh_cap) * 8));
+    s.vh_next = cast(*i32, d.sem_alloc(cast(i64, s.vh_cap) * 4));
+    let is i32 as i with mut = 0;
+    while (i < VAR_HASH_BUCKETS) {
+        s.vh_buckets[i] = 0 - 1;
+        i = i + 1;
+    }
+    s.vh_count = 0;
+}
+
+fn vh_grow(s as *d.Scope) as void {
+    let is i32 as new_cap = s.vh_cap * 2;
+    let is *i64 as new_ptrs = cast(*i64, d.sem_alloc(cast(i64, new_cap) * 8));
+    let is *i32 as new_next = cast(*i32, d.sem_alloc(cast(i64, new_cap) * 4));
+    let is i32 as i with mut = 0;
+    while (i < s.vh_count) {
+        let is *i64 as src_pp = cast(*i64, cast(i64, s.vh_ptrs) + cast(i64, i) * 8);
+        let is *i32 as src_np = cast(*i32, cast(i64, s.vh_next) + cast(i64, i) * 4);
+        let is *i64 as dst_pp = cast(*i64, cast(i64, new_ptrs) + cast(i64, i) * 8);
+        let is *i32 as dst_np = cast(*i32, cast(i64, new_next) + cast(i64, i) * 4);
+        *dst_pp = *src_pp;
+        *dst_np = *src_np;
+        i = i + 1;
+    }
+    s.vh_ptrs = new_ptrs;
+    s.vh_next = new_next;
+    s.vh_cap = new_cap;
+}
+
+fn vh_insert(s as *d.Scope, v as *d.Variable) as void {
+    if (cast(i64, s.vh_buckets) == 0) { vh_init(s); }
+    if (s.vh_count >= s.vh_cap) { vh_grow(s); }
+    let is i32 as h = var_hash(v.name_ptr, v.name_len);
+    let is i32 as idx = s.vh_count;
+    let is *i64 as pp = cast(*i64, cast(i64, s.vh_ptrs) + cast(i64, idx) * 8);
+    let is *i32 as np = cast(*i32, cast(i64, s.vh_next) + cast(i64, idx) * 4);
+    *pp = cast(i64, v);
+    *np = s.vh_buckets[h];
+    s.vh_buckets[h] = idx;
+    s.vh_count = s.vh_count + 1;
+}
+
+fn vh_lookup(s as *d.Scope, name_ptr as *u8, name_len as i32) as *d.Variable {
+    if (cast(i64, s.vh_buckets) == 0) { return cast(*d.Variable, 0); }
+    let is i32 as h = var_hash(name_ptr, name_len);
+    let is i32 as idx with mut = s.vh_buckets[h];
+    while (idx >= 0) {
+        let is *i64 as pp = cast(*i64, cast(i64, s.vh_ptrs) + cast(i64, idx) * 8);
+        let is *d.Variable as v = cast(*d.Variable, *pp);
+        if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
+            return v;
+        }
+        let is *i32 as np = cast(*i32, cast(i64, s.vh_next) + cast(i64, idx) * 4);
+        idx = *np;
+    }
+    return cast(*d.Variable, 0);
+}
+
+// Exact lexical-scope lookup: callers that bind an already loaded module use
+// this explicitly; user declarations must never reuse an existing variable.
+fn lookup_var_here(name_ptr as *u8, name_len as i32) as *d.Variable {
+    if (cast(i64, current_scope) == 0) { return cast(*d.Variable, 0); }
+    if (current_scope.is_global == 1) { return vh_lookup(current_scope, name_ptr, name_len); }
+    let is *d.Variable as v with mut = current_scope.vars;
+    while (cast(i64, v) != 0) {
+        if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) { return v; }
+        v = v.next;
+    }
+    return cast(*d.Variable, 0);
+}
+
+fn declare_var(name_ptr as *u8, name_len as i32, ty as *u8, flags as i32, declaration as *ast.Node) as *d.Variable {
+    if (cast(i64, lookup_var_here(name_ptr, name_len)) != 0) {
+        sem_error_at2(declaration, "declaracao duplicada no mesmo escopo:", name_ptr, name_len);
+    }
+
+    let is *d.Variable as nv = d.new_variable();
+    nv.name_ptr = d.str_dup(name_ptr, name_len);
+    nv.name_len = name_len;
+    nv.ty = ty;
+    nv.flags = cast(i8, flags);
+    nv.is_init = 1;
+
+    let is *ast.Type as t = cast(*ast.Type, ty);
+
+    if (current_scope.is_global == 1) {
+        nv.is_global = 1;
+        nv.offset = 0;
+        // Mangle with module prefix
+        if (current_mod_prefix_len > 0) {
+            let is i32 as out_len with mut = 0;
+            nv.asm_name_ptr = d.str_concat3(current_mod_prefix_ptr, current_mod_prefix_len, "_", 1, name_ptr, name_len, &out_len);
+            nv.asm_name_len = out_len;
+        } else {
+            nv.asm_name_ptr = d.str_dup(name_ptr, name_len);
+            nv.asm_name_len = name_len;
+        }
+    } else {
+        nv.is_global = 0;
+        stack_offset = stack_offset + t.size;
+        // An array or struct starts on a word boundary (16 bytes for the big
+        // ones): whole-word copies and loads of it then line up with each other.
+        if ((t.kind == ast.TY_ARRAY || t.kind == ast.TY_STRUCT) && t.size >= 8) {
+            let is i32 as ao with mut = 8;
+            if (t.size >= 16) { ao = 16; }
+            stack_offset = stack_offset + (ao - stack_offset % ao) % ao;
+        }
+        nv.offset = stack_offset;
+    }
+
+    nv.next = current_scope.vars;
+    current_scope.vars = nv;
+    if (current_scope.is_global == 1) {
+        vh_insert(current_scope, nv);
+    }
+    return nv;
+}
+
+fn lookup_var(name_ptr as *u8, name_len as i32) as *d.Variable {
+    let is *d.Scope as s with mut = current_scope;
+    while (cast(i64, s) != 0) {
+        if (s.is_global == 1) {
+            let is *d.Variable as hit = vh_lookup(s, name_ptr, name_len);
+            if (cast(i64, hit) != 0) { return hit; }
+        } else {
+            let is *d.Variable as v with mut = s.vars;
+            while (cast(i64, v) != 0) {
+                if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
+                    return v;
+                }
+                v = v.next;
+            }
+        }
+        s = s.parent;
+    }
+    return cast(*d.Variable, 0);
+}
+
+// === Function declaration / lookup ===
+
+fn declare_fn(name_ptr as *u8, name_len as i32, ret_ty as *u8, param_types as *u8, param_count as i32, is_variadic as i32, is_extern as i32) as void {
+    declare_fn_dll(name_ptr, name_len, ret_ty, param_types, param_count, is_variadic, is_extern, cast(*u8, 0), 0);
+}
+
+fn declare_fn_dll(name_ptr as *u8, name_len as i32, ret_ty as *u8, param_types as *u8, param_count as i32, is_variadic as i32, is_extern as i32, dll_ptr as *u8, dll_len as i32) as void {
+    // O(1) duplicate check via hash table
+    let is *d.Function as existing = lookup_fn_qualified(name_ptr, name_len, current_mod_prefix_ptr, current_mod_prefix_len);
+    if (cast(i64, existing) != 0) { return; }
+
+    let is *d.Function as nf = d.new_function();
+    nf.name_ptr = d.str_dup(name_ptr, name_len);
+    nf.name_len = name_len;
+    nf.return_type = ret_ty;
+    nf.param_types = param_types;
+    nf.param_count = param_count;
+    nf.is_variadic = is_variadic;
+    nf.is_extern = is_extern;
+    if (dll_len > 0) {
+        nf.dll_name_ptr = d.str_dup(dll_ptr, dll_len);
+        nf.dll_name_len = dll_len;
+    } else {
+        nf.dll_name_ptr = cast(*u8, 0);
+        nf.dll_name_len = 0;
+    }
+
+    if (current_mod_prefix_len > 0) {
+        nf.mod_prefix_ptr = d.str_dup(current_mod_prefix_ptr, current_mod_prefix_len);
+        nf.mod_prefix_len = current_mod_prefix_len;
+    }
+
+    // Build asm_name
+    if (is_extern == 1) {
+        nf.asm_name_ptr = d.str_dup(name_ptr, name_len);
+        nf.asm_name_len = name_len;
+    } else if (current_mod_prefix_len > 0) {
+        let is i32 as out_len with mut = 0;
+        nf.asm_name_ptr = d.str_concat3(current_mod_prefix_ptr, current_mod_prefix_len, "_", 1, name_ptr, name_len, &out_len);
+        nf.asm_name_len = out_len;
+    } else {
+        nf.asm_name_ptr = d.str_dup(name_ptr, name_len);
+        nf.asm_name_len = name_len;
+    }
+
+    nf.next = function_table;
+    function_table = nf;
+
+    // Insert into hash table
+    if (fn_count == fn_hash_cap) { _fn_hash_grow(); }
+    let is i32 as idx = fn_count;
+    let is i32 as h = fn_hash(nf.name_ptr, nf.name_len, nf.mod_prefix_ptr, nf.mod_prefix_len);
+    fn_hash_ptrs[idx] = cast(i64, nf);
+    fn_hash_next[idx] = fn_hash_buckets[h];
+    fn_hash_buckets[h] = idx;
+    fn_count = fn_count + 1;
+}
+
+fn lookup_fn_qualified(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i32) as *d.Function {
+    let is i32 as h = fn_hash(name_ptr, name_len, prefix_ptr, prefix_len);
+    let is i32 as idx with mut = fn_hash_buckets[h];
+    while (idx >= 0) {
+        let is *d.Function as f = cast(*d.Function, fn_hash_ptrs[idx]);
+        if (d.str_eq(f.name_ptr, f.name_len, name_ptr, name_len) == 1) {
+            if (prefix_len == 0 && f.mod_prefix_len == 0) { return f; }
+            if (prefix_len > 0 && f.mod_prefix_len > 0) {
+                if (d.str_eq(prefix_ptr, prefix_len, f.mod_prefix_ptr, f.mod_prefix_len) == 1) {
+                    return f;
+                }
+            }
+        }
+        idx = fn_hash_next[idx];
+    }
+    return cast(*d.Function, 0);
+}
+
+fn lookup_fn(name_ptr as *u8, name_len as i32) as *d.Function {
+    // Try current module first
+    if (current_mod_prefix_len > 0) {
+        let is *d.Function as f = lookup_fn_qualified(name_ptr, name_len, current_mod_prefix_ptr, current_mod_prefix_len);
+        if (cast(i64, f) != 0) { return f; }
+    }
+    // Try global
+    return lookup_fn_qualified(name_ptr, name_len, cast(*u8, 0), 0);
+}
+
+// === Module alias chains ===
+//
+// `hub.mid.deep.f()` names a module by walking a chain of aliases: `hub` is a
+// module variable in scope, `mid` is a submodule of `hub`, `deep` a submodule
+// of `mid`. Every hop is the same lookup, so the chain has no depth limit.
+//
+// The chain reaches the semantic layer in two shapes: as a dotted NAME the
+// parser flattened (types, generic instantiations, `fn_ptr`) and as an
+// NK_MEMBER expression tree (calls, member reads). The primitives below cover
+// the name shape; the tree shape walks `find_submodule` directly (walk.cst's
+// `resolve_module_expr`).
+
+fn find_submodule(m as *d.Module, alias_ptr as *u8, alias_len as i32) as *d.Module {
+    if (cast(i64, m) == 0) { return cast(*d.Module, 0); }
+    let is *d.SubModule as sm with mut = cast(*d.SubModule, m.submodules);
+    while (cast(i64, sm) != 0) {
+        if (d.str_eq(sm.alias_ptr, sm.alias_len, alias_ptr, alias_len) == 1) {
+            return cast(*d.Module, sm.module_ref);
+        }
+        sm = cast(*d.SubModule, sm.next);
+    }
+    return cast(*d.Module, 0);
+}
+
+// Offset of the next '.' at or after `off`, or -1 when the rest of `name` has
+// none (i.e. `off` already starts the final component).
+fn dot_from(name_ptr as *u8, off as i32, name_len as i32) as i32 {
+    let is i32 as i with mut = off;
+    while (i < name_len) {
+        if (name_ptr[i] == 46) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0) - cast(i32, 1);
+}
+
+// Consume the leading components of `name` (from *io_off) that name
+// submodules of `m`, descending one module per hop. The final component is
+// never consumed — it is the member being named. Stops early at the first
+// component that isn't a submodule alias, which leaves the remainder for the
+// caller to mangle exactly as before.
+fn descend_submodules(m as *d.Module, name_ptr as *u8, name_len as i32, io_off as *i32) as *d.Module {
+    let is *d.Module as cur with mut = m;
+    let is i32 as off with mut = *io_off;
+    while (cast(i64, cur) != 0) {
+        let is i32 as dp = dot_from(name_ptr, off, name_len);
+        if (dp < 0) { break; }
+        let is *d.Module as sub = find_submodule(cur, cast(*u8, cast(i64, name_ptr) + cast(i64, off)), dp - off);
+        if (cast(i64, sub) == 0) { break; }
+        cur = sub;
+        off = dp + 1;
+    }
+    *io_off = off;
+    return cur;
+}
+
+// `a.b.c.X` -> the module `a.b.c` names, with *out_off left at the offset of
+// `X`. Returns 0 when the name has no dot or its head isn't a module alias in
+// scope. *out_only reports whether the head was an `only` import (the filter
+// is declared at the import site, so only the head can carry one).
+fn resolve_mod_path(name_ptr as *u8, name_len as i32, out_off as *i32, out_only as *i32) as *d.Module {
+    *out_off = 0;
+    *out_only = 0;
+    let is i32 as dp = dot_from(name_ptr, 0, name_len);
+    if (dp < 0) { return cast(*d.Module, 0); }
+    let is *d.Variable as v = lookup_var(name_ptr, dp);
+    if (cast(i64, v) == 0 || v.is_module == 0 || cast(i64, v.module_ref) == 0) {
+        return cast(*d.Module, 0);
+    }
+    let is i32 as off with mut = dp + 1;
+    let is *d.Module as m = descend_submodules(cast(*d.Module, v.module_ref), name_ptr, name_len, &off);
+    *out_off = off;
+    *out_only = cast(i32, v.has_only);
+    return m;
+}
+
+// === Error helpers ===
+
+fn sem_error(msg as *u8) as void {
+    if (lsp_mode == 1) {
+        lsp_add_error(0, 0, msg, _strlen(msg), 1);
+        return;
+    }
+    io.write_str(io.STDERR, "Erro semantico: ");
+    io.write_str(io.STDERR, msg);
+    io.write_str(io.STDERR, "\n");
+    io.exit(cast(i32, cast(i32, 1)));
+}
+
+fn sem_error2(msg as *u8, name as *u8, nlen as i32) as void {
+    if (lsp_mode == 1) {
+        let is i32 as ml = _strlen(msg);
+        let is i32 as total = ml + 3 + nlen;
+        let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+        mem.memcpy(buf, msg, cast(i64, ml));
+        buf[ml] = cast(u8, 32);
+        buf[ml + 1] = cast(u8, 39);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), name, cast(i64, nlen));
+        buf[ml + 2 + nlen] = cast(u8, 39);
+        buf[total] = cast(u8, 0);
+        lsp_add_error(0, 0, buf, total, 1);
+        return;
+    }
+    io.write_str(io.STDERR, "Erro semantico: ");
+    io.write_str(io.STDERR, msg);
+    io.write_str(io.STDERR, " '");
+    io.write_bytes(io.STDERR, name, cast(i64, nlen));
+    io.write_str(io.STDERR, "'\n");
+    io.exit(cast(i32, cast(i32, 1)));
+}
+
+fn sem_error3(msg as *u8, a as *u8, alen as i32, b as *u8, blen as i32) as void {
+    if (lsp_mode == 1) {
+        let is i32 as ml = _strlen(msg);
+        let is i32 as total = ml + 3 + alen + 1 + blen;
+        let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+        mem.memcpy(buf, msg, cast(i64, ml));
+        buf[ml] = cast(u8, 32);
+        buf[ml + 1] = cast(u8, 39);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), a, cast(i64, alen));
+        buf[ml + 2 + alen] = cast(u8, 46);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 3 + cast(i64, alen)), b, cast(i64, blen));
+        buf[ml + 3 + alen + blen] = cast(u8, 39);
+        buf[total] = cast(u8, 0);
+        lsp_add_error(0, 0, buf, total, 1);
+        return;
+    }
+    io.write_str(io.STDERR, "Erro semantico: ");
+    io.write_str(io.STDERR, msg);
+    io.write_str(io.STDERR, " '");
+    io.write_bytes(io.STDERR, a, cast(i64, alen));
+    io.write_str(io.STDERR, ".");
+    io.write_bytes(io.STDERR, b, cast(i64, blen));
+    io.write_str(io.STDERR, "'\n");
+    io.exit(cast(i32, cast(i32, 1)));
+}
+
+fn sem_error_at(node as *ast.Node, msg as *u8) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            lsp_add_error(t.line, t.col, msg, _strlen(msg), 1);
+        }
+        return;
+    }
+    if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+        let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+        let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+        lex.error_at_report(sem_src, sem_src_len, sem_filename, t.line, t.col, msg);
+    } else {
+        io.write_str(io.STDERR, "Erro semantico: ");
+        io.write_str(io.STDERR, msg);
+        io.write_str(io.STDERR, "\n");
+    }
+    io.exit(cast(i32, cast(i32, 1)));
+}
+
+fn sem_error_at2(node as *ast.Node, msg as *u8, name as *u8, nlen as i32) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            let is i32 as ml = _strlen(msg);
+            let is i32 as total = ml + 3 + nlen;
+            let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+            mem.memcpy(buf, msg, cast(i64, ml));
+            buf[ml] = cast(u8, 32);
+            buf[ml + 1] = cast(u8, 39);
+            mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), name, cast(i64, nlen));
+            buf[ml + 2 + nlen] = cast(u8, 39);
+            buf[total] = cast(u8, 0);
+            lsp_add_error(t.line, t.col, buf, total, 1);
+        }
+        return;
+    }
+    if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+        let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+        let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+        let is i32 as msg_len with mut = 0;
+        let is *u8 as mp = msg;
+        while (mp[msg_len] != cast(u8, 0)) { msg_len = msg_len + 1; }
+        let is i32 as total = msg_len + 3 + nlen;
+        let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+        mem.memcpy(buf, msg, cast(i64, msg_len));
+        buf[msg_len] = cast(u8, 32);
+        buf[msg_len + 1] = cast(u8, 39);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, msg_len) + 2), name, cast(i64, nlen));
+        buf[msg_len + 2 + nlen] = cast(u8, 39);
+        buf[total] = cast(u8, 0);
+        lex.error_at_report(sem_src, sem_src_len, sem_filename, t.line, t.col, buf);
+    } else {
+        io.write_str(io.STDERR, "Erro semantico: ");
+        io.write_str(io.STDERR, msg);
+        io.write_str(io.STDERR, " '");
+        io.write_bytes(io.STDERR, name, cast(i64, nlen));
+        io.write_str(io.STDERR, "'\n");
+    }
+    io.exit(cast(i32, cast(i32, 1)));
+}
+
+fn sem_warn_at(node as *ast.Node, msg as *u8) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            lsp_add_error(t.line, t.col, msg, _strlen(msg), 2);
+        }
+        return;
+    }
+    if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+        let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+        let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+        io.write_str(io.STDERR, "Aviso em ");
+        io.write_str(io.STDERR, sem_filename);
+        io.write_str(io.STDERR, ":");
+        io.write_int(io.STDERR, cast(i64, t.line));
+        io.write_str(io.STDERR, ":");
+        io.write_int(io.STDERR, cast(i64, t.col));
+        io.write_str(io.STDERR, ": ");
+        io.write_str(io.STDERR, msg);
+        io.write_str(io.STDERR, "\n");
+    } else {
+        io.write_str(io.STDERR, "Aviso: ");
+        io.write_str(io.STDERR, msg);
+        io.write_str(io.STDERR, "\n");
+    }
+}
+
+fn sem_warn_at2(node as *ast.Node, msg as *u8, name as *u8, nlen as i32) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            let is i32 as ml = _strlen(msg);
+            let is i32 as total = ml + 3 + nlen;
+            let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+            mem.memcpy(buf, msg, cast(i64, ml));
+            buf[ml] = cast(u8, 32);
+            buf[ml + 1] = cast(u8, 39);
+            mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), name, cast(i64, nlen));
+            buf[ml + 2 + nlen] = cast(u8, 39);
+            buf[total] = cast(u8, 0);
+            lsp_add_error(t.line, t.col, buf, total, 2);
+        }
+        return;
+    }
+    if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+        let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+        let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+        io.write_str(io.STDERR, "Aviso em ");
+        io.write_str(io.STDERR, sem_filename);
+        io.write_str(io.STDERR, ":");
+        io.write_int(io.STDERR, cast(i64, t.line));
+        io.write_str(io.STDERR, ":");
+        io.write_int(io.STDERR, cast(i64, t.col));
+        io.write_str(io.STDERR, ": ");
+        io.write_str(io.STDERR, msg);
+        io.write_str(io.STDERR, " '");
+        io.write_bytes(io.STDERR, name, cast(i64, nlen));
+        io.write_str(io.STDERR, "'\n");
+    } else {
+        io.write_str(io.STDERR, "Aviso: ");
+        io.write_str(io.STDERR, msg);
+        io.write_str(io.STDERR, " '");
+        io.write_bytes(io.STDERR, name, cast(i64, nlen));
+        io.write_str(io.STDERR, "'\n");
+    }
+}
+
+// === Module prefix helpers ===
+
+// A module below the configured stdlib root has the same symbol identity as
+// "std/..." in a source-relative build. Installation paths are not part of
+// libcaustic's ABI; unrelated directories containing a "std" stay distinct.
+fn _stdlib_symbol_offset(path_ptr as *u8, path_len as i32) as i32 {
+    let is i32 as root_len = stdlib_dir_len;
+    if (root_len <= 0 || path_len <= root_len) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < root_len) {
+        if (path_ptr[i] != stdlib_dir_ptr[i]) { return 0; }
+        i = i + 1;
+    }
+    let is i32 as off with mut = root_len;
+    if (stdlib_dir_ptr[root_len - 1] != 47) {
+        if (path_ptr[off] != 47) { return 0; }
+        off = off + 1;
+    }
+    if (path_len < off + 4) { return 0; }
+    if (path_ptr[off] != 115 || path_ptr[off + 1] != 116
+        || path_ptr[off + 2] != 100 || path_ptr[off + 3] != 47) { return 0; }
+    return off;
+}
+
+fn get_mod_prefix(path_ptr as *u8, path_len as i32) as *u8 {
+    // "std/mem.cst" -> "_std_mem_cst"
+    let is i32 as off = _stdlib_symbol_offset(path_ptr, path_len);
+    let is *u8 as buf = d.sem_alloc(cast(i64, path_len - off) + 2);
+    buf[0] = cast(u8, 95); // '_'
+    let is i32 as j with mut = 1;
+    let is i32 as i with mut = off;
+    while (i < path_len) {
+        let is u8 as c = path_ptr[i];
+        if (c == 47 || c == 46 || c == 92 || c == 45) {
+            // '/' '.' '\' '-' -> '_'
+            buf[j] = cast(u8, 95);
+        } else {
+            buf[j] = c;
+        }
+        j = j + 1;
+        i = i + 1;
+    }
+    buf[j] = cast(u8, 0);
+    return buf;
+}
+
+fn get_mod_prefix_len(path_ptr as *u8, path_len as i32) as i32 {
+    return path_len - _stdlib_symbol_offset(path_ptr, path_len) + 1;
+}
+
+// Normalize path: remove "." and ".." components
+// "a/b/../c" -> "a/c", "a/./b" -> "a/b"
+fn normalize_path(path_ptr as *u8, path_len as i32, out_len as *i32) as *u8 {
+    let is *u8 as buf = d.sem_alloc(cast(i64, path_len) + 1);
+    let is i32 as wi with mut = 0;
+    let is i32 as ri with mut = 0;
+    while (ri < path_len) {
+        let is i32 as is_dotdot with mut = 0;
+        let is i32 as is_dot with mut = 0;
+        // Check for ".." component
+        if (ri + 1 < path_len && path_ptr[ri] == 46 && path_ptr[ri + 1] == 46) {
+            if (ri + 2 >= path_len || path_ptr[ri + 2] == 47) {
+                is_dotdot = 1;
+            }
+        }
+        // Check for "." component
+        if (is_dotdot == 0 && path_ptr[ri] == 46) {
+            if (ri + 1 >= path_len || path_ptr[ri + 1] == 47) {
+                is_dot = 1;
+            }
+        }
+        if (is_dotdot == 1) {
+            // A ".." with nothing left to remove has to be KEPT, not dropped.
+            // Dropping it rewrote "coreutils/../../../X" as "X" instead of
+            // "../../X", so a module above the source directory vanished and
+            // the compiler reported it missing — but only when the source was
+            // named relatively, since an absolute path has components to spare
+            // for the extra pops to eat.
+            //
+            // On an absolute path dropping IS right: ".." above "/" is "/"
+            // (POSIX). The leading separator is what marks that floor, so the
+            // backtrack must never consume it.
+            let is i32 as absolute with mut = 0;
+            if (path_len > 0 && path_ptr[0] == 47) { absolute = 1; }
+            let is i32 as floor with mut = 0;
+            if (absolute == 1) { floor = 1; }
+
+            // If the last component written is itself "..", there is nothing
+            // to back over — otherwise "../../x" would eat its own first
+            // "..". Look past a trailing separator to find that component.
+            let is i32 as e with mut = wi;
+            if (e > 0 && buf[e - 1] == 47) { e = e - 1; }
+            let is i32 as tail_dotdot with mut = 0;
+            if (e >= 2 && buf[e - 1] == 46 && buf[e - 2] == 46) {
+                if (e == 2 || buf[e - 3] == 47) { tail_dotdot = 1; }
+            }
+
+            if (wi == 0 || tail_dotdot == 1) {
+                if (absolute == 0) {
+                    if (wi > 0 && buf[wi - 1] != 47) { buf[wi] = cast(u8, 47); wi = wi + 1; }
+                    buf[wi] = cast(u8, 46);
+                    buf[wi + 1] = cast(u8, 46);
+                    wi = wi + 2;
+                }
+                ri = ri + 2;
+                // Keep the separator, or the next component is glued onto the
+                // ".." we just wrote ("../..x").
+                if (ri < path_len && path_ptr[ri] == 47) {
+                    if (absolute == 0) { buf[wi] = cast(u8, 47); wi = wi + 1; }
+                    ri = ri + 1;
+                }
+            } else {
+                // Backtrack: remove last component, stopping at the floor.
+                if (wi > floor && buf[wi - 1] == 47) { wi = wi - 1; }
+                while (wi > floor && buf[wi - 1] != 47) { wi = wi - 1; }
+                ri = ri + 2;
+                if (ri < path_len && path_ptr[ri] == 47) { ri = ri + 1; }
+            }
+        } else if (is_dot == 1) {
+            ri = ri + 1;
+            if (ri < path_len && path_ptr[ri] == 47) { ri = ri + 1; }
+        } else {
+            buf[wi] = path_ptr[ri];
+            wi = wi + 1;
+            ri = ri + 1;
+        }
+    }
+    buf[wi] = cast(u8, 0);
+    *out_len = wi;
+    return buf;
+}
+
+// Resolve raw module path relative to current dir, then normalize
+// Falls back to stdlib system directory if file not found
+fn resolve_module_path(raw_ptr as *u8, raw_len as i32, out_len as *i32) as *u8 {
+    let is *u8 as resolved with mut = cast(*u8, 0);
+    let is i32 as resolved_len with mut = 0;
+    if (current_source_dir_len > 0) {
+        resolved = resolve_path(current_source_dir_ptr, current_source_dir_len, raw_ptr, raw_len, &resolved_len);
+    } else {
+        resolved = d.str_dup(raw_ptr, raw_len);
+        resolved_len = raw_len;
+    }
+    let is *u8 as norm = normalize_path(resolved, resolved_len, out_len);
+
+    // Check if file exists
+    let is i64 as fd = io._open_read(norm);
+    if (fd >= 0) {
+        io._close_fd(fd);
+        return norm;
+    }
+
+    // Fallback: try extra search paths (--path flags)
+    //
+    // `norm_len` belongs to `norm`, which is what this function returns when
+    // nothing resolves. Every candidate below writes its own length through
+    // out_len, so it has to be put back when the candidate is not the answer —
+    // exactly as the stdlib fallback does a few lines down. Without that, a
+    // failed resolution returned `norm` paired with the length of the LAST
+    // --path candidate, and the caller printed that many bytes of it: the error
+    // naming the missing module was itself truncated, to a length that moved
+    // with the search path, and pointed at a file whose name was cut in half.
+    let is i32 as norm_len = *out_len;
+    let is i32 as epi with mut = 0;
+    while (epi < extra_search_path_count) {
+        let is *u8 as ep = cast(*u8, extra_search_paths[epi]);
+        let is i32 as ep_len with mut = 0;
+        while (ep[ep_len] != cast(u8, 0)) { ep_len = ep_len + 1; }
+        let is i32 as ep_rlen with mut = 0;
+        let is *u8 as ep_resolved = resolve_path(ep, ep_len, raw_ptr, raw_len, &ep_rlen);
+        let is *u8 as ep_norm = normalize_path(ep_resolved, ep_rlen, out_len);
+        let is i64 as ep_fd = io._open_read(ep_norm);
+        if (ep_fd >= 0) {
+            io._close_fd(ep_fd);
+            return ep_norm;
+        }
+        *out_len = norm_len;
+        epi = epi + 1;
+    }
+
+    // Fallback: try stdlib system directory
+    if (stdlib_dir_len > 0) {
+        let is i32 as saved_len = *out_len;
+        let is i32 as fb_len with mut = 0;
+        let is *u8 as fb = resolve_path(stdlib_dir_ptr, stdlib_dir_len, raw_ptr, raw_len, &fb_len);
+        let is *u8 as fb_norm = normalize_path(fb, fb_len, out_len);
+        let is i64 as fd2 = io._open_read(fb_norm);
+        if (fd2 >= 0) {
+            io._close_fd(fd2);
+            return fb_norm;
+        }
+        *out_len = saved_len;
+    }
+
+    // Return original (will fail in read_file with proper error)
+    return norm;
+}
+
+// Extract directory from path: "foo/bar/baz.cst" -> "foo/bar"
+// Returns length of dir part. If no separator, returns 0 (meaning ".").
+// A file in the root is in "/", which is length 1 — not "no directory": that
+// answer made "/x.cst" resolve its `use "std/..."` relative to the working
+// directory, and on CausticOS, which opens absolute paths only, to nothing.
+// Accepts both '/' (POSIX) and '\\' (Windows) since CreateFileA handles
+// either and stage2-on-Windows feeds us "src\\main.cst" via SSH.
+fn get_dir_len(path_ptr as *u8, path_len as i32) as i32 {
+    let is i32 as i with mut = path_len - 1;
+    while (i >= 0) {
+        if (path_ptr[i] == 47 || path_ptr[i] == 92) {
+            if (i == 0) { return 1; }
+            return i;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Resolve path relative to a directory: dir + "/" + path
+fn resolve_path(dir_ptr as *u8, dir_len as i32, path_ptr as *u8, path_len as i32, out_len as *i32) as *u8 {
+    if (dir_len == 0) {
+        // No directory, just use path as-is
+        *out_len = path_len;
+        return d.str_dup(path_ptr, path_len);
+    }
+    // An absolute import names a file outright and has no relationship to the
+    // importing file's directory. Joining anyway produced paths like
+    // "/tmp//home/user/lib.cst", which resolve nowhere.
+    if (path_len > 0 && path_ptr[0] == 47) {
+        *out_len = path_len;
+        return d.str_dup(path_ptr, path_len);
+    }
+    // Allocate: dir + "/" + path + null. A directory that already ends in a
+    // separator ("/", the root) gets no second one: "//std/x" is not a path
+    // every filesystem takes.
+    let is i32 as sep with mut = 1;
+    if (dir_ptr[dir_len - 1] == 47 || dir_ptr[dir_len - 1] == 92) { sep = 0; }
+    let is i32 as total = dir_len + sep + path_len;
+    let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+    mem.memcpy(buf, dir_ptr, cast(i64, dir_len));
+    if (sep == 1) { buf[dir_len] = cast(u8, 47); }
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, dir_len) + cast(i64, sep)), path_ptr, cast(i64, path_len));
+    buf[total] = cast(u8, 0);
+    *out_len = total;
+    return buf;
+}

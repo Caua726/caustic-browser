@@ -1,0 +1,47 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>E</title></head><body><noscript><p id="ns">no</p></noscript><pre id="out"></pre><form name="nf"><input name="fq" value="v"></form>
+<script>
+var R=[];function P(){R.push(Array.prototype.join.call(arguments,' '))}
+var topv=5;function topf(){return 'f'}let topl=7;
+P(window.topv,typeof window.topf,Object.getOwnPropertyDescriptor(window,'topl')===undefined,typeof notThere);
+window.fromw=9;P(fromw);topv=6;P(window.topv);
+function who(){return this===window}P(who(),who.call(null),(function(){'use strict';return this})());
+P(this===window,(()=>this===window)());
+P(eval('1+2'),(0,eval)('topv*2'),eval(5),eval(),eval('var e1=11;e1+1'),window.e1,e1);
+eval('function e2(){return this===window}');P(typeof e2,e2());
+var cnt=0;for(var i=0;i<3;i++)P(eval('cnt++;cnt'));
+P(new Function('return 3')(),Function('a','b','return a+b')(2,3),new Function('a,b','c','return a*b*c')(2,3,4),Function('return this')()===window,new Function().name);
+try{eval('1+')}catch(e){P(e.name)}
+try{eval('throw new RangeError("r")')}catch(e){P(e.name,e.message)}
+try{new Function('(')}catch(e){P(e.name)}
+var big=[];for(var j=0;j<20000;j++)big.push({a:j});
+P((0,eval)('(function(){var s=0;for(var k=0;k<big.length;k++)s+=big[k].a;return s})()'));
+var f=eval('(function named(x){return function(){return x+1}})');P(f(1)(),f.name,f.length);
+var gen=(function*(){yield eval('40+2')})();P(gen.next().value);
+new Promise(function(ok){ok(eval('"p"'))}).then(function(v){P(v);
+ var dt=new Date(Date.UTC(2026,10,5,18,7,9,250));P(dt.toUTCString(),String(dt),dt.toDateString(),dt.toTimeString(),dt.toISOString());
+ dt.setSeconds(70);P(dt.getTime());dt.setMinutes(1,2,3);P(dt.getTime());dt.setHours(25);P(dt.getTime());dt.setDate(0);P(dt.getTime());dt.setMonth(13);P(dt.getTime());dt.setFullYear(2000,1,29);P(dt.getTime());dt.setMilliseconds(5);P(dt.getTime());dt.setTime(0);P(dt.getTime(),dt.toUTCString(),''+dt,dt-1,+dt,JSON.stringify(dt));
+ P(new Date(-1).getUTCHours(),new Date(-1).getUTCMinutes(),new Date(-1).getUTCSeconds(),Date.parse('Thu, 01 Jan 1970 00:00:01 GMT'),Date.parse('Jan 2 2000'),String(new Date(NaN)),new Date(1e12).toLocaleDateString());
+ document.cookie='a=1; path=/';document.cookie='b=two';document.cookie='gone=x; expires=Thu, 01 Jan 1970 00:00:00 GMT';P(document.cookie.split('; ').sort().join('|'),document.cookie.indexOf('gone='));document.cookie='a=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';P(document.cookie.indexOf('a=')>=0);document.cookie='b=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+ P(typeof location.replace,typeof location.assign,String(location)===location.href,location.pathname,location.search,location.hash,window.location===location,document.location===location,typeof navigator.sendBeacon);
+ var erro=[];window.onerror=function(m,s,l,c,e){erro.push(typeof m,e&&e.message);return true};setTimeout(function(){throw new Error('late')},0);
+ setTimeout(function(){P(erro.join());window.onerror=null;P(location.hash);location.hash='#x';setTimeout(function(){P(location.hash,location.href.indexOf('#x')>0);
+ var dv=new DataView(new ArrayBuffer(16));dv.setFloat64(0,1.5);dv.setUint16(8,258,true);dv.setFloat32(10,-2.25);P(dv.getFloat64(0),dv.getUint8(0),dv.getUint16(8,true),dv.getUint8(8),dv.getFloat32(10));
+ P(Object.isExtensible({}),Object.isExtensible(Object.freeze({})),Object.isSealed(Object.seal({a:1})),Object.isSealed({}),[1,2,3].with(1,9).join(),[1,2,3].toSpliced(1,1).join(),Math.asin(1).toFixed(6),Math.acos(0).toFixed(6),Math.log2(8),Math.log10(1000),Math.cbrt(27),Math.hypot(3,4),Math.sinh(1).toFixed(6),Math.cosh(1).toFixed(6),Math.tanh(1).toFixed(6),Math.fround(5.5),(1234.5).toExponential(2),escape('a b'),unescape('%41'));
+ var sq=document.createElement('section');sq.id='sq';sq.className='k';sq.setAttribute('data-foo-bar','1');sq.innerHTML='<b id="in1">x</b><i>y</i>';document.body.appendChild(sq);
+ P(sq.matches('.k'),sq.matches('.no'),document.getElementById('in1').closest('section').id,sq.getAttributeNames().join(),sq.attributes.length,sq.attributes[0].name,sq.dataset.fooBar,sq.childElementCount,sq.hasChildNodes(),sq.outerHTML);
+ sq.dataset.newOne='v';P(sq.getAttribute('data-new-one'));sq.toggleAttribute('hidden');P(sq.hasAttribute('hidden'));sq.toggleAttribute('hidden');
+ sq.insertAdjacentHTML('beforeend','<u>z</u>');sq.firstChild.after(document.createTextNode('T'));sq.lastChild.before('B');P(sq.innerHTML);sq.prepend('P');sq.append('A');P(sq.textContent);sq.replaceChildren('only');P(sq.textContent);
+ P(document.forms.length,document.nf.elements.length,document.nf.length,document.nf.fq.form===document.nf,document.getElementsByName('fq').length,document.compatMode,document.characterSet,document.visibilityState,typeof document.createRange().setStart,document.createEvent('Event') instanceof Event);
+ var lk=document.createElement('a');lk.href='/p/q?x=1#h';P(lk.pathname,lk.search,lk.hash,lk.href===location.origin+'/p/q?x=1#h',lk.getAttribute('href'));
+ var im2=document.createElement('img');im2.src='a.png';P(im2.src===location.origin+'/a.png',im2.getAttribute('src'));
+ var fd=new FormData(document.nf);P(fd.get('fq'),[...fd].length);var ac=new AbortController;P(ac.signal.aborted);ac.abort();P(ac.signal.aborted);var mc=new MessageChannel;P(typeof mc.port1.addEventListener);
+ P(typeof crypto.getRandomValues,crypto.getRandomValues(new Uint8Array(4)).length,crypto.randomUUID().length,new Blob(['ab']).size,new KeyboardEvent('keydown',{key:'a'}).key,new CustomEvent('c',{detail:3}).detail,new MouseEvent('click',{clientX:2}).clientX,document.createElement('input') instanceof HTMLInputElement,document.createElement('div') instanceof HTMLInputElement,navigator.appName,navigator.cookieEnabled,navigator.webdriver,screen.colorDepth);
+ var tw=document.createTreeWalker(document.nf,NodeFilter.SHOW_ELEMENT);var twn=[];while(tw.nextNode())twn.push(tw.currentNode.tagName);P(twn.join());P(document.nf.compareDocumentPosition(document.nf.fq),document.nf.fq.compareDocumentPosition(document.nf),document.nf.contains(document.nf.fq),document.nf.fq.getRootNode()===document);
+ var inl=document.createElement('script');inl.textContent='window.fromInline=7;window.curOk=document.currentScript!==null';document.head.appendChild(inl);
+ var html=document.createElement('div');html.innerHTML='<scr'+'ipt>window.fromHtml=1</scr'+'ipt>';document.body.appendChild(html);
+ var ext=document.createElement('script');ext.src='added.js';ext.onload=function(){P(window.fromFile,window.fromInline,window.curOk,window.fromHtml,typeof addedFn,addedFn&&addedFn());
+ var bad=document.createElement('script');bad.src='nope.js';bad.onerror=function(){P('error heard');
+ var im=new Image(4,5);P(im.tagName,im.width,im.height);
+ P(typeof document.nf,document.nf&&document.nf.fq&&document.nf.fq.value,document.nf&&document.nf.nothing);P(document.getElementById('ns')===null||getComputedStyle(document.getElementById('ns').parentNode).display);
+ document.getElementById('out').textContent=R.join('\n');document.body.setAttribute('data-done','1')};document.head.appendChild(bad)};document.head.appendChild(ext)},20)},20)});
+</script></body></html>

@@ -731,6 +731,10 @@ fn layout_scrolls(b as *bx.Box) as i64 {
 
 fn _replaced(p as *Painter, b as *bx.Box, alpha as f64) as void {
     if (_visible(b) == 0) { return; }
+    if (b.node != null && b.node.tag == tg.IFRAME && b.node.ns == dom.NS_HTML) {
+        if (cast(i64, p.c.frames) != 0) { call(p.c.frames, cast(i64, p.c.user), cast(i64, b), cast(i64, p.l), p.fixed); }
+        return;
+    }
     let is f64 as x = b.ax + b.b[bx.LEFT] + b.p[bx.LEFT];
     let is f64 as y = b.ay + b.b[bx.TOP] + b.p[bx.TOP];
     if (b.img != null) {

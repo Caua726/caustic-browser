@@ -1,0 +1,1276 @@
+use "../../std/io.cst" as io;
+use "../../src/ir/opt_mem.cst" as om;
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../core/relocate.cst" as crel;
+use "pdb_writer.cst" as pdbw;
+use "pe_debug.cst" as pedbg;
+use "pe_imports.cst" as imp;
+use "pe_entry.cst" as entry;
+use "pe_reloc.cst" as reloc;
+use "pe_exports.cst" as exports;
+use "../../src/codegen/target.cst" as tgt;
+
+// ============================================================
+// pe_writer.cst — PE32+ executable writer (Windows x86_64)
+//
+// write_minimal_exit42(fd) emits a complete hardcoded PE executable
+// whose entry point calls ExitProcess(42). Used to bootstrap-test the
+// PE format machinery (DOS header, PE/COFF, optional header, section
+// table, import table, IAT, ILT, hint/name table).
+//
+// write_pe_executable(ls, output_path) is the real linker entry: it
+// emits a PE32+ binary from a populated LinkerState with .text/.idata/
+// optional .rdata/.data/.pdata/.xdata/.reloc and Windows DLL imports
+// resolved via the cstimport directive.
+// ============================================================
+
+// === PE/COFF constants ===
+let is i32 as IMAGE_FILE_MACHINE_AMD64 with imut = 34404;   // 0x8664
+let is i32 as IMAGE_FILE_MACHINE_ARM64 with imut = 43620;   // 0xAA64
+
+// COFF Machine for the target being linked. Emitting AMD64 unconditionally
+// produced a PE that claimed x86-64 while carrying AArch64 code.
+fn pe_machine() as i32 {
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) { return IMAGE_FILE_MACHINE_ARM64; }
+    return IMAGE_FILE_MACHINE_AMD64;
+}
+let is i32 as IMAGE_FILE_EXECUTABLE_IMAGE with imut = 2;
+let is i32 as IMAGE_FILE_LARGE_ADDRESS_AWARE with imut = 32;  // 0x20
+let is i32 as PE_OPT_MAGIC_PE32PLUS with imut = 523;        // 0x20B
+let is i32 as IMAGE_SUBSYSTEM_WINDOWS_CUI with imut = 3;
+let is i64 as IMAGE_SCN_CNT_CODE with imut = 32;            // 0x00000020
+let is i64 as IMAGE_SCN_CNT_INITIALIZED_DATA with imut = 64; // 0x00000040
+let is i64 as IMAGE_SCN_MEM_EXECUTE with imut = 536870912;   // 0x20000000
+let is i64 as IMAGE_SCN_MEM_READ with imut = 1073741824;     // 0x40000000
+let is i64 as IMAGE_SCN_MEM_WRITE with imut = 2147483648;    // 0x80000000
+
+// File / section layout for the minimal exe
+let is i64 as FILE_ALIGN with imut = 512;       // 0x200
+let is i64 as SECTION_ALIGN with imut = 4096;   // 0x1000
+let is i64 as IMAGE_BASE with imut = 5368709120; // 0x140000000
+
+// Headers end at 0x1D8 → padded to FILE_ALIGN = 0x200.
+let is i64 as HEADERS_FILE_SIZE with imut = 512;   // 0x200
+let is i64 as SIZE_OF_HEADERS with imut = 512;     // value written into opt header
+
+// .text: RVA 0x1000, raw at file 0x200, raw size 0x200 (one page padded)
+let is i64 as TEXT_RVA with imut = 4096;          // 0x1000
+let is i64 as TEXT_FILE with imut = 512;          // 0x200
+let is i64 as TEXT_RAW_SIZE with imut = 512;      // 0x200
+let is i64 as TEXT_VIRT_SIZE with imut = 16;      // sub rsp + mov ecx + call = 4+5+6 + room
+
+// .idata defaults to RVA 0x2000 in write_minimal_exit42's hand-rolled layout.
+// write_pe_executable computes its own .idata RVA dynamically based on which
+// sections are present.
+let is i64 as IDATA_RVA with imut = 8192;         // 0x2000
+let is i64 as IDATA_FILE with imut = 1024;        // 0x400
+let is i64 as IDATA_RAW_SIZE with imut = 512;     // 0x200
+
+// SizeOfImage covers up to end of last section's virtual area, aligned
+let is i64 as SIZE_OF_IMAGE with imut = 12288;    // 0x3000 (idata + section_align)
+
+// Layout inside .idata (offsets relative to IDATA_RVA):
+//   0x00  IAT slot for ExitProcess (8 bytes) + null (8 bytes) = 16
+//   0x10  IID for kernel32 (20) + null IID (20) = 40
+//   0x38  ILT entry for ExitProcess (8) + null (8) = 16
+//   0x48  Hint(2) + "ExitProcess\0" + pad = 16
+//   0x58  "kernel32.dll\0" + pad = 16
+//   0x68  end (104 bytes virtual)
+let is i64 as IDATA_IAT_OFF with imut = 0;
+let is i64 as IDATA_IID_OFF with imut = 16;     // 0x10
+let is i64 as IDATA_ILT_OFF with imut = 56;     // 0x38
+let is i64 as IDATA_HINT_OFF with imut = 72;    // 0x48
+let is i64 as IDATA_DLLNAME_OFF with imut = 88; // 0x58
+let is i64 as IDATA_VIRT_SIZE with imut = 104;  // 0x68
+
+// === Helpers ===
+
+fn pad_to(b as *reader.ByteBuffer, target as i64) as void {
+    while (b.len < target) { reader.buf_emit8(b, 0); }
+}
+
+fn emit_str(b as *reader.ByteBuffer, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { reader.buf_emit8(b, cast(i32, s[i])); i = i + 1; }
+}
+
+// === Public entry: write hardcoded ExitProcess(42) PE ===
+
+fn write_minimal_exit42(fd as i64) as i32 {
+    let is reader.ByteBuffer as out = reader.buf_init(4096);
+
+    // --- DOS header (64 bytes) ---
+    reader.buf_emit8(&out, 77);   // 'M'
+    reader.buf_emit8(&out, 90);   // 'Z'
+    // pad to 0x3C
+    pad_to(&out, 60);
+    reader.buf_emit32_le(&out, 128);  // e_lfanew = 0x80
+    pad_to(&out, 64);
+
+    // DOS stub (64 bytes): zero-filled. Real Windows ignores this in PE mode.
+    pad_to(&out, 128);
+
+    // --- PE signature ---
+    reader.buf_emit8(&out, 80);   // 'P'
+    reader.buf_emit8(&out, 69);   // 'E'
+    reader.buf_emit8(&out, 0);
+    reader.buf_emit8(&out, 0);
+
+    // --- COFF file header (20 bytes) ---
+    reader.buf_emit16_le(&out, cast(i32, pe_machine()));    // Machine
+    reader.buf_emit16_le(&out, 2);                          // NumberOfSections = .text + .idata
+    reader.buf_emit32_le(&out, 0);                          // TimeDateStamp
+    reader.buf_emit32_le(&out, 0);                          // PointerToSymbolTable (stripped)
+    reader.buf_emit32_le(&out, 0);                          // NumberOfSymbols
+    reader.buf_emit16_le(&out, 240);                        // SizeOfOptionalHeader (PE32+)
+    reader.buf_emit16_le(&out, IMAGE_FILE_EXECUTABLE_IMAGE + IMAGE_FILE_LARGE_ADDRESS_AWARE);
+
+    // --- Optional header PE32+ (240 bytes) ---
+    reader.buf_emit16_le(&out, PE_OPT_MAGIC_PE32PLUS);     // Magic = 0x20B
+    reader.buf_emit8(&out, 1);                              // MajorLinkerVersion
+    reader.buf_emit8(&out, 0);                              // MinorLinkerVersion
+    reader.buf_emit32_le(&out, TEXT_RAW_SIZE);              // SizeOfCode
+    reader.buf_emit32_le(&out, IDATA_RAW_SIZE);             // SizeOfInitializedData
+    reader.buf_emit32_le(&out, 0);                          // SizeOfUninitializedData
+    reader.buf_emit32_le(&out, TEXT_RVA);                   // AddressOfEntryPoint
+    reader.buf_emit32_le(&out, TEXT_RVA);                   // BaseOfCode
+    reader.buf_emit64_le(&out, IMAGE_BASE);                 // ImageBase
+    reader.buf_emit32_le(&out, SECTION_ALIGN);              // SectionAlignment
+    reader.buf_emit32_le(&out, FILE_ALIGN);                 // FileAlignment
+    reader.buf_emit16_le(&out, 6);                          // MajorOSVersion
+    reader.buf_emit16_le(&out, 0);                          // MinorOSVersion
+    reader.buf_emit16_le(&out, 0);                          // MajorImageVersion
+    reader.buf_emit16_le(&out, 0);                          // MinorImageVersion
+    reader.buf_emit16_le(&out, 6);                          // MajorSubsystemVersion
+    reader.buf_emit16_le(&out, 0);                          // MinorSubsystemVersion
+    reader.buf_emit32_le(&out, 0);                          // Win32VersionValue (reserved)
+    reader.buf_emit32_le(&out, SIZE_OF_IMAGE);              // SizeOfImage
+    reader.buf_emit32_le(&out, SIZE_OF_HEADERS);            // SizeOfHeaders
+    reader.buf_emit32_le(&out, 0);                          // CheckSum (loader doesn't enforce for EXEs)
+    reader.buf_emit16_le(&out, IMAGE_SUBSYSTEM_WINDOWS_CUI); // Subsystem
+    reader.buf_emit16_le(&out, 0);                          // DllCharacteristics
+    reader.buf_emit64_le(&out, 1048576);                    // SizeOfStackReserve = 0x100000
+    reader.buf_emit64_le(&out, 4096);                       // SizeOfStackCommit  = 0x1000
+    reader.buf_emit64_le(&out, 1048576);                    // SizeOfHeapReserve  = 0x100000
+    reader.buf_emit64_le(&out, 4096);                       // SizeOfHeapCommit   = 0x1000
+    reader.buf_emit32_le(&out, 0);                          // LoaderFlags
+    reader.buf_emit32_le(&out, 16);                         // NumberOfRvaAndSizes
+
+    // Data directories (16 × 8 = 128 bytes). Only Import (1) and IAT (12) are non-zero.
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [0] Export
+    reader.buf_emit32_le(&out, IDATA_RVA + IDATA_IID_OFF); reader.buf_emit32_le(&out, 40); // [1] Import (2 IID entries)
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [2] Resource
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [3] Exception
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [4] Certificate
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [5] Base Relocation
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [6] Debug
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [7] Architecture
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [8] Global Ptr
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [9] TLS
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [10] Load Config
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [11] Bound Import
+    reader.buf_emit32_le(&out, IDATA_RVA + IDATA_IAT_OFF); reader.buf_emit32_le(&out, 16); // [12] IAT
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [13] Delay Import
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [14] CLR
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0); // [15] Reserved
+
+    // --- Section table (2 entries × 40 bytes = 80 bytes) ---
+    // .text
+    emit_str(&out, ".text", 5); pad_to(&out, out.len + 3);  // name pad to 8 bytes
+    reader.buf_emit32_le(&out, TEXT_VIRT_SIZE);             // VirtualSize
+    reader.buf_emit32_le(&out, TEXT_RVA);                   // VirtualAddress
+    reader.buf_emit32_le(&out, TEXT_RAW_SIZE);              // SizeOfRawData
+    reader.buf_emit32_le(&out, TEXT_FILE);                  // PointerToRawData
+    reader.buf_emit32_le(&out, 0);                          // PointerToRelocations
+    reader.buf_emit32_le(&out, 0);                          // PointerToLinenumbers
+    reader.buf_emit16_le(&out, 0);                          // NumberOfRelocations
+    reader.buf_emit16_le(&out, 0);                          // NumberOfLinenumbers
+    reader.buf_emit32_le(&out, IMAGE_SCN_CNT_CODE + IMAGE_SCN_MEM_EXECUTE + IMAGE_SCN_MEM_READ);
+
+    // .idata
+    emit_str(&out, ".idata", 6); pad_to(&out, out.len + 2);  // name pad to 8 bytes
+    reader.buf_emit32_le(&out, IDATA_VIRT_SIZE);
+    reader.buf_emit32_le(&out, IDATA_RVA);
+    reader.buf_emit32_le(&out, IDATA_RAW_SIZE);
+    reader.buf_emit32_le(&out, IDATA_FILE);
+    reader.buf_emit32_le(&out, 0);
+    reader.buf_emit32_le(&out, 0);
+    reader.buf_emit16_le(&out, 0);
+    reader.buf_emit16_le(&out, 0);
+    reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ + IMAGE_SCN_MEM_WRITE);
+
+    // Pad headers to FileAlignment (0x200)
+    pad_to(&out, HEADERS_FILE_SIZE);
+
+    // --- .text raw data (at file 0x200, RVA 0x1000) ---
+    // sub rsp, 0x28     ; 48 83 EC 28        (shadow space + alignment)
+    reader.buf_emit8(&out, 72);   // 0x48
+    reader.buf_emit8(&out, 131);  // 0x83
+    reader.buf_emit8(&out, 236);  // 0xEC
+    reader.buf_emit8(&out, 40);   // 0x28
+    // mov ecx, 42       ; B9 2A 00 00 00
+    reader.buf_emit8(&out, 185);  // 0xB9
+    reader.buf_emit32_le(&out, 42);
+    // call qword ptr [rip+disp32]  ; FF 15 disp32
+    // RVA of this call = TEXT_RVA + 4 + 5 = 0x1009
+    // Next instruction RVA = 0x1009 + 6 = 0x100F
+    // Target = IDATA_RVA + IDATA_IAT_OFF = 0x2000
+    // disp32 = 0x2000 - 0x100F = 0xFF1
+    reader.buf_emit8(&out, 255);  // 0xFF
+    reader.buf_emit8(&out, 21);   // 0x15
+    let is i64 as call_next_rva = TEXT_RVA + 4 + 5 + 6;     // 0x100F
+    let is i64 as iat_slot_rva = IDATA_RVA + IDATA_IAT_OFF;  // 0x2000
+    reader.buf_emit32_le(&out, iat_slot_rva - call_next_rva);
+
+    // Pad .text raw to TEXT_RAW_SIZE (next section at file 0x400)
+    pad_to(&out, TEXT_FILE + TEXT_RAW_SIZE);
+
+    // --- .idata raw (at file 0x400, RVA 0x2000) ---
+    // [IAT slot for ExitProcess] = RVA to hint/name (loader patches at load time)
+    let is i64 as hint_rva = IDATA_RVA + IDATA_HINT_OFF;
+    reader.buf_emit64_le(&out, hint_rva);    // 8 bytes — IAT entry
+    reader.buf_emit64_le(&out, 0);            // 8 bytes — IAT null terminator
+
+    // [IID for kernel32] (20 bytes)
+    reader.buf_emit32_le(&out, IDATA_RVA + IDATA_ILT_OFF);  // OriginalFirstThunk (ILT RVA)
+    reader.buf_emit32_le(&out, 0);                          // TimeDateStamp
+    reader.buf_emit32_le(&out, 0);                          // ForwarderChain
+    reader.buf_emit32_le(&out, IDATA_RVA + IDATA_DLLNAME_OFF); // Name (DLL name RVA)
+    reader.buf_emit32_le(&out, IDATA_RVA + IDATA_IAT_OFF);  // FirstThunk (IAT RVA)
+    // [Null IID] (20 zero bytes)
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+    reader.buf_emit32_le(&out, 0);
+
+    // [ILT entry for ExitProcess] (8 bytes) = RVA to hint/name (bit 63 = 0 → by-name import)
+    reader.buf_emit64_le(&out, hint_rva);
+    // [ILT null] (8 bytes)
+    reader.buf_emit64_le(&out, 0);
+
+    // [Hint(2) + "ExitProcess\0" + pad to 16 bytes]
+    reader.buf_emit16_le(&out, 0);  // hint
+    emit_str(&out, "ExitProcess", 11);
+    reader.buf_emit8(&out, 0);      // NUL
+    reader.buf_emit8(&out, 0);      // pad
+    // Total: 2 + 11 + 1 + 1 = 15. Should be 16 to land at IDATA_DLLNAME_OFF.
+    reader.buf_emit8(&out, 0);      // pad to 16
+
+    // ["kernel32.dll\0" + pad to 16 bytes]
+    emit_str(&out, "kernel32.dll", 12);
+    reader.buf_emit8(&out, 0);      // NUL
+    pad_to(&out, IDATA_FILE + IDATA_DLLNAME_OFF + 16);  // pad name area to 16
+
+    // Pad .idata raw to IDATA_RAW_SIZE
+    pad_to(&out, IDATA_FILE + IDATA_RAW_SIZE);
+
+    // --- Write to file ---
+    io._write_fd(fd, out.data, out.len);
+    return 0;
+}
+
+// ============================================================
+// write_pe_executable — generic PE writer driven by LinkerState
+//
+// Layout for compiler-driven hello-world / small programs:
+//   0x000  DOS header + zero stub                          (128 bytes)
+//   0x080  PE\\0\\0 signature                                 (4 bytes)
+//   0x084  COFF header                                     (20 bytes)
+//   0x098  Optional header PE32+                          (240 bytes)
+//   0x188  Section table: .text, .idata                    (80 bytes)
+//   0x200  .text raw data — from ls.text
+//   0x400  .idata raw data — IAT region, IID, ILT, hint/name, DLL names
+//          (.idata layout described in compute_idata_layout below)
+//
+// The writer assigns synthesized helper and import-slot addresses, validates
+// all symbols, and only then applies relocations against the final PE layout.
+// ============================================================
+
+fn write_pe_executable(ls as *linker.LinkerState, output_path as *u8) as i32 {
+    let is reader.ByteBuffer as out = reader.buf_init(65536);
+
+    // The entry stub unconditionally calls ExitProcess (to terminate) and
+    // GetCommandLineA (to feed __caustic_parse_argv). Synthesize the imports
+    // if the user program didn't reference them so the IAT is always populated.
+    if (imp._has_cstimport(ls, "GetCommandLineA", 15) == 0) {
+        linker.add_cstimport(ls, "kernel32.dll", 12, "GetCommandLineA", 15);
+    }
+    if (imp._has_cstimport(ls, "ExitProcess", 11) == 0) {
+        linker.add_cstimport(ls, "kernel32.dll", 12, "ExitProcess", 11);
+    }
+
+    // Sizes of the three pieces of code we prepend to .text. Declared up
+    // front because reloc.build_reloc_blob (called below) needs TEXT_RVA +
+    // STUB_SIZE to compute the final RVA of each text-section relocation,
+    // and the SEH builder later derives the internal helpers' begin/end
+    // RVAs from the same constants.
+    // AArch64 has no __caustic_chkstk: the stack probe it implements is an
+    // x86 concern and the backend never calls it, so its slot is zero-sized.
+    let is i32 as is_a64 = tgt.target_get().arch;
+    let is i64 as ENTRY_STUB_SIZE with mut = 47;
+    let is i64 as CHKSTK_SIZE     with mut = 57;
+    let is i64 as PARSE_ARGV_SIZE with mut = 228;
+    if (is_a64 == tgt.ARCH_AARCH64) {
+        ENTRY_STUB_SIZE = entry.A64_ENTRY_STUB_SIZE;
+        CHKSTK_SIZE     = 0;
+        PARSE_ARGV_SIZE = entry.A64_PARSE_ARGV_SIZE;
+    }
+    let is i64 as STUB_SIZE       = ENTRY_STUB_SIZE + CHKSTK_SIZE + PARSE_ARGV_SIZE;
+
+    // Compute headers footprint: PE+COFF (128+4+20) + OptHdr (240) + sections.
+    // Aligned up to FILE_ALIGN. With 2 sections fits in 0x200; 3 sections
+    // also fits exactly; 4 sections overflows, need 0x400.
+
+    // 1. Lay out standard and merged custom sections at page boundaries.
+    let is *reader.ByteBuffer as rodata_buf = linker.get_rodata(ls);
+
+    // CodeView debug entries land at the end of .rdata so DataDirectory[6]
+    // can point inside an existing section. Appended BEFORE rodata_virt is
+    // measured so the section header reflects the final size. RVA / file
+    // offset fields are patched once the layout is resolved.
+    let is i64 as debug_dir_off with mut = 0;
+    let is i64 as debug_rsds_off with mut = 0;
+    let is [16]u8 as debug_guid;
+    let is *u8 as debug_pdb_path with mut = cast(*u8, 0);
+    let is i32 as debug_pdb_path_len with mut = 0;
+    let is i32 as debug_rsds_size = pedbg._emit_debug_entries(rodata_buf, output_path,
+        &debug_dir_off, &debug_rsds_off,
+        cast(*u8, &debug_guid[0]), &debug_pdb_path, &debug_pdb_path_len);
+
+    // --shared: append the export directory to .rdata (ships in an existing
+    // section, like the debug directory). Pointer RVAs patched after layout.
+    let is i64 as export_dir_off with mut = 0;
+    let is i32 as export_n with mut = 0;
+    let is i64 as export_names_off with mut = 0;
+    if (ls.is_shared == 1) {
+        exports.pe_set_dll_name(output_path);
+        exports.build_pe_export_dir(ls, rodata_buf, &export_dir_off, &export_n, &export_names_off, STUB_SIZE);
+    }
+
+    let is i64 as rodata_virt = rodata_buf.len;
+    let is i64 as rodata_raw with mut = rodata_virt;
+    if (rodata_raw > 0 && (rodata_raw % FILE_ALIGN) != 0) {
+        rodata_raw = rodata_raw + (FILE_ALIGN - (rodata_raw % FILE_ALIGN));
+    }
+    let is i32 as has_rodata with mut = 0;
+    if (rodata_virt > 0) { has_rodata = 1; }
+
+    let is *reader.ByteBuffer as data_buf = linker.get_data(ls);
+    let is i64 as data_virt = data_buf.len;
+    let is i64 as data_raw with mut = data_virt;
+    if (data_raw > 0 && (data_raw % FILE_ALIGN) != 0) {
+        data_raw = data_raw + (FILE_ALIGN - (data_raw % FILE_ALIGN));
+    }
+    let is i32 as has_data with mut = 0;
+    if (data_virt > 0) { has_data = 1; }
+
+    // Section RVA layout: each section gets a slot starting at the next
+    // SECTION_ALIGN-aligned RVA after the previous section's virtual size.
+    // Earlier this code hardcoded idata=0x2000, rodata=0x3000, data=0x4000
+    // assuming .text fit in a single page; that broke once .text exceeded
+    // 4 KiB (PE loader maps each section header for one page of mapped
+    // virtual range — sections starting inside an already-mapped page get
+    // overlapped, and execute access to the would-be-code page fires a
+    // fault because the loader marked it as data).
+    //
+    // Empirical (Wine): .idata must precede .rdata/.data in RVA order or
+    // the IAT silently doesn't get patched. Keep that invariant by giving
+    // it the slot immediately after .text.
+    //
+    // Section-table and file order follow ascending RVAs: .text, .idata,
+    // [.rdata], [.data], custom sections, .pdata, .xdata, [.reloc].
+    let is i64 as text_virt_for_layout = linker.get_text(ls).len + STUB_SIZE;
+    let is i64 as text_pages = (text_virt_for_layout + SECTION_ALIGN - 1) / SECTION_ALIGN;
+    let is i64 as idata_rva = TEXT_RVA + text_pages * SECTION_ALIGN;
+    // Import tables can span multiple pages; reserve their complete mapped size.
+    let is imp.ImportLayout as lay = imp.compute_idata_layout(ls, idata_rva);
+    let is i64 as idata_pages = (lay.idata_virt_size + SECTION_ALIGN - 1) / SECTION_ALIGN;
+    let is i64 as rodata_rva with mut = idata_rva + idata_pages * SECTION_ALIGN;
+    let is i64 as rodata_pages with mut = 0;
+    if (has_rodata == 1) {
+        rodata_pages = (rodata_virt + SECTION_ALIGN - 1) / SECTION_ALIGN;
+    }
+    let is i64 as data_rva with mut = rodata_rva + rodata_pages * SECTION_ALIGN;
+    // BSS lives appended to .data in memory (`with mut` uninitialized
+    // globals get loader-zero-fill via VirtualSize > RawSize). Section
+    // page count MUST cover .data + BSS, otherwise BSS spills into the
+    // next section's readonly page and trips a write fault.
+    let is i64 as data_virt_total = data_virt + ls.bss_total;
+    let is i64 as data_pages with mut = 0;
+    if (has_data == 1 || ls.bss_total > 0) {
+        data_pages = (data_virt_total + SECTION_ALIGN - 1) / SECTION_ALIGN;
+        has_data = 1;
+    }
+    let is i64 as custom_rva_start = data_rva + data_pages * SECTION_ALIGN;
+    let is *i64 as custom_sizes = cast(*i64, ls.csec_sizes);
+    let is *i64 as custom_vaddrs = cast(*i64, ls.csec_vaddrs);
+    let is *i32 as custom_execs = cast(*i32, ls.csec_execs);
+    let is i64 as custom_virt_total with mut = 0;
+    let is i64 as custom_raw_total with mut = 0;
+    let is i64 as custom_code_raw with mut = 0;
+    let is i64 as custom_data_raw with mut = 0;
+    let is i32 as custom_nsec with mut = 0;
+    let is i32 as ci with mut = 0;
+    while (ci < ls.csec_count) {
+        if (custom_sizes[ci] > 0) {
+            let is i64 as raw_size = ((custom_sizes[ci] + FILE_ALIGN - 1) / FILE_ALIGN) * FILE_ALIGN;
+            custom_virt_total = custom_virt_total + ((custom_sizes[ci] + SECTION_ALIGN - 1) / SECTION_ALIGN) * SECTION_ALIGN;
+            custom_raw_total = custom_raw_total + raw_size;
+            if (custom_execs[ci] == 1) { custom_code_raw = custom_code_raw + raw_size; }
+            else { custom_data_raw = custom_data_raw + raw_size; }
+            custom_nsec = custom_nsec + 1;
+        }
+        ci = ci + 1;
+    }
+    let is i64 as pdata_rva = custom_rva_start + custom_virt_total;
+    let is i64 as xdata_rva = pdata_rva + SECTION_ALIGN;
+    let is i64 as reloc_rva with mut = xdata_rva + SECTION_ALIGN;
+
+    // 2. Lay out text. We prepend three small routines BEFORE the merged
+    //    object .text: entry stub (47), __caustic_chkstk (43), and
+    //    __caustic_parse_argv (65). Together they reserve STUB_SIZE bytes
+    //    at the start of .text; obj-local symbol vaddrs are shifted by
+    //    that amount via the loop below.
+    let is *reader.ByteBuffer as text_buf = linker.get_text(ls);
+    let is i64 as text_virt = text_buf.len + STUB_SIZE;
+    let is i64 as text_raw with mut = text_virt;
+    if (text_raw % FILE_ALIGN != 0) {
+        text_raw = text_raw + (FILE_ALIGN - text_raw % FILE_ALIGN);
+    }
+    if (text_raw < FILE_ALIGN) { text_raw = FILE_ALIGN; }
+
+    // 3. Set text_vaddr in LinkerState — main offsets start AFTER the stub.
+    //    obj.text_offset (set in merge_sections) is relative to text_buf
+    //    start, but in the EXE main lives at text_vaddr + STUB_SIZE + offset.
+    //    Easiest: set ls.text_vaddr = base + TEXT_RVA + STUB_SIZE so all
+    //    obj-local symbol vaddrs already include the stub shift.
+    // Save OLD vaddrs (set by linker's assign_addresses, used by build_symtab
+    // when populating gsym vaddrs). We need them to compute per-symbol shift.
+    let is i64 as old_rodata_vaddr = ls.rodata_vaddr;
+    let is i64 as old_data_vaddr = ls.data_vaddr;
+    let is i64 as old_bss_vaddr = ls.bss_vaddr;
+
+    ls.text_vaddr = ls.base_addr + TEXT_RVA + STUB_SIZE;
+    ls.rodata_vaddr = ls.base_addr + rodata_rva;
+    ls.data_vaddr = ls.base_addr + data_rva;
+    // BSS lives at the end of .data in the PE image — uninitialized `with mut`
+    // globals get zero-fill in the .data section (we don't emit a separate
+    // .bss section; size already accounted for via data_virt).
+    ls.bss_vaddr = ls.data_vaddr + ls.data_size;
+
+    // 4. Set entry to the stub itself, not main. Also rebuild main_vaddr.
+    let is *linker.GlobalSymTab as gsyms2 = linker.get_gsyms(ls);
+    let is i32 as ent_gi = linker.gsym_find(gsyms2, ls.entry_name, _strlen_i32(ls.entry_name));
+    let is i64 as main_vaddr with mut = 0;
+    // Shift ALL defined gsyms based on which section they live in:
+    //   .text   → shift by STUB_SIZE (text moves down by stub bytes)
+    //   .rodata → reposition relative to NEW rodata_vaddr
+    //   .data   → reposition relative to NEW data_vaddr
+    // build_symtab populated gsym.vaddr using the OLD per-section vaddrs;
+    // we recompute as new_vaddr = NEW_section_vaddr + (old - OLD_vaddr).
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms2.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms2, gi);
+        if (g.defined == 1) {
+            if (g.section == reader.SECIDX_TEXT) {
+                g.vaddr = g.vaddr + STUB_SIZE;
+            } else if (g.section == reader.SECIDX_RODATA) {
+                g.vaddr = ls.rodata_vaddr + (g.vaddr - old_rodata_vaddr);
+            } else if (g.section == reader.SECIDX_DATA) {
+                g.vaddr = ls.data_vaddr + (g.vaddr - old_data_vaddr);
+            } else if (g.section == reader.SECIDX_BSS) {
+                g.vaddr = ls.bss_vaddr + (g.vaddr - old_bss_vaddr);
+            } else if (g.section > reader.SECIDX_BSS && g.obj_idx >= 0) {
+                let is *reader.ObjFile as obj = linker.get_obj(ls, g.obj_idx);
+                let is i64 as old_section_base = linker.resolve_sym_vaddr(ls, obj, g.section, 0);
+                let is i64 as custom_rva with mut = custom_rva_start;
+                ci = 0;
+                while (ci < ls.csec_count) {
+                    if (custom_sizes[ci] > 0) {
+                        if (old_section_base >= custom_vaddrs[ci]
+                            && old_section_base < custom_vaddrs[ci] + custom_sizes[ci]) {
+                            g.vaddr = ls.base_addr + custom_rva + (g.vaddr - custom_vaddrs[ci]);
+                            break;
+                        }
+                        custom_rva = custom_rva + ((custom_sizes[ci] + SECTION_ALIGN - 1) / SECTION_ALIGN) * SECTION_ALIGN;
+                    }
+                    ci = ci + 1;
+                }
+            }
+        }
+        gi = gi + 1;
+    }
+    if (ent_gi >= 0) { main_vaddr = linker.gsym_get(gsyms2, ent_gi).vaddr; }
+
+    // Local/section relocations and synthesized bounds must use the same
+    // final custom addresses as globals. Metadata was excluded during merge.
+    let is i64 as custom_rva with mut = custom_rva_start;
+    ci = 0;
+    while (ci < ls.csec_count) {
+        custom_vaddrs[ci] = ls.base_addr + custom_rva;
+        if (custom_sizes[ci] > 0) {
+            custom_rva = custom_rva + ((custom_sizes[ci] + SECTION_ALIGN - 1) / SECTION_ALIGN) * SECTION_ALIGN;
+        }
+        ci = ci + 1;
+    }
+    if (linker.synthesize_section_bounds_syms(ls, gsyms2) != 0) { return 1; }
+
+    // Build base-relocation sites only after every custom RVA is final.
+    let is reader.ByteBuffer as reloc_buf = reader.buf_init(256);
+    let is i64 as reloc_blob_size = reloc.build_reloc_blob(ls, &reloc_buf,
+                                                     TEXT_RVA + STUB_SIZE,
+                                                     rodata_rva, data_rva);
+    let is i32 as has_reloc with mut = 0;
+    if (reloc_blob_size > 0) { has_reloc = 1; }
+    let is i64 as reloc_raw with mut = reloc_blob_size;
+    if (has_reloc == 1 && (reloc_raw % FILE_ALIGN) != 0) {
+        reloc_raw = reloc_raw + (FILE_ALIGN - (reloc_raw % FILE_ALIGN));
+    }
+
+    // Pre-compute final section count so we can size headers correctly.
+    // .pdata + .xdata are always present (the 3 internal helpers alone
+    // justify them; programs without those would still need them for
+    // RtlVirtualUnwind correctness).
+    let is i32 as nsec with mut = 4 + custom_nsec; // .text, .idata, .pdata, .xdata
+    if (has_rodata == 1) { nsec = nsec + 1; }
+    if (has_data == 1) { nsec = nsec + 1; }
+    if (has_reloc == 1) { nsec = nsec + 1; }
+    // Headers end at 0x188 + nsec*40. Align up to FILE_ALIGN.
+    let is i64 as headers_size with mut = 0x188 + cast(i64, nsec) * 40;
+    if ((headers_size % FILE_ALIGN) != 0) {
+        headers_size = headers_size + (FILE_ALIGN - (headers_size % FILE_ALIGN));
+    }
+    let is i64 as text_file_local = headers_size;
+
+    // 5. Register __imp_<sym> globals so PC32 relocations resolve to IAT.
+    //    Must run AFTER the section-shift loop above so the IAT-slot vaddrs
+    //    we assign here aren't clobbered by the SECIDX_DATA branch.
+    imp.register_imp_gsyms(ls, &lay);
+
+    // 5b. Synthesize __caustic_chkstk gsym pointing at the chkstk trampoline
+    //     we emit right after the entry stub at TEXT_RVA + ENTRY_STUB_SIZE.
+    //     Upsert: if any obj already referenced it as undefined, patch in
+    //     the resolved vaddr; otherwise add fresh.
+    if (is_a64 != tgt.ARCH_AARCH64) {
+        let is i64 as chkstk_vaddr = ls.base_addr + TEXT_RVA + ENTRY_STUB_SIZE;
+        let is i32 as chk_existing = linker.gsym_find(gsyms2, "__caustic_chkstk", 16);
+        if (chk_existing >= 0) {
+            let is *linker.GlobalSym as cg = linker.gsym_get(gsyms2, chk_existing);
+            cg.vaddr = chkstk_vaddr;
+            cg.section = reader.SECIDX_TEXT;
+            cg.defined = 1;
+        } else {
+            linker.gsym_add(gsyms2, "__caustic_chkstk", 16,
+                            reader.SECIDX_TEXT, chkstk_vaddr, 0, 1);
+        }
+    }
+    if (linker.validate_symbols(ls) != 0) { return 1; }
+
+    // Entry = stub's RVA (= TEXT_RVA, because stub is at the start of .text)
+    ls.entry_vaddr = ls.base_addr + TEXT_RVA;
+
+    // 5c. Build SEH tables (.pdata + .xdata).
+    //
+    // .xdata gets one UNWIND_INFO blob per function. For the three internal
+    // helpers (entry stub, __caustic_chkstk, __caustic_parse_argv) we emit
+    // hand-built blobs; for user functions we decode the prolog from text_buf
+    // and emit a matching blob. text_buf still holds raw obj bytes here —
+    // apply_relocations runs below and only patches operand fields, never
+    // the push/sub bytes that form the prolog.
+    //
+    // .pdata gets one RUNTIME_FUNCTION (12 bytes) per function: BeginAddress,
+    // EndAddress, UnwindInfoAddress. Loader requires the array to be sorted
+    // by BeginAddress, which we satisfy by emitting in vaddr-ascending order.
+    //
+    // Each field is conceptually an IMAGE_REL_AMD64_ADDR32NB (image-relative
+    // 32-bit RVA) — we write the resolved RVA directly as a u32, because the
+    // linker computes the final layout here and there's no relocation to
+    // apply later. The runtime ADDs ImageBase at load time to turn each RVA
+    // into a VA. ADDR32NB only matters when these tables come from a .obj.
+    let is reader.ByteBuffer as xdata_buf = reader.buf_init(1024);
+    let is reader.ByteBuffer as pdata_buf = reader.buf_init(512);
+
+    // Helper to push one RUNTIME_FUNCTION entry given begin/end RVAs and the
+    // .xdata-relative offset where its UNWIND_INFO lives.
+    // Inline three internal entries first, then walk user TEXT gsyms.
+    let is i64 as stub_begin = TEXT_RVA;
+    let is i64 as stub_end   = TEXT_RVA + ENTRY_STUB_SIZE;
+    let is i64 as cks_begin  = stub_end;
+    let is i64 as cks_end    = cks_begin + CHKSTK_SIZE;
+    let is i64 as pa_begin   = cks_end;
+    let is i64 as pa_end     = pa_begin + PARSE_ARGV_SIZE;
+
+    if (is_a64 == tgt.ARCH_AARCH64) {
+        // 8-byte entries; no __caustic_chkstk on this architecture.
+        reader.buf_emit32_le(&pdata_buf, stub_begin);
+        reader.buf_emit32_le(&pdata_buf, entry.a64_packed_unwind(stub_end - stub_begin));
+        reader.buf_emit32_le(&pdata_buf, pa_begin);
+        reader.buf_emit32_le(&pdata_buf, entry.a64_packed_unwind(pa_end - pa_begin));
+    } else {
+        let is i64 as stub_xoff = entry.emit_entry_stub_unwind(&xdata_buf);
+        reader.buf_emit32_le(&pdata_buf, stub_begin);
+        reader.buf_emit32_le(&pdata_buf, stub_end);
+        reader.buf_emit32_le(&pdata_buf, xdata_rva + stub_xoff);
+
+        let is i64 as cks_xoff = entry.emit_chkstk_unwind(&xdata_buf);
+        reader.buf_emit32_le(&pdata_buf, cks_begin);
+        reader.buf_emit32_le(&pdata_buf, cks_end);
+        reader.buf_emit32_le(&pdata_buf, xdata_rva + cks_xoff);
+
+        let is i64 as pa_xoff = entry.emit_parse_argv_unwind(&xdata_buf);
+        reader.buf_emit32_le(&pdata_buf, pa_begin);
+        reader.buf_emit32_le(&pdata_buf, pa_end);
+        reader.buf_emit32_le(&pdata_buf, xdata_rva + pa_xoff);
+    }
+
+    // User functions: enumerate gsyms with section=TEXT && defined=1 EXCEPT
+    // __caustic_chkstk (already covered above). Sort by vaddr ascending so
+    // we can use the next entry's vaddr as the current function's end.
+    //
+    // Sized by the symbol count. This was a [256] that stopped collecting at
+    // 256, so every function after it got no .pdata entry — no unwind
+    // information, which is what an exception or a stack walk through it needs.
+    let is *i32 as user_idxs = cast(*i32, om.opt_alloc(cast(i64, gsyms2.count) * 4 + 4));
+    let is i32 as n_user with mut = 0;
+    let is i32 as ui with mut = 0;
+    while (ui < gsyms2.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms2, ui);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT
+            && reader.streq(g.name, g.name_len, "__caustic_chkstk", 16) == 0) {
+            user_idxs[n_user] = ui;
+            n_user = n_user + 1;
+        }
+        ui = ui + 1;
+    }
+    // Insertion sort by gsym.vaddr.
+    let is i32 as si with mut = 1;
+    while (si < n_user) {
+        let is i32 as key = user_idxs[si];
+        let is i64 as key_vaddr = linker.gsym_get(gsyms2, key).vaddr;
+        let is i32 as sj with mut = si - 1;
+        while (sj >= 0 && linker.gsym_get(gsyms2, user_idxs[sj]).vaddr > key_vaddr) {
+            user_idxs[sj + 1] = user_idxs[sj];
+            sj = sj - 1;
+        }
+        user_idxs[sj + 1] = key;
+        si = si + 1;
+    }
+
+    // Decode each user function's prolog and emit pdata/xdata entries.
+    let is [8]u8 as up_offsets;
+    let is [8]u8 as up_ops;
+    let is [8]u8 as up_infos;
+    let is [8]i32 as up_extras;
+    let is i64 as text_end_rva = TEXT_RVA + STUB_SIZE + text_buf.len;
+    let is i32 as fi with mut = 0;
+    while (fi < n_user) {
+        let is *linker.GlobalSym as gf = linker.gsym_get(gsyms2, user_idxs[fi]);
+        let is i64 as begin = gf.vaddr - ls.base_addr;
+        let is i64 as end with mut = text_end_rva;
+        if (fi + 1 < n_user) {
+            end = linker.gsym_get(gsyms2, user_idxs[fi + 1]).vaddr - ls.base_addr;
+        }
+        // Decode at text_buf offset = vaddr - ls.text_vaddr.
+        if (is_a64 == tgt.ARCH_AARCH64) {
+            reader.buf_emit32_le(&pdata_buf, begin);
+            let is i64 as pk with mut = entry.a64_packed_unwind(end - begin);
+            if (pk == 0) { pk = xdata_rva + entry.a64_emit_xdata(&xdata_buf, end - begin); }
+            reader.buf_emit32_le(&pdata_buf, pk);
+            fi = fi + 1;
+            continue;
+        }
+        let is i64 as tb_off = gf.vaddr - ls.text_vaddr;
+        let is i32 as max_bytes = cast(i32, end - begin);
+        let is i32 as prolog_size with mut = 0;
+        let is i32 as n_ops with mut = 0;
+        if (tb_off >= 0 && tb_off < cast(i64, text_buf.len)) {
+            n_ops = entry.decode_user_prologue(cast(*u8, cast(i64, text_buf.data) + tb_off),
+                                         max_bytes,
+                                         cast(*u8, &up_offsets), cast(*u8, &up_ops),
+                                         cast(*u8, &up_infos), cast(*i32, &up_extras),
+                                         &prolog_size);
+        }
+        let is i64 as u_xoff = entry.emit_unwind_info(&xdata_buf, prolog_size,
+                                                cast(*u8, &up_offsets), cast(*u8, &up_ops),
+                                                cast(*u8, &up_infos), cast(*i32, &up_extras),
+                                                n_ops);
+        reader.buf_emit32_le(&pdata_buf, begin);
+        reader.buf_emit32_le(&pdata_buf, end);
+        reader.buf_emit32_le(&pdata_buf, xdata_rva + u_xoff);
+        fi = fi + 1;
+    }
+
+    let is i64 as pdata_size = pdata_buf.len;
+    let is i64 as xdata_size = xdata_buf.len;
+    let is i64 as pdata_raw with mut = pdata_size;
+    if (pdata_raw % FILE_ALIGN != 0) {
+        pdata_raw = pdata_raw + (FILE_ALIGN - pdata_raw % FILE_ALIGN);
+    }
+    let is i64 as xdata_raw with mut = xdata_size;
+    if (xdata_raw % FILE_ALIGN != 0) {
+        xdata_raw = xdata_raw + (FILE_ALIGN - xdata_raw % FILE_ALIGN);
+    }
+
+    // 6. Apply relocations — patches .text bytes with resolved addresses.
+    crel.apply_relocations(ls);
+
+    // 7. Write DOS header (128 bytes)
+    reader.buf_emit8(&out, 77); reader.buf_emit8(&out, 90);   // "MZ"
+    pad_to(&out, 60);
+    reader.buf_emit32_le(&out, 128);                          // e_lfanew
+    pad_to(&out, 128);
+
+    // 8. PE signature
+    reader.buf_emit8(&out, 80); reader.buf_emit8(&out, 69);
+    reader.buf_emit8(&out, 0);  reader.buf_emit8(&out, 0);
+
+    // 9. COFF header
+    reader.buf_emit16_le(&out, cast(i32, pe_machine()));
+    let is i32 as num_sections = nsec;
+    reader.buf_emit16_le(&out, num_sections);                 // NumberOfSections
+    reader.buf_emit32_le(&out, 0);                            // TimeDateStamp
+    reader.buf_emit32_le(&out, 0);                            // PointerToSymbolTable
+    reader.buf_emit32_le(&out, 0);                            // NumberOfSymbols
+    reader.buf_emit16_le(&out, 240);                          // SizeOfOptionalHeader
+    // IMAGE_FILE_DLL = 0x2000 when --shared (8192).
+    reader.buf_emit16_le(&out, IMAGE_FILE_EXECUTABLE_IMAGE + IMAGE_FILE_LARGE_ADDRESS_AWARE + ls.is_shared * 8192);
+
+    // 10. Optional header PE32+
+    let is i64 as entry_rva with mut = ls.entry_vaddr - ls.base_addr;
+    if (ls.is_shared == 1) { entry_rva = 0; }   // a DLL has no DllMain entry
+    // SizeOfImage = end-of-last-section's VIRTUAL placement (not file).
+    // With the new layout, last section in VA order is the highest of
+    // idata/rodata/data.
+    let is i64 as last_va_end with mut = idata_rva + lay.idata_virt_size;
+    if (has_rodata == 1) {
+        let is i64 as rd_end = rodata_rva + rodata_virt;
+        if (rd_end > last_va_end) { last_va_end = rd_end; }
+    }
+    if (has_data == 1) {
+        let is i64 as dt_end = data_rva + data_virt;
+        if (dt_end > last_va_end) { last_va_end = dt_end; }
+    }
+    if (has_reloc == 1) {
+        let is i64 as rl_end = reloc_rva + reloc_blob_size;
+        if (rl_end > last_va_end) { last_va_end = rl_end; }
+    }
+    let is i64 as pd_end = pdata_rva + pdata_size;
+    if (pd_end > last_va_end) { last_va_end = pd_end; }
+    let is i64 as xd_end = xdata_rva + xdata_size;
+    if (xd_end > last_va_end) { last_va_end = xd_end; }
+    let is i64 as size_of_image with mut = last_va_end;
+    if (size_of_image % SECTION_ALIGN != 0) {
+        size_of_image = size_of_image + (SECTION_ALIGN - size_of_image % SECTION_ALIGN);
+    }
+    let is i64 as size_init_data = lay.idata_raw_size + rodata_raw + data_raw + custom_data_raw + pdata_raw + xdata_raw + reloc_raw;
+
+    reader.buf_emit16_le(&out, PE_OPT_MAGIC_PE32PLUS);
+    reader.buf_emit8(&out, 1); reader.buf_emit8(&out, 0);    // Linker version 1.0
+    reader.buf_emit32_le(&out, text_raw + custom_code_raw);   // SizeOfCode
+    reader.buf_emit32_le(&out, size_init_data);               // SizeOfInitializedData
+    reader.buf_emit32_le(&out, 0);                            // SizeOfUninitializedData
+    reader.buf_emit32_le(&out, entry_rva);                    // AddressOfEntryPoint
+    reader.buf_emit32_le(&out, TEXT_RVA);                     // BaseOfCode
+    reader.buf_emit64_le(&out, ls.base_addr);                 // ImageBase
+    reader.buf_emit32_le(&out, SECTION_ALIGN);
+    reader.buf_emit32_le(&out, FILE_ALIGN);
+    reader.buf_emit16_le(&out, 6); reader.buf_emit16_le(&out, 0);  // OSVer 6.0
+    reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);  // ImageVer 0.0
+    reader.buf_emit16_le(&out, 6); reader.buf_emit16_le(&out, 0);  // SubsystemVer 6.0
+    reader.buf_emit32_le(&out, 0);                            // Win32Version
+    reader.buf_emit32_le(&out, size_of_image);                // SizeOfImage
+    reader.buf_emit32_le(&out, headers_size);                 // SizeOfHeaders (dynamic)
+    reader.buf_emit32_le(&out, 0);                            // CheckSum
+    reader.buf_emit16_le(&out, IMAGE_SUBSYSTEM_WINDOWS_CUI);
+    // DllCharacteristics: HIGH_ENTROPY_VA (0x20) | DYNAMIC_BASE (0x40) |
+    // NX_COMPAT (0x100). HIGH_ENTROPY_VA lets the loader use the full 64-bit
+    // address space for ASLR. When .reloc is absent, .text is PC-relative
+    // and the image stays position-independent.
+    reader.buf_emit16_le(&out, 352);                          // 0x160
+    reader.buf_emit64_le(&out, 1048576);                      // StackReserve
+    reader.buf_emit64_le(&out, 4096);                         // StackCommit
+    reader.buf_emit64_le(&out, 1048576);                      // HeapReserve
+    reader.buf_emit64_le(&out, 4096);                         // HeapCommit
+    reader.buf_emit32_le(&out, 0);                            // LoaderFlags
+    reader.buf_emit32_le(&out, 16);                           // NumberOfRvaAndSizes
+
+    // 11. Data directories (16 × 8 = 128 bytes)
+    let is i64 as iid_rva = idata_rva + lay.iat_total_size;
+    let is i64 as iid_total_size = cast(i64, lay.dll_count + 1) * 20;
+    let is i64 as i_dd with mut = 0;
+    while (i_dd < 16) {
+        if (i_dd == 0 && ls.is_shared == 1) {
+            // IMAGE_DIRECTORY_ENTRY_EXPORT — the .dll export directory in .rdata
+            reader.buf_emit32_le(&out, rodata_rva + export_dir_off);
+            reader.buf_emit32_le(&out, rodata_virt - export_dir_off);
+        } else if (i_dd == 1) {
+            reader.buf_emit32_le(&out, iid_rva);
+            reader.buf_emit32_le(&out, iid_total_size);
+        } else if (i_dd == 3) {
+            // IMAGE_DIRECTORY_ENTRY_EXCEPTION — points at the .pdata
+            // RUNTIME_FUNCTION table (used by RtlLookupFunctionEntry).
+            reader.buf_emit32_le(&out, pdata_rva);
+            reader.buf_emit32_le(&out, pdata_size);
+        } else if (i_dd == 5 && has_reloc == 1) {
+            // IMAGE_DIRECTORY_ENTRY_BASERELOC
+            reader.buf_emit32_le(&out, reloc_rva);
+            reader.buf_emit32_le(&out, reloc_blob_size);
+        } else if (i_dd == 6 && has_rodata == 1) {
+            // IMAGE_DIRECTORY_ENTRY_DEBUG — IMAGE_DEBUG_DIRECTORY at the
+            // tail of .rdata. WinDbg / VS use it to find the matching PDB.
+            reader.buf_emit32_le(&out, rodata_rva + debug_dir_off);
+            reader.buf_emit32_le(&out, pedbg.DEBUG_DIR_SIZE);
+        } else if (i_dd == 12) {
+            reader.buf_emit32_le(&out, idata_rva);
+            reader.buf_emit32_le(&out, lay.iat_total_size);
+        } else {
+            reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+        }
+        i_dd = i_dd + 1;
+    }
+
+    // 12. Section table — RVA-ascending order: .text, .idata, [.rdata,] [.data],
+    //     .pdata, .xdata, [.reloc]. File content laid out in the SAME order.
+    let is i64 as idata_file with mut = text_file_local + text_raw;
+    let is i64 as rodata_file with mut = idata_file + lay.idata_raw_size;
+
+    // Now that rodata_rva and rodata_file are pinned down, patch the placeholder
+    // fields in IMAGE_DEBUG_DIRECTORY we appended to rodata_buf earlier.
+    pedbg._patch_debug_dir(rodata_buf, debug_dir_off, debug_rsds_off,
+                     debug_rsds_size, rodata_rva, rodata_file);
+    if (ls.is_shared == 1) {
+        exports._pe_patch_export_dir(rodata_buf, export_dir_off, export_names_off, export_n, rodata_rva);
+    }
+    let is i64 as data_file with mut = rodata_file + rodata_raw;
+    let is i64 as custom_file_start = data_file + data_raw;
+    let is i64 as pdata_file with mut = custom_file_start + custom_raw_total;
+    let is i64 as xdata_file with mut = pdata_file + pdata_raw;
+    let is i64 as reloc_file with mut = xdata_file + xdata_raw;
+
+    // Record section-table start so we can hand the 40-byte IMAGE_SECTION_HEADER
+    // array to the PDB writer for its Section Headers stream. Without this,
+    // WinDbg can't resolve section-relative offsets back to RVAs / source.
+    let is i64 as sectab_start = out.len;
+
+    // .text
+    emit_str(&out, ".text", 5); pad_to(&out, out.len + 3);
+    reader.buf_emit32_le(&out, text_virt);
+    reader.buf_emit32_le(&out, TEXT_RVA);
+    reader.buf_emit32_le(&out, text_raw);
+    reader.buf_emit32_le(&out, text_file_local);
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+    reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+    reader.buf_emit32_le(&out, IMAGE_SCN_CNT_CODE + IMAGE_SCN_MEM_EXECUTE + IMAGE_SCN_MEM_READ);
+
+    // .idata — immediately after the complete .text virtual range.
+    emit_str(&out, ".idata", 6); pad_to(&out, out.len + 2);
+    reader.buf_emit32_le(&out, lay.idata_virt_size);
+    reader.buf_emit32_le(&out, idata_rva);
+    reader.buf_emit32_le(&out, lay.idata_raw_size);
+    reader.buf_emit32_le(&out, idata_file);
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+    reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+    reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ + IMAGE_SCN_MEM_WRITE);
+
+    // .rdata (only if non-empty rodata) — read-only data
+    if (has_rodata == 1) {
+        emit_str(&out, ".rdata", 6); pad_to(&out, out.len + 2);
+        reader.buf_emit32_le(&out, rodata_virt);
+        reader.buf_emit32_le(&out, rodata_rva);
+        reader.buf_emit32_le(&out, rodata_raw);
+        reader.buf_emit32_le(&out, rodata_file);
+        reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+        reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+        reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ);
+    }
+
+    // .data (only if non-empty) — readable + writable initialized data.
+    // VirtualSize includes BSS (loader zero-fills the gap between RawSize
+    // and VirtualSize, giving us .bss without a separate section header).
+    if (has_data == 1) {
+        emit_str(&out, ".data", 5); pad_to(&out, out.len + 3);
+        reader.buf_emit32_le(&out, data_virt_total);
+        reader.buf_emit32_le(&out, data_rva);
+        reader.buf_emit32_le(&out, data_raw);
+        reader.buf_emit32_le(&out, data_file);
+        reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+        reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+        reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ + IMAGE_SCN_MEM_WRITE);
+    }
+
+    let is *i64 as custom_names = cast(*i64, ls.csec_names);
+    let is *i32 as custom_name_lens = cast(*i32, ls.csec_name_lens);
+    let is i64 as custom_file with mut = custom_file_start;
+    ci = 0;
+    while (ci < ls.csec_count) {
+        if (custom_sizes[ci] > 0) {
+            // PE image section names have eight bytes, without a string table.
+            let is i32 as name_len with mut = custom_name_lens[ci];
+            if (name_len > 8) { name_len = 8; }
+            emit_str(&out, cast(*u8, custom_names[ci]), name_len);
+            pad_to(&out, out.len + cast(i64, 8 - name_len));
+            let is i64 as raw_size = ((custom_sizes[ci] + FILE_ALIGN - 1) / FILE_ALIGN) * FILE_ALIGN;
+            reader.buf_emit32_le(&out, custom_sizes[ci]);
+            reader.buf_emit32_le(&out, custom_vaddrs[ci] - ls.base_addr);
+            reader.buf_emit32_le(&out, raw_size);
+            reader.buf_emit32_le(&out, custom_file);
+            reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+            reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+            let is i64 as characteristics with mut = IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ + IMAGE_SCN_MEM_WRITE;
+            if (custom_execs[ci] == 1) {
+                characteristics = IMAGE_SCN_CNT_CODE + IMAGE_SCN_MEM_EXECUTE + IMAGE_SCN_MEM_READ;
+            }
+            reader.buf_emit32_le(&out, characteristics);
+            custom_file = custom_file + raw_size;
+        }
+        ci = ci + 1;
+    }
+
+    // .pdata — RUNTIME_FUNCTION table. Read-only initialized data.
+    emit_str(&out, ".pdata", 6); pad_to(&out, out.len + 2);
+    reader.buf_emit32_le(&out, pdata_size);
+    reader.buf_emit32_le(&out, pdata_rva);
+    reader.buf_emit32_le(&out, pdata_raw);
+    reader.buf_emit32_le(&out, pdata_file);
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+    reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+    reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ);
+
+    // .xdata — UNWIND_INFO blobs. Read-only initialized data.
+    emit_str(&out, ".xdata", 6); pad_to(&out, out.len + 2);
+    reader.buf_emit32_le(&out, xdata_size);
+    reader.buf_emit32_le(&out, xdata_rva);
+    reader.buf_emit32_le(&out, xdata_raw);
+    reader.buf_emit32_le(&out, xdata_file);
+    reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+    reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+    reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ);
+
+    // .reloc — base relocations (only if we collected any ADDR64 sites)
+    // Characteristics: INITIALIZED_DATA | MEM_READ | MEM_DISCARDABLE (0x02000000)
+    if (has_reloc == 1) {
+        emit_str(&out, ".reloc", 6); pad_to(&out, out.len + 2);
+        reader.buf_emit32_le(&out, reloc_blob_size);
+        reader.buf_emit32_le(&out, reloc_rva);
+        reader.buf_emit32_le(&out, reloc_raw);
+        reader.buf_emit32_le(&out, reloc_file);
+        reader.buf_emit32_le(&out, 0); reader.buf_emit32_le(&out, 0);
+        reader.buf_emit16_le(&out, 0); reader.buf_emit16_le(&out, 0);
+        reader.buf_emit32_le(&out, IMAGE_SCN_CNT_INITIALIZED_DATA + IMAGE_SCN_MEM_READ + 33554432);
+    }
+
+    let is i64 as sectab_end = out.len;
+    let is i64 as sectab_size = sectab_end - sectab_start;
+
+    // 13. Pad to headers_size (FILE_ALIGN-aligned)
+    pad_to(&out, headers_size);
+
+    // 14. .text raw data — entry stub + chkstk + parse_argv FIRST, then
+    //     the merged object .text. All three live at fixed offsets
+    //     within the prefix; see PREFIX_SIZE = STUB_SIZE up top.
+    let is i64 as exit_iat_rva = imp._find_iat_rva(ls, &lay, "ExitProcess", 11);
+    if (exit_iat_rva < 0) {
+        io._write_fd(io.STDERR, "caustic-ld: ExitProcess not in cstimport — PE entry stub needs kernel32!ExitProcess\n", 84);
+        return 1;
+    }
+    let is i64 as getcmdline_iat_rva = imp._find_iat_rva(ls, &lay, "GetCommandLineA", 15);
+    if (getcmdline_iat_rva < 0) {
+        io._write_fd(io.STDERR, "caustic-ld: GetCommandLineA not in cstimport — PE entry stub needs kernel32!GetCommandLineA\n", 92);
+        return 1;
+    }
+    let is i64 as parse_argv_rva = TEXT_RVA + ENTRY_STUB_SIZE + CHKSTK_SIZE;
+    if (is_a64 == tgt.ARCH_AARCH64) {
+        entry.emit_a64_entry_stub(&out, main_vaddr - ls.base_addr,
+                            getcmdline_iat_rva, parse_argv_rva,
+                            exit_iat_rva, TEXT_RVA);
+        entry.emit_a64_parse_argv(&out);
+    } else {
+        entry.emit_win_entry_stub(&out, main_vaddr - ls.base_addr,
+                            getcmdline_iat_rva, parse_argv_rva,
+                            exit_iat_rva, TEXT_RVA);
+        // __caustic_chkstk at TEXT_RVA + ENTRY_STUB_SIZE — registered as a gsym
+        // below so codegen-emitted `call __caustic_chkstk` resolves via PC32.
+        entry.emit_caustic_chkstk(&out);
+        // __caustic_parse_argv at TEXT_RVA + ENTRY_STUB_SIZE + CHKSTK_SIZE.
+        entry.emit_caustic_parse_argv(&out);
+    }
+    let is i64 as tb_len = text_buf.len;
+    let is i64 as ti with mut = 0;
+    while (ti < tb_len) {
+        reader.buf_emit8(&out, cast(i32, text_buf.data[ti]));
+        ti = ti + 1;
+    }
+    pad_to(&out, text_file_local + text_raw);
+    // .idata raw data emitted next (in section 15 below at idata_file = right after text)
+    // After .idata, we'll emit .rdata and .data so file order matches RVA order.
+
+    // 15. .idata raw data
+    // 15a. IAT region — each entry = RVA to hint/name (loader patches at load time)
+    _pe_emit_idata(&out, ls, &lay);
+
+    pad_to(&out, idata_file + lay.idata_raw_size);
+
+    // 15f. .rdata raw data (after .idata in file)
+    if (has_rodata == 1) {
+        let is i64 as rd_len = rodata_buf.len;
+        let is i64 as rdi with mut = 0;
+        while (rdi < rd_len) {
+            reader.buf_emit8(&out, cast(i32, rodata_buf.data[rdi]));
+            rdi = rdi + 1;
+        }
+        pad_to(&out, rodata_file + rodata_raw);
+    }
+
+    // 15g. .data raw data (after .rdata in file)
+    if (has_data == 1) {
+        let is i64 as dd_len = data_buf.len;
+        let is i64 as ddi with mut = 0;
+        while (ddi < dd_len) {
+            reader.buf_emit8(&out, cast(i32, data_buf.data[ddi]));
+            ddi = ddi + 1;
+        }
+        pad_to(&out, data_file + data_raw);
+    }
+    // Merged custom bytes have already been patched by apply_relocations.
+    let is *reader.ByteBuffer as custom_bufs = cast(*reader.ByteBuffer, ls.csec_bufs);
+    custom_file = custom_file_start;
+    ci = 0;
+    while (ci < ls.csec_count) {
+        if (custom_sizes[ci] > 0) {
+            reader.buf_append(&out, custom_bufs[ci].data, custom_sizes[ci]);
+            custom_file = custom_file + ((custom_sizes[ci] + FILE_ALIGN - 1) / FILE_ALIGN) * FILE_ALIGN;
+            pad_to(&out, custom_file);
+        }
+        ci = ci + 1;
+    }
+
+
+    // 15g2. .pdata raw — RUNTIME_FUNCTION table
+    let is i64 as pdi with mut = 0;
+    while (pdi < pdata_size) {
+        reader.buf_emit8(&out, cast(i32, pdata_buf.data[pdi]));
+        pdi = pdi + 1;
+    }
+    pad_to(&out, pdata_file + pdata_raw);
+
+    // 15g3. .xdata raw — UNWIND_INFO blobs
+    let is i64 as xdi with mut = 0;
+    while (xdi < xdata_size) {
+        reader.buf_emit8(&out, cast(i32, xdata_buf.data[xdi]));
+        xdi = xdi + 1;
+    }
+    pad_to(&out, xdata_file + xdata_raw);
+
+    // 15h. .reloc raw data (last section in file). NOTE: reloc.build_reloc_blob
+    //      collects RVAs from the OBJ relocs which were already shifted to
+    //      their final positions via the gsym-shift loop above. The bytes
+    //      we wrote into reloc_buf at the start of this function are still
+    //      valid because the RVAs depend on layout constants (TEXT_RVA +
+    //      STUB_SIZE, rodata_rva, data_rva), all of which are computed
+    //      before the shift loop runs.
+    if (has_reloc == 1) {
+        let is i64 as rli with mut = 0;
+        while (rli < reloc_blob_size) {
+            reader.buf_emit8(&out, cast(i32, reloc_buf.data[rli]));
+            rli = rli + 1;
+        }
+        pad_to(&out, reloc_file + reloc_raw);
+    }
+
+    // 16. Write to file
+    let is i64 as fd = io._open_write(output_path);
+    if (fd < 0) {
+        io._write_fd(io.STDERR, "caustic-ld: cannot create output\n", 33);
+        return 1;
+    }
+    // The whole image or an error. A short write is not a PE, and the PDB
+    // written below describes an image that is not on disk — so this returns
+    // before either, leaving no executable behind.
+    let is i64 as w = io.write_all_fd(fd, out.data, out.len);
+    if (w != out.len) {
+        io._write_fd(io.STDERR, "caustic-ld: short write: ", 25);
+        io._write_fd(io.STDERR, output_path, cast(i64, _strlen_i32(output_path)));
+        io._write_fd(io.STDERR, "\n", 1);
+        io._close_fd(fd);
+        return 1;
+    }
+    io._close_fd(fd);
+    io.make_executable(output_path);
+
+    _pe_emit_pdb(ls, &out, cast(*u8, &debug_guid[0]), debug_pdb_path, debug_pdb_path_len, sectab_start, sectab_size, STUB_SIZE);
+    return 0;
+}
+
+fn _strlen_i32(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}
+
+fn _pe_emit_idata(out as *reader.ByteBuffer, ls as *linker.LinkerState, lay as *imp.ImportLayout) as void {
+    let is *i64 as hr_w = cast(*i64, lay.hint_rvas);
+    let is *i64 as ldp_w = cast(*i64, ls.cstimport_dll_ptrs);
+    let is *i32 as ldl_w = cast(*i32, ls.cstimport_dll_lens);
+    // Walk DLLs, emit each DLL's IAT entries followed by null terminator.
+    let is i32 as didx with mut = 0;
+    while (didx < lay.dll_count) {
+        let is i32 as ii with mut = 0;
+        while (ii < ls.cstimport_count) {
+            let is i32 as this_didx = imp._find_dll_idx(lay, cast(*u8, ldp_w[ii]), ldl_w[ii]);
+            if (this_didx == didx) {
+                reader.buf_emit64_le(out, hr_w[ii]);
+            }
+            ii = ii + 1;
+        }
+        reader.buf_emit64_le(out, 0);  // null terminator for this DLL
+        didx = didx + 1;
+    }
+
+    // 15b. IID array
+    let is *i64 as diatf_w = cast(*i64, lay.dll_iat_first_rvas);
+    let is *i64 as diltf_w = cast(*i64, lay.dll_ilt_first_rvas);
+    let is *i64 as dnr_w = cast(*i64, lay.dll_name_rvas);
+    didx = 0;
+    while (didx < lay.dll_count) {
+        reader.buf_emit32_le(out, diltf_w[didx]);  // OriginalFirstThunk (ILT)
+        reader.buf_emit32_le(out, 0);              // TimeDateStamp
+        reader.buf_emit32_le(out, 0);              // ForwarderChain
+        reader.buf_emit32_le(out, dnr_w[didx]);    // Name (DLL name RVA)
+        reader.buf_emit32_le(out, diatf_w[didx]);  // FirstThunk (IAT)
+        didx = didx + 1;
+    }
+    // Null IID terminator
+    reader.buf_emit32_le(out, 0); reader.buf_emit32_le(out, 0);
+    reader.buf_emit32_le(out, 0); reader.buf_emit32_le(out, 0);
+    reader.buf_emit32_le(out, 0);
+
+    // 15c. ILT region (mirrors IAT)
+    didx = 0;
+    while (didx < lay.dll_count) {
+        let is i32 as ii2 with mut = 0;
+        while (ii2 < ls.cstimport_count) {
+            let is i32 as this_didx = imp._find_dll_idx(lay, cast(*u8, ldp_w[ii2]), ldl_w[ii2]);
+            if (this_didx == didx) {
+                reader.buf_emit64_le(out, hr_w[ii2]);
+            }
+            ii2 = ii2 + 1;
+        }
+        reader.buf_emit64_le(out, 0);
+        didx = didx + 1;
+    }
+
+    // 15d. Hint/name entries (in cstimport order, padded to 16 bytes)
+    let is *i64 as lsp_w = cast(*i64, ls.cstimport_sym_ptrs);
+    let is *i32 as lsl_w = cast(*i32, ls.cstimport_sym_lens);
+    let is i32 as i_hn with mut = 0;
+    while (i_hn < ls.cstimport_count) {
+        reader.buf_emit16_le(out, 0);             // hint
+        emit_str(out, cast(*u8, lsp_w[i_hn]), cast(i64, lsl_w[i_hn]));
+        reader.buf_emit8(out, 0);                  // NUL
+        let is i64 as entry_sz with mut = 2 + cast(i64, lsl_w[i_hn]) + 1;
+        while ((entry_sz & 15) != 0) { reader.buf_emit8(out, 0); entry_sz = entry_sz + 1; }
+        i_hn = i_hn + 1;
+    }
+
+    // 15e. DLL name strings (padded to 16 bytes)
+    let is *i64 as dnp_w = cast(*i64, lay.dll_name_ptrs);
+    let is *i32 as dnl_w = cast(*i32, lay.dll_name_lens);
+    didx = 0;
+    while (didx < lay.dll_count) {
+        emit_str(out, cast(*u8, dnp_w[didx]), cast(i64, dnl_w[didx]));
+        reader.buf_emit8(out, 0);
+        let is i64 as entry_sz with mut = cast(i64, dnl_w[didx]) + 1;
+        while ((entry_sz & 15) != 0) { reader.buf_emit8(out, 0); entry_sz = entry_sz + 1; }
+        didx = didx + 1;
+    }
+}
+
+fn _pe_emit_pdb(ls as *linker.LinkerState, out as *reader.ByteBuffer, debug_guid_ptr as *u8, debug_pdb_path as *u8, debug_pdb_path_len as i32, sectab_start as i64, sectab_size as i64, stub_size as i64) as void {
+    // 17. Build Publics + Symbol Records + Module Stream from gsyms+.cstdebug.
+    //     Then emit the matching .pdb sidecar. The GUID written into
+    //     IMAGE_DEBUG_DIRECTORY's RSDS record must be the same value embedded
+    //     in the PDB Info stream — debuggers match on (GUID, Age) and reject
+    //     mismatched sidecars.
+    let is reader.ByteBuffer as symrec_buf = reader.buf_init(4096);
+    let is reader.ByteBuffer as publics_buf = reader.buf_init(1024);
+    let is i64 as text_section_va = ls.base_addr + TEXT_RVA;
+    pedbg.build_publics_buffers(ls, text_section_va, &symrec_buf, &publics_buf);
+
+    // TPI is built FIRST so the module stream's pedbg.S_LOCAL records can
+    // reference real CV type indices (pedbg.LF_POINTER, pedbg.LF_ARRAY, pedbg.LF_STRUCTURE)
+    // produced during type-record emission. build_tpi_body returns:
+    //   proc_indices    — function i → its pedbg.LF_PROCEDURE TPI index
+    //   struct_indices  — struct ordinal → its pedbg.LF_STRUCTURE TPI index
+    //   tm_keys/tm_vals — (kind, extra) → composite-type CV index map
+    let is reader.ByteBuffer as tpi_body_buf = reader.buf_init(1024);
+    // One slot per function; build_tpi_body counts them among the gsyms.
+    let is *i32 as proc_indices = cast(*i32, om.opt_alloc(cast(i64, linker.get_gsyms(ls).count + 1) * 4));
+    let is *i32 as tpi_struct_indices with mut = cast(*i32, 0);
+    let is *i32 as tpi_struct_fwd with mut = cast(*i32, 0);
+    let is *i32 as tpi_obj_base with mut = cast(*i32, 0);
+    let is i32 as tpi_num_structs with mut = 0;
+    let is *i64 as tpi_tm_keys with mut = cast(*i64, 0);
+    let is *i32 as tpi_tm_vals with mut = cast(*i32, 0);
+    let is i32 as tpi_tm_count with mut = 0;
+    let is i32 as tpi_num_types = pedbg.build_tpi_body(ls, &tpi_body_buf, proc_indices,
+        &tpi_struct_indices, &tpi_num_structs,
+        &tpi_struct_fwd, &tpi_obj_base,
+        &tpi_tm_keys, &tpi_tm_vals, &tpi_tm_count);
+
+    // One module per object that carries a source — each with its own symbol
+    // stream and line table — so a multi-file link keeps every compiland.
+    let is *i64 as mod_blobs = cast(*i64, om.opt_alloc(cast(i64, ls.obj_count + 1) * 8));
+    let is *i32 as mod_sizes = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is *i64 as mod_names = cast(*i64, om.opt_alloc(cast(i64, ls.obj_count + 1) * 8));
+    let is *i32 as mod_name_lens = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is *i32 as mod_sym_sizes = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is *i32 as mod_c13_sizes = cast(*i32, om.opt_alloc(cast(i64, ls.obj_count + 1) * 4));
+    let is i32 as n_modules with mut = 0;
+    let is *u8 as first_src with mut = cast(*u8, 0);
+    let is i32 as first_src_len with mut = 0;
+    let is i32 as moi with mut = 0;
+    while (moi < ls.obj_count) {
+        let is reader.ByteBuffer as mbuf = reader.buf_init(4096);
+        let is *u8 as m_src with mut = cast(*u8, 0);
+        let is i32 as m_src_len with mut = 0;
+        let is i32 as m_sym with mut = 0;
+        let is i32 as m_c13 with mut = 0;
+        let is i32 as got = pedbg.build_module_stream(ls, moi, text_section_va, &mbuf,
+                            &m_src, &m_src_len, &m_sym, &m_c13,
+                            tpi_struct_indices, tpi_num_structs,
+                            tpi_tm_keys, tpi_tm_vals, tpi_tm_count,
+                            tpi_obj_base);
+        if (got == 0 || m_src_len == 0) { moi = moi + 1; continue; }
+        if (first_src_len == 0) { first_src = m_src; first_src_len = m_src_len; }
+        mod_blobs[n_modules] = cast(i64, mbuf.data);
+        mod_sizes[n_modules] = cast(i32, mbuf.len);
+        mod_names[n_modules] = cast(i64, m_src);
+        mod_name_lens[n_modules] = m_src_len;
+        mod_sym_sizes[n_modules] = m_sym;
+        mod_c13_sizes[n_modules] = m_c13;
+        n_modules = n_modules + 1;
+        moi = moi + 1;
+    }
+
+    let is reader.ByteBuffer as ipi_body_buf = reader.buf_init(1024);
+    let is i32 as ipi_num_records = pedbg.build_ipi_body(ls, &ipi_body_buf,
+        first_src, first_src_len,
+        debug_pdb_path, debug_pdb_path_len,
+        proc_indices);
+
+    pdbw.write_pdb(debug_pdb_path, cast(*u8, debug_guid_ptr),
+                   cast(*u8, cast(i64, out.data) + sectab_start),
+                   cast(i32, sectab_size / 40),
+                   symrec_buf.data, cast(i32, symrec_buf.len),
+                   publics_buf.data, cast(i32, publics_buf.len),
+                   mod_blobs, mod_sizes,
+                   mod_names, mod_name_lens,
+                   mod_sym_sizes, mod_c13_sizes,
+                   n_modules,
+                   cast(i32, ls.text_size + stub_size),
+                   ipi_body_buf.data, cast(i32, ipi_body_buf.len),
+                   ipi_num_records,
+                   tpi_body_buf.data, cast(i32, tpi_body_buf.len),
+                   tpi_num_types);
+
+}

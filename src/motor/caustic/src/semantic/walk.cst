@@ -1,0 +1,1596 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "types.cst" as ty;
+use "generics.cst" as gn;
+use "modules.cst" as mod;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../parser/top.cst" as top;
+use "../codegen/target.cst" as tgt;
+use "../nest.cst" as nest;
+use "walk_types.cst" as wt;
+
+fn walk_return(node as *ast.Node) as void {
+    if (cast(i64, node.expr) != 0) {
+        walk(node.expr);
+        if (ty.try_implicit_convert(node.expr, sc.current_return_type) == 0) {
+            sc.sem_error_at(node, "tipo de retorno incompativel");
+        }
+    } else {
+        let is *ast.Type as rt = cast(*ast.Type, sc.current_return_type);
+        if (cast(i64, rt) != cast(i64, ast.type_void)) {
+            sc.sem_error_at(node, "retorno vazio em funcao nao-void");
+        }
+    }
+}
+
+// Conservative "this construct always reaches a return statement" predicate.
+// A block always returns if any of its statements does. An if always returns
+// only if it has an else branch and both branches always return. Loops are
+// not counted (they may not execute). Match would need exhaustiveness — not
+// tracked here, so a match never qualifies (false negatives, not positives).
+fn body_always_returns(node as *ast.Node) as i32 {
+    if (cast(i64, node) == 0) { return 0; }
+    let is i32 as k = node.kind;
+    if (k == ast.NK_RETURN) { return 1; }
+    if (k == ast.NK_BLOCK) {
+        let is *ast.Node as s with mut = node.stmts;
+        while (cast(i64, s) != 0) {
+            if (body_always_returns(s) == 1) { return 1; }
+            s = s.next;
+        }
+        return 0;
+    }
+    if (k == ast.NK_IF) {
+        if (cast(i64, node.else_b) == 0) { return 0; }
+        if (body_always_returns(node.then_b) != 1) { return 0; }
+        return body_always_returns(node.else_b);
+    }
+    return 0;
+}
+
+fn walk_fn_def(node as *ast.Node) as void {
+    ast.node_ensure_extra(node).walked = 1;
+    // Interface signature with no body: a regular function imported from a binary
+    // `.csti` has its body stripped (only its signature is exported; the machine
+    // code lives in that module's own .o). There is nothing to analyze, and the
+    // "returns on all paths" check must not fire on the absent body. The function
+    // symbol was already registered (with asm_name) in pass 5. Extern/FFI decls
+    // (is_extern=1) keep their existing handling.
+    if (cast(i64, node.body) == 0 && node.is_extern == 0) {
+        return;
+    }
+    // `with naked` functions take full control: the asm-only body reads args
+    // from registers (never by name) and terminates control flow itself. Skip
+    // param declaration (avoids spurious unused-param warnings) and the
+    // returns-on-all-paths check (the asm body has no IR return).
+    let is i32 as naked = ast.nx_is_naked(node);
+    sc.enter_scope();
+    sc.stack_offset = 48;
+    if (naked == 0) {
+        let is *ast.Node as param with mut = node.params;
+        while (cast(i64, param) != 0) {
+            let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags, param);
+            param.var_offset = var.offset;
+            param = param.next;
+        }
+    }
+    let is *d.Function as fs = sc.lookup_fn(node.name_ptr, node.name_len);
+    if (cast(i64, fs) != 0 && fs.asm_name_len > 0) {
+        node.asm_name_ptr = fs.asm_name_ptr;
+        node.asm_name_len = cast(i16, fs.asm_name_len);
+    }
+    let is *u8 as saved_rt = sc.current_return_type;
+    sc.current_return_type = cast(*u8, node.return_type);
+    // Parameters and the outer function body are one lexical scope. Only an
+    // explicitly nested block introduces a scope in which they may be shadowed.
+    if (cast(i64, node.body) != 0 && node.body.kind == ast.NK_BLOCK) {
+        walk_block_contents(node.body, sc.current_scope.vars);
+    } else {
+        walk(node.body);
+    }
+    let is *ast.Type as rt = cast(*ast.Type, node.return_type);
+    if (naked == 0 && cast(i64, rt) != cast(i64, ast.type_void) && body_always_returns(node.body) == 0) {
+        sc.sem_error_at2(node, "funcao nao retorna em todos os paths", node.name_ptr, node.name_len);
+    }
+    node.stack_size = sc.stack_offset;
+    sc.current_return_type = saved_rt;
+    sc.exit_scope();
+}
+
+fn walk_block_contents(node as *ast.Node, stop_before as *d.Variable) as void {
+    let is *ast.Node as s with mut = node.stmts;
+    while (cast(i64, s) != 0) {
+        walk(s);
+        s = s.next;
+    }
+    let is *d.Variable as bv with mut = sc.current_scope.vars;
+    while (cast(i64, bv) != cast(i64, stop_before)) {
+        if (bv.is_used == 0 && bv.is_global == 0 && bv.is_module == 0) {
+            if (bv.name_len > 0 && bv.name_ptr[0] != cast(u8, 95)) {
+                let is *ast.Node as bwn = ast.new_node(ast.NK_IDENT);
+                bwn.tok_idx = bv.decl_tok_idx;
+                sc.sem_warn_at2(bwn, "variavel nao utilizada", bv.name_ptr, bv.name_len);
+            }
+        }
+        bv = bv.next;
+    }
+}
+
+fn walk_block(node as *ast.Node) as void {
+    sc.enter_scope();
+    walk_block_contents(node, cast(*d.Variable, 0));
+    sc.exit_scope();
+}
+
+// Try to evaluate an init expression to an integer literal at semantic time.
+// === Layer 2 comptime: AST interpreter for `with imut` functions ===
+//
+// Each call to an imut fn opens a fresh frame (params + locals). The walker
+// uses a single 32-slot bump-allocated frame stack; nested imut calls share
+// the same array, each one tracking its own `frame_base` so locals don't
+// collide. Bounded at 32 nesting levels so a buggy recursion can't blow up
+// the compiler. Slot layout per fn: params first (in declaration order),
+// then locals in the order they appear via `let`.
+let is [256]i64 as imut_slot_val;          // 8 frames × 32 slots = 256
+let is [256]i64 as imut_slot_name_ptr;     // i64 stash of *u8 name
+let is [256]i32 as imut_slot_name_len;
+let is i32 as imut_sp with mut = 0;        // slot stack pointer
+let is i32 as imut_depth with mut = 0;     // current recursion depth
+
+// Returns 1 if a local with the given name exists in the current frame
+// (between imut_frame_base and imut_sp). Writes its value into *out.
+fn imut_lookup(frame_base as i32, name_ptr as *u8, name_len as i32, out as *i64) as i32 {
+    let is i32 as i with mut = imut_sp - 1;
+    while (i >= frame_base) {
+        let is i64 as np = imut_slot_name_ptr[i];
+        let is i32 as nl = imut_slot_name_len[i];
+        if (nl == name_len && d.str_eq(cast(*u8, np), nl, name_ptr, name_len) == 1) {
+            *out = imut_slot_val[i];
+            return 1;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn imut_bind(name_ptr as *u8, name_len as i32, val as i64) as i32 {
+    if (imut_sp >= 256) { return 0; }
+    imut_slot_name_ptr[imut_sp] = cast(i64, name_ptr);
+    imut_slot_name_len[imut_sp] = name_len;
+    imut_slot_val[imut_sp] = val;
+    imut_sp = imut_sp + 1;
+    return 1;
+}
+
+// Evaluate an expression node in the current imut frame. Returns 1 on
+// success (value in *out), 0 on any non-foldable construct.
+fn imut_eval_expr(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) { *out = n.val; return 1; }
+    if (k == ast.NK_IDENT) {
+        if (imut_lookup(frame_base, n.name_ptr, n.name_len, out) == 1) { return 1; }
+        // Fall back to const-folded imut globals.
+        let is *d.Variable as v = sc.lookup_var(n.name_ptr, n.name_len);
+        if (cast(i64, v) != 0 && v.has_folded_init == 1) {
+            *out = v.folded_init_val;
+            return 1;
+        }
+        return 0;
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL
+        || k == ast.NK_DIV || k == ast.NK_MOD
+        || k == ast.NK_EQ  || k == ast.NK_NE
+        || k == ast.NK_LT  || k == ast.NK_LE
+        || k == ast.NK_GT  || k == ast.NK_GE) {
+        let is i64 as l with mut = 0;
+        let is i64 as r with mut = 0;
+        if (imut_eval_expr(n.lhs, frame_base, &l) == 0) { return 0; }
+        if (imut_eval_expr(n.rhs, frame_base, &r) == 0) { return 0; }
+        if (k == ast.NK_ADD) { *out = l + r; return 1; }
+        if (k == ast.NK_SUB) { *out = l - r; return 1; }
+        if (k == ast.NK_MUL) { *out = l * r; return 1; }
+        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
+        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
+        if (k == ast.NK_EQ)  { *out = 0; if (l == r) { *out = 1; } return 1; }
+        if (k == ast.NK_NE)  { *out = 0; if (l != r) { *out = 1; } return 1; }
+        if (k == ast.NK_LT)  { *out = 0; if (l <  r) { *out = 1; } return 1; }
+        if (k == ast.NK_LE)  { *out = 0; if (l <= r) { *out = 1; } return 1; }
+        if (k == ast.NK_GT)  { *out = 0; if (l >  r) { *out = 1; } return 1; }
+        if (k == ast.NK_GE)  { *out = 0; if (l >= r) { *out = 1; } return 1; }
+    }
+    if (k == ast.NK_FNCALL) {
+        // Recursive imut call: fold by re-entering the interpreter.
+        return try_fold_imut_call(n, out);
+    }
+    return 0;
+}
+
+// Control-flow sentinel for imut_exec_stmt:
+//   returns 0 = continue with next stmt
+//   returns 1 = explicit return executed (value in *out)
+//   returns 2 = non-foldable, abort interpretation
+fn imut_exec_stmt(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    // Parser wraps standalone expressions/assignments in NK_EXPR_STMT.
+    // Unwrap so the inner NK_ASSIGN / NK_FNCALL is handled below.
+    if (k == ast.NK_EXPR_STMT) {
+        if (cast(i64, n.expr) == 0) { return 0; }
+        return imut_exec_stmt(n.expr, frame_base, out);
+    }
+    if (k == ast.NK_BLOCK) {
+        let is *ast.Node as s with mut = n.stmts;
+        while (cast(i64, s) != 0) {
+            let is i32 as r = imut_exec_stmt(s, frame_base, out);
+            if (r != 0) { return r; }
+            s = s.next;
+        }
+        return 0;
+    }
+    if (k == ast.NK_RETURN) {
+        if (cast(i64, n.expr) == 0) { *out = 0; return 1; }
+        if (imut_eval_expr(n.expr, frame_base, out) == 0) { return 2; }
+        return 1;
+    }
+    if (k == ast.NK_LET) {
+        let is i64 as v with mut = 0;
+        if (cast(i64, n.init_expr) != 0) {
+            if (imut_eval_expr(n.init_expr, frame_base, &v) == 0) { return 2; }
+        }
+        if (imut_bind(n.name_ptr, n.name_len, v) == 0) { return 2; }
+        return 0;
+    }
+    if (k == ast.NK_IF) {
+        let is i64 as cv with mut = 0;
+        if (imut_eval_expr(n.cond, frame_base, &cv) == 0) { return 2; }
+        if (cv != 0) { return imut_exec_stmt(n.then_b, frame_base, out); }
+        if (cast(i64, n.else_b) != 0) { return imut_exec_stmt(n.else_b, frame_base, out); }
+        return 0;
+    }
+    if (k == ast.NK_WHILE) {
+        // Cap iterations to prevent compiler-time DoS on unbounded loops.
+        let is i32 as iter with mut = 0;
+        while (iter < 65536) {
+            let is i64 as cv with mut = 0;
+            if (imut_eval_expr(n.cond, frame_base, &cv) == 0) { return 2; }
+            if (cv == 0) { return 0; }
+            let is i32 as r = imut_exec_stmt(n.body, frame_base, out);
+            if (r != 0) { return r; }
+            iter = iter + 1;
+        }
+        return 2;
+    }
+    if (k == ast.NK_ASSIGN) {
+        // Only LHS = NK_IDENT to a local in this frame is supported.
+        if (cast(i64, n.lhs) == 0 || n.lhs.kind != ast.NK_IDENT) { return 2; }
+        let is i64 as rv with mut = 0;
+        if (imut_eval_expr(n.rhs, frame_base, &rv) == 0) { return 2; }
+        let is i32 as i with mut = imut_sp - 1;
+        while (i >= frame_base) {
+            let is i64 as np = imut_slot_name_ptr[i];
+            let is i32 as nl = imut_slot_name_len[i];
+            if (nl == n.lhs.name_len && d.str_eq(cast(*u8, np), nl, n.lhs.name_ptr, n.lhs.name_len) == 1) {
+                imut_slot_val[i] = rv;
+                return 0;
+            }
+            i = i - 1;
+        }
+        return 2;
+    }
+    return 2;
+}
+
+// Attempt to fold a NK_FNCALL into a literal by interpreting the callee's
+// body. Returns 1 on success (with the result in *out), 0 if the call site
+// is not foldable (callee not imut, args not all literal, body uses an
+// unsupported construct, recursion too deep, etc).
+fn try_fold_imut_call(cn as *ast.Node, out as *i64) as i32 {
+    if (cast(i64, cn.name_ptr) == 0 || cn.name_len <= 0) { return 0; }
+    let is *d.Function as f = sc.lookup_fn(cn.name_ptr, cn.name_len);
+    return try_fold_imut_fn(f, cn, out);
+}
+
+// As try_fold_imut_call, but takes an already-resolved function. walk_fncall
+// resolves the callee for every call shape (including module-qualified ones
+// like `os.current()`, whose lhs is NK_MEMBER and thus has no plain name to
+// re-look-up), so it folds via this entry point directly. The name-lookup
+// wrapper above is kept for the recursive case inside imut_eval_expr.
+fn try_fold_imut_fn(f as *d.Function, cn as *ast.Node, out as *i64) as i32 {
+    if (imut_depth >= 8) { return 0; }
+    if (cast(i64, f) == 0) { return 0; }
+    if (f.is_imut == 0 || cast(i64, f.ast_node) == 0) { return 0; }
+    let is *ast.Node as fn_node = cast(*ast.Node, f.ast_node);
+
+    // Evaluate all args first (in caller's frame). All must be foldable.
+    // arg count must match param count (no variadic).
+    let is [16]i64 as arg_vals;
+    let is i32 as arg_n with mut = 0;
+    let is *ast.Node as a with mut = cn.args;
+    while (cast(i64, a) != 0) {
+        if (arg_n >= 16) { return 0; }
+        let is i64 as v with mut = 0;
+        if (imut_eval_expr(a, imut_sp, &v) == 0) { return 0; }
+        arg_vals[arg_n] = v;
+        arg_n = arg_n + 1;
+        a = a.next;
+    }
+    if (arg_n != f.param_count) { return 0; }
+
+    // Open frame: bind params, then run body, then pop.
+    let is i32 as saved_sp = imut_sp;
+    let is *ast.Node as p with mut = fn_node.params;
+    let is i32 as pi with mut = 0;
+    while (cast(i64, p) != 0) {
+        if (imut_bind(p.name_ptr, p.name_len, arg_vals[pi]) == 0) {
+            imut_sp = saved_sp;
+            return 0;
+        }
+        pi = pi + 1;
+        p = p.next;
+    }
+    let is i64 as rv with mut = 0;
+    imut_depth = imut_depth + 1;
+    let is i32 as r = imut_exec_stmt(fn_node.body, saved_sp, &rv);
+    imut_depth = imut_depth - 1;
+    imut_sp = saved_sp;
+    if (r == 1) { *out = rv; return 1; }
+    return 0;
+}
+
+// Returns 1 on success and writes the value to *out; returns 0 if the node
+// references something non-foldable (mut global, runtime call, etc).
+// Supports: NK_NUM, references to imut globals with folded inits, the same
+// arithmetic and comparison ops that gen_expr's const-fold handles, and
+// calls to `with imut` functions when all args fold. Bounded to avoid
+// infinite recursion on cyclic references (which would be a user bug, but
+// defending here keeps the compiler well-behaved).
+fn try_fold_const(n as *ast.Node, out as *i64, depth as i32) as i32 {
+    if (depth > 32) { return 0; }
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) {
+        // Float literals: value lives in fval, not val. We don't yet
+        // const-prop floats (the AST rewrite path stores val into NK_NUM
+        // but downstream codegen would still need fval), so refuse to
+        // fold them — caller falls back to a normal global load.
+        if (cast(i64, n.ty) != 0
+            && (n.ty.kind == ast.TY_F32 || n.ty.kind == ast.TY_F64)) {
+            return 0;
+        }
+        *out = n.val;
+        return 1;
+    }
+    if (k == ast.NK_IDENT) {
+        let is *d.Variable as v = sc.lookup_var(n.name_ptr, n.name_len);
+        if (cast(i64, v) != 0 && v.has_folded_init == 1) {
+            *out = v.folded_init_val;
+            return 1;
+        }
+        return 0;
+    }
+    if (k == ast.NK_FNCALL) {
+        // Try Layer 2 comptime evaluation if callee is `with imut`.
+        return try_fold_imut_call(n, out);
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL
+        || k == ast.NK_DIV || k == ast.NK_MOD
+        || k == ast.NK_EQ  || k == ast.NK_NE
+        || k == ast.NK_LT  || k == ast.NK_LE
+        || k == ast.NK_GT  || k == ast.NK_GE) {
+        let is i64 as l with mut = 0;
+        let is i64 as r with mut = 0;
+        if (try_fold_const(n.lhs, &l, depth + 1) == 0) { return 0; }
+        if (try_fold_const(n.rhs, &r, depth + 1) == 0) { return 0; }
+        if (k == ast.NK_ADD) { *out = l + r; return 1; }
+        if (k == ast.NK_SUB) { *out = l - r; return 1; }
+        if (k == ast.NK_MUL) { *out = l * r; return 1; }
+        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
+        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
+        if (k == ast.NK_EQ)  { *out = 0; if (l == r) { *out = 1; } return 1; }
+        if (k == ast.NK_NE)  { *out = 0; if (l != r) { *out = 1; } return 1; }
+        if (k == ast.NK_LT)  { *out = 0; if (l <  r) { *out = 1; } return 1; }
+        if (k == ast.NK_LE)  { *out = 0; if (l <= r) { *out = 1; } return 1; }
+        if (k == ast.NK_GT)  { *out = 0; if (l >  r) { *out = 1; } return 1; }
+        if (k == ast.NK_GE)  { *out = 0; if (l >= r) { *out = 1; } return 1; }
+    }
+    return 0;
+}
+
+// The value of a float constant expression the compiler can compute: literals,
+// `with imut` globals holding one, and arithmetic on them (IEEE double, what the
+// program's own f64 arithmetic does).
+fn float_const_of(n as *ast.Node, out as *f64, depth as i32) as i32 {
+    if (depth > 32 || cast(i64, n) == 0 || cast(i64, n.ty) == 0 || n.ty.kind != ast.TY_F64) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) { *out = n.fval; return 1; }
+    if (k == ast.NK_IDENT && n.is_string_const == ast.IDENT_FLOAT_CONST) { *out = ast.i64_to_f64(n.val); return 1; }
+    if (k == ast.NK_NEG) {
+        let is f64 as v with mut = 0.0;
+        if (float_const_of(n.expr, &v, depth + 1) == 0) { return 0; }
+        if (v == 0.0) { return 0; }
+        *out = 0.0 - v;
+        return 1;
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV) {
+        let is f64 as l with mut = 0.0;
+        let is f64 as r with mut = 0.0;
+        if (float_const_of(n.lhs, &l, depth + 1) == 0 || float_const_of(n.rhs, &r, depth + 1) == 0) { return 0; }
+        let is f64 as v with mut = 0.0;
+        if (k == ast.NK_ADD) { v = l + r; }
+        if (k == ast.NK_SUB) { v = l - r; }
+        if (k == ast.NK_MUL) { v = l * r; }
+        if (k == ast.NK_DIV) { v = l / r; }
+        if (v != v) { return 0; }
+        *out = v;
+        return 1;
+    }
+    return 0;
+}
+
+fn walk_let(node as *ast.Node) as void {
+    node.ty = wt.resolve_type_ptr(cast(*u8, node.ty));
+    if (node.ty.kind == ast.TY_VOID) {
+        sc.sem_error_at2(node, "variavel nao pode ser void", node.name_ptr, node.name_len);
+    }
+    if (node.is_extern == 1) {
+        let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags, node);
+        var.is_extern = 1;
+        var.is_string_const = ast.IDENT_EXTERN_VAR;
+        node.var_offset = var.offset;
+        node.is_global = var.is_global;
+        return;
+    }
+    if (cast(i64, node.init_expr) != 0) {
+        walk(node.init_expr);
+        if (ty.try_implicit_convert(node.init_expr, cast(*u8, node.ty)) == 0) {
+            sc.sem_error_at2(node, "tipo incompativel na inicializacao de", node.name_ptr, node.name_len);
+        }
+    }
+    let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags, node);
+    var.decl_tok_idx = node.tok_idx;
+    node.var_offset = var.offset;
+    node.is_global = var.is_global;
+    if (var.is_global == 1 && node.flags == ast.VF_IMUT && cast(i64, node.init_expr) != 0 && node.init_expr.kind == ast.NK_STRING) {
+        var.is_string_const = 1;
+        node.is_string_const = 1;
+    }
+    // Eager const-prop: if this is an imut global whose init expression
+    // evaluates to a literal at semantic time, record the value so gen_expr
+    // can substitute literal at every use site.
+    if (var.is_global == 1 && node.flags == ast.VF_IMUT && cast(i64, node.init_expr) != 0) {
+        let is i64 as fv with mut = 0;
+        let is f64 as flit with mut = 0.0;
+        if (try_fold_const(node.init_expr, &fv, 0) == 1) {
+            var.has_folded_init = 1;
+            var.folded_init_val = fv;
+        } else if (node.ty.kind == ast.TY_F32 && node.init_expr.kind == ast.NK_NUM) {
+            var.has_folded_init = 2;
+            var.folded_init_val = ast.f64_to_i64(ast.round_f32(node.init_expr.fval));
+        } else if (float_const_of(node.init_expr, &flit, 0) == 1) {
+            var.has_folded_init = 2;
+            var.folded_init_val = ast.f64_to_i64(flit);
+        }
+    }
+    if (var.asm_name_len > 0) {
+        node.asm_name_ptr = var.asm_name_ptr;
+        node.asm_name_len = cast(i16, var.asm_name_len);
+    }
+    // Locals without an init expression start uninitialized. Globals are
+    // BSS-zeroed; aggregates (array/struct) are used as buffers (filled via
+    // address-of, which marks them initialized in walk_addr).
+    if (cast(i64, node.init_expr) == 0 && var.is_global == 0) {
+        let is i32 as tk = node.ty.kind;
+        if (tk != ast.TY_ARRAY && tk != ast.TY_STRUCT) {
+            var.is_init = 0;
+        }
+    }
+}
+
+fn walk_binop(node as *ast.Node) as void {
+    let is i32 as k = node.kind;
+    walk(node.lhs);
+    walk(node.rhs);
+    if (node.rhs.kind == ast.NK_NUM && node.lhs.kind != ast.NK_NUM) {
+        ty.can_narrow_literal_to(node.rhs, cast(*u8, node.lhs.ty));
+    }
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
+        ty.can_narrow_literal_to(node.lhs, cast(*u8, node.rhs.ty));
+    }
+    // When both sides are literals (typical after imut-global const-prop
+    // rewrites IDENT → NK_NUM), narrow the wider one to the narrower one
+    // if it fits — keeps the result type at the originally-declared size
+    // and avoids spurious "narrowing required" errors at the use site.
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM
+        && cast(i64, node.lhs.ty) != 0 && cast(i64, node.rhs.ty) != 0
+        && node.lhs.ty.size != node.rhs.ty.size) {
+        if (node.lhs.ty.size > node.rhs.ty.size) {
+            ty.can_narrow_literal_to(node.lhs, cast(*u8, node.rhs.ty));
+        } else {
+            ty.can_narrow_literal_to(node.rhs, cast(*u8, node.lhs.ty));
+        }
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB) {
+        if (node.lhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.rhs.ty)) == 1) {
+            node.ty = node.lhs.ty;
+            return;
+        }
+        if (node.rhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.lhs.ty)) == 1) {
+            if (k == ast.NK_SUB) { sc.sem_error_at(node, "subtracao int - ptr invalida"); }
+            node.ty = node.rhs.ty;
+            return;
+        }
+        if (node.lhs.ty.kind == ast.TY_PTR && node.rhs.ty.kind == ast.TY_PTR) {
+            if (k == ast.NK_SUB) { node.ty = ast.type_i64; return; }
+            sc.sem_error_at(node, "soma de dois ponteiros invalida");
+        }
+    }
+    if (node.lhs.ty.size > node.rhs.ty.size) {
+        node.ty = node.lhs.ty;
+    } else {
+        node.ty = node.rhs.ty;
+    }
+    // NOTE: we intentionally do NOT fold this op to a NK_NUM literal at the
+    // AST level even when both sides are NK_NUM — that would lose the
+    // narrowing path in walk_let (which narrows a literal NK_NUM to a
+    // smaller declared type). Const-fold of arithmetic happens later in
+    // gen_expr where types are settled.
+}
+
+fn walk_cmp(node as *ast.Node) as void {
+    walk(node.lhs);
+    walk(node.rhs);
+    if (node.rhs.kind == ast.NK_NUM && node.lhs.kind != ast.NK_NUM) {
+        ty.can_narrow_literal_to(node.rhs, cast(*u8, node.lhs.ty));
+    }
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
+        ty.can_narrow_literal_to(node.lhs, cast(*u8, node.rhs.ty));
+    }
+    node.ty = ast.type_bool;
+    // If both sides folded to literals, collapse the comparison itself to
+    // a 0/1 literal — lets `if (x == y)` with x,y imut-folded reach the
+    // NK_IF dead-branch elim. Integer literals only: float literals keep
+    // their value in fval, so comparing val would compare 0 with 0.
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM
+        && num_is_float(node.lhs) == 0 && num_is_float(node.rhs) == 0) {
+        let is i64 as a = node.lhs.val;
+        let is i64 as b = node.rhs.val;
+        let is i32 as k = node.kind;
+        let is i64 as r with mut = 0;
+        if (k == ast.NK_EQ) { if (a == b) { r = 1; } }
+        else if (k == ast.NK_NE) { if (a != b) { r = 1; } }
+        else if (k == ast.NK_LT) { if (a <  b) { r = 1; } }
+        else if (k == ast.NK_LE) { if (a <= b) { r = 1; } }
+        else if (k == ast.NK_GT) { if (a >  b) { r = 1; } }
+        else if (k == ast.NK_GE) { if (a >= b) { r = 1; } }
+        node.kind = ast.NK_NUM;
+        node.val = r;
+    }
+}
+
+// Float literals store their value in fval, not the integer val field.
+// Integer-only constant comparisons must therefore exclude float literals.
+fn num_is_float(n as *ast.Node) as i32 {
+    if (cast(i64, n.ty) == 0) { return 0; }
+    if (n.ty.kind == ast.TY_F64 || n.ty.kind == ast.TY_F32) { return 1; }
+    return 0;
+}
+
+
+fn walk_assign(node as *ast.Node) as void {
+    walk(node.rhs);
+    let is i32 as lk = node.lhs.kind;
+    if (lk != ast.NK_IDENT && lk != ast.NK_DEREF && lk != ast.NK_INDEX && lk != ast.NK_MEMBER) {
+        sc.sem_error_at(node, "alvo de atribuicao invalido");
+    }
+    if (lk == ast.NK_IDENT) {
+        // Handle the target variable directly so the uninit read check
+        // doesn't fire on the very variable being assigned.
+        let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
+        if (cast(i64, var) == 0) {
+            sc.sem_error_at2(node.lhs, "variavel nao declarada", node.lhs.name_ptr, node.lhs.name_len);
+        } else {
+            if (var.flags != ast.VF_MUT) {
+                sc.sem_error_at2(node, "nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
+            }
+            var.is_init = 1;
+            var.is_used = 1;
+            node.lhs.ty = cast(*ast.Type, var.ty);
+            node.lhs.var_offset = var.offset;
+            node.lhs.is_global = var.is_global;
+            node.lhs.is_string_const = var.is_string_const;
+            if (var.asm_name_len > 0) { node.lhs.asm_name_ptr = var.asm_name_ptr; node.lhs.asm_name_len = cast(i16, var.asm_name_len); }
+        }
+    } else {
+        walk(node.lhs);
+    }
+    // The rule a `let` is held to. This checked literals only, so a variable of
+    // the wrong type — an f64 into an i64, a function of another signature into
+    // a function type — was stored without a word.
+    if (cast(i64, node.lhs.ty) != 0
+        && ty.try_implicit_convert(node.rhs, cast(*u8, node.lhs.ty)) == 0) {
+        if (cast(i64, node.rhs.ty) != 0 && node.lhs.ty.kind == ast.TY_FN && node.rhs.ty.kind == ast.TY_FN) {
+            sc.sem_error_at(node, "assinatura de funcao incompativel na atribuicao");
+        } else {
+            sc.sem_error_at(node, "tipo incompativel na atribuicao");
+        }
+    }
+    node.ty = node.lhs.ty;
+}
+
+fn walk_for(node as *ast.Node) as void {
+    sc.enter_scope();
+    if (cast(i64, node.for_init) != 0) { walk(node.for_init); }
+    if (cast(i64, node.cond) != 0) { walk(node.cond); }
+    if (cast(i64, node.for_step) != 0) { walk(node.for_step); }
+    sc.loop_depth = sc.loop_depth + 1;
+    walk(node.body);
+    sc.loop_depth = sc.loop_depth - 1;
+    sc.exit_scope();
+}
+
+// === Main walk function ===
+
+fn walk(node as *ast.Node) as void {
+    if (cast(i64, node) == 0) { return; }
+    if (nest.spent() == 1) { io.exit(1); }
+    let is i32 as k = node.kind;
+
+    if (k == ast.NK_ASM) { return; }
+    if (k == ast.NK_NUM) { if (cast(i64, node.ty) == 0) { node.ty = ast.type_i64; } return; }
+    if (k == ast.NK_STRING) {
+        let is *ast.Type as p = ast.new_type(ast.TY_PTR);
+        p.base = ast.type_u8; p.size = 8; node.ty = p; return;
+    }
+    if (k == ast.NK_IDENT) {
+        let is *d.Variable as var = sc.lookup_var(node.name_ptr, node.name_len);
+        if (cast(i64, var) == 0) { sc.sem_error_at2(node, "variavel nao declarada", node.name_ptr, node.name_len); }
+        if (var.is_init == 0) {
+            sc.sem_error_at2(node, "uso de variavel nao inicializada", node.name_ptr, node.name_len);
+        }
+        var.is_used = 1;
+        node.ty = cast(*ast.Type, var.ty);
+        node.var_offset = var.offset;
+        node.is_global = var.is_global;
+        node.is_string_const = var.is_string_const;
+        if (var.asm_name_len > 0) { node.asm_name_ptr = var.asm_name_ptr; node.asm_name_len = cast(i16, var.asm_name_len); }
+        // Const-prop at the AST level: if this references an imut global
+        // whose init folded to a literal in walk_let, rewrite the node
+        // in-place to NK_NUM so downstream arithmetic + comparison folds
+        // in gen_expr fire transitively (`A + B`, `A == 1`, etc. all see
+        // both sides as literals).
+        if (var.has_folded_init == 1) {
+            node.kind = ast.NK_NUM;
+            node.val = var.folded_init_val;
+        }
+        if (var.has_folded_init == 2) {
+            node.is_string_const = ast.IDENT_FLOAT_CONST;
+            node.val = var.folded_init_val;
+        }
+        return;
+    }
+    if (k == ast.NK_RETURN) { walk_return(node); return; }
+    if (k == ast.NK_FN) { walk_fn_def(node); return; }
+    if (k == ast.NK_EXPR_STMT) { walk(node.expr); return; }
+    if (k == ast.NK_BLOCK) { walk_block(node); return; }
+    if (k == ast.NK_LET) { walk_let(node); return; }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV || k == ast.NK_MOD || k == ast.NK_SHL || k == ast.NK_SHR || k == ast.NK_BAND || k == ast.NK_BOR || k == ast.NK_BXOR) {
+        walk_binop(node); return;
+    }
+    if (k == ast.NK_EQ || k == ast.NK_NE || k == ast.NK_LT || k == ast.NK_LE || k == ast.NK_GT || k == ast.NK_GE) {
+        walk_cmp(node); return;
+    }
+    if (k == ast.NK_LAND || k == ast.NK_LOR) {
+        walk(node.lhs);
+        node.ty = ast.type_bool;
+        // Preserve short-circuiting, including missing wrong-target modules.
+        // Collapse before IR generation caches foreign-call reachability.
+        if (node.lhs.kind == ast.NK_NUM && num_is_float(node.lhs) == 0) {
+            if ((k == ast.NK_LAND && node.lhs.val == 0)
+                || (k == ast.NK_LOR && node.lhs.val != 0)) {
+                node.kind = ast.NK_NUM;
+                node.val = cast(i64, k == ast.NK_LOR);
+                return;
+            }
+        }
+        walk(node.rhs);
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM
+            && num_is_float(node.lhs) == 0 && num_is_float(node.rhs) == 0) {
+            node.kind = ast.NK_NUM;
+            node.val = cast(i64, node.rhs.val != 0);
+        }
+        return;
+    }
+    if (k == ast.NK_DEFER) {
+        if (node.expr.kind != ast.NK_FNCALL) { sc.sem_error_at(node, "defer so aceita chamadas de funcao"); }
+        walk(node.expr); return;
+    }
+    if (k == ast.NK_BREAK) { if (sc.loop_depth == 0) { sc.sem_error_at(node, "break fora de loop"); } return; }
+    if (k == ast.NK_CONTINUE) { if (sc.loop_depth == 0) { sc.sem_error_at(node, "continue fora de loop"); } return; }
+    if (k == ast.NK_IF) {
+        walk(node.cond);
+        // Semantic dead-branch elim: when the condition has already been
+        // rewritten to a literal during walk(cond) (NK_IDENT→NK_NUM for
+        // imut globals, NK_EQ of two literals → NK_NUM), skip semantic-
+        // walking the dead arm. Cheap path — no extra fold attempt, we
+        // just look at what `walk` left in node.cond. The IR generator
+        // does the same trim later; doing it here also stops references
+        // in the dead arm from being resolved against modules that a
+        // top-level `if (__target_is_X) use` intentionally didn't load.
+        if (node.cond.kind == ast.NK_NUM) {
+            if (node.cond.val != 0) { walk(node.then_b); }
+            else if (cast(i64, node.else_b) != 0) { walk(node.else_b); }
+            return;
+        }
+        walk(node.then_b);
+        if (cast(i64, node.else_b) != 0) { walk(node.else_b); }
+        return;
+    }
+    if (k == ast.NK_WHILE) { walk(node.cond); sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; return; }
+    if (k == ast.NK_DO_WHILE) { sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; walk(node.cond); return; }
+    if (k == ast.NK_FOR) { walk_for(node); return; }
+    if (k == ast.NK_ADDR) {
+        let is *ast.Node as inner = node.expr;
+        if (inner.kind == ast.NK_IDENT) {
+            // Taking address of a variable marks it as initialized — the
+            // callee receiving the pointer may write through it. Skip the
+            // uninit read check by resolving fields directly.
+            let is *d.Variable as v = sc.lookup_var(inner.name_ptr, inner.name_len);
+            if (cast(i64, v) == 0) { sc.sem_error_at2(inner, "variavel nao declarada", inner.name_ptr, inner.name_len); }
+            v.is_init = 1;
+            v.is_used = 1;
+            inner.ty = cast(*ast.Type, v.ty);
+            inner.var_offset = v.offset;
+            inner.is_global = v.is_global;
+            inner.is_string_const = v.is_string_const;
+            if (v.asm_name_len > 0) { inner.asm_name_ptr = v.asm_name_ptr; inner.asm_name_len = cast(i16, v.asm_name_len); }
+        } else {
+            walk(inner);
+        }
+        let is *ast.Type as p = ast.new_type(ast.TY_PTR);
+        p.base = inner.ty; p.size = 8; node.ty = p; return;
+    }
+    if (k == ast.NK_DEREF) {
+        walk(node.expr);
+        if (node.expr.ty.kind != ast.TY_PTR) { sc.sem_error_at(node, "operador * requer ponteiro"); }
+        node.ty = node.expr.ty.base; return;
+    }
+    if (k == ast.NK_NEG) { walk(node.expr); node.ty = node.expr.ty; return; }
+    if (k == ast.NK_BNOT) { walk(node.expr); node.ty = node.expr.ty; return; }
+    if (k == ast.NK_LNOT) {
+        walk(node.expr);
+        node.ty = ast.type_bool;
+        if (node.expr.kind == ast.NK_NUM && num_is_float(node.expr) == 0) {
+            node.kind = ast.NK_NUM;
+            node.val = cast(i64, node.expr.val == 0);
+        }
+        return;
+    }
+    if (k == ast.NK_INDEX) {
+        walk(node.lhs); walk(node.rhs);
+        if (node.lhs.ty.kind != ast.TY_ARRAY && node.lhs.ty.kind != ast.TY_PTR) { sc.sem_error_at(node, "indexacao requer array ou ponteiro"); }
+        if (node.lhs.ty.kind == ast.TY_ARRAY && node.lhs.ty.array_len > 0 && node.rhs.kind == ast.NK_NUM) {
+            if (node.rhs.val < 0 || node.rhs.val >= cast(i64, node.lhs.ty.array_len)) {
+                sc.sem_error_at(node, "indice constante fora dos limites do array");
+            }
+        }
+        node.ty = node.lhs.ty.base; return;
+    }
+    if (k == ast.NK_ASSIGN) { walk_assign(node); return; }
+    if (k == ast.NK_CAST) { walk(node.expr); node.ty = wt.resolve_type_ptr(cast(*u8, node.ty)); return; }
+    if (k == ast.NK_SIZEOF) {
+        node.ty = wt.resolve_type_ptr(cast(*u8, node.ty));
+        node.kind = ast.NK_NUM; node.val = cast(i64, node.ty.size); node.ty = ast.type_i32; return;
+    }
+    if (k == ast.NK_FN_PTR) { walk_fn_ptr_node(node); return; }
+    if (k == ast.NK_STRUCT_LIT) { walk_struct_lit(node); return; }
+    if (k == ast.NK_VA_START) { walk(node.expr); node.ty = ast.type_void; return; }
+    if (k == ast.NK_SQRT) {
+        walk(node.expr);
+        if (node.expr.ty.kind == ast.TY_F32) { node.ty = ast.type_f32; }
+        else { node.ty = ast.type_f64; }
+        return;
+    }
+    if (k == ast.NK_MULHI) {
+        // Both operands are 64-bit integers; the result is the high half of
+        // their unsigned product, so u64 regardless of how they were spelled.
+        let is *ast.Node as m with mut = node.args;
+        let is i32 as n_args with mut = 0;
+        while (cast(i64, m) != 0) { walk(m); n_args = n_args + 1; m = m.next; }
+        if (n_args != 2) {
+            sc.sem_error_at(node, "__builtin_mulhi_u64 requer dois argumentos");
+        }
+        m = node.args;
+        while (cast(i64, m) != 0) {
+            if (cast(i64, m.ty) != 0 && m.ty.size != 8) {
+                sc.sem_error_at(node, "__builtin_mulhi_u64 requer operandos de 64 bits");
+            }
+            m = m.next;
+        }
+        node.ty = ast.type_u64;
+        return;
+    }
+    if (k == ast.NK_ATOMIC) {
+        // Atomic builtins (seq_cst). arg0 must be a pointer to a 4/8-byte int
+        // or pointer; result type is the pointee (LOAD/ADD/XCHG/CAS return the
+        // OLD value), or void for STORE/FENCE.
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { walk(a); a = a.next; }
+        let is i32 as sub = cast(i32, node.val);
+        if (sub == ast.ATOMIC_FENCE) { node.ty = ast.type_void; return; }
+        let is *ast.Node as p0 = node.args;
+        if (cast(i64, p0) == 0 || cast(i64, p0.ty) == 0 || p0.ty.kind != ast.TY_PTR) {
+            sc.sem_error_at(node, "atomic requer ponteiro como primeiro argumento");
+            node.ty = ast.type_i64; return;
+        }
+        let is *ast.Type as pointee = p0.ty.base;
+        if (cast(i64, pointee) == 0 || (pointee.size != 4 && pointee.size != 8)) {
+            sc.sem_error_at(node, "atomic requer ponteiro para inteiro de 4 ou 8 bytes");
+        }
+        if (sub == ast.ATOMIC_STORE) { node.ty = ast.type_void; return; }
+        node.ty = pointee; return;
+    }
+    if (k == ast.NK_FNCALL) { walk_fncall(node); return; }
+    if (k == ast.NK_CALL_INDIRECT) {
+        walk(node.expr);
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { walk(a); a = a.next; }
+        // Typed fn_ptr: check args and use return type
+        let is *ast.Type as ety = node.expr.ty;
+        if (cast(i64, ety) != 0 && ety.kind == ast.TY_FN) {
+            // Check arg count
+            let is i32 as argc with mut = 0;
+            a = node.args;
+            while (cast(i64, a) != 0) { argc = argc + 1; a = a.next; }
+            if (argc != ety.field_count) {
+                sc.sem_error_at(node, "numero de argumentos incorreto em call()");
+            }
+            // Check arg types — by the rule a direct call uses. This compared
+            // size AND kind before, so it fired only when both differed, and
+            // never between pointers, which are all eight bytes.
+            let is i32 as ai with mut = 0;
+            a = node.args;
+            while (cast(i64, a) != 0 && ai < ety.field_count) {
+                if (ty.arg_compatible(a, cast(*u8, ast.ga_get(ety.fields, ai))) == 0) {
+                    sc.sem_error_at(a, "tipo de argumento incompativel em call()");
+                }
+                ai = ai + 1;
+                a = a.next;
+            }
+            // Use return type from fn signature
+            if (cast(i64, ety.base) != 0) {
+                node.ty = ety.base;
+            } else {
+                node.ty = ast.type_void;
+            }
+        } else {
+            // Untyped *u8 fn_ptr: return i64
+            node.ty = ast.type_i64;
+        }
+        return;
+    }
+    if (k == ast.NK_SYSCALL) {
+        // The "syscall() not supported on this target" gate lives in codegen
+        // (emit_inst.cst, IR_SYSCALL case), not here — semantic walks every
+        // imported file's body, so a Windows build transitively importing
+        // linux.cst would otherwise flag its syscall-wrapping functions even
+        // though DCE drops them before codegen.
+        node.ty = ast.type_i64;
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { walk(a); a = a.next; }
+        return;
+    }
+    if (k == ast.NK_USE) { return; }
+    if (k == ast.NK_ENUM_LIT) { return; }
+    if (k == ast.NK_MATCH) { walk_match(node); return; }
+    if (k == ast.NK_MEMBER) { walk_member(node); return; }
+}
+
+// === Module alias chains in expression position ===
+
+// A module reference written as an expression is a chain of aliases: `hub`,
+// `hub.mid`, `hub.mid.deep`, ... Each hop is one submodule lookup, so nesting
+// is unbounded. Returns 0 as soon as a link isn't a module — which is exactly
+// the signal a caller needs to fall back to struct/method resolution.
+fn resolve_module_expr(e as *ast.Node) as *d.Module {
+    if (cast(i64, e) == 0) { return cast(*d.Module, 0); }
+    if (e.kind == ast.NK_IDENT) {
+        let is *d.Variable as v = sc.lookup_var(e.name_ptr, e.name_len);
+        if (cast(i64, v) != 0 && v.is_module == 1) {
+            return cast(*d.Module, v.module_ref);
+        }
+        return cast(*d.Module, 0);
+    }
+    if (e.kind == ast.NK_MEMBER) {
+        let is *d.Module as parent = resolve_module_expr(e.lhs);
+        if (cast(i64, parent) == 0) { return cast(*d.Module, 0); }
+        return sc.find_submodule(parent, e.member_ptr, e.member_len);
+    }
+    return cast(*d.Module, 0);
+}
+
+// Whether the chain's head alias was imported with an `only` list. The filter
+// is declared at the import site, so only the head can carry one.
+fn module_chain_has_only(e as *ast.Node) as i32 {
+    let is *ast.Node as h with mut = e;
+    while (cast(i64, h) != 0 && h.kind == ast.NK_MEMBER) { h = h.lhs; }
+    if (cast(i64, h) == 0 || h.kind != ast.NK_IDENT) { return 0; }
+    let is *d.Variable as v = sc.lookup_var(h.name_ptr, h.name_len);
+    if (cast(i64, v) != 0 && v.is_module == 1) { return cast(i32, v.has_only); }
+    return 0;
+}
+
+// === FNCALL handler ===
+
+// `recv.method(args)` -> `Type_method(&recv, args)`, for any receiver
+// expression whose type names a struct or enum. Walks `recv`, resolves the
+// method (including generic methods on a generic receiver), and prepends the
+// self argument to `node.args`. Returns 0 if no method matched.
+fn resolve_method_call(node as *ast.Node, recv as *ast.Node) as *d.Function {
+    walk(recv);
+    let is *ast.Type as obj_ty = recv.ty;
+    let is *ast.Type as base_ty with mut = obj_ty;
+    if (base_ty.kind == ast.TY_PTR) { base_ty = base_ty.base; }
+    if ((base_ty.kind != ast.TY_STRUCT && base_ty.kind != ast.TY_ENUM) || base_ty.name_len == 0) {
+        sc.sem_error_at(node, "chamada de metodo em tipo nao suportado");
+        return cast(*d.Function, 0);
+    }
+
+    let is i32 as mflen with mut = 0;
+    let is *u8 as mfname = d.str_concat3(base_ty.name_ptr, base_ty.name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &mflen);
+    let is *d.Function as func with mut = sc.lookup_fn(mfname, mflen);
+
+    // A type named through a module keeps its source spelling ("d.Vec2",
+    // "hub.b.c.d.Vec2") — resolve_type_ref copies the layout in but leaves the
+    // name alone. Its methods are declared under the owning module's prefix,
+    // so strip the alias chain and look them up there.
+    if (cast(i64, func) == 0) {
+        let is i32 as tail_off with mut = 0;
+        let is i32 as chain_only with mut = 0;
+        let is *d.Module as tmod = sc.resolve_mod_path(base_ty.name_ptr, base_ty.name_len, &tail_off, &chain_only);
+        if (cast(i64, tmod) != 0) {
+            let is i32 as qflen with mut = 0;
+            let is *u8 as qfname = d.str_concat3(cast(*u8, cast(i64, base_ty.name_ptr) + cast(i64, tail_off)), base_ty.name_len - tail_off,
+                                                 "_", 1, node.lhs.member_ptr, node.lhs.member_len, &qflen);
+            func = sc.lookup_fn_qualified(qfname, qflen, tmod.prefix_ptr, tmod.prefix_len);
+        }
+    }
+
+    // The spelling above only resolves where the type's own module is bound.
+    // A type reached through a re-exporting hub — `type Coisa = sub.Coisa` in a
+    // hub the caller imports instead of `sub` — keeps the spelling `sub.Coisa`,
+    // which names nothing in the caller's scope, so its methods went missing
+    // for the one arrangement a hub exists to enable. The owner recorded when
+    // the type was resolved does not depend on the caller's scope at all.
+    if (cast(i64, func) == 0 && base_ty.owner_prefix_len > 0) {
+        let is *u8 as bare_ptr with mut = base_ty.name_ptr;
+        let is i32 as bare_len with mut = base_ty.name_len;
+        let is i32 as dp = sc.dot_from(bare_ptr, 0, bare_len);
+        if (dp >= 0) {
+            // Strip every qualifier: the method is declared under the owner's
+            // prefix with the bare type name.
+            let is i32 as last with mut = dp;
+            let is i32 as k with mut = dp;
+            while (k >= 0) { last = k; k = sc.dot_from(bare_ptr, k + 1, bare_len); }
+            bare_ptr = cast(*u8, cast(i64, bare_ptr) + cast(i64, last) + 1);
+            bare_len = bare_len - last - 1;
+        }
+        let is i32 as oflen with mut = 0;
+        let is *u8 as ofname = d.str_concat3(bare_ptr, bare_len, "_", 1,
+                                             node.lhs.member_ptr, node.lhs.member_len, &oflen);
+        func = sc.lookup_fn_qualified(ofname, oflen, base_ty.owner_prefix_ptr, base_ty.owner_prefix_len);
+    }
+
+    // Try generic method
+    if (cast(i64, func) == 0 && base_ty.gen_arg_count > 0 && base_ty.base_name_len > 0) {
+        // Resolve dot-qualified base name ("sl.Slice", "hub.sl.Slice", ...)
+        let is *u8 as real_base_ptr with mut = base_ty.base_name_ptr;
+        let is i32 as real_base_len with mut = base_ty.base_name_len;
+        let is *u8 as method_prefix_ptr with mut = cast(*u8, 0);
+        let is i32 as method_prefix_len with mut = 0;
+        let is i32 as tail_off with mut = 0;
+        let is i32 as chain_only with mut = 0;
+        let is *d.Module as bm = sc.resolve_mod_path(base_ty.base_name_ptr, base_ty.base_name_len, &tail_off, &chain_only);
+        if (cast(i64, bm) != 0) {
+            real_base_ptr = cast(*u8, cast(i64, base_ty.base_name_ptr) + cast(i64, tail_off));
+            real_base_len = base_ty.base_name_len - tail_off;
+            method_prefix_ptr = bm.prefix_ptr;
+            method_prefix_len = bm.prefix_len;
+        }
+        let is i32 as tmlen with mut = 0;
+        let is *u8 as tmname = d.str_concat3(real_base_ptr, real_base_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &tmlen);
+        let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(tmname, tmlen);
+        if (cast(i64, tmpl) == 0 && method_prefix_len > 0) {
+            tmpl = gn.lookup_template_prefixed(tmname, tmlen, method_prefix_ptr, method_prefix_len);
+        }
+        if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
+            let is *u8 as mangled = gn.mangle_generic(tmname, tmlen, base_ty.gen_args, base_ty.gen_arg_count);
+            let is i32 as mglen = gn.str_len(mangled);
+            // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+            let is *u8 as omp = sc.current_mod_prefix_ptr;
+            let is i32 as oml = sc.current_mod_prefix_len;
+            if (tmpl.mod_prefix_len > 0) {
+                sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
+                sc.current_mod_prefix_len = tmpl.mod_prefix_len;
+            }
+            let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, base_ty.gen_args, base_ty.gen_arg_count, mangled, mglen);
+            if (cast(i64, fn_clone) != 0) {
+                let is i32 as so = sc.stack_offset;
+                let is *d.Scope as ss = sc.current_scope;
+                walk(fn_clone);
+                sc.stack_offset = so;
+                sc.current_scope = ss;
+            }
+            // Lookup with template's module prefix
+            if (tmpl.mod_prefix_len > 0) {
+                func = sc.lookup_fn_qualified(mangled, mglen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
+            } else {
+                func = sc.lookup_fn(mangled, mglen);
+            }
+            sc.current_mod_prefix_ptr = omp;
+            sc.current_mod_prefix_len = oml;
+        }
+    }
+
+    if (cast(i64, func) == 0) {
+        sc.sem_error_at2(node, "metodo nao encontrado", mfname, mflen);
+        return cast(*d.Function, 0);
+    }
+
+    // Prepend &self
+    let is *ast.Node as self_arg with mut = cast(*ast.Node, 0);
+    if (obj_ty.kind == ast.TY_PTR) {
+        self_arg = recv;
+    } else {
+        self_arg = ast.new_node(ast.NK_ADDR);
+        self_arg.expr = recv;
+        let is *ast.Type as pt = ast.new_type(ast.TY_PTR);
+        pt.base = obj_ty;
+        pt.size = 8;
+        self_arg.ty = pt;
+    }
+    self_arg.next = node.args;
+    node.args = self_arg;
+    return func;
+}
+
+fn walk_fncall(node as *ast.Node) as void {
+    let is *d.Function as func with mut = cast(*d.Function, 0);
+
+    // Case 0: Enum constructor (Enum.Variant(args))
+    if (node.lhs.kind == ast.NK_MEMBER && node.lhs.lhs.kind == ast.NK_IDENT) {
+        let is *ast.Node as enum_ident = node.lhs.lhs;
+        let is *d.Variable as vc = sc.lookup_var(enum_ident.name_ptr, enum_ident.name_len);
+        let is *u8 as enum_ty with mut = cast(*u8, 0);
+        if (cast(i64, vc) == 0) {
+            enum_ty = ty.lookup_enum_pf(enum_ident.name_ptr, enum_ident.name_len);
+        }
+        if (cast(i64, enum_ty) != 0) {
+            walk_enum_constructor(node, cast(*ast.Type, enum_ty));
+            return;
+        }
+    }
+
+    // Case 1: Direct identifier call
+    if (node.lhs.kind == ast.NK_IDENT) {
+        func = sc.lookup_fn(node.lhs.name_ptr, node.lhs.name_len);
+        // Try generic instantiation
+        // Check generic args on FNCALL node or on lhs (dot+gen case from postfix)
+        let is i32 as ga_count with mut = node.generic_arg_count;
+        let is *u8 as ga_args with mut = node.generic_args;
+        let is *u8 as ga_member_ptr with mut = node.member_ptr;
+        let is i32 as ga_member_len with mut = node.member_len;
+        if (ga_count == 0 && node.lhs.generic_arg_count > 0) {
+            ga_count = node.lhs.generic_arg_count;
+            ga_args = node.lhs.generic_args;
+            ga_member_ptr = node.lhs.member_ptr;
+            ga_member_len = node.lhs.member_len;
+        }
+        if (cast(i64, func) == 0 && ga_count > 0 && ga_member_len > 0) {
+            let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(ga_member_ptr, ga_member_len);
+            // Handle dot-qualified names ("sl.slice_new", "hub.sl.slice_new", ...)
+            if (cast(i64, tmpl) == 0) {
+                let is i32 as tail_off with mut = 0;
+                let is i32 as chain_only with mut = 0;
+                let is *d.Module as mm = sc.resolve_mod_path(ga_member_ptr, ga_member_len, &tail_off, &chain_only);
+                if (cast(i64, mm) != 0) {
+                    let is *u8 as fname_ptr = cast(*u8, cast(i64, ga_member_ptr) + cast(i64, tail_off));
+                    let is i32 as fname_len = ga_member_len - tail_off;
+                    tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, mm.prefix_ptr, mm.prefix_len);
+                    // Fallback: search submodules (for 'only' imports)
+                    if (cast(i64, tmpl) == 0 && chain_only == 1) {
+                        let is *d.SubModule as sm with mut = cast(*d.SubModule, mm.submodules);
+                        while (cast(i64, sm) != 0 && cast(i64, tmpl) == 0) {
+                            let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                            tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, sub.prefix_ptr, sub.prefix_len);
+                            sm = cast(*d.SubModule, sm.next);
+                        }
+                    }
+                }
+            }
+            if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
+                // Mangle with template's own name (without module prefix)
+                let is *u8 as mangled = gn.mangle_generic(tmpl.name_ptr, tmpl.name_len, ga_args, ga_count);
+                let is i32 as mlen = gn.str_len(mangled);
+                node.lhs.name_ptr = d.str_dup(mangled, mlen);
+                node.lhs.name_len = mlen;
+                // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+                let is *u8 as old_mp = sc.current_mod_prefix_ptr;
+                let is i32 as old_ml = sc.current_mod_prefix_len;
+                if (tmpl.mod_prefix_len > 0) {
+                    sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
+                    sc.current_mod_prefix_len = tmpl.mod_prefix_len;
+                }
+                let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, ga_args, ga_count, mangled, mlen);
+                if (cast(i64, fn_clone) != 0) {
+                    let is i32 as so = sc.stack_offset;
+                    let is *d.Scope as ss = sc.current_scope;
+                    walk(fn_clone);
+                    sc.stack_offset = so;
+                    sc.current_scope = ss;
+                }
+                // Lookup with template's module prefix
+                if (tmpl.mod_prefix_len > 0) {
+                    func = sc.lookup_fn_qualified(mangled, mlen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
+                } else {
+                    func = sc.lookup_fn(mangled, mlen);
+                }
+                sc.current_mod_prefix_ptr = old_mp;
+                sc.current_mod_prefix_len = old_ml;
+            }
+        }
+        if (cast(i64, func) == 0) {
+            sc.sem_error_at2(node, "funcao nao declarada", node.lhs.name_ptr, node.lhs.name_len);
+        }
+    }
+    // Case 2: Member access call (mod.func() or Type.new() or obj.method())
+    else if (node.lhs.kind == ast.NK_MEMBER) {
+        let is *ast.Node as lhs_expr = node.lhs.lhs;
+
+        // Module-qualified call. The receiver is a chain of module aliases —
+        // `mod`, `mod.sub`, `mod.sub.sub`, ... — walked one hop at a time, so a
+        // hub can nest sub-hubs to any depth.
+        let is *d.Module as recv_mod = resolve_module_expr(lhs_expr);
+        if (cast(i64, recv_mod) != 0) {
+            // An `only` import flattens the listed submodules into the alias,
+            // so those come first; the module's own functions are the fallback.
+            if (module_chain_has_only(lhs_expr) == 1) {
+                let is *d.SubModule as sm with mut = cast(*d.SubModule, recv_mod.submodules);
+                while (cast(i64, sm) != 0 && cast(i64, func) == 0) {
+                    let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                    func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, sub.prefix_ptr, sub.prefix_len);
+                    sm = cast(*d.SubModule, sm.next);
+                }
+            }
+            if (cast(i64, func) == 0) {
+                func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, recv_mod.prefix_ptr, recv_mod.prefix_len);
+            }
+            if (cast(i64, func) == 0) {
+                sc.sem_error_at2(node, "funcao nao encontrada no modulo", node.lhs.member_ptr, node.lhs.member_len);
+            }
+        }
+        else if (lhs_expr.kind == ast.NK_IDENT) {
+            let is *d.Variable as var = sc.lookup_var(lhs_expr.name_ptr, lhs_expr.name_len);
+
+            if (cast(i64, var) == 0) {
+                // Associated function: Type.new() or Type.method()
+                let is *u8 as sty with mut = ty.lookup_struct_pf(lhs_expr.name_ptr, lhs_expr.name_len);
+                if (cast(i64, sty) == 0) {
+                    sty = ty.lookup_enum_pf(lhs_expr.name_ptr, lhs_expr.name_len);
+                }
+                if (cast(i64, sty) != 0) {
+                    let is *ast.Type as st = cast(*ast.Type, sty);
+                    // Build assoc_fn name: TypeName_method
+                    let is i32 as aflen with mut = 0;
+                    let is *u8 as afname = d.str_concat3(st.name_ptr, st.name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &aflen);
+                    func = sc.lookup_fn(afname, aflen);
+                    if (cast(i64, func) == 0) {
+                        sc.sem_error_at2(node, "funcao associada nao encontrada", afname, aflen);
+                    }
+                } else {
+                    sc.sem_error_at2(node, "nao e modulo, variavel ou tipo", lhs_expr.name_ptr, lhs_expr.name_len);
+                }
+            } else {
+                // Method call: obj.method(args) -> Type_method(&obj, args)
+                func = resolve_method_call(node, lhs_expr);
+            }
+        } else {
+            // Any other receiver expression — a field of a struct, an element
+            // of an array, a module global, the result of a call: dispatch the
+            // method on whatever type it walks to.
+            func = resolve_method_call(node, lhs_expr);
+        }
+    } else {
+        sc.sem_error_at(node, "tipo de chamada invalido");
+    }
+
+    // Only reachable in LSP mode, where sem_error_at records and returns
+    // instead of exiting. Bail out rather than dereference a null Function.
+    if (cast(i64, func) == 0) { return; }
+
+    // Set return type and asm_name
+    node.ty = cast(*ast.Type, func.return_type);
+    node.asm_name_ptr = func.asm_name_ptr;
+    node.asm_name_len = cast(i16, func.asm_name_len);
+    node.is_variadic = cast(i8, func.is_variadic);
+    node.is_extern = cast(i8, func.is_extern);
+    // For calls to `extern "dll.dll" fn`, propagate dll name onto the call
+    // node (overloading impl_ptr/impl_len, unused for non-method calls) so
+    // IR generation can lower this to IR_FFI_CALL.
+    if (func.dll_name_len > 0) {
+        let is *ast.Node_Extra as ie = ast.node_ensure_extra(node);
+        ie.impl_ptr = func.dll_name_ptr;
+        ie.impl_len = cast(i16, func.dll_name_len);
+    }
+
+    // Verify args
+    let is i32 as arg_count with mut = 0;
+    let is *ast.Node as ac with mut = node.args;
+    while (cast(i64, ac) != 0) { arg_count = arg_count + 1; ac = ac.next; }
+
+    if (func.is_variadic == 1) {
+        if (arg_count < func.param_count) {
+            sc.sem_error_at2(node, "poucos argumentos para funcao", func.name_ptr, func.name_len);
+        }
+    } else {
+        if (arg_count != func.param_count) {
+            sc.sem_error_at2(node, "numero incorreto de argumentos para funcao", func.name_ptr, func.name_len);
+        }
+    }
+
+    // Walk and type-check args
+    let is *ast.Node as arg with mut = node.args;
+    let is i32 as i with mut = 0;
+    while (i < func.param_count) {
+        walk(arg);
+        let is *u8 as pt = d.pt_get(func.param_types, i);
+        if (ty.arg_compatible(arg, pt) == 0) {
+            sc.sem_error_at2(node, "tipo incompativel no argumento de", func.name_ptr, func.name_len);
+        }
+        arg = arg.next;
+        i = i + 1;
+    }
+    // Walk remaining variadic args
+    while (cast(i64, arg) != 0) {
+        walk(arg);
+        arg = arg.next;
+    }
+
+    // Layer 2 comptime: if callee is `with imut` and every arg already
+    // folded to NK_NUM (via NK_IDENT→NK_NUM rewrite or recursive imut
+    // fold), evaluate the body now and rewrite this NK_FNCALL node into
+    // the resulting NK_NUM literal. Codegen will then see a constant
+    // instead of a runtime call.
+    if (func.is_imut == 1 && cast(i64, func.ast_node) != 0) {
+        let is i32 as all_lit with mut = 1;
+        let is *ast.Node as ck with mut = node.args;
+        while (cast(i64, ck) != 0) {
+            if (ck.kind != ast.NK_NUM) { all_lit = 0; ck = cast(*ast.Node, 0); }
+            else { ck = ck.next; }
+        }
+        if (all_lit == 1) {
+            let is i64 as folded with mut = 0;
+            // Fold via the already-resolved callee. This handles every call
+            // shape, including module-qualified calls (`os.current()`) whose
+            // lhs is NK_MEMBER and carries no plain identifier name to re-look-
+            // up — the original name-based path silently skipped those.
+            if (try_fold_imut_fn(func, node, &folded) == 1) {
+                node.kind = ast.NK_NUM;
+                node.val = folded;
+                node.ty = cast(*ast.Type, func.return_type);
+            }
+        }
+    }
+}
+
+// === Enum constructor ===
+
+fn walk_enum_constructor(node as *ast.Node, enum_ty as *ast.Type) as void {
+    let is *u8 as variant_ptr = node.lhs.member_ptr;
+    let is i32 as variant_len = node.lhs.member_len;
+
+    // Find variant
+    let is *ast.Node as variant with mut = cast(*ast.Node, enum_ty.fields);
+    while (cast(i64, variant) != 0) {
+        if (d.str_eq(variant.name_ptr, variant.name_len, variant_ptr, variant_len) == 1) {
+            break;
+        }
+        variant = variant.next;
+    }
+    if (cast(i64, variant) == 0) {
+        sc.sem_error_at2(node, "variante nao existe no enum", variant_ptr, variant_len);
+    }
+
+    // Walk args
+    let is *ast.Node as arg with mut = node.args;
+    while (cast(i64, arg) != 0) {
+        walk(arg);
+        arg = arg.next;
+    }
+
+    // Transform to ENUM_LIT
+    node.kind = ast.NK_ENUM_LIT;
+    node.ty = enum_ty;
+    node.discriminant = variant.discriminant;
+    node.payload_args = node.args;
+}
+
+// === MATCH handler ===
+
+fn walk_match(node as *ast.Node) as void {
+    wt.resolve_type(cast(*u8, node.match_type));
+    walk(node.expr);
+
+    let is *ast.Type as mt = node.match_type;
+    if (mt.kind != ast.TY_ENUM) {
+        sc.sem_error_at(node, "match requer tipo enum");
+    }
+
+    let is *ast.Node as c with mut = node.cases;
+    while (cast(i64, c) != 0) {
+        // Find variant
+        let is *ast.Node as variant with mut = cast(*ast.Node, mt.fields);
+        while (cast(i64, variant) != 0) {
+            if (d.str_eq(variant.name_ptr, variant.name_len, c.name_ptr, c.name_len) == 1) {
+                break;
+            }
+            variant = variant.next;
+        }
+        if (cast(i64, variant) == 0) {
+            sc.sem_error_at2(node, "variante nao existe no enum (match)", c.name_ptr, c.name_len);
+        }
+        c.val = cast(i64, variant.discriminant);
+
+        // Handle bindings
+        sc.enter_scope();
+        if (cast(i64, c.params) != 0) {
+            if (cast(i64, variant.ty) == 0) {
+                sc.sem_error_at2(node, "variante sem dados para destructuring", c.name_ptr, c.name_len);
+            }
+            let is *ast.Type as vty = variant.ty;
+            if (vty.kind == ast.TY_STRUCT && cast(i64, vty.fields) != 0) {
+                // Multi-field payload
+                let is *ast.Node as binding with mut = c.params;
+                let is *ast.Node as pf with mut = cast(*ast.Node, vty.fields);
+                while (cast(i64, binding) != 0 && cast(i64, pf) != 0) {
+                    wt.resolve_type(cast(*u8, pf.ty));
+                    binding.ty = pf.ty;
+                    let is *d.Variable as bvar = sc.declare_var(binding.name_ptr, binding.name_len, cast(*u8, pf.ty), ast.VF_NONE, binding);
+                    binding.var_offset = bvar.offset;
+                    binding = binding.next;
+                    pf = pf.next;
+                }
+            } else {
+                // Single payload
+                let is *ast.Node as binding = c.params;
+                wt.resolve_type(cast(*u8, vty));
+                binding.ty = vty;
+                let is *d.Variable as bvar = sc.declare_var(binding.name_ptr, binding.name_len, cast(*u8, vty), ast.VF_NONE, binding);
+                binding.var_offset = bvar.offset;
+            }
+        }
+        walk(c.body);
+        sc.exit_scope();
+        c = c.next;
+    }
+
+    // Walk else branch
+    if (cast(i64, node.else_b) != 0) {
+        sc.enter_scope();
+        walk(node.else_b);
+        sc.exit_scope();
+    }
+}
+
+// === MEMBER access ===
+
+fn walk_member(node as *ast.Node) as void {
+    // Check if LHS is enum name (Enum.Variant)
+    if (node.lhs.kind == ast.NK_IDENT) {
+        let is *d.Variable as vc = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
+        let is i32 as vc_is_enum with mut = 0;
+        if (cast(i64, vc) != 0 && vc.is_module == 0) {
+            let is *ast.Type as vc_ty = cast(*ast.Type, vc.ty);
+            if (vc_ty.kind == ast.TY_ENUM) { vc_is_enum = 1; }
+        }
+        if (cast(i64, vc) == 0 || vc_is_enum == 0) {
+            let is *u8 as enum_ty = ty.lookup_enum_pf(node.lhs.name_ptr, node.lhs.name_len);
+            if (cast(i64, enum_ty) != 0) {
+                // Enum variant without payload
+                let is *ast.Type as et = cast(*ast.Type, enum_ty);
+                let is *ast.Node as variant with mut = cast(*ast.Node, et.fields);
+                while (cast(i64, variant) != 0) {
+                    if (d.str_eq(variant.name_ptr, variant.name_len, node.member_ptr, node.member_len) == 1) {
+                        break;
+                    }
+                    variant = variant.next;
+                }
+                if (cast(i64, variant) == 0) {
+                    sc.sem_error_at2(node, "variante nao existe no enum", node.member_ptr, node.member_len);
+                }
+                node.kind = ast.NK_ENUM_LIT;
+                node.ty = et;
+                node.discriminant = variant.discriminant;
+                node.payload_args = cast(*ast.Node, 0);
+                return;
+            }
+        }
+    }
+
+    // Module member access: mod.X, mod.sub.X, mod.sub.sub.X, ... The receiver
+    // is a chain of module aliases walked one hop at a time, so a hub can nest
+    // sub-hubs to any depth. A chain that isn't all modules resolves to 0 and
+    // falls through to regular struct-field resolution below.
+    let is *d.Module as owner = resolve_module_expr(node.lhs);
+    if (cast(i64, owner) != 0) {
+        // Try function
+        let is *d.Function as fref = sc.lookup_fn_qualified(node.member_ptr, node.member_len, owner.prefix_ptr, owner.prefix_len);
+        if (cast(i64, fref) != 0) {
+            node.kind = ast.NK_IDENT;
+            node.name_ptr = fref.asm_name_ptr;
+            node.name_len = fref.asm_name_len;
+            node.ty = cast(*ast.Type, fref.return_type);
+            return;
+        }
+        // Try variable in module scope
+        let is *d.Variable as mv with mut = owner.scope.vars;
+        while (cast(i64, mv) != 0) {
+            if (d.str_eq(mv.name_ptr, mv.name_len, node.member_ptr, node.member_len) == 1) {
+                // Const-prop through module access: `os.current` where
+                // `current` is an imut global folded to a literal in
+                // walk_let should collapse to that literal here too —
+                // otherwise dead-branch elim in if-statements that use
+                // `os.X == os.Y` patterns wouldn't fire for module-
+                // qualified references.
+                if (mv.has_folded_init == 1) {
+                    node.kind = ast.NK_NUM;
+                    node.val = mv.folded_init_val;
+                    node.ty = cast(*ast.Type, mv.ty);
+                    return;
+                }
+                node.kind = ast.NK_IDENT;
+                node.name_ptr = mv.asm_name_ptr;
+                node.name_len = mv.asm_name_len;
+                node.ty = cast(*ast.Type, mv.ty);
+                node.var_offset = mv.offset;
+                node.is_global = mv.is_global;
+                node.is_string_const = mv.is_string_const;
+                if (mv.has_folded_init == 2) {
+                    node.is_string_const = ast.IDENT_FLOAT_CONST;
+                    node.val = mv.folded_init_val;
+                }
+                return;
+            }
+            mv = mv.next;
+        }
+        sc.sem_error_at2(node, "membro nao encontrado no modulo", node.member_ptr, node.member_len);
+        return;
+    }
+
+    // Regular struct field access
+    walk(node.lhs);
+    let is *ast.Type as struct_ty with mut = node.lhs.ty;
+    if (struct_ty.kind == ast.TY_PTR) { struct_ty = struct_ty.base; }
+    if (struct_ty.kind != ast.TY_STRUCT) {
+        sc.sem_error_at(node, "operador . requer struct");
+    }
+
+    let is *ast.Node as field with mut = cast(*ast.Node, struct_ty.fields);
+    while (cast(i64, field) != 0) {
+        if (d.str_eq(field.name_ptr, field.name_len, node.member_ptr, node.member_len) == 1) {
+            node.ty = field.ty;
+            node.var_offset = field.var_offset;
+            return;
+        }
+        field = field.next;
+    }
+    sc.sem_error_at2(node, "membro nao encontrado em struct", node.member_ptr, node.member_len);
+}
+
+// === FN_PTR handler ===
+
+// Struct literal: `StructName { field = value, ... }`. Looks up the named
+// struct, matches each literal entry against a declared field by name, and
+// records per-entry type info. Unmatched or missing fields are flagged.
+fn walk_struct_lit(node as *ast.Node) as void {
+    let is *ast.Type as st = cast(*ast.Type, ty.lookup_struct(node.name_ptr, node.name_len));
+    if (cast(i64, st) == 0) {
+        sc.sem_error_at2(node, "struct nao encontrada", node.name_ptr, node.name_len);
+        return;
+    }
+    node.ty = st;
+    let is *ast.Node as entry with mut = node.args;
+    while (cast(i64, entry) != 0) {
+        // Resolve the entry's value expression first.
+        if (cast(i64, entry.expr) != 0) { walk(entry.expr); }
+        // Find matching struct field by name.
+        let is *ast.Node as f with mut = cast(*ast.Node, st.fields);
+        let is *ast.Node as matched with mut = cast(*ast.Node, 0);
+        while (cast(i64, f) != 0) {
+            if (f.name_len == entry.name_len &&
+                d.str_eq(f.name_ptr, f.name_len, entry.name_ptr, entry.name_len) == 1) {
+                matched = f;
+                f = cast(*ast.Node, 0);
+            } else {
+                f = f.next;
+            }
+        }
+        if (cast(i64, matched) == 0) {
+            sc.sem_error_at2(node, "campo nao existe na struct", entry.name_ptr, entry.name_len);
+        } else {
+            entry.ty = matched.ty;
+            entry.var_offset = matched.var_offset;
+        }
+        entry = entry.next;
+    }
+}
+
+fn walk_fn_ptr_node(node as *ast.Node) as void {
+    let is *d.Function as func with mut = cast(*d.Function, 0);
+
+    if (node.generic_arg_count > 0) {
+        // Generic fn_ptr
+        func = sc.lookup_fn(node.name_ptr, node.name_len);
+        if (cast(i64, func) == 0 && node.member_len > 0) {
+            let is *d.GenericTemplate as tmpl = gn.lookup_template(node.member_ptr, node.member_len);
+            if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
+                let is *u8 as mangled = gn.mangle_generic(tmpl.name_ptr, tmpl.name_len, node.generic_args, node.generic_arg_count);
+                let is i32 as mlen = gn.str_len(mangled);
+                node.name_ptr = d.str_dup(mangled, mlen);
+                node.name_len = mlen;
+                let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, node.generic_args, node.generic_arg_count, mangled, mlen);
+                if (cast(i64, fn_clone) != 0) {
+                    let is i32 as so = sc.stack_offset;
+                    let is *d.Scope as ss = sc.current_scope;
+                    walk(fn_clone);
+                    sc.stack_offset = so;
+                    sc.current_scope = ss;
+                }
+                func = sc.lookup_fn(mangled, mlen);
+            }
+        }
+    } else if (node.member_len > 0) {
+        // Module-qualified fn_ptr: fn_ptr(mod.f), fn_ptr(mod.sub.f), ...
+        // The head alias is in name_ptr; member_ptr holds the rest of the
+        // dotted path, whose leading components name submodules.
+        let is *d.Variable as var = sc.lookup_var(node.name_ptr, node.name_len);
+        if (cast(i64, var) != 0 && var.is_module == 1) {
+            let is i32 as tail_off with mut = 0;
+            let is *d.Module as modd = sc.descend_submodules(cast(*d.Module, var.module_ref), node.member_ptr, node.member_len, &tail_off);
+            if (cast(i64, modd) != 0) {
+                let is *u8 as fn_name = cast(*u8, cast(i64, node.member_ptr) + cast(i64, tail_off));
+                func = sc.lookup_fn_qualified(fn_name, node.member_len - tail_off, modd.prefix_ptr, modd.prefix_len);
+            }
+        }
+        if (cast(i64, func) != 0) {
+            node.name_ptr = func.asm_name_ptr;
+            node.name_len = func.asm_name_len;
+        }
+    } else {
+        // Simple fn_ptr
+        func = sc.lookup_fn(node.name_ptr, node.name_len);
+        if (cast(i64, func) != 0 && func.asm_name_len > 0) {
+            node.name_ptr = func.asm_name_ptr;
+            node.name_len = func.asm_name_len;
+        }
+    }
+
+    if (cast(i64, func) == 0) {
+        sc.sem_error_at2(node, "funcao nao encontrada (fn_ptr)", node.name_ptr, node.name_len);
+    }
+
+    // Build TY_FN from function signature
+    let is *ast.Type as fty = ast.new_type(ast.TY_FN);
+    fty.size = 8;
+    fty.base = cast(*ast.Type, func.return_type);
+    fty.fields = func.param_types;
+    fty.field_count = func.param_count;
+    node.ty = fty;
+}
+
+// === Multi-pass analysis ===
+// Pass IDs: 1=register_structs, 2=register_aliases, 3=resolve_fields,
+//           4=register_vars, 5=register_fns, 6=analyze_bodies
+

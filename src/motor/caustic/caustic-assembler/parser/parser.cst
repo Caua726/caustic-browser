@@ -1,0 +1,731 @@
+use "../../std/io.cst" as io;
+use "../../src/ir/opt_mem.cst" as om;
+use "../lexer/lexer.cst" as lex;
+use "../core/asm_defs.cst" as def;
+use "../encoder/encoder_util.cst" as enc;
+use "parsed_line.cst" as pl;
+use "custom_sections.cst" as cs;
+use "cstimport.cst" as ci;
+use "../core/util.cst" as util;
+
+// Count of statement-initial bare words that are neither a label nor a known
+// instruction (i.e. unknown mnemonics). main/assemble_buf reads this after
+// parsing and refuses to emit an object — previously such lines were silently
+// dropped, producing a .o missing whatever the typo'd instruction stood for.
+let is i32 as parse_errors with mut = 0;
+
+fn parse_reset() as void { parse_errors = 0; }
+fn parse_had_error() as i32 { return parse_errors; }
+
+// === Operand parsing ===
+
+// Parse a memory operand: [base +/- disp], [base + index*scale +/- disp] or
+// [disp] (an absolute address, no base), with optional size prefix.
+fn parse_mem_operand(tl as *lex.TokenList, pos as i32, out_pos as *i32, line as *pl.ParsedLine, which as i32, mem_size as i32) as void {
+    let is i32 as p with mut = pos + 1; // skip '['
+    let is *lex.Token as base_tok = lex.tl_get(tl, p);
+    // An address with no register in it: [0x58], [-8]. What it is relative to
+    // is the segment's base — this is how fs:[0] names a thread's own block.
+    if (base_tok.kind == lex.TK_NUMBER || base_tok.kind == lex.TK_MINUS) {
+        let is i64 as adisp with mut = base_tok.num_val;
+        if (base_tok.kind == lex.TK_MINUS) {
+            p = p + 1;
+            adisp = 0 - lex.tl_get(tl, p).num_val;
+        }
+        p = p + 1;
+        let is *lex.Token as arb = lex.tl_get(tl, p);
+        if (arb.kind == lex.TK_RBRACKET) { p = p + 1; }
+        *out_pos = p;
+        pl.set_op_mem(line, which, def.REG_NONE, adisp, mem_size);
+        return;
+    }
+    let is i32 as base_reg = base_tok.id;
+    p = p + 1;
+    if (base_reg == def.REG_RIP) {
+        let is *lex.Token as op_tok = lex.tl_get(tl, p);
+        if (op_tok.kind == lex.TK_PLUS) {
+            p = p + 1;
+            let is *lex.Token as lab_tok = lex.tl_get(tl, p);
+            p = p + 1;
+            let is *lex.Token as rb = lex.tl_get(tl, p);
+            if (rb.kind == lex.TK_RBRACKET) { p = p + 1; }
+            *out_pos = p;
+            pl.set_op_rip(line, which, lab_tok.ptr, lab_tok.len, mem_size);
+            return;
+        }
+    }
+    let is i64 as disp with mut = 0;
+    let is i32 as index_reg with mut = def.REG_NONE;
+    let is i32 as scale with mut = 0;
+    let is *lex.Token as next2 = lex.tl_get(tl, p);
+    if (next2.kind == lex.TK_PLUS) {
+        let is *lex.Token as peek = lex.tl_get(tl, p + 1);
+        if (peek.kind == lex.TK_REGISTER) {
+            p = p + 1;
+            index_reg = peek.id;
+            p = p + 1;
+            let is *lex.Token as star = lex.tl_get(tl, p);
+            if (star.kind == lex.TK_STAR) {
+                p = p + 1;
+                let is *lex.Token as sc = lex.tl_get(tl, p);
+                scale = cast(i32, sc.num_val);
+                p = p + 1;
+            } else {
+                scale = 1;
+            }
+            let is *lex.Token as after = lex.tl_get(tl, p);
+            if (after.kind == lex.TK_PLUS) {
+                p = p + 1;
+                let is *lex.Token as d = lex.tl_get(tl, p);
+                disp = d.num_val;
+                p = p + 1;
+            } else if (after.kind == lex.TK_MINUS) {
+                p = p + 1;
+                let is *lex.Token as d = lex.tl_get(tl, p);
+                disp = 0 - d.num_val;
+                p = p + 1;
+            }
+        } else {
+            p = p + 1;
+            let is *lex.Token as d = lex.tl_get(tl, p);
+            disp = d.num_val;
+            p = p + 1;
+        }
+    } else if (next2.kind == lex.TK_MINUS) {
+        p = p + 1;
+        let is *lex.Token as d = lex.tl_get(tl, p);
+        disp = 0 - d.num_val;
+        p = p + 1;
+    }
+    let is *lex.Token as rb2 = lex.tl_get(tl, p);
+    if (rb2.kind == lex.TK_RBRACKET) { p = p + 1; }
+    *out_pos = p;
+    if (index_reg != def.REG_NONE) {
+        pl.set_op_mem_sib(line, which, base_reg, index_reg, scale, disp, mem_size);
+    } else {
+        pl.set_op_mem(line, which, base_reg, disp, mem_size);
+    }
+}
+
+// The segment prefix byte when the tokens at `at` are `fs : [` or `gs : [`,
+// else 0.
+fn _segment(tl as *lex.TokenList, at as i32) as i32 {
+    if (at + 2 >= tl.count) { return 0; }
+    let is *lex.Token as nm = lex.tl_get(tl, at);
+    if (nm.kind != lex.TK_IDENT || nm.len != 2 || nm.ptr[1] != 115) { return 0; }   // ?s
+    if (lex.tl_get(tl, at + 1).kind != lex.TK_COLON) { return 0; }
+    if (lex.tl_get(tl, at + 2).kind != lex.TK_LBRACKET) { return 0; }
+    if (nm.ptr[0] == 102) { return def.SEG_FS; }                                    // fs
+    if (nm.ptr[0] == 103) { return def.SEG_GS; }                                    // gs
+    return 0;
+}
+
+// Parse an operand starting at token index pos, stores into line's op1 or op2
+fn parse_operand(tl as *lex.TokenList, pos as i32, out_pos as *i32, line as *pl.ParsedLine, which as i32) as void {
+    let is *lex.Token as tok = lex.tl_get(tl, pos);
+
+    if (tok.kind == lex.TK_REGISTER) {
+        *out_pos = pos + 1;
+        pl.set_op_reg(line, which, tok.id);
+        return;
+    }
+    if (tok.kind == lex.TK_NUMBER) {
+        *out_pos = pos + 1;
+        pl.set_op_imm(line, which, tok.num_val);
+        return;
+    }
+    if (tok.kind == lex.TK_MINUS) {
+        let is *lex.Token as next = lex.tl_get(tl, pos + 1);
+        if (next.kind == lex.TK_NUMBER) {
+            *out_pos = pos + 2;
+            pl.set_op_imm(line, which, 0 - next.num_val);
+            return;
+        }
+    }
+    // A segment override: [SIZE PTR] fs:[...] or gs:[...].
+    let is i32 as sz_at with mut = 0;
+    let is i32 as seg_at with mut = pos;
+    if (tok.kind == lex.TK_SIZE_PREFIX) { sz_at = tok.id; seg_at = pos + 1; }
+    let is i32 as seg = _segment(tl, seg_at);
+    if (seg != 0) {
+        let is i32 as lb_at = seg_at + 2;
+        let is *lex.Token as ml = lex.tl_get(tl, lb_at + 1);
+        if (ml.kind == lex.TK_REGISTER && ml.id == def.REG_RIP) {
+            // fs:[rip+x] reads x's offset from the segment base, which is
+            // never what was meant; nothing emits it, so nothing accepts it.
+            parse_errors = parse_errors + 1;
+            util.eprint_str("caustic-as: error: line ");
+            util.eprint_int(cast(i64, line.line_no));
+            util.eprint_str(": a segment override cannot be rip-relative\n");
+        }
+        parse_mem_operand(tl, lb_at, out_pos, line, which, sz_at);
+        pl.set_op_seg(line, which, seg);
+        return;
+    }
+    if (tok.kind == lex.TK_SIZE_PREFIX) {
+        let is *lex.Token as lb = lex.tl_get(tl, pos + 1);
+        if (lb.kind == lex.TK_LBRACKET) {
+            parse_mem_operand(tl, pos + 1, out_pos, line, which, tok.id);
+            return;
+        }
+    }
+    if (tok.kind == lex.TK_LBRACKET) {
+        parse_mem_operand(tl, pos, out_pos, line, which, 0);
+        return;
+    }
+    if (tok.kind == lex.TK_IDENT || tok.kind == lex.TK_INSTRUCTION) {
+        *out_pos = pos + 1;
+        pl.set_op_label(line, which, tok.ptr, tok.len);
+        return;
+    }
+    *out_pos = pos;
+}
+
+// === Parsing: skip to end of line ===
+
+fn skip_to_eol(tl as *lex.TokenList, pos as i32) as i32 {
+    let is i32 as p with mut = pos;
+    while (p < tl.count) {
+        let is *lex.Token as t = lex.tl_get(tl, p);
+        if (t.kind == lex.TK_NEWLINE || t.kind == lex.TK_EOF) { break; }
+        p = p + 1;
+    }
+    return p;
+}
+
+// === Parsing: parse a numeric value (possibly negative) ===
+
+fn parse_dir_num(tl as *lex.TokenList, pos as i32, out_pos as *i32) as i64 {
+    let is *lex.Token as val_tok = lex.tl_get(tl, pos);
+    if (val_tok.kind == lex.TK_NUMBER) {
+        *out_pos = pos + 1;
+        return val_tok.num_val;
+    } else if (val_tok.kind == lex.TK_MINUS) {
+        let is *lex.Token as n = lex.tl_get(tl, pos + 1);
+        *out_pos = pos + 2;
+        return 0 - n.num_val;
+    }
+    *out_pos = pos;
+    return 0;
+}
+
+// === Parsing: directive handler ===
+
+fn parse_directive(tl as *lex.TokenList, pos as i32, line as *pl.ParsedLine, current_section as *i32) as i32 {
+    let is *lex.Token as tok = lex.tl_get(tl, pos);
+    let is i32 as p with mut = pos;
+
+    if (enc.streq_lit(tok.ptr, tok.len, ".intel_syntax") == 1) {
+        line.dir_kind = pl.DIR_INTEL;
+        p = skip_to_eol(tl, p + 1);
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".cstimport") == 1) {
+        // .cstimport "kernel32.dll" ExitProcess
+        line.dir_kind = pl.DIR_CSTIMPORT;
+        p = p + 1;
+        let is *lex.Token as dll_tok = lex.tl_get(tl, p);
+        let is *u8 as dll_ptr with mut = dll_tok.ptr;
+        let is i32 as dll_len with mut = dll_tok.len;
+        // Strip surrounding quotes
+        if (dll_len >= 2 && dll_ptr[0] == 34 && dll_ptr[dll_len - 1] == 34) {
+            dll_ptr = cast(*u8, cast(i64, dll_ptr) + 1);
+            dll_len = dll_len - 2;
+        }
+        p = p + 1;
+        let is *lex.Token as sym_tok = lex.tl_get(tl, p);
+        ci.cstimport_add(dll_ptr, dll_len, sym_tok.ptr, sym_tok.len);
+        p = skip_to_eol(tl, p + 1);
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".text") == 1) {
+        line.dir_kind = pl.DIR_TEXT;
+        *current_section = cs.SECTION_TEXT;
+        return p + 1;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".data") == 1) {
+        line.dir_kind = pl.DIR_DATA;
+        *current_section = cs.SECTION_DATA;
+        return p + 1;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".bss") == 1) {
+        line.dir_kind = pl.DIR_BSS;
+        *current_section = cs.SECTION_BSS;
+        return p + 1;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".rodata") == 1) {
+        line.dir_kind = pl.DIR_RODATA;
+        *current_section = cs.SECTION_RODATA;
+        return p + 1;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".section") == 1) {
+        line.dir_kind = pl.DIR_SECTION;
+        p = p + 1;
+        let is *lex.Token as sec_tok = lex.tl_get(tl, p);
+        if (sec_tok.kind != lex.TK_NEWLINE && sec_tok.kind != lex.TK_EOF) {
+            if (enc.streq_lit(sec_tok.ptr, sec_tok.len, ".rodata") == 1) { *current_section = cs.SECTION_RODATA; }
+            else if (enc.streq_lit(sec_tok.ptr, sec_tok.len, ".data") == 1) { *current_section = cs.SECTION_DATA; }
+            else if (enc.streq_lit(sec_tok.ptr, sec_tok.len, ".bss") == 1) { *current_section = cs.SECTION_BSS; }
+            else if (enc.streq_lit(sec_tok.ptr, sec_tok.len, ".text") == 1) { *current_section = cs.SECTION_TEXT; }
+            else {
+                // Custom section. Strip surrounding quotes if present.
+                let is *u8 as sname with mut = sec_tok.ptr;
+                let is i32 as sname_len with mut = sec_tok.len;
+                if (sname_len > 2 && sname[0] == 34 && sname[sname_len - 1] == 34) {
+                    sname = cast(*u8, cast(i64, sname) + 1);
+                    sname_len = sname_len - 2;
+                }
+                let is i32 as cidx = cs.csec_find_or_add(sname, sname_len);
+                *current_section = cs.SECTION_CUSTOM_BASE + cidx;
+                // `.section .name, "ax", @progbits` — the flag string decides
+                // whether this section holds code. These flags used to be
+                // skipped wholesale, so a section carrying a function was
+                // indistinguishable from one carrying data and ended up mapped
+                // non-executable. Walk the rest of the line for the quoted flag
+                // token (skipping commas and @progbits) and look for 'x'.
+                let is i32 as fp with mut = p + 1;
+                while (1 == 1) {
+                    let is *lex.Token as ft = lex.tl_get(tl, fp);
+                    if (ft.kind == lex.TK_NEWLINE || ft.kind == lex.TK_EOF) { break; }
+                    if (ft.len >= 2 && ft.ptr[0] == 34) {          // a "..." token
+                        let is i32 as fi with mut = 1;
+                        while (fi < ft.len - 1) {
+                            if (ft.ptr[fi] == 120) { cs.csec_mark_exec(cidx); }  // 'x'
+                            fi = fi + 1;
+                        }
+                        break;
+                    }
+                    fp = fp + 1;
+                }
+            }
+            p = p + 1;
+        }
+        line.section = cast(i8, *current_section);
+        p = skip_to_eol(tl, p);
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".globl") == 1 || enc.streq_lit(tok.ptr, tok.len, ".global") == 1) {
+        line.dir_kind = pl.DIR_GLOBL;
+        p = p + 1;
+        let is *lex.Token as name_tok = lex.tl_get(tl, p);
+        if (name_tok.kind != lex.TK_NEWLINE && name_tok.kind != lex.TK_EOF) {
+            line.dir_arg_ptr = name_tok.ptr;
+            line.dir_arg_len = name_tok.len;
+            p = p + 1;
+        }
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".ascii") == 1) {
+        line.dir_kind = pl.DIR_ASCII;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is *lex.Token as asc_tok = lex.tl_get(tl, p);
+        if (asc_tok.kind == lex.TK_STRING) {
+            line.dir_arg_ptr = asc_tok.ptr;
+            line.dir_arg_len = asc_tok.len;
+            p = p + 1;
+        }
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".string") == 1 || enc.streq_lit(tok.ptr, tok.len, ".asciz") == 1) {
+        line.dir_kind = pl.DIR_STRING;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is *lex.Token as str_tok = lex.tl_get(tl, p);
+        if (str_tok.kind == lex.TK_STRING) {
+            line.dir_arg_ptr = str_tok.ptr;
+            line.dir_arg_len = str_tok.len;
+            p = p + 1;
+        }
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".incbin") == 1) {
+        line.dir_kind = pl.DIR_INCBIN;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        // `.incbin "path"` splices the raw bytes of an external file into the
+        // current section. NUL-terminate the path for the file API, slurp the
+        // file, and stash the bytes in decoded_ptr/decoded_len — the file may
+        // contain NULs, so the length is explicit, not strlen-derived.
+        let is *lex.Token as inc_tok = lex.tl_get(tl, p);
+        line.decoded_ptr = cast(*u8, 0);
+        line.decoded_len = 0;
+        if (inc_tok.kind == lex.TK_STRING) {
+            // The lexer keeps the surrounding double-quotes in the token; strip
+            // them so the path is the bare filename.
+            let is *u8 as praw with mut = inc_tok.ptr;
+            let is i32 as plen with mut = inc_tok.len;
+            if (plen >= 2 && praw[0] == cast(u8, 34)) {
+                praw = cast(*u8, cast(i64, praw) + 1);
+                plen = plen - 2;
+            }
+            let is *u8 as ipath = om.opt_alloc(cast(i64, plen) + 1);
+            let is i32 as ic with mut = 0;
+            while (ic < plen) { ipath[ic] = praw[ic]; ic = ic + 1; }
+            ipath[plen] = cast(u8, 0);
+            let is i64 as isz = util.read_file_size(ipath);
+            let is *u8 as idata = util.read_file(ipath);
+            if (cast(i64, idata) != 0 && isz > 0) {
+                line.decoded_ptr = idata;
+                line.decoded_len = cast(i32, isz);
+            } else {
+                io._write_fd(io.STDERR, ".incbin: cannot read file: ", 27);
+                io._write_fd(io.STDERR, ipath, cast(i64, plen));
+                io._write_fd(io.STDERR, "\n", 1);
+            }
+            p = p + 1;
+        }
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".byte") == 1) {
+        line.dir_kind = pl.DIR_BYTE;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        // `.byte` takes a comma-separated list of values (e.g. `.byte 0x8F, 0x07`);
+        // each is one emitted byte. Store them all in decoded_ptr/decoded_len —
+        // emitting only the first dropped raw-opcode bytes and corrupted hand-
+        // written asm thunks (the smp/syscall stubs), misaligning the stream.
+        let is *u8 as bb = om.opt_alloc(256);
+        let is i32 as bn with mut = 0;
+        let is i32 as cur with mut = p;
+        let is i32 as np with mut = p;
+        while (bn < 256) {
+            let is i64 as v = parse_dir_num(tl, cur, &np);
+            if (np == cur) { break; }
+            bb[bn] = cast(u8, v & 255); bn = bn + 1; cur = np;
+            let is *lex.Token as ct = lex.tl_get(tl, cur);
+            if (ct.kind == lex.TK_COMMA) { cur = cur + 1; } else { break; }
+        }
+        line.decoded_ptr = bb; line.decoded_len = bn; line.dir_num = 0;
+        return cur;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".word") == 1 || enc.streq_lit(tok.ptr, tok.len, ".value") == 1
+        || enc.streq_lit(tok.ptr, tok.len, ".short") == 1) {
+        line.dir_kind = pl.DIR_WORD;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is i32 as np with mut = p;
+        line.dir_num = parse_dir_num(tl, p, &np);
+        return np;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".long") == 1) {
+        line.dir_kind = pl.DIR_LONG;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is i32 as np with mut = p;
+        line.dir_num = parse_dir_num(tl, p, &np);
+        return np;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".ripdisp") == 1) {
+        // `.ripdisp <symbol>`: the disp32 of a [rip+symbol] operand, for an
+        // instruction written out with .byte. Nothing may follow it.
+        line.dir_kind = pl.DIR_LONG;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is *lex.Token as rt = lex.tl_get(tl, p);
+        line.dir_arg_ptr = rt.ptr;
+        line.dir_arg_len = rt.len;
+        line.dir_num = 0;
+        return p + 1;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".quad") == 1) {
+        line.dir_kind = pl.DIR_QUAD;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is *lex.Token as qt = lex.tl_get(tl, p);
+        if (qt.kind == lex.TK_IDENT) {
+            // `.quad <symbol>` — emits an R_X86_64_64 relocation at codegen.
+            line.dir_arg_ptr = qt.ptr;
+            line.dir_arg_len = qt.len;
+            line.dir_num = 0;
+            return p + 1;
+        }
+        let is i32 as np with mut = p;
+        line.dir_num = parse_dir_num(tl, p, &np);
+        return np;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".p2align") == 1) {
+        line.dir_kind = pl.DIR_P2ALIGN;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is *lex.Token as pw = lex.tl_get(tl, p);
+        if (pw.kind == lex.TK_NUMBER) { line.dir_num = pw.num_val; p = p + 1; }
+        line.op1_imm = 0;
+        // `, fill` (empty only) then `, max`
+        let is *lex.Token as c1 = lex.tl_get(tl, p);
+        if (c1.kind == lex.TK_COMMA) {
+            p = p + 1;
+            let is *lex.Token as c2 = lex.tl_get(tl, p);
+            if (c2.kind == lex.TK_COMMA) {
+                p = p + 1;
+                let is *lex.Token as mx = lex.tl_get(tl, p);
+                if (mx.kind == lex.TK_NUMBER) { line.op1_imm = mx.num_val; p = p + 1; }
+            }
+        }
+        return skip_to_eol(tl, p);
+    }
+    // `.loopalign`: before a loop head label. Laid out like `.p2align 4,,10`
+    // until the loop's length is known, then padded so the loop spans as few
+    // 64-byte lines (then 32-byte fetch windows) as it can (passes.cst).
+    if (enc.streq_lit(tok.ptr, tok.len, ".loopalign") == 1) {
+        line.dir_kind = pl.DIR_P2ALIGN;
+        line.section = cast(i8, *current_section);
+        line.dir_num = 4;
+        line.op1_imm = 10;
+        line.op2_imm = 1;
+        line.op2_mem_disp = 0 - 1;
+        return skip_to_eol(tl, p + 1);
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".zero") == 1) {
+        line.dir_kind = pl.DIR_ZERO;
+        line.section = cast(i8, *current_section);
+        p = p + 1;
+        let is *lex.Token as val_tok = lex.tl_get(tl, p);
+        if (val_tok.kind == lex.TK_NUMBER) {
+            line.dir_num = val_tok.num_val;
+            p = p + 1;
+        }
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".file") == 1) {
+        // `.file <num> "<path>"` — record the source path for .cstdebug.
+        line.dir_kind = pl.DIR_FILE;
+        p = p + 1;
+        let is *lex.Token as num_tok = lex.tl_get(tl, p);
+        if (num_tok.kind == lex.TK_NUMBER) { line.dir_num = num_tok.num_val; p = p + 1; }
+        let is *lex.Token as path_tok = lex.tl_get(tl, p);
+        if (path_tok.kind == lex.TK_STRING) {
+            let is *u8 as praw with mut = path_tok.ptr;
+            let is i32 as plen with mut = path_tok.len;
+            if (plen >= 2 && praw[0] == cast(u8, 34) && praw[plen - 1] == cast(u8, 34)) {
+                praw = cast(*u8, cast(i64, praw) + 1);
+                plen = plen - 2;
+            }
+            line.dir_arg_ptr = praw;
+            line.dir_arg_len = plen;
+            p = p + 1;
+        }
+        p = skip_to_eol(tl, p);
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".loc") == 1) {
+        // `.loc <file> <line> <column>` — keep the line number.
+        line.dir_kind = pl.DIR_LOC;
+        p = p + 1;
+        let is *lex.Token as f_tok = lex.tl_get(tl, p);
+        if (f_tok.kind == lex.TK_NUMBER) { p = p + 1; }
+        let is *lex.Token as l_tok = lex.tl_get(tl, p);
+        if (l_tok.kind == lex.TK_NUMBER) { line.dir_num = l_tok.num_val; p = p + 1; }
+        p = skip_to_eol(tl, p);
+        return p;
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".dbg_prologue_end") == 1) {
+        line.dir_kind = pl.DIR_DBG_PROLOGUE_END;
+        return skip_to_eol(tl, p + 1);
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".cfi_startproc") == 1) {
+        line.dir_kind = pl.DIR_CFI_STARTPROC;
+        p = p + 1;
+        // Optional function name (the assembler keys the record by symbol).
+        let is *lex.Token as nm = lex.tl_get(tl, p);
+        if (nm.kind == lex.TK_IDENT) {
+            line.dir_arg_ptr = nm.ptr;
+            line.dir_arg_len = nm.len;
+            p = p + 1;
+        }
+        return skip_to_eol(tl, p);
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".cfi_endproc") == 1) {
+        line.dir_kind = pl.DIR_CFI_ENDPROC;
+        return skip_to_eol(tl, p + 1);
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".cfi_def_cfa_offset") == 1) {
+        line.dir_kind = pl.DIR_CFI_DEF_CFA_OFFSET;
+        p = p + 1;
+        let is *lex.Token as n = lex.tl_get(tl, p);
+        if (n.kind == lex.TK_NUMBER) { line.dir_num = n.num_val; p = p + 1; }
+        return skip_to_eol(tl, p);
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".cfi_def_cfa_register") == 1) {
+        line.dir_kind = pl.DIR_CFI_DEF_CFA_REGISTER;
+        p = p + 1;
+        let is *lex.Token as r = lex.tl_get(tl, p);
+        if (r.kind == lex.TK_REGISTER) { line.dir_arg_len = r.id; p = p + 1; }
+        return skip_to_eol(tl, p);
+    }
+    if (enc.streq_lit(tok.ptr, tok.len, ".cfi_offset") == 1) {
+        line.dir_kind = pl.DIR_CFI_OFFSET;
+        p = p + 1;
+        let is *lex.Token as r = lex.tl_get(tl, p);
+        if (r.kind == lex.TK_REGISTER) { line.dir_arg_len = r.id; p = p + 1; }
+        let is *lex.Token as cm = lex.tl_get(tl, p);
+        if (cm.kind == lex.TK_COMMA) { p = p + 1; }
+        let is i32 as np with mut = p;
+        line.dir_num = parse_dir_num(tl, p, &np);
+        return skip_to_eol(tl, np);
+    }
+    line.dir_kind = pl.DIR_OTHER;
+    return p + 1;
+}
+
+// === Parsing: instruction handler ===
+
+fn parse_instruction(tl as *lex.TokenList, pos as i32, line as *pl.ParsedLine) as i32 {
+    let is i32 as p with mut = pos;
+
+    // Handle "rep movsb" / "lock cmpxchg ..." — prefix-only line, don't parse
+    // operands; the following mnemonic is parsed as its own instruction line so
+    // the prefix byte (F3 / F0) is emitted right before it.
+    if (line.inst_id == def.INST_REP || line.inst_id == def.INST_LOCK) {
+        return p;
+    }
+
+    // Parse operand 1
+    let is *lex.Token as next = lex.tl_get(tl, p);
+    if (next.kind != lex.TK_NEWLINE && next.kind != lex.TK_EOF) {
+        let is i32 as new_pos with mut = p;
+        parse_operand(tl, p, &new_pos, line, 1);
+        p = new_pos;
+
+        // Check for comma -> operand 2
+        let is *lex.Token as comma = lex.tl_get(tl, p);
+        if (comma.kind == lex.TK_COMMA) {
+            p = p + 1;
+            parse_operand(tl, p, &new_pos, line, 2);
+            p = new_pos;
+        }
+    }
+    // Skip to end of line
+    p = skip_to_eol(tl, p);
+    return p;
+}
+
+// === Parsing: main loop ===
+
+// Parse one chunk's worth of tokens, APPENDING parsed lines to `lines` and
+// threading the current section through `section_ptr` (in/out). Used by both
+// parse_all (whole token list) and parse_streaming (one line-aligned chunk at
+// a time). Each chunk's token list ends in a TK_EOF, which terminates the loop.
+fn parse_chunk(tl as *lex.TokenList, lines as *pl.ParsedLines, section_ptr as *i32, line_ptr as *i32) as void {
+    let is i32 as pos with mut = 0;
+    let is i32 as current_section with mut = *section_ptr;
+    // Running 1-based source line number. Persisted across streaming chunks via
+    // line_ptr so diagnostics report the true file line, not a per-chunk offset.
+    // Every source `\n` is exactly one TK_NEWLINE (the lexer never coalesces),
+    // and parse_instruction/parse_directive stop at the newline, so the main
+    // loop sees — and counts — each line break exactly once.
+    let is i32 as cur_line with mut = *line_ptr;
+
+    while (pos < tl.count) {
+        let is *lex.Token as tok = lex.tl_get(tl, pos);
+
+        // Skip newlines
+        if (tok.kind == lex.TK_NEWLINE || tok.kind == lex.TK_EOF) {
+            if (tok.kind == lex.TK_EOF) { break; }
+            cur_line = cur_line + 1;
+            pos = pos + 1;
+        }
+        // Directive
+        else if (tok.kind == lex.TK_DIRECTIVE) {
+            let is *pl.ParsedLine as line = pl.pl_add(lines);
+            line.kind = pl.LINE_DIRECTIVE;
+            line.section = cast(i8, current_section);
+            line.line_no = cur_line;
+            pos = parse_directive(tl, pos, line, &current_section);
+            // Update section from directive (may have changed)
+            line.section = cast(i8, current_section);
+            pos = skip_to_eol(tl, pos);
+        }
+        // Instruction (but check for label first: "add:" etc.)
+        else if (tok.kind == lex.TK_INSTRUCTION) {
+            let is *lex.Token as peek = lex.tl_get(tl, pos + 1);
+            if (peek.kind == lex.TK_COLON) {
+                let is *pl.ParsedLine as lbl = pl.pl_add(lines);
+                lbl.kind = pl.LINE_LABEL;
+                lbl.section = cast(i8, current_section);
+                lbl.label_ptr = tok.ptr;
+                lbl.label_len = cast(i16, tok.len);
+                lbl.line_no = cur_line;
+                pos = pos + 2;
+            } else {
+                let is *pl.ParsedLine as line = pl.pl_add(lines);
+                line.kind = pl.LINE_INST;
+                line.section = cast(i8, current_section);
+                line.inst_id = cast(i16, tok.id);
+                line.line_no = cur_line;
+                pos = parse_instruction(tl, pos + 1, line);
+            }
+        }
+        // Label (IDENT followed by COLON)
+        else if (tok.kind == lex.TK_IDENT) {
+            let is *lex.Token as next = lex.tl_get(tl, pos + 1);
+            if (next.kind == lex.TK_COLON) {
+                let is *pl.ParsedLine as line = pl.pl_add(lines);
+                line.kind = pl.LINE_LABEL;
+                line.section = cast(i8, current_section);
+                line.label_ptr = tok.ptr;
+                line.label_len = cast(i16, tok.len);
+                line.line_no = cur_line;
+                pos = pos + 2;
+            } else {
+                // A bare word at statement start that is not a label (no ':')
+                // and was not recognized as an instruction/register. A leading
+                // '.' means an unrecognized directive or local label — skip
+                // those silently as before; anything else is an unknown
+                // mnemonic, which must not pass silently.
+                if (tok.ptr[0] != 46) {
+                    parse_errors = parse_errors + 1;
+                    util.eprint_str("caustic-as: error: line ");
+                    util.eprint_int(cast(i64, cur_line));
+                    util.eprint_str(": unknown instruction '");
+                    io._write_fd(io.STDERR, tok.ptr, cast(i64, tok.len));
+                    util.eprint_str("'\n");
+                }
+                pos = skip_to_eol(tl, pos + 1);
+            }
+        }
+        else {
+            pos = pos + 1;
+        }
+    }
+
+    *section_ptr = current_section;
+    *line_ptr = cur_line;
+}
+
+fn parse_all(tl as *lex.TokenList, line_hint as i32) as pl.ParsedLines {
+    let is pl.ParsedLines as lines = pl.pl_init(line_hint);
+    let is i32 as section with mut = cs.SECTION_TEXT;
+    let is i32 as cur_line with mut = 1;
+    parse_chunk(tl, &lines, &section, &cur_line);
+    return lines;
+}
+
+// Streaming parse: tokenize the source one line-aligned chunk at a time into a
+// small reusable token buffer (freed after each chunk), instead of holding the
+// whole file's tokens at once. Bounds peak token memory to ~one chunk rather
+// than the entire token array (a large RSS cut for big .s files). ParsedLine
+// pointers reference the source text (which the caller keeps alive), not the
+// token buffers, so freeing each chunk's tokens is safe.
+fn parse_streaming(src as *u8, src_len as i64, line_hint as i32) as pl.ParsedLines {
+    let is pl.ParsedLines as lines = pl.pl_init(line_hint);
+    let is i32 as section with mut = cs.SECTION_TEXT;
+    let is i32 as cur_line with mut = 1;     // running source line, threaded across chunks
+    let is i64 as CHUNK = 524288;            // 512 KiB; extended to the next newline
+    let is i64 as pos with mut = 0;
+    while (pos < src_len) {
+        let is i64 as cend with mut = pos + CHUNK;
+        if (cend >= src_len) {
+            cend = src_len;
+        } else {
+            // Extend to the next newline so no line (or token) spans a chunk.
+            while (cend < src_len && src[cend] != 10) { cend = cend + 1; }
+            if (cend < src_len) { cend = cend + 1; }   // include the newline
+        }
+        let is lex.TokenList as tl = lex.tokenize(cast(*u8, cast(i64, src) + pos), cend - pos);
+        parse_chunk(&tl, &lines, &section, &cur_line);
+        lex.tl_free(&tl);
+        pos = cend;
+    }
+    return lines;
+}

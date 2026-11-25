@@ -1,0 +1,227 @@
+// motor_pack: build/motor/rt.cst, the runtime as one text: its parts in order, and one function
+// naming every global the collector must look at, so that none can be forgotten by hand.
+let is i64 as CAP with imut = 16777216;
+let is *u8 as out with mut = cast(*u8, 0);
+let is i64 as out_n with mut = 0;
+let is *u8 as all with mut = cast(*u8, 0);
+let is i64 as all_n with mut = 0;
+fn put(s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { out[out_n] = s[i]; out_n = out_n + 1; i = i + 1; }
+}
+fn len(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
+fn puts(s as *u8) as void { put(s, len(s)); }
+fn word_is(s as *u8, n as i64, w as *u8) as i64 {
+    if (n != len(w)) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) { if (s[i] != w[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+fn starts(s as *u8, n as i64, w as *u8) as i64 {
+    let is i64 as l = len(w);
+    if (n < l) { return 0; }
+    return word_is(s, l, w);
+}
+fn is_name(c as i64) as i64 { return cast(i64, (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95); }
+fn skipped(s as *u8, n as i64) as i64 {
+    // Not pointers, or the collector's own.
+    let is [17]*u8 as names;
+    names[0] = "obuf"; names[1] = "nbuf"; names[2] = "sd"; names[3] = "numb"; names[4] = "segs"; names[5] = "free_segs";
+    names[6] = "cls_tab"; names[7] = "cls_size"; names[8] = "gc_free"; names[9] = "gc_bump"; names[10] = "gc_bump_end";
+    names[11] = "mstack"; names[12] = "an_attr"; names[13] = "heap_lo"; names[14] = "heap_hi"; names[15] = "host_t"; names[16] = "rxp";
+    let is i64 as i with mut = 0;
+    while (i < 17) { if (word_is(s, n, names[i]) == 1) { return 1; } i = i + 1; }
+    return 0;
+}
+fn roots() as void {
+    puts("fn gc_roots_rt() as void {\n");
+    let is i64 as i with mut = 0;
+    while (i < all_n) {
+        let is i64 as e with mut = i;
+        while (e < all_n && all[e] != 10) { e = e + 1; }
+        let is *u8 as l = cast(*u8, cast(i64, all) + i);
+        let is i64 as n = e - i;
+        i = e + 1;
+        if (starts(l, n, "let is ") == 0) { continue; }
+        let is i64 as p with mut = 7;
+        let is *u8 as arr with mut = cast(*u8, 0);
+        let is i64 as arr_n with mut = 0;
+        if (l[p] == 91) {
+            arr = cast(*u8, cast(i64, l) + p + 1);
+            while (arr[arr_n] != 93) { arr_n = arr_n + 1; }
+            p = p + arr_n + 2;
+        }
+        let is i64 as ty = p;
+        while (p < n && l[p] != 32) { p = p + 1; }
+        let is i64 as tn = p - ty;
+        if (starts(cast(*u8, cast(i64, l) + p), n - p, " as ") == 0) { continue; }
+        p = p + 4;
+        let is i64 as nm = p;
+        while (p < n && is_name(cast(i64, l[p])) == 1) { p = p + 1; }
+        let is i64 as nn = p - nm;
+        if (starts(cast(*u8, cast(i64, l) + p), n - p, " with mut") == 0) { continue; }
+        let is *u8 as tp = cast(*u8, cast(i64, l) + ty);
+        if (word_is(tp, tn, "f64") == 1 || word_is(tp, tn, "u8") == 1 || word_is(tp, tn, "f32") == 1) { continue; }
+        let is *u8 as np = cast(*u8, cast(i64, l) + nm);
+        if (skipped(np, nn) == 1) { continue; }
+        puts("    gc_range(cast(i64, &");
+        put(np, nn);
+        puts("), ");
+        if (arr_n > 0) { put(arr, arr_n); puts(" * 8"); } else { puts("8"); }
+        puts(");\n");
+    }
+    puts("}\n");
+}
+fn write_all(path as *u8, p as *u8, n as i64) as i64 {
+    let is i64 as o = syscall(2, path, 577, 420);
+    if (o < 0) { return 0; }
+    let is i64 as off with mut = 0;
+    while (off < n) { let is i64 as w = syscall(1, o, cast(i64, p) + off, n - off); if (w <= 0) { return 0; } off = off + w; }
+    syscall(3, o);
+    return 1;
+}
+// The pack: rt.cst, prelude.js, the compiler, and every std file the runtime reaches.
+let is i64 as PACK_CAP with imut = 67108864;
+let is *u8 as pk with mut = cast(*u8, 0);
+let is i64 as pk_n with mut = 8 + 4;
+let is i64 as pk_count with mut = 0;
+fn pk_i64(v as i64) as void { *cast(*i64, cast(i64, pk) + pk_n) = v; pk_n = pk_n + 8; }
+fn pk_file(name as *u8, path as *u8) as *u8 {
+    let is i64 as fd = syscall(2, path, 0, 0);
+    if (fd < 0) { syscall(1, 2, "motor_pack: cannot read ", 24); syscall(1, 2, path, len(path)); syscall(1, 2, "\n", 1); return cast(*u8, 0); }
+    let is i64 as nl = len(name);
+    pk_i64(nl);
+    put_pk(name, nl + 1);
+    let is i64 as size_at = pk_n;
+    pk_i64(0);
+    let is i64 as start = pk_n;
+    while (1 == 1) {
+        let is i64 as r = syscall(0, fd, cast(i64, pk) + pk_n, PACK_CAP - pk_n);
+        if (r <= 0) { break; }
+        pk_n = pk_n + r;
+    }
+    syscall(3, fd);
+    *cast(*i64, cast(i64, pk) + size_at) = pk_n - start;
+    pk_count = pk_count + 1;
+    return cast(*u8, cast(i64, pk) + start);
+}
+fn put_pk(s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { pk[pk_n] = s[i]; pk_n = pk_n + 1; i = i + 1; }
+}
+// A std file, by its path under std/, and whatever it uses in turn.
+let is [512][256]u8 as seen with mut;
+let is i64 as nseen with mut = 0;
+fn pk_std(rel as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < nseen) {
+        if (word_is(cast(*u8, &seen[i]), len(cast(*u8, &seen[i])), rel) == 1) { return 1; }
+        i = i + 1;
+    }
+    let is *u8 as me = cast(*u8, &seen[nseen]);
+    let is i64 as rl = len(rel);
+    i = 0;
+    while (i <= rl) { me[i] = rel[i]; i = i + 1; }
+    nseen = nseen + 1;
+    let is [512]u8 as path;
+    let is [512]u8 as name;
+    let is i64 as a with mut = 0;
+    let is *u8 as pre with mut = "src/motor/caustic/std/";
+    while (pre[a] != 0) { path[a] = pre[a]; a = a + 1; }
+    i = 0;
+    while (i <= rl) { path[a + i] = rel[i]; i = i + 1; }
+    a = 0;
+    pre = "/motor/std/";
+    while (pre[a] != 0) { name[a] = pre[a]; a = a + 1; }
+    i = 0;
+    while (i <= rl) { name[a + i] = rel[i]; i = i + 1; }
+    let is *u8 as text = pk_file(cast(*u8, &name), cast(*u8, &path));
+    if (cast(i64, text) == 0) { return 0; }
+    let is i64 as n = *cast(*i64, cast(i64, text) - 8);
+    // Its own directory, for what it names relative to itself.
+    let is i64 as dl with mut = rl;
+    while (dl > 0 && rel[dl - 1] != 47) { dl = dl - 1; }
+    let is i64 as p with mut = 0;
+    while (p < n) {
+        let is i64 as e with mut = p;
+        while (e < n && text[e] != 10) { e = e + 1; }
+        let is *u8 as l = cast(*u8, cast(i64, text) + p);
+        let is i64 as ln = e - p;
+        p = e + 1;
+        if (ln < 6 || (starts(l, ln, "use \"") == 0 && starts(l, ln, "if (") == 0)) { continue; }
+        let is i64 as q with mut = 0;
+        while (q + 5 < ln && starts(cast(*u8, cast(i64, l) + q), ln - q, "use \"") == 0) { q = q + 1; }
+        if (starts(cast(*u8, cast(i64, l) + q), ln - q, "use \"") == 0) { continue; }
+        q = q + 5;
+        let is i64 as u0 = q;
+        while (q < ln && l[q] != 34) { q = q + 1; }
+        // Relative to here, each ../ one directory less.
+        let is [256]u8 as next;
+        let is i64 as keep with mut = dl;
+        let is i64 as s0 with mut = u0;
+        while (starts(cast(*u8, cast(i64, l) + s0), q - s0, "../") == 1) {
+            s0 = s0 + 3;
+            if (keep > 0) { keep = keep - 1; }
+            while (keep > 0 && rel[keep - 1] != 47) { keep = keep - 1; }
+        }
+        let is i64 as w with mut = 0;
+        while (w < keep) { next[w] = rel[w]; w = w + 1; }
+        while (s0 < q) { next[w] = l[s0]; w = w + 1; s0 = s0 + 1; }
+        next[w] = cast(u8, 0);
+        if (pk_std(cast(*u8, &next)) == 0) { return 0; }
+    }
+    return 1;
+}
+fn make_pack() as i32 {
+    pk = cast(*u8, syscall(9, 0, PACK_CAP, 3, 34, -1, 0));
+    pk[0] = cast(u8, 77); pk[1] = cast(u8, 80); pk[2] = cast(u8, 75); pk[3] = cast(u8, 49);
+    if (cast(i64, pk_file("rt.cst", "build/motor/rt.cst")) == 0) { return 1; }
+    if (cast(i64, pk_file("prelude.js", "src/motor/prelude.js")) == 0) { return 1; }
+    if (cast(i64, pk_file("caustic.csl", "build/motor/caustic.csl")) == 0) { return 1; }
+    if (pk_std("math.cst") == 0 || pk_std("exceptions.cst") == 0) { return 1; }
+    *cast(*i64, cast(i64, pk) + 4) = pk_count;
+    if (write_all("build/motor/motor.pack", pk, pk_n) == 0) { return 1; }
+    // Generated, with the pack's hash in it, so that a new pack makes this module build again.
+    let is i64 as h with mut = 1469598103934665603;
+    let is i64 as i with mut = 0;
+    while (i < pk_n) { h = (h ^ cast(i64, pk[i])) * 1099511628211; i = i + 1; }
+    out_n = 0;
+    // In the assembly, not a comment: the compiler's object cache does not see comments.
+    puts("// Generated by tools/motor_pack.cst.\nfn _blob() as void with naked { asm(\".incbin \\\"build/motor/motor.pack\\\"\\n.ascii \\\"");
+    let is i64 as b with mut = 0;
+    while (b < 16) {
+        let is i64 as nib = (h >> (b * 4)) & 15;
+        let is [1]u8 as hx;
+        if (nib < 10) { hx[0] = cast(u8, 48 + nib); } else { hx[0] = cast(u8, 87 + nib); }
+        put(cast(*u8, &hx), 1);
+        b = b + 1;
+    }
+    puts("\\\"\\n\"); }\nfn start() as *u8 { return cast(*u8, fn_ptr(_blob)); }\n");
+    if (write_all("src/motor/embed.cst", out, out_n) == 0) { return 1; }
+    return 0;
+}
+fn main() as i32 {
+    out = cast(*u8, syscall(9, 0, CAP, 3, 34, -1, 0));
+    all = cast(*u8, syscall(9, 0, CAP, 3, 34, -1, 0));
+    let is [6]*u8 as parts;
+    parts[0] = "src/motor/rt/core.cst"; parts[1] = "src/motor/rt/gc.cst"; parts[2] = "src/motor/rt/obj.cst";
+    parts[3] = "src/motor/rt/lib.cst"; parts[4] = "src/motor/rt/regex.cst"; parts[5] = "src/motor/rt/dom.cst";
+    let is i64 as k with mut = 0;
+    while (k < 6) {
+        let is i64 as fd = syscall(2, parts[k], 0, 0);
+        if (fd < 0) { syscall(1, 2, "motor_pack: a part is missing\n", 30); return 1; }
+        while (1 == 1) {
+            let is i64 as r = syscall(0, fd, cast(i64, all) + all_n, CAP - all_n);
+            if (r <= 0) { break; }
+            all_n = all_n + r;
+        }
+        syscall(3, fd);
+        k = k + 1;
+    }
+    put(all, all_n);
+    roots();
+    syscall(83, "build", 493);
+    syscall(83, "build/motor", 493);
+    if (write_all("build/motor/rt.cst", out, out_n) == 0) { return 1; }
+    return make_pack();
+}

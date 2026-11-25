@@ -1,0 +1,4 @@
+// caustic-ld's version, which --version prints. Tracked, not generated: a clean
+// clone must build. install.sh --from-source rewrites it for the length of a
+// source build with the version git describe gives this repository.
+let is *u8 as VERSION with imut = "0.1.0";

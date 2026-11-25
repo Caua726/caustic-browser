@@ -1,0 +1,297 @@
+// eh_frame.cst — SysV Call Frame Information (.eh_frame).
+//
+// Codegen emits `.cfi_*` directives around each function's prologue; the
+// assembler turns them into a DW_CFA opcode stream per function in the
+// `.cstcfi` custom section (start/end text offsets + the opcodes). This module
+// wraps those into a real `.eh_frame`: one CIE (the initial rules every FDE
+// starts from) and one FDE per function, with the absolute vaddr the linker
+// has just assigned.
+//
+// Pointer encoding is DW_EH_PE_absptr (a plain 8-byte address), so the FDE
+// needs no pcrel arithmetic and the section can sit anywhere.
+use "../readers/elf_reader.cst" as reader;
+use "../core/linker.cst" as linker;
+use "../../src/ir/opt_mem.cst" as om;
+use "../../src/codegen/target.cst" as tgt;
+
+// DW_CFA opcodes emitted by the assembler; the CIE's initial instructions are
+// written here directly.
+let is i32 as DW_CFA_def_cfa with imut = 12;
+let is i32 as DW_CFA_OFFSET_RA with imut = 144;       // 0x80 | 16 (rip)
+
+fn _u32_at(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off])
+         + (cast(i64, p[off + 1]) << 8)
+         + (cast(i64, p[off + 2]) << 16)
+         + (cast(i64, p[off + 3]) << 24);
+}
+
+fn _find_cstcfi(obj as *reader.ObjFile) as *reader.ObjSection {
+    let is *i64 as names = cast(*i64, obj.csec_names);
+    let is *i32 as nlens = cast(*i32, obj.csec_name_lens);
+    let is i32 as i with mut = 0;
+    while (i < obj.csec_count) {
+        let is *u8 as nm = cast(*u8, names[i]);
+        if (nlens[i] == 7 && reader.streq(nm, 7, ".cstcfi", 7) == 1) {
+            return cast(*reader.ObjSection,
+                cast(i64, obj.csec_data) + cast(i64, i) * sizeof(reader.ObjSection));
+        }
+        i = i + 1;
+    }
+    return cast(*reader.ObjSection, 0);
+}
+
+fn _patch_u32(b as *reader.ByteBuffer, off as i64, val as i64) as void {
+    let is *u8 as d = b.data;
+    d[off]     = cast(u8, val & 255);
+    d[off + 1] = cast(u8, (val >> 8) & 255);
+    d[off + 2] = cast(u8, (val >> 16) & 255);
+    d[off + 3] = cast(u8, (val >> 24) & 255);
+}
+
+// Entries are packed 4-byte aligned; the pad bytes are DW_CFA_nop (0) and are
+// counted in the entry's length.
+fn _align4(b as *reader.ByteBuffer) as void {
+    while ((b.len & 3) != 0) { reader.buf_emit8(b, 0); }
+}
+
+// True when at least one object carries .cstcfi.
+fn cfi_present(ls as *linker.LinkerState) as i32 {
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstcfi(o);
+        if (cast(i64, ss) != 0 && ss.size >= 4) {
+            if (_u32_at(ss.data, 0) > 0) { return 1; }
+        }
+        oi = oi + 1;
+    }
+    return 0;
+}
+
+// Emit the CIE and return its start offset.
+fn _emit_cie(out as *reader.ByteBuffer, pic as i32) as i64 {
+    // AArch64 differs from x86_64 in three CIE fields: the code alignment
+    // factor is the 4-byte instruction, the return address lives in x30 (not
+    // on the stack at entry), and the CFA starts at sp rather than rsp+8.
+    let is i32 as is_a64 with mut = 0;
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) { is_a64 = 1; }
+    let is i64 as cie_start = out.len;
+    reader.buf_emit32_le(out, 0);                 // length (patched)
+    let is i64 as len_off = out.len - 4;
+    reader.buf_emit32_le(out, 0);                 // CIE_id = 0
+    reader.buf_emit8(out, 1);                     // version
+    reader.buf_emit8(out, 122);                   // 'z'
+    reader.buf_emit8(out, 82);                    // 'R'
+    reader.buf_emit8(out, 0);                     // NUL
+    if (is_a64 == 1) { reader.buf_emit8(out, 4); } else { reader.buf_emit8(out, 1); }  // code_alignment_factor
+    reader.buf_emit8(out, 120);                   // data_alignment_factor = -8 (sleb)
+    if (is_a64 == 1) { reader.buf_emit8(out, 30); } else { reader.buf_emit8(out, 16); } // return_address_register
+    reader.buf_emit8(out, 1);                     // augmentation_length
+    // pointer_encoding: a PIC image (.so) is mapped at an arbitrary base, so
+    // the FDE's pc_begin must be a pcrel sdata4 (0x1b); a non-PIE executable
+    // uses absptr (0).
+    if (pic == 1) { reader.buf_emit8(out, 27); } else { reader.buf_emit8(out, 0); }
+    // Initial instructions.
+    if (is_a64 == 1) {
+        reader.buf_emit8(out, cast(i32, DW_CFA_def_cfa));
+        reader.buf_emit8(out, 31);                // sp
+        reader.buf_emit8(out, 0);
+    } else {
+        reader.buf_emit8(out, cast(i32, DW_CFA_def_cfa));
+        reader.buf_emit8(out, 7);                 // rsp
+        reader.buf_emit8(out, 8);
+        reader.buf_emit8(out, cast(i32, DW_CFA_OFFSET_RA));
+        reader.buf_emit8(out, 1);                 // offset = 1 * -8 = -8
+    }
+    _align4(out);
+    _patch_u32(out, len_off, out.len - len_off - 4);
+    return cie_start;
+}
+
+// Number of FDEs build_eh_frame will emit (one per .cstcfi record). An upper
+// bound: records for functions that DCE pruned have no surviving symbol.
+fn cfi_fde_count(ls as *linker.LinkerState) as i32 {
+    let is i32 as total with mut = 0;
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstcfi(o);
+        if (cast(i64, ss) != 0 && ss.size >= 4) { total = total + cast(i32, _u32_at(ss.data, 0)); }
+        oi = oi + 1;
+    }
+    return total;
+}
+
+fn _name_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Find the CFI opcode stream for `name` across every object's .cstcfi.
+// Returns its length (0 if absent), filling out_ptr/out_len.
+fn _find_cfi(ls as *linker.LinkerState, name as *u8, name_len as i32,
+             out_ptr as **u8, out_len as *i32) as i32 {
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as o = linker.get_obj(ls, oi);
+        let is *reader.ObjSection as ss = _find_cstcfi(o);
+        if (cast(i64, ss) != 0 && ss.size >= 4) {
+            let is *u8 as p = ss.data;
+            let is i64 as n = _u32_at(p, 0);
+            let is i64 as cur with mut = 4;
+            let is i64 as k with mut = 0;
+            while (k < n && cur + 4 <= ss.size) {
+                let is i64 as nl = _u32_at(p, cur); cur = cur + 4;
+                if (cur + nl + 4 > ss.size) { k = n; continue; }
+                let is *u8 as np = cast(*u8, cast(i64, p) + cur);
+                cur = cur + nl;
+                let is i64 as dl = _u32_at(p, cur); cur = cur + 4;
+                if (cur + dl > ss.size) { k = n; continue; }
+                if (cast(i32, nl) == name_len && _name_eq(np, cast(i32, nl), name, name_len) == 1) {
+                    *out_ptr = cast(*u8, cast(i64, p) + cur);
+                    *out_len = cast(i32, dl);
+                    return 1;
+                }
+                cur = cur + dl;
+                k = k + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+    return 0;
+}
+
+fn _sort_gsym_idx(idx as *i32, va as *i64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is i32 as ci = idx[i];
+        let is i64 as cv = va[i];
+        let is i32 as j with mut = i - 1;
+        while (j >= 0 && va[j] > cv) {
+            idx[j + 1] = idx[j];
+            va[j + 1] = va[j];
+            j = j - 1;
+        }
+        idx[j + 1] = ci;
+        va[j + 1] = cv;
+        i = i + 1;
+    }
+}
+
+// Build the whole .eh_frame into `out`. FDEs are keyed by the final text
+// symbol addresses, not by the object-local offsets in .cstcfi: dead-code
+// elimination repacks each object's .text, so those offsets are stale by the
+// time we get here. Fills fde_pc[i]/fde_off[i] for the header's table and
+// returns the FDE count.
+fn build_eh_frame(ls as *linker.LinkerState, out as *reader.ByteBuffer,
+                  fde_pc as *i64, fde_off as *i64,
+                  pic as i32, eh_vaddr as i64) as i32 {
+    let is i64 as cie_start = _emit_cie(out, pic);
+
+    // Sorted defined .text globals = the functions, with their final addresses.
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    let is i32 as ntext with mut = 0;
+    let is i32 as gi with mut = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) { ntext = ntext + 1; }
+        gi = gi + 1;
+    }
+    if (ntext < 1) { return 0; }
+    let is *i32 as idx = cast(*i32, om.opt_alloc(cast(i64, ntext) * 4));
+    let is *i64 as va = cast(*i64, om.opt_alloc(cast(i64, ntext) * 8));
+    let is i32 as cnt with mut = 0;
+    gi = 0;
+    while (gi < gsyms.count) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+        if (g.defined == 1 && g.section == reader.SECIDX_TEXT) {
+            idx[cnt] = gi;
+            va[cnt] = g.vaddr;
+            cnt = cnt + 1;
+        }
+        gi = gi + 1;
+    }
+    _sort_gsym_idx(idx, va, cnt);
+    let is i64 as text_end = ls.text_vaddr + ls.text_size;
+
+    let is i32 as nfde with mut = 0;
+    let is i32 as f with mut = 0;
+    while (f < cnt) {
+        let is *linker.GlobalSym as g = linker.gsym_get(gsyms, idx[f]);
+        let is *u8 as cfi_ptr with mut = cast(*u8, 0);
+        let is i32 as cfi_len with mut = 0;
+        if (_find_cfi(ls, g.name, g.name_len, &cfi_ptr, &cfi_len) == 1 && cfi_len > 0) {
+            let is i64 as begin = g.vaddr;
+            let is i64 as fin with mut = text_end;
+            if (f + 1 < cnt) { fin = va[f + 1]; }
+            let is i64 as fde_start = out.len;
+            reader.buf_emit32_le(out, 0);                 // length (patched)
+            let is i64 as len_off = out.len - 4;
+            reader.buf_emit32_le(out, (fde_start + 4) - cie_start);
+            if (pic == 1) {
+                // pc_begin: sdata4, pcrel from this field's own address. The
+                // delta is load-base-independent, so the linker can resolve it.
+                let is i64 as field_addr = eh_vaddr + out.len;
+                reader.buf_emit32_le(out, begin - field_addr);
+                reader.buf_emit32_le(out, fin - begin);       // pc_range (sdata4)
+            } else {
+                reader.buf_emit64_le(out, begin);             // pc_begin (absptr)
+                reader.buf_emit64_le(out, fin - begin);       // pc_range
+            }
+            reader.buf_emit8(out, 0);                     // augmentation_length
+            let is i32 as j with mut = 0;
+            while (j < cfi_len) { reader.buf_emit8(out, cast(i32, cfi_ptr[j])); j = j + 1; }
+            _align4(out);
+            _patch_u32(out, len_off, out.len - len_off - 4);
+            fde_pc[nfde] = begin;
+            fde_off[nfde] = fde_start;
+            nfde = nfde + 1;
+        }
+        f = f + 1;
+    }
+    return nfde;
+}
+
+// Sort the FDE table by initial pc (the binary-search table must be ordered).
+fn _sort_fdes(pc as *i64, off as *i64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is i64 as cp = pc[i];
+        let is i64 as co = off[i];
+        let is i32 as j with mut = i - 1;
+        while (j >= 0 && pc[j] > cp) {
+            pc[j + 1] = pc[j];
+            off[j + 1] = off[j];
+            j = j - 1;
+        }
+        pc[j + 1] = cp;
+        off[j + 1] = co;
+        i = i + 1;
+    }
+}
+
+// Build .eh_frame_hdr: version 1, pcrel|sdata4 eh_frame pointer, udata4 count,
+// and a datarel|sdata4 binary-search table of (initial_location, fde_address).
+// `eh_vaddr`/`hdr_vaddr` are the final addresses the linker assigned.
+fn build_eh_frame_hdr(out as *reader.ByteBuffer, fde_pc as *i64, fde_off as *i64,
+                      n as i32, eh_vaddr as i64, hdr_vaddr as i64) as void {
+    _sort_fdes(fde_pc, fde_off, n);
+    reader.buf_emit8(out, 1);                     // version
+    reader.buf_emit8(out, 27);                    // eh_frame_ptr_enc = pcrel|sdata4
+    reader.buf_emit8(out, 3);                     // fde_count_enc = udata4
+    reader.buf_emit8(out, 59);                    // table_enc = datarel|sdata4
+    reader.buf_emit32_le(out, eh_vaddr - (hdr_vaddr + 4));   // eh_frame_ptr
+    reader.buf_emit32_le(out, cast(i64, n));                 // fde_count
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        reader.buf_emit32_le(out, fde_pc[i] - hdr_vaddr);
+        reader.buf_emit32_le(out, (eh_vaddr + fde_off[i]) - hdr_vaddr);
+        i = i + 1;
+    }
+}

@@ -1,0 +1,1033 @@
+use "../../src/ir/opt_mem.cst" as om;
+use "../core/asm_defs.cst" as def;
+use "../core/buf.cst" as buf;
+use "elf.cst" as elf;
+use "../encoder/encoder_emit.cst" as ence;
+use "../encoder/encoder_size.cst" as encs;
+use "../encoder/encoder_ctrl.cst" as encc;
+use "../encoder/encoder_util.cst" as eu;
+use "../parser/parsed_line.cst" as pl;
+use "../parser/custom_sections.cst" as cs;
+use "../core/util.cst" as util;
+use "../../src/debug_proto.cst" as dbgproto;
+use "../../src/codegen/target.cst" as tgt;
+
+// === .cstdebug line table (PE/COFF only) ===
+//
+// The compiler emits `.file n "path"` once and `.loc n <line> 0` before each
+// instruction. We collect (text offset, line) pairs into `.cstdebug`, which
+// the PE linker turns into the module's CodeView line table. Collected here
+// because pass2 is exactly where each instruction's final text offset is known.
+let is *u8 as dbg_file_ptr with mut = cast(*u8, 0);
+let is i32 as dbg_file_len with mut = 0;
+let is *i64 as dbg_offs with mut;
+let is *i64 as dbg_lines with mut;
+let is i32 as dbg_cap with mut = 0;
+let is i32 as dbg_count with mut = 0;
+let is i32 as dbg_last_line with mut = 0;
+// Prologue-end offsets (`.dbg_prologue_end`), appended after the loc table.
+let is *i64 as dbg_pend with mut;
+let is i32 as dbg_pend_cap with mut = 0;
+let is i32 as dbg_pend_count with mut = 0;
+
+fn _dbg_reset() as void {
+    dbg_file_ptr = cast(*u8, 0);
+    dbg_file_len = 0;
+    dbg_cap = 64;
+    dbg_offs = cast(*i64, om.opt_alloc(cast(i64, dbg_cap) * 8));
+    dbg_lines = cast(*i64, om.opt_alloc(cast(i64, dbg_cap) * 8));
+    dbg_count = 0;
+    dbg_last_line = 0;
+    dbg_pend_cap = 16;
+    dbg_pend = cast(*i64, om.opt_alloc(cast(i64, dbg_pend_cap) * 8));
+    dbg_pend_count = 0;
+}
+
+fn _dbg_pend_add(off as i64) as void {
+    if (dbg_pend_count >= dbg_pend_cap) {
+        let is i32 as nc = dbg_pend_cap * 2;
+        let is *i64 as np = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+        let is i32 as i with mut = 0;
+        while (i < dbg_pend_count) { np[i] = dbg_pend[i]; i = i + 1; }
+        dbg_pend = np; dbg_pend_cap = nc;
+    }
+    dbg_pend[dbg_pend_count] = off;
+    dbg_pend_count = dbg_pend_count + 1;
+}
+
+fn _dbg_add(off as i64, line as i64) as void {
+    if (dbg_count >= dbg_cap) {
+        let is i32 as nc = dbg_cap * 2;
+        let is *i64 as no = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+        let is *i64 as nl = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+        let is i32 as i with mut = 0;
+        while (i < dbg_count) { no[i] = dbg_offs[i]; nl[i] = dbg_lines[i]; i = i + 1; }
+        dbg_offs = no; dbg_lines = nl; dbg_cap = nc;
+    }
+    dbg_offs[dbg_count] = off;
+    dbg_lines[dbg_count] = line;
+    dbg_count = dbg_count + 1;
+}
+
+// Serialize the collected line table into the `.cstdebug` custom section.
+// Layout: u32 magic, u32 reserved, u32 src_len, byte[src_len] path, pad to 4,
+// u32 count, count × (u32 text_offset, u32 line).
+fn _dbg_emit_section() as void {
+    if (dbg_count == 0 || dbg_file_len == 0) { return; }
+    let is i32 as idx = cs.csec_find_or_add(".cstdebug", 9);
+    let is *i64 as bp = cast(*i64, cs.csec_buf_ptrs);
+    let is *buf.ByteBuffer as bb = cast(*buf.ByteBuffer, bp[idx]);
+    buf.buf_emit32_le(bb, cast(i64, dbgproto.CSTDEBUG_MAGIC));
+    buf.buf_emit32_le(bb, 0);
+    buf.buf_emit32_le(bb, cast(i64, dbg_file_len));
+    let is i32 as i with mut = 0;
+    while (i < dbg_file_len) { buf.buf_emit8(bb, cast(i32, dbg_file_ptr[i])); i = i + 1; }
+    while ((bb.len & 3) != 0) { buf.buf_emit8(bb, 0); }
+    buf.buf_emit32_le(bb, cast(i64, dbg_count));
+    i = 0;
+    while (i < dbg_count) {
+        buf.buf_emit32_le(bb, dbg_offs[i]);
+        buf.buf_emit32_le(bb, dbg_lines[i]);
+        i = i + 1;
+    }
+    // Prologue-end offsets, appended after the loc table. Readers that only
+    // want the lines (the PDB writer) read `dbg_count` entries and ignore this.
+    buf.buf_emit32_le(bb, cast(i64, dbg_pend_count));
+    i = 0;
+    while (i < dbg_pend_count) {
+        buf.buf_emit32_le(bb, dbg_pend[i]);
+        i = i + 1;
+    }
+}
+
+// === .cstcfi: Call Frame Information (SysV .eh_frame) ===
+//
+// Codegen emits `.cfi_startproc` / `.cfi_def_cfa_offset` / `.cfi_offset` /
+// `.cfi_def_cfa_register` / `.cfi_endproc` around each function's prologue.
+// pass2 turns each into the DW_CFA opcode stream an FDE carries, using the
+// text offset at the directive as the advance_loc point. The records go into
+// `.cstcfi`, which the ELF linker wraps into `.eh_frame` (CIE + FDEs) once the
+// final addresses are known.
+let is i32 as _cfi_count with mut = 0;
+let is i32 as _cfi_cap with mut = 0;
+let is *i64 as _cfi_data with mut;
+let is *i32 as _cfi_dlen with mut;
+let is *i64 as _cfi_nptr with mut;   // function name (pointer into the .s buffer)
+let is *i32 as _cfi_nlen with mut;
+let is i32 as _cfi_active with mut = 0;
+let is i32 as _cfi_enabled with mut = 0;
+let is i64 as _cfi_fn_start with mut = 0;
+let is i64 as _cfi_last with mut = 0;
+let is *u8 as _cfi_cur_name with mut;
+let is i32 as _cfi_cur_nlen with mut = 0;
+let is buf.ByteBuffer as _cfi_buf with mut;
+
+fn _cfi_reset() as void {
+    _cfi_count = 0;
+    _cfi_cap = 64;
+    _cfi_data = cast(*i64, om.opt_alloc(cast(i64, _cfi_cap) * 8));
+    _cfi_dlen = cast(*i32, om.opt_alloc(cast(i64, _cfi_cap) * 4));
+    _cfi_nptr = cast(*i64, om.opt_alloc(cast(i64, _cfi_cap) * 8));
+    _cfi_nlen = cast(*i32, om.opt_alloc(cast(i64, _cfi_cap) * 4));
+    _cfi_active = 0;
+    _cfi_last = 0;
+    _cfi_cur_name = cast(*u8, 0);
+    _cfi_cur_nlen = 0;
+    _cfi_buf = buf.buf_init(256);
+}
+
+// Assembler register id -> DWARF register number (x86_64).
+fn _cfi_dwarf_reg(regid as i32) as i32 {
+    if (regid == 0) { return 0; }   // rax
+    if (regid == 1) { return 2; }   // rcx
+    if (regid == 2) { return 1; }   // rdx
+    if (regid == 3) { return 3; }   // rbx
+    if (regid == 4) { return 7; }   // rsp
+    if (regid == 5) { return 6; }   // rbp
+    if (regid == 6) { return 4; }   // rsi
+    if (regid == 7) { return 5; }   // rdi
+    if (regid >= 8 && regid <= 15) { return regid; }  // r8..r15
+    return regid;
+}
+
+fn _cfi_uleb(v_in as i64) as void {
+    let is i64 as v with mut = v_in;
+    while (v >= 128) {
+        buf.buf_emit8(&_cfi_buf, cast(i32, (v & 127) | 128));
+        v = v >> 7;
+    }
+    buf.buf_emit8(&_cfi_buf, cast(i32, v & 127));
+}
+
+// Emit DW_CFA_advance_loc from the last recorded offset to `off`.
+fn _cfi_advance(off as i64) as void {
+    let is i64 as delta = off - _cfi_last;
+    if (delta <= 0) { return; }
+    if (delta <= 63) {
+        buf.buf_emit8(&_cfi_buf, cast(i32, 64 | delta));
+    } else if (delta <= 255) {
+        buf.buf_emit8(&_cfi_buf, 2);
+        buf.buf_emit8(&_cfi_buf, cast(i32, delta));
+    } else if (delta <= 65535) {
+        buf.buf_emit8(&_cfi_buf, 3);
+        buf.buf_emit16_le(&_cfi_buf, cast(i32, delta));
+    } else {
+        buf.buf_emit8(&_cfi_buf, 4);
+        buf.buf_emit32_le(&_cfi_buf, delta);
+    }
+    _cfi_last = off;
+}
+
+fn _cfi_record(name_ptr as *u8, name_len as i32, data as *u8, dlen as i32) as void {
+    if (_cfi_count >= _cfi_cap) {
+        let is i32 as nc = _cfi_cap * 2;
+        let is *i64 as nd = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+        let is *i32 as nl = cast(*i32, om.opt_alloc(cast(i64, nc) * 4));
+        let is *i64 as nnp = cast(*i64, om.opt_alloc(cast(i64, nc) * 8));
+        let is *i32 as nnl = cast(*i32, om.opt_alloc(cast(i64, nc) * 4));
+        let is i32 as i with mut = 0;
+        while (i < _cfi_count) {
+            nd[i] = _cfi_data[i]; nl[i] = _cfi_dlen[i];
+            nnp[i] = _cfi_nptr[i]; nnl[i] = _cfi_nlen[i];
+            i = i + 1;
+        }
+        _cfi_data = nd; _cfi_dlen = nl; _cfi_nptr = nnp; _cfi_nlen = nnl; _cfi_cap = nc;
+    }
+    _cfi_nptr[_cfi_count] = cast(i64, name_ptr);
+    _cfi_nlen[_cfi_count] = name_len;
+    // Copy: _cfi_buf is reused for the next function, so storing its pointer
+    // would leave every record pointing at the last function's opcodes.
+    let is *u8 as copy = om.opt_alloc(dlen + 1);
+    let is i32 as i with mut = 0;
+    while (i < dlen) { copy[i] = data[i]; i = i + 1; }
+    _cfi_data[_cfi_count] = cast(i64, copy);
+    _cfi_dlen[_cfi_count] = dlen;
+    _cfi_count = _cfi_count + 1;
+}
+
+// Serialize the collected records into `.cstcfi`. Per record:
+//   u32 name_len, byte[name_len] name, u32 cfi_len, byte[cfi_len] cfi
+// The name is the key: DCE repacks each object's .text, so an object-local
+// offset would be stale by link time.
+fn _cfi_emit_section() as void {
+    if (_cfi_count == 0) { return; }
+    // The custom-section id space is finite and shared with the user's own
+    // `with section(...)` sections. `.cstcfi` is optional (unwind info), so
+    // when the budget is exhausted it is dropped rather than failing a build
+    // that would otherwise succeed — a program at the 95-section limit keeps
+    // building, just without .eh_frame.
+    if (cs.csec_count >= cs.MAX_CUSTOM_SECTIONS) { return; }
+    let is i32 as idx = cs.csec_find_or_add(".cstcfi", 7);
+    let is *i64 as bp = cast(*i64, cs.csec_buf_ptrs);
+    let is *buf.ByteBuffer as bb = cast(*buf.ByteBuffer, bp[idx]);
+    buf.buf_emit32_le(bb, cast(i64, _cfi_count));
+    let is i32 as i with mut = 0;
+    while (i < _cfi_count) {
+        buf.buf_emit32_le(bb, cast(i64, _cfi_nlen[i]));
+        buf.buf_append(bb, cast(*u8, _cfi_nptr[i]), cast(i64, _cfi_nlen[i]));
+        buf.buf_emit32_le(bb, cast(i64, _cfi_dlen[i]));
+        buf.buf_append(bb, cast(*u8, _cfi_data[i]), cast(i64, _cfi_dlen[i]));
+        i = i + 1;
+    }
+}
+
+// === Public CFI API ===
+//
+// The AArch64 assembler parses its own dialect and does not build ParsedLines,
+// so it drives the same collector through these entry points. Offsets are byte
+// offsets into .text; the caller passes DWARF register numbers directly.
+// `caf` is the CIE's code_alignment_factor (1 for x86_64, 4 for AArch64),
+// which scales DW_CFA_advance_loc.
+let is i32 as _cfi_caf with mut = 1;
+
+fn cfi_init(caf as i32) as void {
+    _cfi_enabled = 0;
+    if (tgt.target_get().object_format == 1) { _cfi_enabled = 1; }
+    _cfi_caf = caf;
+    if (_cfi_enabled == 1) { _cfi_reset(); }
+}
+
+fn cfi_begin(name_ptr as *u8, name_len as i32, off as i64) as void {
+    if (_cfi_enabled == 0) { return; }
+    _cfi_active = 1;
+    _cfi_fn_start = off;
+    _cfi_last = 0;
+    _cfi_buf.len = 0;
+    _cfi_cur_name = name_ptr;
+    _cfi_cur_nlen = name_len;
+}
+
+fn cfi_end(off as i64) as void {
+    if (_cfi_enabled == 0 || _cfi_active == 0) { return; }
+    _cfi_active = 0;
+    _cfi_record(_cfi_cur_name, _cfi_cur_nlen, _cfi_buf.data, cast(i32, _cfi_buf.len));
+}
+
+fn cfi_def_cfa_offset(off as i64, n as i64) as void {
+    if (_cfi_enabled == 0 || _cfi_active == 0) { return; }
+    _cfi_advance((off - _cfi_fn_start) / cast(i64, _cfi_caf));
+    buf.buf_emit8(&_cfi_buf, 14);              // DW_CFA_def_cfa_offset
+    _cfi_uleb(n);
+}
+
+fn cfi_def_cfa_register(off as i64, dreg as i32) as void {
+    if (_cfi_enabled == 0 || _cfi_active == 0) { return; }
+    _cfi_advance((off - _cfi_fn_start) / cast(i64, _cfi_caf));
+    buf.buf_emit8(&_cfi_buf, 13);              // DW_CFA_def_cfa_register
+    _cfi_uleb(cast(i64, dreg));
+}
+
+fn cfi_offset(off as i64, dreg as i32, n as i64) as void {
+    if (_cfi_enabled == 0 || _cfi_active == 0) { return; }
+    _cfi_advance((off - _cfi_fn_start) / cast(i64, _cfi_caf));
+    buf.buf_emit8(&_cfi_buf, 128 | dreg);      // DW_CFA_offset
+    _cfi_uleb((0 - n) / 8);                    // factored by -8
+}
+
+fn cfi_flush() as void {
+    if (_cfi_enabled == 1) { _cfi_emit_section(); }
+}
+
+// === Duplicate definitions ===
+//
+// The symbol table is keyed by name with no per-function scope, and
+// sym_find_or_add updates a symbol only while it is still a forward reference
+// (section == UNDEF). So a name defined a SECOND time used to be swallowed:
+// the first definition kept its offset, and every jump to that name resolved
+// there — often inside a different function entirely.
+//
+// That is how an -O1 miscompile in the caller reached the user as a segfault
+// with no diagnostic. The compiler was duplicating a `naked` asm body, the
+// label inside it landed in the output twice, and the assembler had no opinion
+// about it. It has one now. The compiler side is fixed; this is so the next
+// producer of a bad .s hears about it here.
+let is i32 as _dup_err with mut = 0;
+fn pass_had_error() as i32 { return _dup_err; }
+
+fn _report_dup(line as *pl.ParsedLine, prev as *elf.Symbol) as void {
+    _dup_err = 1;
+    util.eprint_str("caustic-as: error: line ");
+    util.eprint_int(cast(i64, line.line_no));
+    util.eprint_str(": label '");
+    let is i32 as i with mut = 0;
+    while (i < line.label_len) {
+        let is [2]u8 as ch;
+        ch[0] = line.label_ptr[i];
+        ch[1] = cast(u8, 0);
+        util.eprint_str(cast(*u8, &ch));
+        i = i + 1;
+    }
+    util.eprint_str("' is defined twice (first at offset ");
+    util.eprint_int(prev.offset);
+    util.eprint_str(" of section ");
+    util.eprint_int(cast(i64, prev.section));
+    util.eprint_str(")\n");
+}
+
+// === String decoding (for .string/.ascii directive data) ===
+
+fn decode_string(ptr as *u8, len as i32, out_len as *i32) as *u8 {
+    let is *u8 as buf = om.opt_alloc(cast(i64, len));
+    let is i32 as out with mut = 0;
+    let is i32 as i with mut = 1; // skip opening quote
+    let is i32 as end = len - 1; // skip closing quote
+
+    while (i < end) {
+        if (ptr[i] == 92) { // backslash
+            i = i + 1;
+            if (i >= end) { break; }
+            if (ptr[i] == 110) { buf[out] = 10; } // \n
+            else if (ptr[i] == 116) { buf[out] = 9; } // \t
+            else if (ptr[i] == 114) { buf[out] = 13; } // \r
+            else if (ptr[i] == 92) { buf[out] = 92; } // \\
+            else if (ptr[i] == 34) { buf[out] = 34; } // \"
+            else if (ptr[i] >= 48 && ptr[i] <= 55) { // \NNN octal
+                let is i32 as oval with mut = cast(i32, ptr[i]) - 48;
+                if (i + 1 < end && ptr[i + 1] >= 48 && ptr[i + 1] <= 55) {
+                    i = i + 1; oval = oval * 8 + (cast(i32, ptr[i]) - 48);
+                }
+                if (i + 1 < end && ptr[i + 1] >= 48 && ptr[i + 1] <= 55) {
+                    i = i + 1; oval = oval * 8 + (cast(i32, ptr[i]) - 48);
+                }
+                buf[out] = cast(u8, oval);
+            }
+            else { buf[out] = ptr[i]; }
+        } else {
+            buf[out] = ptr[i];
+        }
+        out = out + 1;
+        i = i + 1;
+    }
+    *out_len = out;
+    return buf;
+}
+
+// === Pass 1: collect symbols, calculate sizes ===
+
+fn calc_inst_size(line as *pl.ParsedLine) as i32 {
+    let is def.Operand as o1 = pl.make_op(line, 1);
+    let is def.Operand as o2 = pl.make_op(line, 2);
+    return encs.fast_inst_size(line.inst_id, &o1, &o2);
+}
+
+fn calc_dir_size(line as *pl.ParsedLine) as i32 {
+    if (line.dir_kind == pl.DIR_STRING || line.dir_kind == pl.DIR_ASCII) {
+        let is i32 as decoded_len with mut = 0;
+        let is *u8 as decoded = decode_string(line.dir_arg_ptr, line.dir_arg_len, &decoded_len);
+        line.decoded_ptr = decoded;
+        line.decoded_len = decoded_len;
+        if (line.dir_kind == pl.DIR_STRING) { return decoded_len + 1; }
+        return decoded_len; // .ascii: no null terminator
+    }
+    if (line.dir_kind == pl.DIR_BYTE) { return line.decoded_len; }
+    if (line.dir_kind == pl.DIR_INCBIN) { return line.decoded_len; }
+    if (line.dir_kind == pl.DIR_WORD) { return 2; }
+    if (line.dir_kind == pl.DIR_LONG) { return 4; }
+    if (line.dir_kind == pl.DIR_QUAD) { return 8; }
+    if (line.dir_kind == pl.DIR_ZERO) { return cast(i32, line.dir_num); }
+    return 0;
+}
+
+// Padding a `.p2align` at section offset `off` takes (0 when over its max).
+fn p2align_pad(line as *pl.ParsedLine, off as i64) as i32 {
+    if (line.dir_num <= 0 || line.dir_num > 12) { return 0; }
+    let is i64 as a = cast(i64, 1) << line.dir_num;
+    let is i64 as pad = (a - off % a) % a;
+    if (line.op1_imm > 0 && pad > line.op1_imm) { return 0; }
+    return cast(i32, pad);
+}
+
+// `n` bytes of nop, in the longest recommended encodings (at most 9 bytes
+// each), so the padding a loop entry falls through costs few instructions.
+fn emit_nops(target as *buf.ByteBuffer, n_in as i32) as void {
+    let is i32 as n with mut = n_in;
+    while (n > 0) {
+        let is i32 as k with mut = n;
+        if (k > 9) { k = 9; }
+        if (k == 1) { buf.buf_emit8(target, 144); }
+        else if (k == 2) { buf.buf_emit8(target, 102); buf.buf_emit8(target, 144); }
+        else if (k == 3) { buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 0); }
+        else if (k == 4) { buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 64); buf.buf_emit8(target, 0); }
+        else if (k == 5) { buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 68); buf.buf_emit8(target, 0); buf.buf_emit8(target, 0); }
+        else if (k == 6) { buf.buf_emit8(target, 102); buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 68); buf.buf_emit8(target, 0); buf.buf_emit8(target, 0); }
+        else if (k == 7) { buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 128); buf.buf_emit32_le(target, 0); }
+        else if (k == 8) { buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 132); buf.buf_emit8(target, 0); buf.buf_emit32_le(target, 0); }
+        else { buf.buf_emit8(target, 102); buf.buf_emit8(target, 15); buf.buf_emit8(target, 31); buf.buf_emit8(target, 132); buf.buf_emit8(target, 0); buf.buf_emit32_le(target, 0); }
+        n = n - k;
+    }
+}
+
+fn pass1(lines as *pl.ParsedLines, symtab as *elf.SymbolTable) as void {
+    let is i64 as text_off with mut = 0;
+    let is i64 as data_off with mut = 0;
+    let is i64 as rodata_off with mut = 0;
+    let is i64 as bss_off with mut = 0;
+    // Per-custom-section running offsets. Without these, a label or data
+    // directive in a `with section(".x")` block (and esp. a section entered
+    // more than once) gets offset 0 — so a 2nd global in the same custom
+    // section aliases the 1st. Indexed by (section - SECTION_CUSTOM_BASE).
+    // Sized by the section count; this was a [32] indexed past its end once a
+    // file had a 33rd custom section.
+    let is *i64 as csec_offs = cast(*i64, om.opt_alloc(cast(i64, cs.csec_count) * 8 + 8));
+    let is i32 as cz with mut = 0;
+    while (cz <= cs.csec_count) { csec_offs[cz] = 0; cz = cz + 1; }
+    let is i32 as i with mut = 0;
+
+    while (i < lines.count) {
+        let is *pl.ParsedLine as line = pl.pl_get(lines, i);
+
+        if (line.kind == pl.LINE_LABEL) {
+            let is i64 as off with mut = 0;
+            if (line.section == cs.SECTION_TEXT) { off = text_off; }
+            else if (line.section == cs.SECTION_DATA) { off = data_off; }
+            else if (line.section == cs.SECTION_RODATA) { off = rodata_off; }
+            else if (line.section == cs.SECTION_BSS) { off = bss_off; }
+            else if (line.section >= cs.SECTION_CUSTOM_BASE) { off = csec_offs[line.section - cs.SECTION_CUSTOM_BASE]; }
+            // A name already carrying a real section is a second definition,
+            // not a forward reference being satisfied. `.globl foo` before
+            // `foo:` is the legitimate case and arrives as UNDEF, so it is not
+            // caught here.
+            let is i32 as prev_idx = elf.sym_find(symtab, line.label_ptr, line.label_len);
+            if (prev_idx != 99999) {
+                let is *elf.Symbol as prev = elf.sym_get(symtab, prev_idx);
+                if (prev.section != cs.SECTION_UNDEF) { _report_dup(line, prev); }
+            }
+            elf.sym_find_or_add(symtab, line.label_ptr, line.label_len, line.section, off, 0);
+        }
+        else if (line.kind == pl.LINE_DIRECTIVE) {
+            if (line.dir_kind == pl.DIR_GLOBL) {
+                elf.sym_find_or_add(symtab, line.dir_arg_ptr, line.dir_arg_len, cs.SECTION_UNDEF, 0, 1);
+            }
+            else if (line.dir_kind == pl.DIR_P2ALIGN) {
+                let is i64 as cur with mut = text_off;
+                if (line.section == cs.SECTION_DATA)   { cur = data_off; }
+                if (line.section == cs.SECTION_RODATA) { cur = rodata_off; }
+                if (line.section == cs.SECTION_BSS)    { cur = bss_off; }
+                if (line.section >= cs.SECTION_CUSTOM_BASE) { cur = csec_offs[line.section - cs.SECTION_CUSTOM_BASE]; }
+                let is i32 as pad = p2align_pad(line, cur);
+                line.size = pad;
+                line.offset = cur;
+                if (line.section == cs.SECTION_TEXT)   { text_off = text_off + cast(i64, pad); }
+                if (line.section == cs.SECTION_DATA)   { data_off = data_off + cast(i64, pad); }
+                if (line.section == cs.SECTION_RODATA) { rodata_off = rodata_off + cast(i64, pad); }
+                if (line.section == cs.SECTION_BSS)    { bss_off = bss_off + cast(i64, pad); }
+                if (line.section >= cs.SECTION_CUSTOM_BASE) {
+                    let is i32 as ci2 = line.section - cs.SECTION_CUSTOM_BASE;
+                    csec_offs[ci2] = csec_offs[ci2] + cast(i64, pad);
+                }
+            }
+            else if (line.dir_kind == pl.DIR_STRING || line.dir_kind == pl.DIR_ASCII || line.dir_kind == pl.DIR_BYTE || line.dir_kind == pl.DIR_WORD ||
+                     line.dir_kind == pl.DIR_LONG || line.dir_kind == pl.DIR_QUAD || line.dir_kind == pl.DIR_ZERO || line.dir_kind == pl.DIR_INCBIN) {
+                let is i32 as sz = calc_dir_size(line);
+                line.size = sz;
+                if (line.section == cs.SECTION_TEXT)   { line.offset = text_off; text_off = text_off + cast(i64, sz); }
+                if (line.section == cs.SECTION_DATA)   { line.offset = data_off; data_off = data_off + cast(i64, sz); }
+                if (line.section == cs.SECTION_RODATA) { line.offset = rodata_off; rodata_off = rodata_off + cast(i64, sz); }
+                if (line.section == cs.SECTION_BSS)    { line.offset = bss_off; bss_off = bss_off + cast(i64, sz); }
+                if (line.section >= cs.SECTION_CUSTOM_BASE) {
+                    let is i32 as ci = line.section - cs.SECTION_CUSTOM_BASE;
+                    line.offset = csec_offs[ci];
+                    csec_offs[ci] = csec_offs[ci] + cast(i64, sz);
+                }
+            }
+        }
+        else if (line.kind == pl.LINE_INST) {
+            let is i32 as sz = calc_inst_size(line);
+            line.size = sz;
+            if (line.section >= cs.SECTION_CUSTOM_BASE) {
+                let is i32 as ci = line.section - cs.SECTION_CUSTOM_BASE;
+                line.offset = csec_offs[ci];
+                csec_offs[ci] = csec_offs[ci] + cast(i64, sz);
+            } else {
+                line.offset = text_off;
+                text_off = text_off + cast(i64, sz);
+            }
+        }
+        i = i + 1;
+    }
+    relax_branches(lines, symtab);
+}
+
+// === Branch relaxation ===
+//
+// pass1 sizes every jump to a label in its long form (jcc rel32, 6 bytes; jmp
+// rel32, 5). A jump in .text to a local label of .text, which pass2 resolves
+// right here with no relocation, takes the 2-byte rel8 form when the target is
+// within -128..127: a small loop then fits in fewer fetch lines, and code
+// shrinks. The choice is recorded as line.size == 2.
+//
+// Shortening moves code, and a `.p2align` may then pad more, so each round lays
+// .text out again and checks every short jump still fits; one that no longer
+// does goes back to long for good. Jumps only ever go long -> short -> long, so
+// this ends; it stops at the first round that changes nothing, where every
+// short jump has been checked against the final layout.
+fn _is_label_branch(line as *pl.ParsedLine) as i32 {
+    if (line.kind != pl.LINE_INST || line.section != cs.SECTION_TEXT || line.op1_kind != def.OP_LABEL) { return 0; }
+    let is i32 as id = cast(i32, line.inst_id);
+    if (id == def.INST_JMP || (id >= def.INST_JZ && id <= def.INST_JBE) || id == def.INST_JP || id == def.INST_JNP) { return 1; }
+    return 0;
+}
+
+// Target offset of a local .text label, or -1 when pass2 would not resolve it
+// inline (undefined, global, or in another section).
+fn _local_target(line as *pl.ParsedLine, symtab as *elf.SymbolTable) as i64 {
+    let is i32 as idx = elf.sym_find(symtab, line.op1_label_ptr, line.op1_label_len);
+    if (idx == 99999) { return 0 - 1; }
+    let is *elf.Symbol as sym = elf.sym_get(symtab, idx);
+    if (sym.section != cs.SECTION_TEXT || sym.is_global == 1) { return 0 - 1; }
+    return sym.offset;
+}
+
+fn _relayout_text(lines as *pl.ParsedLines, symtab as *elf.SymbolTable) as void {
+    let is i64 as cur with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < lines.count) {
+        let is *pl.ParsedLine as line = pl.pl_get(lines, i);
+        if (line.section == cs.SECTION_TEXT) {
+            if (line.kind == pl.LINE_LABEL) {
+                let is i32 as idx = elf.sym_find(symtab, line.label_ptr, line.label_len);
+                if (idx != 99999) {
+                    let is *elf.Symbol as sym = elf.sym_get(symtab, idx);
+                    if (sym.section == cs.SECTION_TEXT) { sym.offset = cur; }
+                }
+            } else if (line.kind == pl.LINE_INST) {
+                line.offset = cur;
+                cur = cur + cast(i64, line.size);
+            } else if (line.kind == pl.LINE_DIRECTIVE) {
+                if (line.dir_kind == pl.DIR_P2ALIGN) {
+                    let is i32 as pad with mut = p2align_pad(line, cur);
+                    if (line.op2_imm == 1 && line.op2_mem_disp >= 0) { pad = _loop_pad(lines, i, line, cur, 1); }
+                    line.size = pad;
+                    line.offset = cur;
+                    cur = cur + cast(i64, pad);
+                } else if (line.dir_kind == pl.DIR_STRING || line.dir_kind == pl.DIR_ASCII || line.dir_kind == pl.DIR_BYTE || line.dir_kind == pl.DIR_WORD ||
+                           line.dir_kind == pl.DIR_LONG || line.dir_kind == pl.DIR_QUAD || line.dir_kind == pl.DIR_ZERO || line.dir_kind == pl.DIR_INCBIN) {
+                    line.offset = cur;
+                    cur = cur + cast(i64, line.size);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// A `.loopalign`'s pad: its loop runs from the head label to the end of the
+// last branch back to it, measured on the previous layout; with a loop inside,
+// whose own pad moves with this one, the body is laid out per candidate. The
+// pad, at most 63, that makes the loop span the fewest 64-byte lines; then one
+// of at most LOOP_JUMP_PAD bytes (code entering the loop runs a longer pad, or
+// jumps over it, each time: fib's loop is entered once per call); then the one
+// that puts the fewest branches beyond two in one line, spans the fewest
+// 32-byte fetch windows, and is the smallest.
+let is i64 as LOOP_MAX_LEN with imut = 256;
+// The linker starts each object's .text this far into a 64-byte line.
+let is i64 as LOOP_BASE with imut = 32;
+let is i32 as LOOP_SETTLE with imut = 3;
+// A loop pad longer than this is jumped over instead of run as nops.
+let is i32 as LOOP_JUMP_PAD with imut = 15;
+
+fn _loop_pad(lines as *pl.ParsedLines, at as i32, line as *pl.ParsedLine, cur as i64, outer as i32) as i32 {
+    let is i32 as bi = cast(i32, line.op2_mem_disp);
+    let is *pl.ParsedLine as be = pl.pl_get(lines, bi);
+    let is i64 as head = line.offset + cast(i64, line.size);
+    let is i64 as len = be.offset + cast(i64, be.size) - head;
+    // too long to place by lines: its head on 16, whatever that takes
+    if (len > LOOP_MAX_LEN) { return cast(i32, (16 - cur % 16) % 16); }
+    if (len <= 0) { return p2align_pad(line, cur); }
+    // An inner loop's pad depends on where this one starts, and this one's
+    // length on that pad: then each candidate lays the body out again.
+    let is i32 as nested with mut = 0;
+    let is i32 as k with mut = at + 1;
+    if (outer == 1) {
+        while (k < bi) {
+            let is *pl.ParsedLine as x = pl.pl_get(lines, k);
+            if (x.kind == pl.LINE_DIRECTIVE && x.dir_kind == pl.DIR_P2ALIGN && x.op2_imm == 1) { nested = 1; }
+            k = k + 1;
+        }
+    }
+    let is [64]i64 as br;
+    let is i32 as nb with mut = 0;
+    let is i32 as best with mut = 0;
+    let is i64 as best_score with mut = 0 - 1;
+    let is i32 as p with mut = 0;
+    while (p < 64) {
+        let is i64 as s = cur + cast(i64, p) + LOOP_BASE;
+        let is i64 as e with mut = s + len - 1;
+        if (nested == 1 || p == 0) {
+            // where the loop's branches and calls sit, from the head
+            nb = 0;
+            let is i64 as c with mut = s;
+            k = at + 1;
+            while (k <= bi) {
+                let is *pl.ParsedLine as x = pl.pl_get(lines, k);
+                if (x.section == cs.SECTION_TEXT) {
+                    if (x.kind == pl.LINE_INST) {
+                        if (nested == 0) { c = s + (x.offset - head); }
+                        if (_is_flow(x) == 1 && nb < 64) { br[nb] = c - s; nb = nb + 1; }
+                        c = c + cast(i64, x.size);
+                    } else if (x.kind == pl.LINE_DIRECTIVE && nested == 1) {
+                        if (x.dir_kind == pl.DIR_P2ALIGN) {
+                            if (x.op2_imm == 1 && x.op2_mem_disp >= 0) { c = c + cast(i64, _loop_pad(lines, k, x, c - LOOP_BASE, 0)); }
+                            else { c = c + cast(i64, p2align_pad(x, c - LOOP_BASE)); }
+                        } else if (x.dir_kind == pl.DIR_STRING || x.dir_kind == pl.DIR_ASCII || x.dir_kind == pl.DIR_BYTE || x.dir_kind == pl.DIR_WORD ||
+                                   x.dir_kind == pl.DIR_LONG || x.dir_kind == pl.DIR_QUAD || x.dir_kind == pl.DIR_ZERO || x.dir_kind == pl.DIR_INCBIN) {
+                            c = c + cast(i64, x.size);
+                        }
+                    }
+                }
+                k = k + 1;
+            }
+            if (nested == 1) { e = c - 1; }
+        }
+        // lines spanned; branches beyond two in one line (the predictor keeps
+        // few per line); 32-byte fetch windows spanned; the pad itself
+        let is i64 as excess with mut = 0;
+        let is i64 as ln with mut = s / 64;
+        while (ln <= e / 64) {
+            let is i64 as cnt with mut = 0;
+            let is i32 as q with mut = 0;
+            while (q < nb) { if ((s + br[q]) / 64 == ln) { cnt = cnt + 1; } q = q + 1; }
+            if (cnt > 2) { excess = excess + cnt - 2; }
+            ln = ln + 1;
+        }
+        let is i64 as big with mut = 0;
+        if (p > LOOP_JUMP_PAD) { big = 1; }
+        let is i64 as score = (e / 64 - s / 64) * 1000000 + big * 100000 + excess * 10000 + (e / 32 - s / 32) * 100 + cast(i64, p);
+        if (best_score < 0 || score < best_score) { best_score = score; best = p; }
+        p = p + 1;
+    }
+    return best;
+}
+
+fn _is_flow(x as *pl.ParsedLine) as i32 {
+    let is i32 as id = cast(i32, x.inst_id);
+    if (id == def.INST_JMP || (id >= def.INST_JZ && id <= def.INST_JBE) || id == def.INST_JP || id == def.INST_JNP
+        || id == def.INST_CALL || id == def.INST_RET) { return 1; }
+    return 0;
+}
+
+fn _same_bytes(a as *u8, b as *u8, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+// Each `.loopalign`: the last branch in .text to the label right after it.
+fn _find_loops(lines as *pl.ParsedLines) as i32 {
+    let is i32 as found with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < lines.count) {
+        let is *pl.ParsedLine as line = pl.pl_get(lines, i);
+        if (line.kind == pl.LINE_DIRECTIVE && line.dir_kind == pl.DIR_P2ALIGN && line.op2_imm == 1) {
+            let is i32 as j with mut = i + 1;
+            while (j < lines.count && pl.pl_get(lines, j).kind == pl.LINE_DIRECTIVE) { j = j + 1; }
+            if (j < lines.count) {
+                let is *pl.ParsedLine as lb = pl.pl_get(lines, j);
+                if (lb.kind == pl.LINE_LABEL && lb.section == cs.SECTION_TEXT) {
+                    let is i32 as k with mut = j + 1;
+                    while (k < lines.count) {
+                        let is *pl.ParsedLine as b = pl.pl_get(lines, k);
+                        if (_is_label_branch(b) == 1 && b.op1_label_len == lb.label_len
+                            && _same_bytes(b.op1_label_ptr, lb.label_ptr, cast(i32, lb.label_len)) == 1) {
+                            line.op2_mem_disp = cast(i64, k);
+                        }
+                        k = k + 1;
+                    }
+                    if (line.op2_mem_disp >= 0) { found = 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn relax_branches(lines as *pl.ParsedLines, symtab as *elf.SymbolTable) as void {
+    if (lines.count == 0) { return; }
+    let is i32 as loops = _find_loops(lines);
+    // 0 long (may shorten), 1 short, 2 long for good
+    let is *u8 as st = om.opt_alloc(cast(i64, lines.count));
+    let is i32 as i with mut = 0;
+    let is i32 as any with mut = 0;
+    while (i < lines.count) {
+        st[i] = cast(u8, 2);
+        let is *pl.ParsedLine as line = pl.pl_get(lines, i);
+        if (_is_label_branch(line) == 1 && _local_target(line, symtab) >= 0) { st[i] = cast(u8, 0); any = 1; }
+        i = i + 1;
+    }
+    // Loop pads read the previous layout, so .text is laid out again until
+    // they settle (at most LOOP_SETTLE extra times). Branches only go
+    // long -> short -> long, so this ends, and it stops on a round that
+    // changes no branch: every short jump was checked on the final layout.
+    let is i32 as settle with mut = 0;
+    if (loops == 1) { any = 1; }
+    while (any == 1) {
+        let is i32 as changed with mut = 0;
+        i = 0;
+        while (i < lines.count) {
+            let is i32 as s0 = cast(i32, st[i]);
+            if (s0 != 2) {
+                let is *pl.ParsedLine as line = pl.pl_get(lines, i);
+                let is i64 as rel = _local_target(line, symtab) - (line.offset + 2);
+                let is i32 as fits with mut = 0;
+                if (rel >= 0 - 128 && rel <= 127) { fits = 1; }
+                if (s0 == 0 && fits == 1) { line.size = 2; st[i] = cast(u8, 1); changed = 1; }
+                else if (s0 == 1 && fits == 0) { line.size = calc_inst_size(line); st[i] = cast(u8, 2); changed = 1; }
+            }
+            i = i + 1;
+        }
+        if (changed == 1) { _relayout_text(lines, symtab); }
+        else if (loops == 1 && settle < LOOP_SETTLE) { _relayout_text(lines, symtab); settle = settle + 1; }
+        else { any = 0; }
+    }
+    om.opt_free(st);
+}
+
+// === Pass 2: encode instructions and emit data ===
+
+fn pass2_resolve_label(line as *pl.ParsedLine, symtab as *elf.SymbolTable, out_undef as *i32, out_sym_idx as *i32) as i64 {
+    let is i32 as idx = elf.sym_find(symtab, line.op1_label_ptr, line.op1_label_len);
+    if (idx != 99999) {
+        let is *elf.Symbol as sym = elf.sym_get(symtab, idx);
+        if (sym.section == cs.SECTION_TEXT) {
+            // Function-sections: reference a GLOBAL .text symbol (a function) via a
+            // relocation even when it is defined in THIS .o, instead of resolving
+            // the offset inline. This exposes the intra-module call edge to the
+            // linker, which is what makes per-function dead-code elimination
+            // (--gc-sections) possible. Local labels (.L — not global) keep
+            // resolving inline; they are intra-function jumps, not call edges.
+            // The linker resolves the reloc to the same offset (S+A-P == the inline
+            // rel), so the emitted binary is byte-identical.
+            if (sym.is_global == 1) {
+                *out_undef = 1;
+                *out_sym_idx = idx;
+                return 0;
+            }
+            *out_undef = 0;
+            return sym.offset;
+        }
+        *out_undef = 1;
+        *out_sym_idx = idx;
+        return 0;
+    }
+    let is i32 as new_idx = elf.sym_find_or_add(symtab, line.op1_label_ptr, line.op1_label_len, cs.SECTION_UNDEF, 0, 0);
+    *out_undef = 1;
+    *out_sym_idx = new_idx;
+    return 0;
+}
+
+fn pass2_encode_rip(line as *pl.ParsedLine, symtab as *elf.SymbolTable, text_buf as *buf.ByteBuffer,
+                    relocs as *elf.RelocList, o1 as *def.Operand, o2 as *def.Operand) as void {
+    let is *u8 as lab_ptr with mut = cast(*u8, 0);
+    let is i32 as lab_len with mut = 0;
+    if (line.op1_kind == def.OP_RIP_LABEL) {
+        lab_ptr = line.op1_label_ptr;
+        lab_len = line.op1_label_len;
+    } else {
+        lab_ptr = line.op2_label_ptr;
+        lab_len = line.op2_label_len;
+    }
+    let is i32 as sym_idx = elf.sym_find_or_add(symtab, lab_ptr, lab_len, cs.SECTION_UNDEF, 0, 0);
+    // A rip operand encoded as a memory operand: the encoder says where its
+    // disp32 went, and whatever follows it (an immediate) moves the addend.
+    if ((o1.kind == def.OP_MEM && o1.mem_base == def.REG_RIP)
+        || (o2.kind == def.OP_MEM && o2.mem_base == def.REG_RIP)) {
+        let is i64 as start = text_buf.len;
+        eu.rip_disp_at = 0 - 1;
+        ence.encode(text_buf, line.inst_id, o1, o2, 0, line.offset, line.line_no);
+        if (eu.rip_disp_at >= 0) {
+            let is i64 as tail = text_buf.len - (eu.rip_disp_at + 4);
+            elf.reloc_add(relocs, line.offset + (eu.rip_disp_at - start), cast(i64, sym_idx),
+                          elf.R_X86_64_PC32, 0 - 4 - tail);
+        }
+        return;
+    }
+    let is i32 as sz = encs.fast_inst_size(line.inst_id, o1, o2);
+    let is i64 as reloc_off = line.offset + cast(i64, sz) - 4;
+
+    let is *elf.Symbol as rip_sym = elf.sym_get(symtab, sym_idx);
+    if (line.inst_id == def.INST_MOV && rip_sym.section == cs.SECTION_UNDEF) {
+        rip_sym.is_global = 1;
+        elf.reloc_add(relocs, reloc_off, cast(i64, sym_idx), elf.R_X86_64_GOTPCREL, 0 - 4);
+    } else {
+        // For CALL with RIP-relative label (the Windows __imp_ pattern),
+        // also mark the symbol global so the linker treats it as an
+        // external import to resolve from the import table.
+        if (line.inst_id == def.INST_CALL && rip_sym.section == cs.SECTION_UNDEF) {
+            rip_sym.is_global = 1;
+        }
+        elf.reloc_add(relocs, reloc_off, cast(i64, sym_idx), elf.R_X86_64_PC32, 0 - 4);
+    }
+    ence.encode(text_buf, line.inst_id, o1, o2, 0, line.offset, line.line_no);
+}
+
+fn pass2_encode_inst(line as *pl.ParsedLine, symtab as *elf.SymbolTable, text_buf as *buf.ByteBuffer,
+                     relocs as *elf.RelocList) as void {
+    let is def.Operand as o1 = pl.make_op(line, 1);
+    let is def.Operand as o2 = pl.make_op(line, 2);
+
+    // Resolve label targets
+    let is i32 as label_is_undef with mut = 0;
+    let is i32 as label_sym_idx with mut = 0;
+    let is i64 as resolve1 with mut = 0;
+    if (line.op1_kind == def.OP_LABEL) {
+        resolve1 = pass2_resolve_label(line, symtab, &label_is_undef, &label_sym_idx);
+    }
+
+    if (line.size == 2 && label_is_undef == 0 && _is_label_branch(line) == 1) {
+        // relaxed by relax_branches: rel8
+        let is i64 as rel = resolve1 - (line.offset + 2);
+        if (cast(i32, line.inst_id) == def.INST_JMP) { buf.buf_emit8(text_buf, 235); }
+        else { buf.buf_emit8(text_buf, encc.jcc_cc(cast(i32, line.inst_id)) - 16); }
+        buf.buf_emit8(text_buf, cast(i32, rel & 255));
+    } else if (line.op1_kind == def.OP_RIP_LABEL || line.op2_kind == def.OP_RIP_LABEL) {
+        pass2_encode_rip(line, symtab, text_buf, relocs, &o1, &o2);
+    } else if (label_is_undef == 1 && (line.inst_id == def.INST_CALL || line.inst_id == def.INST_JMP)) {
+        let is *elf.Symbol as ext_sym = elf.sym_get(symtab, label_sym_idx);
+        ext_sym.is_global = 1;
+        let is i64 as reloc_off = line.offset + 1;
+        elf.reloc_add(relocs, reloc_off, cast(i64, label_sym_idx), elf.R_X86_64_PLT32, 0 - 4);
+        ence.encode(text_buf, line.inst_id, &o1, &o2, 0, line.offset, line.line_no);
+    } else if (label_is_undef == 1 && ((line.inst_id >= def.INST_JZ && line.inst_id <= def.INST_JBE) ||
+               line.inst_id == def.INST_JP || line.inst_id == def.INST_JNP)) {
+        let is *elf.Symbol as ext_sym = elf.sym_get(symtab, label_sym_idx);
+        ext_sym.is_global = 1;
+        let is i64 as reloc_off = line.offset + 2;
+        elf.reloc_add(relocs, reloc_off, cast(i64, label_sym_idx), elf.R_X86_64_PC32, 0 - 4);
+        ence.encode(text_buf, line.inst_id, &o1, &o2, 0, line.offset, line.line_no);
+    } else {
+        ence.encode(text_buf, line.inst_id, &o1, &o2, resolve1, line.offset, line.line_no);
+    }
+}
+
+fn pass2_emit_directive(line as *pl.ParsedLine, target as *buf.ByteBuffer, bss_size as *i64) as void {
+    if (line.dir_kind == pl.DIR_STRING) {
+        buf.buf_append(target, line.decoded_ptr, cast(i64, line.decoded_len));
+        buf.buf_emit8(target, 0);
+    }
+    else if (line.dir_kind == pl.DIR_ASCII) {
+        buf.buf_append(target, line.decoded_ptr, cast(i64, line.decoded_len));
+    }
+    else if (line.dir_kind == pl.DIR_BYTE) {
+        buf.buf_append(target, line.decoded_ptr, cast(i64, line.decoded_len));
+    }
+    else if (line.dir_kind == pl.DIR_INCBIN) {
+        buf.buf_append(target, line.decoded_ptr, cast(i64, line.decoded_len));
+    }
+    else if (line.dir_kind == pl.DIR_WORD) {
+        buf.buf_emit16_le(target, cast(i32, line.dir_num));
+    }
+    else if (line.dir_kind == pl.DIR_LONG) {
+        buf.buf_emit32_le(target, line.dir_num);
+    }
+    else if (line.dir_kind == pl.DIR_QUAD) {
+        buf.buf_emit64_le(target, line.dir_num);
+    }
+    else if (line.dir_kind == pl.DIR_P2ALIGN) {
+        if (line.section == cs.SECTION_BSS) {
+            *bss_size = *bss_size + cast(i64, line.size);
+        } else if (line.section == cs.SECTION_DATA || line.section == cs.SECTION_RODATA) {
+            let is i32 as zp with mut = 0;
+            while (zp < line.size) { buf.buf_emit8(target, 0); zp = zp + 1; }
+        } else if (line.op2_imm == 1 && line.size > LOOP_JUMP_PAD) {
+            // a loop pad the code before falls into: jump over it
+            buf.buf_emit8(target, 235);
+            buf.buf_emit8(target, line.size - 2);
+            emit_nops(target, line.size - 2);
+        } else {
+            // .text and custom sections (functions `with section` run there)
+            emit_nops(target, line.size);
+        }
+    }
+    else if (line.dir_kind == pl.DIR_ZERO) {
+        if (line.section == cs.SECTION_BSS) {
+            *bss_size = *bss_size + line.dir_num;
+        } else {
+            let is i64 as zi with mut = 0;
+            while (zi < line.dir_num) {
+                buf.buf_emit8(target, 0);
+                zi = zi + 1;
+            }
+        }
+    }
+}
+
+fn pass2(lines as *pl.ParsedLines, symtab as *elf.SymbolTable, text_buf as *buf.ByteBuffer,
+         data_buf as *buf.ByteBuffer, rodata_buf as *buf.ByteBuffer, bss_size as *i64,
+         relocs as *elf.RelocList, data_relocs as *elf.RelocList) as void {
+    let is i32 as i with mut = 0;
+    _dbg_reset();
+    _cfi_reset();
+    _cfi_enabled = 0;
+    if (tgt.target_get().object_format == 1) { _cfi_enabled = 1; }
+
+    while (i < lines.count) {
+        let is *pl.ParsedLine as line = pl.pl_get(lines, i);
+
+        if (line.kind == pl.LINE_INST) {
+            // pass1 already assigns per-section offsets to instructions; pass2
+            // used to encode every one into text_buf regardless, so a function
+            // emitted under `.section .foo` silently landed in .text. Route the
+            // bytes (and its relocations) to the section the line belongs to.
+            let is *buf.ByteBuffer as itgt with mut = text_buf;
+            let is *elf.RelocList as irl with mut = relocs;
+            if (line.section >= cs.SECTION_CUSTOM_BASE) {
+                let is *i64 as ibp = cast(*i64, cs.csec_buf_ptrs);
+                itgt = cast(*buf.ByteBuffer, ibp[line.section - cs.SECTION_CUSTOM_BASE]);
+                let is *i64 as irp = cast(*i64, cs.csec_reloc_ptrs);
+                irl = cast(*elf.RelocList, irp[line.section - cs.SECTION_CUSTOM_BASE]);
+            }
+            pass2_encode_inst(line, symtab, itgt, irl);
+        }
+        else if (line.kind == pl.LINE_DIRECTIVE) {
+            // Debug directives: `.file` records the source path, `.loc`
+            // registers the current .text offset with the line it starts.
+            if (line.dir_kind == pl.DIR_FILE) {
+                if (line.dir_arg_len > 0) {
+                    dbg_file_ptr = line.dir_arg_ptr;
+                    dbg_file_len = line.dir_arg_len;
+                }
+            } else if (line.dir_kind == pl.DIR_LOC) {
+                let is i32 as ln = cast(i32, line.dir_num);
+                if (ln != dbg_last_line) {
+                    _dbg_add(text_buf.len, cast(i64, ln));
+                    dbg_last_line = ln;
+                }
+            } else if (line.dir_kind == pl.DIR_DBG_PROLOGUE_END) {
+                if (text_buf.len > 0) { _dbg_pend_add(text_buf.len); }
+            } else if (line.dir_kind == pl.DIR_CFI_STARTPROC) {
+                if (_cfi_enabled == 1) {
+                    _cfi_active = 1;
+                    _cfi_fn_start = text_buf.len;
+                    _cfi_last = 0;
+                    _cfi_buf.len = 0;
+                    _cfi_cur_name = line.dir_arg_ptr;
+                    _cfi_cur_nlen = line.dir_arg_len;
+                }
+            } else if (line.dir_kind == pl.DIR_CFI_ENDPROC) {
+                if (_cfi_enabled == 1 && _cfi_active == 1) {
+                    _cfi_active = 0;
+                    _cfi_record(_cfi_cur_name, _cfi_cur_nlen, _cfi_buf.data, cast(i32, _cfi_buf.len));
+                }
+            } else if (line.dir_kind == pl.DIR_CFI_DEF_CFA_OFFSET) {
+                if (_cfi_enabled == 1 && _cfi_active == 1) {
+                    _cfi_advance(text_buf.len - _cfi_fn_start);
+                    buf.buf_emit8(&_cfi_buf, 14);              // DW_CFA_def_cfa_offset
+                    _cfi_uleb(line.dir_num);
+                }
+            } else if (line.dir_kind == pl.DIR_CFI_DEF_CFA_REGISTER) {
+                if (_cfi_enabled == 1 && _cfi_active == 1) {
+                    _cfi_advance(text_buf.len - _cfi_fn_start);
+                    buf.buf_emit8(&_cfi_buf, 13);              // DW_CFA_def_cfa_register
+                    _cfi_uleb(cast(i64, _cfi_dwarf_reg(line.dir_arg_len)));
+                }
+            } else if (line.dir_kind == pl.DIR_CFI_OFFSET) {
+                if (_cfi_enabled == 1 && _cfi_active == 1) {
+                    _cfi_advance(text_buf.len - _cfi_fn_start);
+                    let is i32 as dr = _cfi_dwarf_reg(line.dir_arg_len);
+                    buf.buf_emit8(&_cfi_buf, 128 | dr);        // DW_CFA_offset
+                    _cfi_uleb((0 - line.dir_num) / 8);          // factored by -8
+                }
+            } else {
+            let is *buf.ByteBuffer as target with mut = text_buf;
+            if (line.section == cs.SECTION_DATA)   { target = data_buf; }
+            if (line.section == cs.SECTION_RODATA) { target = rodata_buf; }
+            if (line.section >= cs.SECTION_CUSTOM_BASE) {
+                let is *i64 as bp = cast(*i64, cs.csec_buf_ptrs);
+                target = cast(*buf.ByteBuffer, bp[line.section - cs.SECTION_CUSTOM_BASE]);
+            }
+            if (line.dir_kind == pl.DIR_LONG && line.dir_arg_len > 0) {
+                let is i32 as rd_idx = elf.sym_find_or_add(symtab, line.dir_arg_ptr, line.dir_arg_len, cs.SECTION_UNDEF, 0, 0);
+                elf.reloc_add(relocs, cast(i64, target.len), cast(i64, rd_idx), elf.R_X86_64_PC32, 0 - 4);
+                buf.buf_emit32_le(target, 0);
+            } else if (line.dir_kind == pl.DIR_QUAD && line.dir_arg_len > 0) {
+                // `.quad <symbol>` emits an R_X86_64_64 relocation at the
+                // current section's offset. Each section has its own reloc
+                // list so the ELF writer can emit one .rela.<name> each.
+                let is i32 as sym_idx = elf.sym_find_or_add(symtab, line.dir_arg_ptr, line.dir_arg_len, cs.SECTION_UNDEF, 0, 0);
+                let is *elf.Symbol as ext_sym = elf.sym_get(symtab, sym_idx);
+                // Absolute relocation does not change a defined label's binding.
+                if (ext_sym.section == cs.SECTION_UNDEF) { ext_sym.is_global = 1; }
+                let is i64 as off = cast(i64, target.len);
+                let is *elf.RelocList as dest_relocs with mut = relocs;
+                if (line.section == cs.SECTION_DATA) { dest_relocs = data_relocs; }
+                if (line.section >= cs.SECTION_CUSTOM_BASE) {
+                    let is *i64 as rp = cast(*i64, cs.csec_reloc_ptrs);
+                    dest_relocs = cast(*elf.RelocList, rp[line.section - cs.SECTION_CUSTOM_BASE]);
+                }
+                elf.reloc_add(dest_relocs, off, cast(i64, sym_idx), elf.R_X86_64_64, 0);
+                buf.buf_emit64_le(target, 0);
+            } else {
+                pass2_emit_directive(line, target, bss_size);
+            }
+            }
+        }
+        i = i + 1;
+    }
+
+    // PE/COFF objects always carry .cstdebug (the linker reads it there); ELF
+    // objects only with -g, so a plain build's object stays byte-identical.
+    if (tgt.target_get().object_format == 2 || tgt.debug_get() == 1) { _dbg_emit_section(); }
+    // .cstcfi (SysV unwind) for ELF objects.
+    if (_cfi_enabled == 1) { _cfi_emit_section(); }
+}

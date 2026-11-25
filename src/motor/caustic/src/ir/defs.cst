@@ -1,0 +1,1158 @@
+use "../../std/mem.cst" only pool, bins, core as mem;
+
+// === IR opcodes ===
+let is i32 as IR_IMM           with imut = 0;
+let is i32 as IR_MOV           with imut = 1;
+let is i32 as IR_ADD           with imut = 2;
+let is i32 as IR_SUB           with imut = 3;
+let is i32 as IR_MUL           with imut = 4;
+let is i32 as IR_DIV           with imut = 5;
+let is i32 as IR_MOD           with imut = 6;
+let is i32 as IR_NEG           with imut = 7;
+let is i32 as IR_EQ            with imut = 8;
+let is i32 as IR_NE            with imut = 9;
+let is i32 as IR_LT            with imut = 10;
+let is i32 as IR_LE            with imut = 11;
+let is i32 as IR_GT            with imut = 12;
+let is i32 as IR_GE            with imut = 13;
+let is i32 as IR_JMP           with imut = 14;
+let is i32 as IR_JZ            with imut = 15;
+let is i32 as IR_JNZ           with imut = 16;
+let is i32 as IR_LABEL         with imut = 17;
+let is i32 as IR_CALL          with imut = 18;
+let is i32 as IR_RET           with imut = 19;
+let is i32 as IR_LOAD          with imut = 20;
+let is i32 as IR_STORE         with imut = 21;
+let is i32 as IR_PHI           with imut = 22;
+let is i32 as IR_ASM           with imut = 23;
+let is i32 as IR_CAST          with imut = 24;
+let is i32 as IR_SHL           with imut = 25;
+let is i32 as IR_SHR           with imut = 26;
+let is i32 as IR_AND           with imut = 27;
+let is i32 as IR_OR            with imut = 28;
+let is i32 as IR_XOR           with imut = 29;
+let is i32 as IR_NOT           with imut = 30;
+let is i32 as IR_GET_ARG       with imut = 31;
+let is i32 as IR_SET_ARG       with imut = 32;
+let is i32 as IR_SET_SYS_ARG   with imut = 33;
+let is i32 as IR_SYSCALL       with imut = 34;
+let is i32 as IR_COPY          with imut = 35;
+let is i32 as IR_ADDR          with imut = 36;
+let is i32 as IR_ADDR_GLOBAL   with imut = 37;
+let is i32 as IR_GET_ALLOC_ADDR with imut = 38;
+let is i32 as IR_SET_CTX       with imut = 39;
+let is i32 as IR_FN_ADDR       with imut = 40;
+let is i32 as IR_FADD          with imut = 41;
+let is i32 as IR_FSUB          with imut = 42;
+let is i32 as IR_FMUL          with imut = 43;
+let is i32 as IR_FDIV          with imut = 44;
+let is i32 as IR_FNEG          with imut = 45;
+let is i32 as IR_VA_START      with imut = 46;
+let is i32 as IR_CALL_INDIRECT with imut = 47;
+// FFI call: calls a Windows DLL function via the IAT. Behaves like
+// IR_CALL but the codegen lowers it with MS x64 ABI (reordered arg
+// regs, 32-byte shadow space) and emits `call qword ptr [rip+__imp_X]`.
+// The dll_name string (e.g. "kernel32.dll") rides on the IRInst so the
+// assembler can emit a `.cstimport <dll> <name>` directive.
+let is i32 as IR_FFI_CALL      with imut = 48;
+// Hardware sqrt: lowers to `sqrtsd xmm0, xmm0`. Bypasses libm; emitted when
+// the parser sees `__builtin_sqrt(x)` (and used by std/math.cst's sqrt wrapper).
+let is i32 as IR_FSQRT         with imut = 49;
+let is i32 as IR_MULHI_U64     with imut = 92;   // high half of a*b, unsigned
+
+// LEA fusion: dest = base + idx * scale, emits a single x86 `lea` instead
+// of the mov+shl+add chain. Scale is encoded in the opcode itself so the
+// IRInst layout stays unchanged. src1 = base, src2 = idx (both VREG).
+let is i32 as IR_LEA2          with imut = 50;
+let is i32 as IR_LEA4          with imut = 51;
+let is i32 as IR_LEA8          with imut = 52;
+
+// === Atomics (B1) — all seq_cst. cast_to carries the pointee type (4/8-byte).
+// Each behaves as a full memory barrier / opaque read-write call: it must be
+// in every optimizer side-effect list (has_side_effects, opt_cse, opt_prop,
+// opt_loop, opt_sr) and a regalloc call-position clobber (alloc_core), exactly
+// like IR_SYSCALL. CAS uses a fixed two-instruction pair: IR_CAS_EXPECTED loads
+// the expected value into rax, IR_ATOMIC_CAS does `lock cmpxchg` and leaves the
+// OLD value in rax. The pair must stay adjacent.
+let is i32 as IR_ATOMIC_LOAD   with imut = 53;  // dest=old, src1=ptr            (plain mov; load is acquire on x86)
+let is i32 as IR_ATOMIC_STORE  with imut = 54;  // src1=ptr, src2=val            (xchg [mem], val — seq_cst store)
+let is i32 as IR_ATOMIC_ADD    with imut = 55;  // dest=old, src1=ptr, src2=val  (lock xadd)
+let is i32 as IR_ATOMIC_XCHG   with imut = 56;  // dest=old, src1=ptr, src2=val  (xchg)
+let is i32 as IR_CAS_EXPECTED  with imut = 57;  // src1=expected -> rax
+let is i32 as IR_ATOMIC_CAS    with imut = 58;  // dest=old, src1=ptr, src2=desired (lock cmpxchg)
+let is i32 as IR_FENCE         with imut = 59;  // mfence
+// if-conversion: dest = src1(cond) ? src2(vtrue) : dest. dest is TIED (the
+// false-value is preloaded into dest by a preceding IR_MOV). Lowers to
+// `test cond,cond; cmovne dest, vtrue`. Created late (just before regalloc)
+// by pass_ifconv so no mid-end pass needs to know about it.
+let is i32 as IR_CMOV          with imut = 60;
+// SIMD (auto-vectorizer). dest of VZERO/VLOAD/VADD is an XMM (128-bit) vreg;
+// VREDUCE produces a GPR (horizontal sum). Created late by the vectorizer and
+// lowered to packed SSE2; see src/ir/vec/.
+let is i32 as IR_VZERO         with imut = 61;  // dest(XMM) = 0           (pxor)
+let is i32 as IR_VLOADQ        with imut = 62;  // dest(XMM) = [src1 GPR]  (movdqu)
+let is i32 as IR_VADDQ         with imut = 63;  // dest(XMM) = src1 + src2 (paddq, 2x i64)
+let is i32 as IR_VREDUCEQ      with imut = 64;  // dest(GPR) = lane0+lane1 of src1(XMM)
+let is i32 as IR_VADDD         with imut = 65;  // dest(XMM) = src1 + src2 (paddd, 4x i32)
+let is i32 as IR_VREDUCED      with imut = 66;  // dest(GPR) = sum of 4 i32 lanes of src1(XMM)
+let is i32 as IR_VADDPD        with imut = 67;  // dest(XMM) = src1 + src2 (addpd, 2x f64)
+let is i32 as IR_VREDUCEPD     with imut = 68;  // dest(XMM f64) = lane0 + lane1 of src1(XMM)
+let is i32 as IR_VSTOREQ       with imut = 69;  // store 128b: [src1(base)+dest.imm(off)] = src2(XMM). dest=OP_IMM (no def)
+let is i32 as IR_VSUBQ         with imut = 70;  // dest(XMM) = src1 - src2 (psubq, 2x i64)
+let is i32 as IR_VSUBD         with imut = 71;  // dest(XMM) = src1 - src2 (psubd, 4x i32)
+let is i32 as IR_VSUBPD        with imut = 72;  // dest(XMM) = src1 - src2 (subpd, 2x f64)
+let is i32 as IR_VMULPD        with imut = 73;  // dest(XMM) = src1 * src2 (mulpd, 2x f64)
+let is i32 as IR_VDIVPD        with imut = 74;  // dest(XMM) = src1 / src2 (divpd, 2x f64)
+// --- AVX2 (256-bit) — emitted as raw VEX .byte from codegen; dest uses the ymm
+// view of an allocated xmm reg. Selected at runtime via IR_HASAVX2 dispatch. ---
+let is i32 as IR_HASAVX2       with imut = 75;  // dest(GPR) = 1 if CPU has AVX2 else 0 (inline cpuid)
+let is i32 as IR_VZERO256      with imut = 76;  // dest(YMM) = 0 (vpxor)
+let is i32 as IR_VLOADQ256     with imut = 77;  // dest(YMM) = [src1(base) + dest.imm? no] ; src1=addr, load 32B (vmovdqu)
+let is i32 as IR_VADDQ256      with imut = 78;  // dest = src1 + src2 (vpaddq, 4x i64)
+let is i32 as IR_VADDD256      with imut = 79;  // dest = src1 + src2 (vpaddd, 8x i32)
+let is i32 as IR_VADDPD256     with imut = 80;  // dest = src1 + src2 (vaddpd, 4x f64)
+let is i32 as IR_VREDUCEQ256   with imut = 81;  // dest(GPR) = sum of 4 i64 lanes
+let is i32 as IR_VREDUCED256   with imut = 82;  // dest(GPR) = sum of 8 i32 lanes
+let is i32 as IR_VREDUCEPD256  with imut = 83;  // dest(XMM f64) = sum of 4 f64 lanes
+let is i32 as IR_VSUBQ256      with imut = 84;  // dest = src1 - src2 (vpsubq, 4x i64)
+let is i32 as IR_VSUBD256      with imut = 85;  // dest = src1 - src2 (vpsubd, 8x i32)
+let is i32 as IR_VSUBPD256     with imut = 86;  // dest = src1 - src2 (vsubpd, 4x f64)
+let is i32 as IR_VMULPD256     with imut = 87;  // dest = src1 * src2 (vmulpd, 4x f64)
+let is i32 as IR_VDIVPD256     with imut = 88;  // dest = src1 / src2 (vdivpd, 4x f64)
+let is i32 as IR_VSTOREQ256    with imut = 89;  // store 32B: [src1(addr)] = src2(YMM) (vmovdqu)
+let is i32 as IR_VSPLATPD      with imut = 90;  // dest(XMM) = [src1, src1] — broadcast f64 scalar to 2 lanes (movddup)
+let is i32 as IR_VSPLATPD256   with imut = 91;  // dest(YMM) = [k,k,k,k] — broadcast f64 scalar to 4 lanes (vbroadcastsd)
+let is i32 as IR_VMULQ         with imut = 93;  // dest(XMM) = src1 * src2, 2x i64 low 64 bits (pmuludq + shifts)
+let is i32 as IR_VMULQ256      with imut = 94;  // dest(YMM) = src1 * src2, 4x i64 low 64 bits (vpmuludq + shifts)
+let is i32 as IR_VSPLATB       with imut = 95;  // dest(XMM) = low byte of src1(GPR) in all 16 lanes
+let is i32 as IR_VSPLATB256    with imut = 96;  // dest(YMM) = low byte of src1(GPR) in all 32 lanes
+let is i32 as IR_VCMPEQB       with imut = 97;  // dest(XMM) = 0xFF where src1 byte == src2 byte, else 0 (pcmpeqb)
+let is i32 as IR_VCMPEQB256    with imut = 98;  // same, 32 bytes (vpcmpeqb)
+let is i32 as IR_VSADBW        with imut = 99;  // dest(XMM) = per 8 bytes, sum |src1 - src2| into a u64 lane (psadbw)
+let is i32 as IR_VSADBW256     with imut = 100; // same, 4 lanes (vpsadbw)
+let is i32 as IR_VPAND         with imut = 101; // dest(XMM) = src1 & src2 (pand)
+let is i32 as IR_VPAND256      with imut = 102; // dest(YMM) = src1 & src2 (vpand)
+// Generic SIMD from the loop widener: the operation and its shape are in
+// dest.label (see vec/vec_ops.cst). VOP defines an xmm-class vreg, VOPG a GPR.
+let is i32 as IR_VOP           with imut = 103;
+let is i32 as IR_VOPG          with imut = 104;
+// x86 codegen only (emit_driver.cst rol_fold): dest = src1 rotated left by
+// src2 (an immediate) within the width of cast_to (4 or 8 bytes).
+let is i32 as IR_ROL           with imut = 105;
+// -O2 on x86: dest = the 64 bits of src1, read as the other register class: an
+// f64 as an integer or an integer as an f64 (`*cast(*i64, &x)`, gen_expr.cst).
+// Not a copy: the passes that look through MOV must not read through this.
+let is i32 as IR_BITS          with imut = 106;
+
+// === Vectorizer (LLVM-class, src/ir/vec/) debug flag ===
+// vec_debug: -debugvec — dumps loop discovery / SCEV / descriptors / legality from
+// the Legal->Plan->Execute vectorizer (vec/vec_driver.cst). -O2-only; the -O1
+// bootstrap never runs the vectorizer (so the self-host fixpoint is untouched).
+let is i32 as vec_debug  with mut = 0;
+
+// === Operand types ===
+let is i32 as OP_NONE  with imut = 0;
+let is i32 as OP_VREG  with imut = 1;
+let is i32 as OP_IMM   with imut = 2;
+let is i32 as OP_LABEL with imut = 3;
+// Codegen only (x86, after every IR pass): the address of a LOAD or STORE is
+// the global of the IR_ADDR_GLOBAL in imm, read as [rip+sym] by the access
+// itself (codegen/emit_driver.cst rip_fold).
+let is i32 as OP_GSYM  with imut = 4;
+// Codegen only (x86): an f64 constant read from the constant pool, imm = its
+// pool index (codegen/emit_driver.cst fconst_fold, emit_output.cst fc_*).
+let is i32 as OP_FCONST with imut = 5;
+
+// === Structs ===
+
+struct Operand {
+    // op_type narrowed to i8 (few operand kinds); Operand is embedded 3x in every
+    // IRInst, so this and the IRInst narrowing below shrink the IR pool slot
+    // directly (the pool slot == sizeof(IRInst), no class rounding). Storage only:
+    // reads widen back to i32.
+    op_type as i8;
+    vreg as i32;
+    imm as i64;
+    label as i32;
+}
+
+struct IRInst {
+    op as i8;             // <128 opcodes
+    next as *IRInst;
+    dest as Operand;
+    src1 as Operand;
+    src2 as Operand;
+    line as i32;
+    is_dead as i8;
+    asm_str_ptr as *u8;
+    asm_str_len as i32;   // inline asm can be long — keep i32
+    call_name_ptr as *u8;
+    call_name_len as i16;
+    is_variadic_call as i8;
+    is_extern_call as i8;
+    global_name_ptr as *u8;
+    global_name_len as i16;
+    is_extern_global as i8;
+    cast_to as *u8;
+    cast_from as *u8;
+    // Bytes following the disp32 field within this instruction (0..5). The
+    // codegen sets it on instructions that emit a PC-relative disp32 with a
+    // non-empty tail (e.g. `mov [rip+sym], imm8` has tail=1). The COFF path
+    // uses it to pick REL32_N (5..9) instead of plain REL32 (4) so the
+    // implicit -(4+N) addend matches the disp32 position.
+    disp_tail_bytes as i8;     // 0..5
+}
+
+struct IRFunction {
+    addr_taken as i32;        // set by emit_driver.cst codegen (d.params_canonical)
+    name_ptr as *u8;
+    name_len as i32;
+    asm_name_ptr as *u8;
+    asm_name_len as i32;
+    instructions as *IRInst;
+    vreg_count as i32;
+    label_count as i32;
+    is_reachable as i32;
+    alloc_stack_size as i32;
+    stack_size as i32;
+    num_args as i32;
+    is_variadic as i32;
+    is_noinline as i32;       // `with noinline`: never inlined
+    is_naked as i32;          // `with naked`: skip prologue/epilogue (asm-only body)
+    // `with section(".name")` on a function. Empty for the usual .text case.
+    // Codegen wraps the body in a .section directive; the assembler routes the
+    // encoded bytes into that section's buffer and the linker maps it +X.
+    fn_section_ptr as *u8;
+    fn_section_len as i32;
+    has_stack_ops as i32;
+    has_asm as i32;           // body contains inline `asm`: never inlinable
+    is_dyn_import as i32;     // set per emission: body belongs to a shared runtime
+    is_recursive as i32;
+    live_inst_count as i32;
+    ast_node as *u8;
+    call_targets as *u8;
+    call_target_count as i32;
+    // Per-vreg class (filled by infer_vreg_classes before regalloc):
+    //   0 = VR_GPR (integer/pointer, allocated to rax/rbx/r8…)
+    //   1 = VR_XMM (f64, allocated to xmm0…xmm15)
+    // Pointer is null until inferred.
+    vreg_class as *i32;
+    // The function's pristine IR, packed (func_pack), while instructions is empty.
+    ir_blob as *u8;
+    // Stack-usage analysis (computed at codegen, used to declare the CSE stack).
+    // sa_frame: exact bytes this call level consumes (return addr + rbp +
+    // callee-saved pushes + aligned locals/spills/allocs), recorded by gen_func.
+    // sa_edges/sa_edge_count: direct-call edges (callee name+len pairs, 12B each).
+    // sa_indirect: 1 if the function makes any call through a function pointer.
+    // sa_state/sa_longest: scratch for the longest-path DFS (state 0/1/2 = unseen/
+    // visiting/done; longest = memoized deepest stack from this function down).
+    // Pointer first (kept 8-byte aligned, flanked by vreg_class/next pointers),
+    // then the i32 scalars grouped — a pointer at a +4 offset between i32s can
+    // alias under the Caustic struct layout (mixed-width gotcha).
+    sa_edges as *u8;
+    sa_frame as i32;
+    sa_edge_count as i32;
+    sa_indirect as i32;
+    sa_state as i32;
+    sa_longest as i32;
+    // What the function returns, set by IR generation: 0 unknown (e.g. read
+    // back from the IR cache), 1 void, 2 a value in a register, 3 a struct
+    // through a hidden pointer. i64 so `next` stays 8-byte aligned.
+    ret_kind as i64;
+    ir_blob_count as i64;     // instructions in ir_blob
+    ir_hash as i64;           // what the IR says, by value (func_value_hash)
+    key_a as i64;             // ir_hash folded with what callers can see of callees
+    key_b as i64;
+    next as *IRFunction;
+}
+
+let is i32 as VR_GPR with imut = 0;
+let is i32 as VR_XMM with imut = 1;
+
+struct IRGlobal {
+    name_ptr as *u8;
+    name_len as i32;
+    size as i32;
+    init_value as i64;
+    is_initialized as i32;
+    is_reachable as i32;
+    is_string_init as i32;
+    is_string_const as i32; // immutable alias to shared literal bytes
+    is_fn_ptr_init as i32;
+    init_fn_name_ptr as *u8;
+    init_fn_name_len as i32;
+    // Struct literal init: field-by-field emission in codegen. The raw AST
+    // pointer is kept so emit_data can walk entries at their field offsets.
+    is_struct_lit_init as i32;
+    struct_lit_ast as *u8;   // cast from *ast.Node (NK_STRUCT_LIT)
+    section_ptr as *u8;
+    section_len as i32;
+    next as *IRGlobal;
+}
+
+struct StringEntry {
+    id as i32;
+    ptr as *u8;
+    len as i32;
+    next as *StringEntry;
+    ht_next as *StringEntry;
+}
+
+struct IRProgram {
+    functions as *IRFunction;
+    main_func as *IRFunction;
+    globals as *IRGlobal;
+    strings as *StringEntry;
+}
+
+// === Config ===
+let is i32 as ir_opt_level with mut = 0;
+// --cpu=<name>: what an x86_64 build may assume about the CPU that runs it.
+let is i32 as CPU_X86_64 with imut = 0;  // default: SSE2 only, tuned for no CPU in particular
+let is i32 as CPU_AUTO   with imut = 1;  // SSE2 and AVX2 paths, picked by a cpuid test at run time
+let is i32 as CPU_V3     with imut = 2;  // AVX2 with no test, tuned for no CPU in particular
+let is i32 as CPU_ZNVER3 with imut = 3;  // AVX2 with no test, code layout tuned on Zen 3
+let is i32 as ir_cpu with mut = 0;
+
+// -O2, one file built into a static x86_64 ELF: nothing but this program's own
+// direct calls reaches a function whose address is never taken (main.cst says
+// when that is so; emit_driver.cst codegen looks for what would break it: a C
+// function that could call back, inline asm that calls). Such a function's narrow
+// integer parameter arrives in its canonical 64-bit form, as every other value
+// does, and needs no extending. params_canonical holds for the function being
+// generated; a call through an untyped pointer can pass anything.
+let is i32 as params_canon_ok with mut = 0;
+let is i32 as params_canon_prog with mut = 0;
+let is i32 as params_canonical with mut = 0;
+
+// Cross-module inline restriction. In --module-objects/--module-only mode this
+// is set to the target module's mangled prefix so pass_inline only inlines
+// SAME-module callees — matching --module-only (where imports are interface-only,
+// no bodies to inline) and making batch emission order-independent (deterministic
+// across -jN and convergent with the warm per-module .o). 0 = no restriction.
+let is *u8 as inline_mod_prefix_ptr with mut = cast(*u8, 0);
+let is i32 as inline_mod_prefix_len with mut = 0;
+fn set_inline_module(ptr as *u8, len as i32) as void { inline_mod_prefix_ptr = ptr; inline_mod_prefix_len = len; }
+
+// True iff `f` may be inlined under the current restriction (always true when no
+// restriction is set; otherwise only if f's asm_name is `<prefix>_...`).
+fn inline_callee_ok(f as *IRFunction) as i32 {
+    if (f.is_dyn_import == 1) { return 0; }
+    let is i32 as plen = inline_mod_prefix_len;
+    if (plen == 0) { return 1; }
+    if (f.asm_name_len < plen + 1) { return 0; }
+    let is *u8 as n = f.asm_name_ptr;
+    let is *u8 as p = inline_mod_prefix_ptr;
+    let is i32 as i with mut = 0;
+    while (i < plen) { if (n[i] != p[i]) { return 0; } i = i + 1; }
+    if (n[plen] != 95) { return 0; }   // '_' module/name boundary
+    return 1;
+}
+
+// === Allocator globals ===
+
+let is mem.Pool as _inst_pool with mut;
+let is mem.Bins as _ir_bins with mut;
+let is i32 as _ir_alloc_ready with mut = 0;
+
+fn ir_alloc_init() as void {
+    if (_ir_alloc_ready == 0) {
+        // IRInst pool. -O0 keeps every function's IR live at once; -O1's inline
+        // pass (emit_driver Phase 2a) regenerates AND re-optimizes every
+        // function and holds them all live simultaneously so callees can be
+        // inlined — and that regenerated+optimized form is *larger* than the
+        // -O0 original, so -O1 needs a bigger pool than -O0, not smaller. The
+        // old 32768 -O1 pool (and even 262144) underflowed on big inputs (the
+        // compiler itself), leaving new_inst's mem.pool.alloc null → memzero
+        // faulted on address 0. The backing region is mmap_anon (lazy), so a
+        // generous slot count costs virtual address space, not resident pages.
+        // -O2 on a whole browser ran past a million, and said so as out of memory
+        // with most of the machine's memory free.
+        let is i64 as pool_sz = 16777216;
+        _inst_pool = mem.pool.create(sizeof(IRInst), pool_sz, 0);
+        _ir_bins = mem.bins.bins_new(65536);
+        _ir_alloc_ready = 1;
+    }
+}
+
+fn ir_alloc_destroy() as void {
+    if (_ir_alloc_ready == 1) {
+        mem.pool.destroy(&_inst_pool);
+        mem.bins.bins_destroy(&_ir_bins);
+        _ir_alloc_ready = 0;
+    }
+}
+
+fn free_inst(i as *IRInst) as void {
+    mem.pool.free(&_inst_pool, cast(*u8, i));
+}
+
+fn free_func_insts(func as *IRFunction) as void {
+    let is *IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        let is *IRInst as next = inst.next;
+        mem.pool.free(&_inst_pool, cast(*u8, inst));
+        inst = next;
+    }
+    func.instructions = cast(*IRInst, 0);
+}
+
+// Deep-copy an instruction list into a fresh list of new IRInst nodes (from
+// _inst_pool). Operands are embedded (copied by value); the pointer fields
+// (call_name_ptr/asm_str_ptr/global_name_ptr/cast_to/cast_from) reference
+// immutable AST/string memory and are intentionally shared (shallow).
+//
+// Used by the parallel-exe per-module inline (emit_driver snapshot mode): a
+// worker clones ITS module's pristine post-frontend IR before inlining into the
+// clone, so the cross-module callee bodies it reads (COW-shared, never cloned in
+// this worker) stay pristine — making the per-module .o deterministic across -j
+// while still inlining across modules.
+fn clone_insts(head as *IRInst) as *IRInst {
+    let is *IRInst as nh with mut = cast(*IRInst, 0);
+    let is *IRInst as nt with mut = cast(*IRInst, 0);
+    let is *IRInst as cur with mut = head;
+    while (cast(i64, cur) != 0) {
+        let is *IRInst as c = cast(*IRInst, _ir_take(mem.pool.alloc(&_inst_pool), sizeof(IRInst)));
+        mem.core.memcpy(cast(*u8, c), cast(*u8, cur), sizeof(IRInst));
+        c.next = cast(*IRInst, 0);
+        if (cast(i64, nh) == 0) { nh = c; nt = c; } else { nt.next = c; nt = c; }
+        cur = cur.next;
+    }
+    return nh;
+}
+
+// A copy of one instruction, not linked anywhere.
+fn clone_inst(src as *IRInst) as *IRInst {
+    let is *IRInst as c = cast(*IRInst, _ir_take(mem.pool.alloc(&_inst_pool), sizeof(IRInst)));
+    mem.core.memcpy(cast(*u8, c), cast(*u8, src), sizeof(IRInst));
+    c.next = cast(*IRInst, 0);
+    return c;
+}
+
+fn is_inline_candidate(f as *IRFunction) as i32 {
+    if (f.is_dyn_import == 1) { return 0; }
+    if (f.is_variadic == 1) { return 0; }
+    if (f.alloc_stack_size != 0) { return 0; }
+    if (f.num_args > 6) { return 0; }
+    if (f.has_stack_ops == 1) { return 0; }
+    if (f.is_recursive == 1) { return 0; }
+    if (f.live_inst_count <= 0 || f.live_inst_count > 60) { return 0; }
+    return 1;
+}
+
+// opt_alloc/opt_free: delegated to opt_mem.cst (uses bins.cst directly, avoids only-import sizeof bug)
+use "opt_mem.cst" as om;
+
+fn opt_bins_init() as void { om.opt_bins_init(); }
+fn opt_alloc(size as i64) as *u8 { return om.opt_alloc(size); }
+fn opt_free(ptr as *u8) as void { om.opt_free(ptr); }
+fn opt_mmap(size as i64) as *u8 { return om.opt_mmap(size); }
+fn opt_munmap(ptr as *u8, size as i64) as void { om.opt_munmap(ptr, size); }
+fn opt_bins_destroy() as void { om.opt_bins_destroy(); }
+
+// === Helpers ===
+
+fn memzero(p as *u8, n as i64) as void {
+    let is i64 as words = n / 8;
+    let is *i64 as wp = cast(*i64, p);
+    let is i64 as i with mut = 0;
+    while (i < words) {
+        let is *i64 as dst = cast(*i64, cast(i64, wp) + i * 8);
+        *dst = 0;
+        i = i + 1;
+    }
+    i = words * 8;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+fn op_none() as Operand {
+    let is Operand as o;
+    memzero(cast(*u8, &o), sizeof(Operand));
+    o.op_type = OP_NONE;
+    return o;
+}
+
+fn op_vreg(v as i32) as Operand {
+    let is Operand as o;
+    memzero(cast(*u8, &o), sizeof(Operand));
+    o.op_type = OP_VREG;
+    o.vreg = v;
+    return o;
+}
+
+fn op_imm(i as i64) as Operand {
+    let is Operand as o;
+    memzero(cast(*u8, &o), sizeof(Operand));
+    o.op_type = OP_IMM;
+    o.imm = i;
+    return o;
+}
+
+fn op_label(l as i32) as Operand {
+    let is Operand as o;
+    memzero(cast(*u8, &o), sizeof(Operand));
+    o.op_type = OP_LABEL;
+    o.label = l;
+    return o;
+}
+
+// What the IR's allocators hand out, or the end of the compile: none of the
+// callers has anything to do with a null but write through it.
+// === Packed IR ===
+// The IR of a large program is a million instructions of 117 bytes each, and all of it
+// sits read-only in memory from IR generation to emission, shared by every worker, for
+// the sake of the one function each is working on. Packed, an instruction takes around
+// 15 bytes: zero fields are absent, integers are varints. A function is opened when it
+// is emitted or looked at by the inliner, and the opened copies are dropped in batches.
+
+let is i32 as ir_pack with mut = 0;
+let is *u8 as _pk_buf with mut = cast(*u8, 0);
+let is i64 as _pk_cap with mut = 0;
+let is i64 as _pk_len with mut = 0;
+let is *u8 as _blob_chunk with mut = cast(*u8, 0);
+let is i64 as _blob_left with mut = 0;
+let is i64 as BLOB_CHUNK with imut = 1048576;
+
+fn _pk_room(n as i64) as void {
+    if (_pk_len + n <= _pk_cap) { return; }
+    let is i64 as nc with mut = _pk_cap * 2;
+    if (nc < 65536) { nc = 65536; }
+    if (nc < _pk_len + n) { nc = _pk_len + n; }
+    let is *u8 as nb = opt_alloc(nc);
+    if (_pk_len > 0) { mem.core.memcpy(nb, _pk_buf, _pk_len); }
+    if (cast(i64, _pk_buf) != 0) { opt_free(_pk_buf); }
+    _pk_buf = nb;
+    _pk_cap = nc;
+}
+
+fn _pk_u8(v as i32) as void {
+    _pk_buf[_pk_len] = cast(u8, v);
+    _pk_len = _pk_len + 1;
+}
+
+// Unsigned LEB128 of the zigzag of v: small magnitudes of either sign are one byte.
+fn _pk_var(v as i64) as void {
+    let is i64 as u with mut = (v << 1) ^ (v >> 63);
+    while ((u & (0 - 128)) != 0) {
+        _pk_u8(cast(i32, (u & 127) | 128));
+        u = (u >> 7) & 144115188075855871;
+    }
+    _pk_u8(cast(i32, u));
+}
+
+fn _pk_ptr(v as *u8) as void {
+    *cast(*i64, _pk_buf + _pk_len) = cast(i64, v);
+    _pk_len = _pk_len + 8;
+}
+
+fn _pk_operand(o as *Operand) as void {
+    let is i32 as tag with mut = cast(i32, o.op_type);
+    if (o.vreg != 0) { tag = tag | 16; }
+    if (o.imm != 0) { tag = tag | 32; }
+    if (o.label != 0) { tag = tag | 64; }
+    _pk_u8(tag);
+    if (o.vreg != 0) { _pk_var(cast(i64, o.vreg)); }
+    if (o.imm != 0) { _pk_var(o.imm); }
+    if (o.label != 0) { _pk_var(cast(i64, o.label)); }
+}
+
+fn _blob_alloc(n as i64) as *u8 {
+    if (n > BLOB_CHUNK / 4) {
+        let is *u8 as own = mem.core.mmap_anon(n);
+        if (cast(i64, own) == 0 || cast(i64, own) == 0 - 1) { mem.core.oom("the intermediate code", n); }
+        return own;
+    }
+    if (n > _blob_left) {
+        _blob_chunk = mem.core.mmap_anon(BLOB_CHUNK);
+        if (cast(i64, _blob_chunk) == 0 || cast(i64, _blob_chunk) == 0 - 1) { mem.core.oom("the intermediate code", BLOB_CHUNK); }
+        _blob_left = BLOB_CHUNK;
+    }
+    let is *u8 as r = _blob_chunk;
+    _blob_chunk = _blob_chunk + n;
+    _blob_left = _blob_left - n;
+    return r;
+}
+
+// === Strings by id ===
+let is *i64 as _str_tab with mut = cast(*i64, 0);
+let is i32 as _str_tab_cap with mut = 0;
+
+fn str_table_put(id as i32, e as *StringEntry) as void {
+    if (id >= _str_tab_cap) {
+        let is i32 as nc with mut = _str_tab_cap * 2;
+        if (nc < 4096) { nc = 4096; }
+        while (nc <= id) { nc = nc * 2; }
+        let is *i64 as na = cast(*i64, opt_alloc(cast(i64, nc) * 8));
+        let is i32 as k with mut = 0;
+        while (k < _str_tab_cap) { na[k] = _str_tab[k]; k = k + 1; }
+        while (k < nc) { na[k] = 0; k = k + 1; }
+        if (cast(i64, _str_tab) != 0) { opt_free(cast(*u8, _str_tab)); }
+        _str_tab = na;
+        _str_tab_cap = nc;
+    }
+    _str_tab[id] = cast(i64, e);
+}
+
+fn str_entry(id as i32) as *StringEntry {
+    if (id < 0 || id >= _str_tab_cap) { return cast(*StringEntry, 0); }
+    return cast(*StringEntry, _str_tab[id]);
+}
+
+// === What a function's IR says ===
+// By value, so two builds that lower the same source agree whatever their allocators
+// did: names by their bytes, a string by its contents and not its id (which moves when
+// any module before it adds one), a type by its shape. Lines stay out: they reach only
+// debug info, and a comment moving code must not cost an object.
+
+fn hash_mix(h as i64, v as i64) as i64 {
+    let is i64 as m = (h ^ v) * 1099511628211;
+    return m ^ ((m >> 29) & 34359738367);
+}
+
+fn hash_bytes(p as *u8, n as i64) as i64 {
+    let is i64 as h with mut = 0 - 3750763034362895579;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = (h ^ cast(i64, p[i])) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _hash_operand(h as i64, o as *Operand) as i64 {
+    let is i64 as x with mut = hash_mix(h, cast(i64, o.op_type));
+    x = hash_mix(x, cast(i64, o.vreg));
+    x = hash_mix(x, o.imm);
+    return hash_mix(x, cast(i64, o.label));
+}
+
+fn _hash_type(h as i64, ty as *u8, depth as i32) as i64 {
+    if (cast(i64, ty) == 0) { return hash_mix(h, 1); }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i64 as x with mut = hash_mix(h, cast(i64, t.kind));
+    x = hash_mix(x, cast(i64, t.size));
+    x = hash_mix(x, cast(i64, t.array_len));
+    if (t.name_len > 0 && cast(i64, t.name_ptr) != 0) { x = hash_mix(x, hash_bytes(t.name_ptr, cast(i64, t.name_len))); }
+    if (depth < 2) { x = _hash_type(x, cast(*u8, t.base), depth + 1); }
+    return x;
+}
+
+fn _hash_symbol(h as i64, p as *u8, n as i32) as i64 {
+    if (cast(i64, p) == 0 || n <= 0) { return hash_mix(h, 2); }
+    // A string literal's symbol, .LC<id>.
+    if (n > 3 && p[0] == 46 && p[1] == 76 && p[2] == 67) {
+        let is i32 as sid with mut = 0;
+        let is i32 as ci with mut = 3;
+        while (ci < n) { sid = sid * 10 + cast(i32, p[ci]) - 48; ci = ci + 1; }
+        let is *StringEntry as e = str_entry(sid);
+        if (cast(i64, e) != 0) { return hash_mix(hash_mix(h, 3), hash_bytes(e.ptr, cast(i64, e.len))); }
+    }
+    return hash_mix(h, hash_bytes(p, cast(i64, n)));
+}
+
+fn func_value_hash(f as *IRFunction) as i64 {
+    let is i64 as h with mut = hash_bytes(f.asm_name_ptr, cast(i64, f.asm_name_len));
+    h = hash_mix(h, cast(i64, f.vreg_count));
+    h = hash_mix(h, cast(i64, f.label_count));
+    h = hash_mix(h, cast(i64, f.alloc_stack_size));
+    h = hash_mix(h, cast(i64, f.stack_size));
+    h = hash_mix(h, cast(i64, f.num_args));
+    h = hash_mix(h, cast(i64, f.is_variadic) + cast(i64, f.is_noinline) * 2 + cast(i64, f.is_naked) * 4
+                    + cast(i64, f.has_stack_ops) * 8 + cast(i64, f.has_asm) * 16 + cast(i64, f.is_recursive) * 32);
+    h = hash_mix(h, cast(i64, f.live_inst_count));
+    h = hash_mix(h, f.ret_kind);
+    if (f.fn_section_len > 0) { h = hash_mix(h, hash_bytes(f.fn_section_ptr, cast(i64, f.fn_section_len))); }
+    let is *IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        h = hash_mix(h, cast(i64, i.op) + cast(i64, i.is_dead) * 256 + cast(i64, i.is_variadic_call) * 512
+                        + cast(i64, i.is_extern_call) * 1024 + cast(i64, i.is_extern_global) * 2048
+                        + cast(i64, i.disp_tail_bytes) * 4096);
+        h = _hash_operand(h, &i.dest);
+        h = _hash_operand(h, &i.src1);
+        h = _hash_operand(h, &i.src2);
+        if (i.asm_str_len > 0) { h = hash_mix(h, hash_bytes(i.asm_str_ptr, cast(i64, i.asm_str_len))); }
+        if (i.call_name_len != cast(i16, 0)) { h = _hash_symbol(h, i.call_name_ptr, cast(i32, i.call_name_len)); }
+        if (i.global_name_len != cast(i16, 0)) { h = _hash_symbol(h, i.global_name_ptr, cast(i32, i.global_name_len)); }
+        if (cast(i64, i.cast_to) != 0) { h = _hash_type(h, i.cast_to, 0); }
+        if (cast(i64, i.cast_from) != 0) { h = _hash_type(h, i.cast_from, 0); }
+        i = i.next;
+    }
+    return h;
+}
+
+// Move a function's instructions into its blob.
+fn func_pack(f as *IRFunction) as void {
+    _pk_len = 0;
+    let is i64 as count with mut = 0;
+    let is *IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        _pk_room(256);
+        _pk_u8(cast(i32, i.op));
+        let is i32 as fl with mut = 0;
+        if (i.line != 0) { fl = fl | 1; }
+        if (i.is_dead != cast(i8, 0)) { fl = fl | 2; }
+        if (cast(i64, i.asm_str_ptr) != 0 || i.asm_str_len != 0) { fl = fl | 4; }
+        if (cast(i64, i.call_name_ptr) != 0 || i.call_name_len != cast(i16, 0)) { fl = fl | 8; }
+        if (cast(i64, i.global_name_ptr) != 0 || i.global_name_len != cast(i16, 0)) { fl = fl | 16; }
+        if (cast(i64, i.cast_to) != 0) { fl = fl | 32; }
+        if (cast(i64, i.cast_from) != 0) { fl = fl | 64; }
+        if (i.is_variadic_call != cast(i8, 0) || i.is_extern_call != cast(i8, 0)
+            || i.is_extern_global != cast(i8, 0) || i.disp_tail_bytes != cast(i8, 0)) { fl = fl | 128; }
+        _pk_u8(fl);
+        if ((fl & 128) != 0) {
+            _pk_u8(cast(i32, i.is_variadic_call));
+            _pk_u8(cast(i32, i.is_extern_call));
+            _pk_u8(cast(i32, i.is_extern_global));
+            _pk_u8(cast(i32, i.disp_tail_bytes));
+        }
+        _pk_operand(&i.dest);
+        _pk_operand(&i.src1);
+        _pk_operand(&i.src2);
+        if ((fl & 1) != 0) { _pk_var(cast(i64, i.line)); }
+        if ((fl & 2) != 0) { _pk_u8(cast(i32, i.is_dead)); }
+        if ((fl & 4) != 0) { _pk_ptr(i.asm_str_ptr); _pk_var(cast(i64, i.asm_str_len)); }
+        if ((fl & 8) != 0) { _pk_ptr(i.call_name_ptr); _pk_var(cast(i64, i.call_name_len)); }
+        if ((fl & 16) != 0) { _pk_ptr(i.global_name_ptr); _pk_var(cast(i64, i.global_name_len)); }
+        if ((fl & 32) != 0) { _pk_ptr(i.cast_to); }
+        if ((fl & 64) != 0) { _pk_ptr(i.cast_from); }
+        count = count + 1;
+        i = i.next;
+    }
+    free_func_insts(f);
+    f.ir_blob_count = count;
+    if (_pk_len == 0) { f.ir_blob = cast(*u8, 0); return; }
+    f.ir_blob = _blob_alloc(_pk_len);
+    mem.core.memcpy(f.ir_blob, _pk_buf, _pk_len);
+}
+
+let is *u8 as _upk with mut = cast(*u8, 0);
+
+fn _upk_u8() as i32 {
+    let is i32 as v = cast(i32, _upk[0]);
+    _upk = _upk + 1;
+    return v;
+}
+
+fn _upk_var() as i64 {
+    let is i64 as u with mut = 0;
+    let is i64 as sh with mut = 0;
+    while (1 == 1) {
+        let is i64 as b = cast(i64, _upk[0]);
+        _upk = _upk + 1;
+        u = u | ((b & 127) << sh);
+        if ((b & 128) == 0) { break; }
+        sh = sh + 7;
+    }
+    let is i64 as half = (u >> 1) & 9223372036854775807;
+    return half ^ (0 - (u & 1));
+}
+
+fn _upk_ptr() as *u8 {
+    let is i64 as v = *cast(*i64, _upk);
+    _upk = _upk + 8;
+    return cast(*u8, v);
+}
+
+fn _upk_operand(o as *Operand) as void {
+    let is i32 as tag = _upk_u8();
+    o.op_type = cast(i8, tag & 15);
+    if ((tag & 16) != 0) { o.vreg = cast(i32, _upk_var()); }
+    if ((tag & 32) != 0) { o.imm = _upk_var(); }
+    if ((tag & 64) != 0) { o.label = cast(i32, _upk_var()); }
+}
+
+// A fresh instruction list out of a function's blob.
+fn func_unpack(f as *IRFunction) as *IRInst { return _unpack_into(f, &_inst_pool); }
+
+fn _unpack_into(f as *IRFunction, pool as *mem.pool.Pool) as *IRInst {
+    let is *IRInst as head with mut = cast(*IRInst, 0);
+    let is *IRInst as tail with mut = cast(*IRInst, 0);
+    _upk = f.ir_blob;
+    let is i64 as n with mut = f.ir_blob_count;
+    while (n > 0) {
+        let is *IRInst as i = cast(*IRInst, _ir_take(mem.pool.alloc(pool), sizeof(IRInst)));
+        memzero(cast(*u8, i), sizeof(IRInst));
+        i.op = cast(i8, _upk_u8());
+        let is i32 as fl = _upk_u8();
+        if ((fl & 128) != 0) {
+            i.is_variadic_call = cast(i8, _upk_u8());
+            i.is_extern_call = cast(i8, _upk_u8());
+            i.is_extern_global = cast(i8, _upk_u8());
+            i.disp_tail_bytes = cast(i8, _upk_u8());
+        }
+        _upk_operand(&i.dest);
+        _upk_operand(&i.src1);
+        _upk_operand(&i.src2);
+        if ((fl & 1) != 0) { i.line = cast(i32, _upk_var()); }
+        if ((fl & 2) != 0) { i.is_dead = cast(i8, _upk_u8()); }
+        if ((fl & 4) != 0) { i.asm_str_ptr = _upk_ptr(); i.asm_str_len = cast(i32, _upk_var()); }
+        if ((fl & 8) != 0) { i.call_name_ptr = _upk_ptr(); i.call_name_len = cast(i16, _upk_var()); }
+        if ((fl & 16) != 0) { i.global_name_ptr = _upk_ptr(); i.global_name_len = cast(i16, _upk_var()); }
+        if ((fl & 32) != 0) { i.cast_to = _upk_ptr(); }
+        if ((fl & 64) != 0) { i.cast_from = _upk_ptr(); }
+        if (cast(i64, tail) == 0) { head = i; } else { tail.next = i; }
+        tail = i;
+        n = n - 1;
+    }
+    return head;
+}
+
+fn free_inst_list(head as *IRInst) as void {
+    let is *IRInst as i with mut = head;
+    while (cast(i64, i) != 0) {
+        let is *IRInst as nx = i.next;
+        mem.pool.free(&_inst_pool, cast(*u8, i));
+        i = nx;
+    }
+}
+
+// Opened functions: f.instructions holds the pristine body until func_close_opened,
+// in a pool of their own, so the working pool can be emptied after every function.
+let is mem.pool.Pool as _open_pool with mut;
+let is i32 as _open_pool_ready with mut = 0;
+let is *i64 as _opened with mut = cast(*i64, 0);
+let is i32 as _opened_cap with mut = 0;
+let is i32 as _opened_n with mut = 0;
+let is i64 as _opened_insts with mut = 0;
+let is i64 as OPEN_KEEP_INSTS with imut = 4096;
+
+fn func_close_opened() as void {
+    let is i32 as k with mut = 0;
+    while (k < _opened_n) {
+        let is *IRFunction as f = cast(*IRFunction, _opened[k]);
+        f.instructions = cast(*IRInst, 0);
+        k = k + 1;
+    }
+    _opened_n = 0;
+    _opened_insts = 0;
+    if (_open_pool_ready == 1) {
+        _open_pool.freelist = cast(*u8, 0);
+        _open_pool.high_water = 0;
+        _open_pool.used_slots = 0;
+    }
+}
+
+fn func_open(f as *IRFunction) as void {
+    if (cast(i64, f) == 0 || cast(i64, f.instructions) != 0 || f.ir_blob_count == 0) { return; }
+    if (_open_pool_ready == 0) {
+        _open_pool = mem.pool.create(sizeof(IRInst), 16777216, 0);
+        _open_pool_ready = 1;
+    }
+    if (_opened_n >= _opened_cap) {
+        let is i32 as nc with mut = _opened_cap * 2;
+        if (nc < 1024) { nc = 1024; }
+        let is *i64 as na = cast(*i64, opt_alloc(cast(i64, nc) * 8));
+        let is i32 as k with mut = 0;
+        while (k < _opened_n) { na[k] = _opened[k]; k = k + 1; }
+        if (cast(i64, _opened) != 0) { opt_free(cast(*u8, _opened)); }
+        _opened = na;
+        _opened_cap = nc;
+    }
+    _opened[_opened_n] = cast(i64, f);
+    _opened_n = _opened_n + 1;
+    _opened_insts = _opened_insts + f.ir_blob_count;
+    f.instructions = _unpack_into(f, &_open_pool);
+}
+
+// Between functions, when no list is in use.
+fn func_trim_opened() as void {
+    if (_opened_insts > OPEN_KEEP_INSTS) { func_close_opened(); }
+}
+
+// Everything in the working pool is one function's: clones, what the passes made of
+// them, and the instructions they dropped along the way without giving them back.
+fn inst_pool_reset() as void {
+    _inst_pool.freelist = cast(*u8, 0);
+    _inst_pool.high_water = 0;
+    _inst_pool.used_slots = 0;
+}
+
+fn _ir_take(p as *u8, size as i64) as *u8 {
+    if (cast(i64, p) == 0) { mem.core.oom("the intermediate code", size); }
+    return p;
+}
+
+fn new_inst(op as i32) as *IRInst {
+    let is *IRInst as i = cast(*IRInst, _ir_take(mem.pool.alloc(&_inst_pool), sizeof(IRInst)));
+    memzero(cast(*u8, i), sizeof(IRInst));
+    i.op = cast(i8, op);
+    return i;
+}
+
+fn new_irfunc() as *IRFunction {
+    let is *IRFunction as f = cast(*IRFunction, _ir_take(mem.bins.bins_alloc(&_ir_bins, sizeof(IRFunction)), sizeof(IRFunction)));
+    memzero(cast(*u8, f), sizeof(IRFunction));
+    return f;
+}
+
+fn new_irglobal() as *IRGlobal {
+    let is *IRGlobal as g = cast(*IRGlobal, _ir_take(mem.bins.bins_alloc(&_ir_bins, sizeof(IRGlobal)), sizeof(IRGlobal)));
+    memzero(cast(*u8, g), sizeof(IRGlobal));
+    return g;
+}
+
+fn new_irprog() as *IRProgram {
+    let is *IRProgram as p = cast(*IRProgram, _ir_take(mem.bins.bins_alloc(&_ir_bins, sizeof(IRProgram)), sizeof(IRProgram)));
+    memzero(cast(*u8, p), sizeof(IRProgram));
+    return p;
+}
+
+fn new_string_entry() as *StringEntry {
+    let is *StringEntry as s = cast(*StringEntry, _ir_take(mem.bins.bins_alloc(&_ir_bins, sizeof(StringEntry)), sizeof(StringEntry)));
+    memzero(cast(*u8, s), sizeof(StringEntry));
+    return s;
+}
+
+fn str_dup(src as *u8, len as i32) as *u8 {
+    let is *u8 as dst = _ir_take(mem.bins.bins_alloc(&_ir_bins, cast(i64, len) + 1), cast(i64, len) + 1);
+    mem.core.memcpy(dst, src, cast(i64, len));
+    dst[len] = cast(u8, 0);
+    return dst;
+}
+
+fn str_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    if (mem.core.memcmp(a, b, cast(i64, alen)) != 0) { return 0; }
+    return 1;
+}
+
+// === Vreg class table accessors ===
+
+fn vreg_class_get(func as *IRFunction, vreg as i32) as i32 {
+    if (cast(i64, func.vreg_class) == 0) { return VR_GPR; }
+    if (vreg < 0 || vreg >= func.vreg_count) { return VR_GPR; }
+    let is *i32 as p = cast(*i32, cast(i64, func.vreg_class) + cast(i64, vreg) * 4);
+    return *p;
+}
+
+fn vreg_class_set(func as *IRFunction, vreg as i32, cls as i32) as void {
+    if (cast(i64, func.vreg_class) == 0) { return; }
+    if (vreg < 0 || vreg >= func.vreg_count) { return; }
+    let is *i32 as p = cast(*i32, cast(i64, func.vreg_class) + cast(i64, vreg) * 4);
+    *p = cls;
+}
+
+// Infer vreg classes from instruction stream. Run AFTER all IR for a func is
+// emitted but BEFORE regalloc.
+//
+// Rules (forward dataflow over the linked list of insts):
+//   - Result of IR_FADD/FSUB/FMUL/FDIV/FNEG/FSQRT is XMM.
+//   - Result of IR_LOAD/STORE with cast_to=f32/f64 is XMM.
+//   - Result of IR_CAST to float is XMM; to int is GPR (handled implicitly).
+//   - Result of IR_MOV/COPY inherits its source's class.
+//   - Result of IR_GET_ARG: a float parameter stays in an xmm when nothing
+//     can clobber it there: a function that makes no call, or a parameter read
+//     only before the first one. One that lives across calls is better in a
+//     callee-saved general register than in a stack slot, so it keeps the
+//     default, like a float a call returned (_call_float_local).
+// Default class is GPR. Iterates until fixed point so MOV chains propagate.
+// `sub rsp, 8` or `add rsp, N` alone: what a call with stack arguments emits as
+// an IR_ASM of its own. It names no slot and no value, unlike inline asm, so it
+// is no reason to give up on a function.
+fn is_stack_adjust(i as *IRInst) as i32 {
+    let is *u8 as s = i.asm_str_ptr;
+    let is i32 as n = i.asm_str_len;
+    if (n == 10 && str_eq(s, 10, "sub rsp, 8", 10) == 1) { return 1; }
+    if (n > 9 && n < 16 && str_eq(s, 9, "add rsp, ", 9) == 1) {
+        let is i32 as k with mut = 9;
+        while (k < n) { if (s[k] < 48 || s[k] > 57) { return 0; } k = k + 1; }
+        return 1;
+    }
+    return 0;
+}
+
+// True if the type pointer (an *ast.Type) is f32/f64. Reads the kind
+// field at offset 0 directly to avoid importing the parser into defs.
+// ast.TY_F32 = 9, ast.TY_F64 = 10.
+fn _ty_is_float(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 0; }
+    let is *i32 as kp = cast(*i32, cast(i64, ty_ptr));
+    if (*kp == 9 || *kp == 10) { return 1; }
+    return 0;
+}
+
+// A right shift of this type is arithmetic: a signed integer type (or none
+// given). Kinds are ast.TY_I8..TY_I64 = 1..4, read at offset 0 as above.
+fn ty_is_f64(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 0; }
+    if (*cast(*i32, ty_ptr) == 10) { return 1; }
+    return 0;
+}
+
+fn ty_shr_is_arith(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 1; }
+    let is *i32 as kp = cast(*i32, cast(i64, ty_ptr));
+    if (*kp >= 1 && *kp <= 4) { return 1; }
+    return 0;
+}
+
+// The float a call returns in xmm0 is read only before the next call, in its
+// own block: it then never has to live across a call and stays in an xmm.
+// (One that does is better in a callee-saved general register than in a
+// stack slot, so it keeps the default.)
+fn _call_float_local(c as *IRInst, v as i32) as i32 {
+    let is i32 as total with mut = 0;
+    let is *IRInst as w with mut = c.next;
+    // uses in the rest of the function
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            if (w.src1.op_type == OP_VREG && w.src1.vreg == v) { total = total + 1; }
+            if (w.src2.op_type == OP_VREG && w.src2.vreg == v) { total = total + 1; }
+            if (w.dest.op_type == OP_VREG && w.dest.vreg == v) {
+                if (w.op == IR_STORE || w.op == IR_SET_ARG) { total = total + 1; } else { return 0; }
+            }
+        }
+        w = w.next;
+    }
+    let is i32 as seen with mut = 0;
+    w = c.next;
+    while (cast(i64, w) != 0 && seen < total) {
+        if (w.is_dead == 0) {
+            let is i32 as op = w.op;
+            if (w.src1.op_type == OP_VREG && w.src1.vreg == v) { seen = seen + 1; }
+            if (w.src2.op_type == OP_VREG && w.src2.vreg == v) { seen = seen + 1; }
+            if (w.dest.op_type == OP_VREG && w.dest.vreg == v) { seen = seen + 1; }
+            if (seen < total && (op == IR_CALL || op == IR_CALL_INDIRECT || op == IR_FFI_CALL
+                || op == IR_LABEL || op == IR_JMP || op == IR_JZ || op == IR_JNZ || op == IR_RET
+                || op == IR_ASM || op == IR_SYSCALL)) { return 0; }
+        }
+        w = w.next;
+    }
+    return cast(i32, seen == total);
+}
+
+// -O2: a constant read only as a float (a returned 1.0, a phi's incoming value,
+// a float argument) is loaded from the pool into an xmm: not through a general
+// register. Called once the classes above have settled.
+fn _classify_float_imms(func as *IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    // 0 nothing yet; 1 one IMM def; 2 not one; +4 read as a float
+    let is *u8 as st = opt_alloc(cast(i64, vc) + 8);
+    let is i32 as i with mut = 0;
+    while (i < vc) { st[i] = cast(u8, 0); i = i + 1; }
+    let is *IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is i32 as v = w.dest.vreg;
+            if (w.op == IR_STORE || w.op == IR_COPY || w.op == IR_CMOV || w.op == IR_VSTOREQ || w.op == IR_VSTOREQ256) { st[v] = cast(u8, 2); }
+            else if (w.op == IR_IMM && st[v] == cast(u8, 0)) { st[v] = cast(u8, 1); }
+            else { st[v] = cast(u8, 2); }
+        }
+        w = w.next;
+    }
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            if (w.src2.op_type == OP_VREG && w.src2.vreg >= 0 && w.src2.vreg < vc) { st[w.src2.vreg] = cast(u8, 2); }
+            if (w.src1.op_type == OP_VREG && w.src1.vreg >= 0 && w.src1.vreg < vc) {
+                let is i32 as v = w.src1.vreg;
+                let is i32 as fl with mut = 0;
+                if (w.op == IR_RET && _ty_is_float(w.cast_to) == 1) { fl = 1; }
+                if (w.op == IR_MOV && w.dest.op_type == OP_VREG && vreg_class_get(func, w.dest.vreg) == VR_XMM) { fl = 1; }
+                if (w.op == IR_SET_ARG && w.src2.op_type == OP_IMM && w.src2.imm >= 100) { fl = 1; }
+                if (fl == 1) { st[v] = cast(u8, cast(i32, st[v]) | 4); }
+                else { st[v] = cast(u8, 2); }
+            }
+        }
+        w = w.next;
+    }
+    i = 0;
+    while (i < vc) {
+        if (st[i] == cast(u8, 5)) { vreg_class_set(func, i, VR_XMM); }
+        i = i + 1;
+    }
+    opt_free(st);
+}
+
+fn infer_vreg_classes(func as *IRFunction) as void {
+    if (func.vreg_count == 0) { return; }
+    func.vreg_class = cast(*i32, opt_alloc(cast(i64, func.vreg_count) * 4));
+    let is i32 as i with mut = 0;
+    while (i < func.vreg_count) {
+        let is *i32 as p = cast(*i32, cast(i64, func.vreg_class) + cast(i64, i) * 4);
+        *p = VR_GPR;
+        i = i + 1;
+    }
+    // Initial seeding: dest of every float op is XMM.
+    let is i32 as makes_call with mut = 0;
+    let is *IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && (inst.op == IR_CALL || inst.op == IR_CALL_INDIRECT || inst.op == IR_FFI_CALL
+            || inst.op == IR_SYSCALL || inst.op == IR_ASM)) { makes_call = 1; }
+        inst = inst.next;
+    }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == OP_VREG) {
+            let is i32 as op = inst.op;
+            // (at -O2: the other levels keep the simplest form)
+            if (op == IR_GET_ARG && ir_opt_level >= 2 && inst.src2.op_type == OP_IMM && inst.src2.imm >= 100
+                && (makes_call == 0 || _call_float_local(inst, inst.dest.vreg) == 1)) {
+                vreg_class_set(func, inst.dest.vreg, VR_XMM);
+            }
+            if (op == IR_FADD || op == IR_FSUB || op == IR_FMUL || op == IR_FDIV
+                || op == IR_FNEG || op == IR_FSQRT
+                || op == IR_VZERO || op == IR_VLOADQ || op == IR_VADDQ || op == IR_VADDD
+                || op == IR_VADDPD || op == IR_VREDUCEPD
+                || op == IR_VSUBQ || op == IR_VSUBD || op == IR_VSUBPD || op == IR_VMULPD || op == IR_VDIVPD
+                || op == IR_VZERO256 || op == IR_VLOADQ256 || op == IR_VADDQ256 || op == IR_VADDD256
+                || op == IR_VADDPD256 || op == IR_VREDUCEPD256
+                || op == IR_VSUBQ256 || op == IR_VSUBD256 || op == IR_VSUBPD256 || op == IR_VMULPD256 || op == IR_VDIVPD256
+                || op == IR_VSPLATPD || op == IR_VSPLATPD256 || op == IR_VMULQ || op == IR_VMULQ256
+                || op == IR_VSPLATB || op == IR_VSPLATB256 || op == IR_VCMPEQB || op == IR_VCMPEQB256
+                || op == IR_VSADBW || op == IR_VSADBW256 || op == IR_VPAND || op == IR_VPAND256
+                || op == IR_VOP) {
+                vreg_class_set(func, inst.dest.vreg, VR_XMM);
+            }
+        }
+        inst = inst.next;
+    }
+    // Seed XMM for every IR_LOAD whose cast_to is f32/f64. The loaded
+    // value is, by definition, a float held in memory — its only uses
+    // are float ops, f64 stores, f64->int casts, or being passed as a
+    // float arg, all of which already handle an xmm-class source. This
+    // lets the f64 LOAD fast path emit `movsd xmm,[mem]` directly
+    // instead of `mov gpr,[mem]; movq xmm,gpr`, and the forward MOV
+    // propagation below carries it through `mj = mov(load)` chains.
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && (inst.op == IR_LOAD || inst.op == IR_BITS) && inst.dest.op_type == OP_VREG
+            && cast(i64, inst.cast_to) != 0 && _ty_is_float(inst.cast_to) == 1) {
+            vreg_class_set(func, inst.dest.vreg, VR_XMM);
+        }
+        if (inst.is_dead == 0 && (inst.op == IR_CALL || inst.op == IR_CALL_INDIRECT) && inst.is_extern_call == 0
+            && inst.dest.op_type == OP_VREG && _ty_is_float(inst.cast_to) == 1
+            && _call_float_local(inst, inst.dest.vreg) == 1) {
+            vreg_class_set(func, inst.dest.vreg, VR_XMM);
+        }
+        // A conversion to a float runs in an xmm (cvtsi2sd, cvtsd2ss, ...)
+        // and its result stays there.
+        if (inst.is_dead == 0 && inst.op == IR_CAST && inst.dest.op_type == OP_VREG
+            && cast(i64, inst.cast_to) != 0 && _ty_is_float(inst.cast_to) == 1) {
+            vreg_class_set(func, inst.dest.vreg, VR_XMM);
+        }
+        inst = inst.next;
+    }
+    // Propagate through MOV/COPY. Iterate until stable.
+    let is i32 as changed with mut = 1;
+    let is i32 as iters with mut = 0;
+    while (changed == 1 && iters < 32) {
+        changed = 0;
+        iters = iters + 1;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.dest.op_type == OP_VREG
+                && (inst.op == IR_MOV || inst.op == IR_COPY)
+                && inst.src1.op_type == OP_VREG) {
+                let is i32 as src_cls = vreg_class_get(func, inst.src1.vreg);
+                let is i32 as dst_cls = vreg_class_get(func, inst.dest.vreg);
+                if (src_cls == VR_XMM && dst_cls == VR_GPR) {
+                    vreg_class_set(func, inst.dest.vreg, VR_XMM);
+                    changed = 1;
+                }
+            }
+            inst = inst.next;
+        }
+    }
+    if (ir_opt_level >= 2) { _classify_float_imms(func); }
+}
