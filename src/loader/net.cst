@@ -405,6 +405,19 @@ fn _get_data(u as *u8, r as *Resource) as i64 {
 
 fn get_data(u as *u8, r as *Resource) as i64 { return _get_data(u, r); }
 
+// For someone looking into a failure: the number, which says far more than the name does.
+fn _note_failure(rc as i64) as void {
+    if (env.getenv("CAUSTIC_JS_TRACE") == null) { return; }
+    let is [24]u8 as t;
+    let is i64 as i with mut = 23;
+    let is i64 as v with mut = 0 - rc;
+    t[23] = 10;
+    if (v <= 0) { i = i - 1; t[i] = 48; }
+    while (v > 0) { i = i - 1; t[i] = cast(u8, 48 + v % 10); v = v / 10; }
+    syscall(1, 2, "net: failed -", 13);
+    syscall(1, 2, cast(i64, &t) + i, 24 - i);
+}
+
 fn _get_http(f as *fetch.Fetch, u as *u8, r as *Resource) as i64 {
     return _exchange(f, u, cast(*u8, 0), cast(*u8, 0), 0, cast(*u8, 0), cast(*u8, 0), r);
 }
@@ -426,6 +439,7 @@ fn _exchange(f as *fetch.Fetch, u as *u8, ctype as *u8, body as *u8, n0 as i64, 
     if (cast(i64, ctype) != 0) { rc = fetch.fetch_post(f, u, ctype, body, n0, origin, referer, conn.deadline_in(DEADLINE_MS)); }
     else { rc = fetch.fetch_get(f, u, conn.deadline_in(DEADLINE_MS)); }
     if (rc != 0) {
+        _note_failure(rc);
         r.error = fetch.fetch_err_name(rc);
         fetch.fetch_free(f);
         return 0 - 1;

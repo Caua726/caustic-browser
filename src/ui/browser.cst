@@ -362,6 +362,7 @@ fn open(p as *ui.program.Program) as i32 {
     ui.app.set_title(br.a, br.win, NAME, ui.len(NAME));
     br.t = ui.app.tree(br.a, br.win);
     br.r = ui.app.router(br.a, br.win);
+    ui.router.set_key_first(br.r, cast(*u8, fn_ptr(_key_first)), cast(*u8, 0));
     let is *ui.tree.Tree as t = br.t;
 
     br.menu = ui.menu.create(t);
@@ -2277,6 +2278,53 @@ fn _date_key(d as *Doc, n as *dom.Node, k as i32, mods as i64) as i64 {
     return 1;
 }
 
+fn kv_of(k as i32) as i64 { return cast(i64, k); }
+// A key as a script knows it: its name, and the number scripts have always compared.
+fn _key_info(kv as i64, ch as *u8, info as *i64) as void {
+    let is *u8 as nm with mut = ch;
+    let is i64 as nn0 with mut = 1;
+    let is i64 as code with mut = kv;
+    if (kv >= 32 && kv < 127) {
+        ch[0] = cast(u8, kv);
+        if (kv >= 97 && kv <= 122) { code = kv - 32; }
+    }
+    else if (kv == cast(i64, keys.TAB)) { nm = "Tab"; nn0 = 3; code = 9; }
+    else if (kv == cast(i64, keys.RETURN)) { nm = "Enter"; nn0 = 5; code = 13; }
+    else if (kv == cast(i64, keys.ESCAPE)) { nm = "Escape"; nn0 = 6; code = 27; }
+    else if (kv == cast(i64, keys.BACKSPACE)) { nm = "Backspace"; nn0 = 9; code = 8; }
+    else if (kv == cast(i64, keys.LEFT)) { nm = "ArrowLeft"; nn0 = 9; code = 37; }
+    else if (kv == cast(i64, keys.UP)) { nm = "ArrowUp"; nn0 = 7; code = 38; }
+    else if (kv == cast(i64, keys.RIGHT)) { nm = "ArrowRight"; nn0 = 10; code = 39; }
+    else if (kv == cast(i64, keys.DOWN)) { nm = "ArrowDown"; nn0 = 9; code = 40; }
+    else if (kv == cast(i64, keys.HOME)) { nm = "Home"; nn0 = 4; code = 36; }
+    else if (kv == cast(i64, keys.END)) { nm = "End"; nn0 = 3; code = 35; }
+    else { nm = "Unidentified"; nn0 = 12; code = 0; }
+    info[0] = 0; info[1] = 0; info[2] = 0; info[3] = cast(i64, nm); info[4] = nn0; info[5] = code;
+}
+// A text field has the focus: the page hears the key first, with the field's text as it is,
+// and may keep the key, as a page that searches on Enter does.
+fn _key_first(user as *u8, k as i64, mods as i64, pressed as i64) as i64 {
+    if (_ed_widget == 0 || ui.router.focused(br.t, br.r) != _ed_widget) { return 0; }
+    if (pg.holds(_ed_doc.pg, _ed_pg) == 0 || pg.js_on(_ed_pg) == 0) { return 0; }
+    let is *dom.Node as n = _ed_node;
+    let is *pg.Page as p = _ed_pg;
+    let is *Doc as d = _ed_doc;
+    let is i64 as tn with mut = 0;
+    let is *u8 as tx = _ed_text(&tn);
+    forms.set_value(&p.doc, n, tx, tn);
+    let is [8]u8 as ch;
+    let is [6]i64 as info;
+    _key_info(k, cast(*u8, &ch), cast(*i64, &info));
+    let is i64 as ran with mut = 0;
+    if (pressed == 1) { ran = pg.js_event(p, n, "keydown", 7, cast(*i64, &info)); }
+    else { pg.js_event(p, n, "keyup", 5, cast(*i64, &info)); }
+    if (pg.js_changed() != 0) { _restyle(d); pg.js_clear(); }
+    _keep_js(d);
+    // A submit the script asked for happens with everything as it left it.
+    if ((ran & 2) != 0) { return 1; }
+    return 0;
+}
+
 fn _key_in(user as *u8, p as *pv.Pointer) as i64 {
     let is *Doc as d = cast(*Doc, user);
     if (_has_page(d) == 0) { return 0; }
@@ -2287,17 +2335,8 @@ fn _key_in(user as *u8, p as *pv.Pointer) as i64 {
         if (at0 == null) { at0 = pg.first_of(d.pg, "body"); }
         if (at0 != null) {
             let is [8]u8 as ch;
-            let is *u8 as nm with mut = cast(*u8, &ch);
-            let is i64 as nn0 with mut = 1;
-            let is i64 as kv = cast(i64, k);
-            if (kv >= 32 && kv < 127) { ch[0] = cast(u8, kv); }
-            else if (k == keys.TAB) { nm = "Tab"; nn0 = 3; }
-            else if (k == keys.RETURN) { nm = "Enter"; nn0 = 5; }
-            else if (k == keys.ESCAPE) { nm = "Escape"; nn0 = 6; }
-            else if (k == keys.BACKSPACE) { nm = "Backspace"; nn0 = 9; }
-            else { nm = "Unidentified"; nn0 = 12; }
             let is [6]i64 as info;
-            info[0] = 0; info[1] = 0; info[2] = 0; info[3] = cast(i64, nm); info[4] = nn0; info[5] = kv;
+            _key_info(kv_of(k), cast(*u8, &ch), cast(*i64, &info));
             let is i64 as ran = pg.js_event(d.pg, at0, "keydown", 7, cast(*i64, &info));
             if (pg.js_changed() != 0) { _restyle(d); pg.js_clear(); }
             _keep_js(d);
