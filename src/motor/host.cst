@@ -239,7 +239,7 @@ fn h_area(node as i64, op as i64, v as i64, n as i64, out as i64) as i64 {
 fn h_set_attr(node as i64, name as i64, nl as i64, v as i64, vl as i64) as i64 {
     dom.set_attr(cur_doc, cast(*dom.Node, node), _attr_name(cast(*dom.Node, node), name, nl), nl, cast(*u8, v), vl);
     dirty = 1;
-    if (cast(*dom.Node, node).tag == tg.SCRIPT) { sheets_touched = 1; }
+    if (cast(*dom.Node, node).tag == tg.SCRIPT || cast(*dom.Node, node).tag == tg.LINK || cast(*dom.Node, node).tag == tg.STYLE) { sheets_touched = 1; }
     if (cast(*dom.Node, node).tag == tg.IMG && (nl == 3 || nl == 6)) { h_img(node, 0); }
     return 0;
 }
@@ -472,13 +472,34 @@ fn h_url(which as i64, out as i64) as i64 {
     return 0;
 }
 fn h_viewport(which as i64) as i64 { if (which == 0) { return view_w; } return view_h; }
+// Asking where something is can lay out the whole page, and a generator's stack is small: that
+// work runs on a stack kept for it. Nothing in layout comes back here while it is in use.
+let is i64 as _ask_stack with mut = 0;
+let is i64 as _ask_busy with mut = 0;
+let is i64 as ASK_STACK with imut = 33554432;
+fn _ask_work(info as i64) as i64 {
+    let is *i64 as a = cast(*i64, info);
+    if (a[0] == 0) { return call(rect_fn, owner, a[1], a[2]); }
+    return call(computed_fn, owner, a[1], a[2], a[3]);
+}
+fn _ask(kind as i64, node as i64, which as i64, out as i64) as i64 {
+    let is [4]i64 as a;
+    a[0] = kind; a[1] = node; a[2] = which; a[3] = out;
+    if (_ask_stack == 0) { _ask_stack = syscall(9, 0, ASK_STACK, 3, 34 + 16384, -1, 0); }
+    if (_ask_stack <= 0) { _ask_stack = 0; return _ask_work(cast(i64, &a)); }
+    if (_ask_busy == 1) { return _ask_work(cast(i64, &a)); }
+    _ask_busy = 1;
+    let is i64 as r = _stack_call(cast(*u8, fn_ptr(_ask_work)), cast(i64, &a), _ask_stack + ASK_STACK - 64);
+    _ask_busy = 0;
+    return r;
+}
 fn h_rect(node as i64, which as i64) as i64 {
     if (cast(i64, rect_fn) == 0) { return 0; }
-    return call(rect_fn, owner, node, which);
+    return _ask(0, node, which, 0);
 }
 fn h_computed(node as i64, which as i64, out as i64) as i64 {
     if (cast(i64, computed_fn) == 0) { return 0; }
-    return call(computed_fn, owner, node, which, out);
+    return _ask(1, node, which, out);
 }
 // document.cookie. The page's address, terminated, for the jar.
 let is [4096]u8 as cookie_url with mut;

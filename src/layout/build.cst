@@ -244,6 +244,8 @@ fn _box_shell(c as *bx.Ctx, n as *dom.Node, st as *style.Style, d as i64) as *bx
     let is i64 as pos = st.v.i[pr.P_POSITION];
     if (pos == pr.K_ABSOLUTE || pos == pr.K_FIXED) { b.is_abs = 1; }
     if (pos == pr.K_FIXED) { b.is_fixed = 1; }
+    // A <button>'s contents sit in the middle of it, however tall it is made.
+    if (cast(i64, n) != 0 && n.ns == dom.NS_HTML && n.tag == tg.BUTTON && kind == bx.B_BLOCK) { b.vcenter = 1; }
     return b;
 }
 

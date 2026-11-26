@@ -49,6 +49,7 @@ let is i64 as MAX_IMAGES  with imut = 512;
 // here yet. Nothing is applied until every one is in.
 struct SheetSlot {
     sheet  as *sh.Sheet;   // null when it came to nothing
+    link   as *dom.Node;   // the <link> that asked, when one did
     kept   as *u8;
     scope  as i64;
     depth  as i64;
@@ -71,6 +72,7 @@ struct ImgWatch {
     node  as *dom.Node;
     l     as *Loaded;
     fired as i64;
+    sheet as i64;     // a <link>'s: 1 its sheet came, 2 it did not, 0 not one of those
     next  as *ImgWatch;
 }
 
@@ -409,12 +411,17 @@ fn _ask_sheets_of(p as *Page, shadows as i64) as void {
                 let is *u8 as text = _element_text(&p.docs_a, x, &n);
                 _fill_slot(p, _new_slot(p, cast(*SheetSlot, 0), x.scope, 0), text, n, cast(*u8, &p.base));
             }
+            // Not for this medium: nothing to fetch yet, but a page waits to hear it has come
+            // before it switches the medium, which is how sheets are put off.
+            if (x.tag == tg.LINK && _media_excludes(x) == 1 && dom.find_attr(x, "href", 4) != null) { _sheet_told(p, x, 1); }
             if (x.tag == tg.LINK && _media_excludes(x) == 0) {
                 let is *dom.Attr as rel = dom.find_attr(x, "rel", 3);
                 let is *dom.Attr as href = dom.find_attr(x, "href", 4);
                 if (rel != null && href != null && _has_word_ci(rel.value, rel.value_len, "stylesheet") == 1 &&
                     _has_word_ci(rel.value, rel.value_len, "alternate") == 0) {
-                    _ask_sheet(p, _new_slot(p, cast(*SheetSlot, 0), x.scope, 0), href.value, href.value_len, cast(*u8, &p.base));
+                    let is *SheetSlot as ls = _new_slot(p, cast(*SheetSlot, 0), x.scope, 0);
+                    ls.link = x;
+                    _ask_sheet(p, ls, href.value, href.value_len, cast(*u8, &p.base));
                 }
             }
         }
@@ -539,7 +546,7 @@ fn _load_images(p as *Page) as void {
 // What this <img> shows now, asked for if nobody has yet.
 fn _img_watch(p as *Page, x as *dom.Node) as *ImgWatch {
     let is *ImgWatch as w with mut = p.img_watch;
-    while (w != null && w.node != x) { w = w.next; }
+    while (w != null && (w.node != x || w.sheet != 0)) { w = w.next; }
     let is *Loaded as l with mut = cast(*Loaded, 0);
     let is i64 as un with mut = 0;
     let is f64 as density with mut = 1.0;
@@ -563,11 +570,23 @@ fn _img_watch(p as *Page, x as *dom.Node) as *ImgWatch {
         w.node = x;
         w.l = cast(*Loaded, 0);
         w.fired = 0;
+        w.sheet = 0;
         w.next = p.img_watch;
         p.img_watch = w;
     }
     if (w.l != l) { w.l = l; w.fired = 0; }
     return w;
+}
+
+// A <link> whose sheet has an answer: load or error, with the pictures' events.
+fn _sheet_told(p as *Page, x as *dom.Node, ok as i64) as void {
+    let is *ImgWatch as w = cast(*ImgWatch, arena.alloc(&p.docs_a, sizeof(ImgWatch)));
+    w.node = x;
+    w.l = cast(*Loaded, 0);
+    w.fired = 0;
+    w.sheet = 2 - ok;
+    w.next = p.img_watch;
+    p.img_watch = w;
 }
 
 // Tells scripts about every picture whose answer has come. Their handlers may ask for more.
@@ -581,9 +600,9 @@ fn _img_fire(p as *Page) as void {
         again = 0;
         let is *ImgWatch as w with mut = p.img_watch;
         while (w != null) {
-            if (w.fired == 0 && w.l != null && w.l.done == 1) {
+            if (w.fired == 0 && (w.sheet != 0 || (w.l != null && w.l.done == 1))) {
                 w.fired = 1;
-                if (w.l.ok != 0) { js_event(p, w.node, "load", 4, cast(*i64, 0)); }
+                if (w.sheet == 1 || (w.sheet == 0 && w.l.ok != 0)) { js_event(p, w.node, "load", 4, cast(*i64, 0)); }
                 else { js_event(p, w.node, "error", 5, cast(*i64, 0)); }
                 any = 1;
                 again = 1;
@@ -1015,6 +1034,10 @@ fn _doc_arrived(p as *Page, j as *fetcher.Job) as void {
 
 fn _sheet_arrived(p as *Page, j as *fetcher.Job) as void {
     p.sheets_out = p.sheets_out - 1;
+    let is *SheetSlot as told = cast(*SheetSlot, j.data);
+    if (told.link != null) {
+        _sheet_told(p, told.link, cast(i64, j.ok == 1 && j.r.status >= 200 && j.r.status < 300));
+    }
     if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) {
         _fill_slot(p, cast(*SheetSlot, j.data), j.r.data, j.r.len, cast(*u8, &j.r.final));
         // One a script added after the first style: the rules join, and the page looks again.
@@ -1397,7 +1420,8 @@ fn _js_mark_sheets(p as *Page) as void {
     let is *dom.Node as root = p.doc.node;
     let is *dom.Node as x with mut = _next_element(root, root);
     while (x != null) {
-        if (x.tag == tg.STYLE || x.tag == tg.LINK || x.tag == tg.SCRIPT) { x.flags = x.flags | FLAG_SHEET_SEEN; }
+        // A sheet for another medium stays to be looked at again: scripts switch it on.
+        if (x.tag == tg.STYLE || (x.tag == tg.LINK && _media_excludes(x) == 0) || x.tag == tg.SCRIPT) { x.flags = x.flags | FLAG_SHEET_SEEN; }
         x = _next_element(root, x);
     }
 }
@@ -1461,9 +1485,10 @@ fn _js_sheets_once(p as *Page) as void {
             if (x.tag == tg.LINK) {
                 let is *dom.Attr as rel = dom.find_attr(x, "rel", 3);
                 let is *dom.Attr as href = dom.find_attr(x, "href", 4);
-                if (rel != null && href != null && decl.eq(rel.value, rel.value_len, "stylesheet") == 1) {
+                if (rel != null && href != null && decl.eq(rel.value, rel.value_len, "stylesheet") == 1 && _media_excludes(x) == 0) {
                     x.flags = x.flags | FLAG_SHEET_SEEN;
                     let is *SheetSlot as sl = _new_slot(p, cast(*SheetSlot, 0), 0, 0);
+                    sl.link = x;
                     _ask_sheet(p, sl, href.value, href.value_len, cast(*u8, &p.base));
                 }
             }

@@ -934,7 +934,7 @@ fn dom_init() as void {
     stays_key[4] = lit("mouseenter"); stays_key[5] = lit("mouseleave"); stays_key[6] = lit("readystatechange");
     S_style_cache = lit("__style"); S_cssText = lit("cssText"); S_title = lit("title");
     an("id", "id"); an("className", "class"); an("rel", "rel"); an("href", "=href"); an("src", "=src"); an("srcdoc", "srcdoc"); an("type", "type");
-    an("value", "value"); an("integrity", "integrity"); an("referrerPolicy", "referrerpolicy"); an("crossOrigin", "-crossorigin");
+    an("media", "media"); an("value", "value"); an("integrity", "integrity"); an("referrerPolicy", "referrerpolicy"); an("crossOrigin", "-crossorigin");
     an("alt", "alt"); an("title", "title"); an("name", "name"); an("placeholder", "placeholder"); an("htmlFor", "for");
     an("defaultValue", "value"); an("frameBorder", "frameborder"); an("scrolling", "scrolling"); an("allow", "allow"); an("sandbox", "sandbox"); an("allowFullscreen", "allowfullscreen"); an("lang", "lang"); an("dir", "dir"); an("action", "=action"); an("method", "method"); an("role", "role");
     an("tabIndex", "tabindex"); an("width", "width"); an("height", "height"); an("download", "download"); an("min", "min"); an("max", "max");
