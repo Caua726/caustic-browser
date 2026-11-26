@@ -727,6 +727,8 @@ fn rt_instanceof(a as i64, f as i64) as i64 {
     if (is_obj(f) == 0) { return rt_error("TypeError", "right side of instanceof is not callable"); }
     let is i64 as hi = get_slow(f, SYM_hasInstance, NOIC());
     if (hi != UNDEF) { return box_b(rt_truthy(rt_fcall(hi, f, 1, a, UNDEF, UNDEF, UNDEF))); }
+    // A bound function asks the one it was bound from (OrdinaryHasInstance, step 2).
+    if (kind_of(f) == K_FN && cast(i64, cast(*Obj, f).code) == cast(i64, fn_ptr(n_bound))) { return rt_instanceof(a, cast(*Obj, f).env[0]); }
     if (is_obj(a) == 0) { return FALSEV; }
     let is i64 as pr = get_slow(f, S_prototype, NOIC());
     let is i64 as w with mut = cast(*Obj, a).proto;

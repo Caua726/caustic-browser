@@ -7,14 +7,19 @@ use "image.cst" as image;
 use "std/io.cst" as io;
 use "std/env.cst" as env;
 use "../dom/dom.cst" as dom;
+use "../css/sheet.cst" as sheet;
+use "../css/style.cst" as style;
+use "../base/arena.cst" as arena;
+use "std/mem.cst" as mem;
 use "../dom/tags.cst" as tg;
+use "../page/forms.cst" as forms;
 use "../html/tree.cst" as tree;
 use "jsc.cst" as jsc;
 use "../loader/net.cst" as net;
 
 let is *dom.Document as cur_doc with mut = cast(*dom.Document, 0);
 let is i64 as dirty with mut = 0;
-let is [40]i64 as table with mut;
+let is [48]i64 as table with mut;
 let is i64 as table_ready with mut = 0;
 let is i64 as runs with mut = 0;
 // The timers of the script that ran last, for its page to keep.
@@ -60,140 +65,55 @@ fn _name_char(c as i64) as i64 {
     if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95) { return 1; }
     return 0;
 }
-fn _match(n as *dom.Node, s as *u8, sl as i64) as i64 {
-    if (n.kind != dom.ELEMENT) { return 0; }
-    let is i64 as i with mut = 0;
-    while (i < sl) {
-        let is i64 as c = cast(i64, s[i]);
-        if (c == 35 || c == 46) {
-            i = i + 1;
-            let is i64 as st = i;
-            while (i < sl && _name_char(cast(i64, s[i])) == 1) { i = i + 1; }
-            let is *u8 as w = cast(*u8, cast(i64, s) + st);
-            let is *dom.Attr as a with mut = cast(*dom.Attr, 0);
-            if (c == 35) {
-                a = dom.find_attr(n, "id", 2);
-                if (a == null || _eq(a.value, a.value_len, w, i - st) == 0) { return 0; }
-            } else {
-                a = dom.find_attr(n, "class", 5);
-                if (a == null || _has_word(a.value, a.value_len, w, i - st) == 0) { return 0; }
-            }
-        } else if (c == 91) {
-            i = i + 1;
-            let is i64 as st = i;
-            while (i < sl && _name_char(cast(i64, s[i])) == 1) { i = i + 1; }
-            let is *dom.Attr as a = dom.find_attr(n, cast(*u8, cast(i64, s) + st), i - st);
-            if (a == null) { return 0; }
-            if (i < sl && cast(i64, s[i]) == 61) {
-                i = i + 1;
-                let is i64 as q with mut = cast(i64, s[i]);
-                if (q == 34 || q == 39) { i = i + 1; } else { q = 93; }
-                let is i64 as vs = i;
-                while (i < sl && cast(i64, s[i]) != q) { i = i + 1; }
-                if (_eq(a.value, a.value_len, cast(*u8, cast(i64, s) + vs), i - vs) == 0) { return 0; }
-                if (q != 93) { i = i + 1; }
-            }
-            if (i >= sl || cast(i64, s[i]) != 93) { return 0; }
-            i = i + 1;
-        } else if (_name_char(c) == 1) {
-            let is i64 as st = i;
-            while (i < sl && _name_char(cast(i64, s[i])) == 1) { i = i + 1; }
-            if (_eq(n.name, n.name_len, cast(*u8, cast(i64, s) + st), i - st) == 0) { return 0; }
-        } else if (c == 42) {
-            i = i + 1;
-        } else {
-            return 0;
-        }
-    }
-    return 1;
+// What a script asks for is parsed and matched by what styles the page, so every selector the
+// page's sheets may use it may use too. The same text comes again and again: the last one is kept.
+let is arena.Arena as _sel_a with mut;
+let is *u8 as _sel_text with mut = cast(*u8, 0);
+let is i64 as _sel_n with mut = 0 - 1;
+let is *sheet.Selector as _sel with mut = cast(*sheet.Selector, 0);
+fn _parsed(s as i64, sl as i64) as *sheet.Selector {
+    if (sl == _sel_n && mem.memcmp(_sel_text, cast(*u8, s), sl) == 0) { return _sel; }
+    arena.free(&_sel_a);
+    _sel_text = arena.copy(&_sel_a, cast(*u8, s), sl);
+    _sel_n = sl;
+    _sel = sheet.parse_selector(&_sel_a, _sel_text, sl);
+    return _sel;
 }
-// A compound with pseudo-classes it does not know matches nothing, as a browser's would not.
-fn _compound_end(s as *u8, from as i64, sl as i64) as i64 {
-    // Where the compound ending at sl begins: after the last combinator outside brackets.
-    let is i64 as i with mut = sl - 1;
-    let is i64 as depth with mut = 0;
-    while (i >= from) {
-        let is i64 as c = cast(i64, s[i]);
-        if (c == 93 || c == 41) { depth = depth + 1; }
-        else if (c == 91 || c == 40) { depth = depth - 1; }
-        else if (depth == 0 && (c <= 32 || c == 62 || c == 43 || c == 126)) { return i + 1; }
-        i = i - 1;
-    }
-    return from;
-}
-fn _complex(n as *dom.Node, s as *u8, sl as i64) as i64 {
-    // Right to left: the last compound against this node, the rest against its relatives.
-    let is i64 as e with mut = sl;
-    while (e > 0 && cast(i64, s[e - 1]) <= 32) { e = e - 1; }
-    let is i64 as st = _compound_end(s, 0, e);
-    if (_match(n, cast(*u8, cast(i64, s) + st), e - st) == 0) { return 0; }
-    let is i64 as i with mut = st - 1;
-    let is i64 as comb with mut = 32;
-    while (i >= 0 && (cast(i64, s[i]) <= 32 || cast(i64, s[i]) == 62 || cast(i64, s[i]) == 43 || cast(i64, s[i]) == 126)) {
-        if (cast(i64, s[i]) > 32) { comb = cast(i64, s[i]); }
-        i = i - 1;
-    }
-    if (i < 0) { return 1; }
-    let is i64 as rest = i + 1;
-    if (comb == 62) {
-        let is *dom.Node as p = n.parent;
-        if (p == null) { return 0; }
-        return _complex(p, s, rest);
-    }
-    if (comb == 32) {
-        let is *dom.Node as p with mut = n.parent;
-        while (p != null) {
-            if (_complex(p, s, rest) == 1) { return 1; }
-            p = p.parent;
-        }
-        return 0;
-    }
-    let is *dom.Node as b with mut = n.prev;
-    while (b != null) {
-        if (b.kind == dom.ELEMENT) {
-            if (_complex(b, s, rest) == 1) { return 1; }
-            if (comb == 43) { return 0; }
-        }
-        b = b.prev;
-    }
-    return 0;
-}
-fn _selector(n as *dom.Node, s as *u8, sl as i64) as i64 {
-    // A list: any member of it, split at commas outside brackets.
-    if (n.kind != dom.ELEMENT) { return 0; }
-    let is i64 as st with mut = 0;
-    let is i64 as depth with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i <= sl) {
-        let is i64 as c with mut = 44;
-        if (i < sl) { c = cast(i64, s[i]); }
-        if (c == 91 || c == 40) { depth = depth + 1; }
-        else if (c == 93 || c == 41) { depth = depth - 1; }
-        else if (c == 44 && depth == 0) {
-            let is i64 as a with mut = st;
-            while (a < i && cast(i64, s[a]) <= 32) { a = a + 1; }
-            if (i > a && _complex(n, cast(*u8, cast(i64, s) + a), i - a) == 1) { return 1; }
-            st = i + 1;
-        }
-        i = i + 1;
-    }
-    return 0;
-}
+// 0 for nothing, 0 - 1 for a selector that is not one.
 fn h_query(root as i64, s as i64, sl as i64) as i64 {
+    let is *sheet.Selector as sel = _parsed(s, sl);
+    if (sel == null) { return 0 - 1; }
+    let is *dom.Node as r = cast(*dom.Node, root);
+    style.scope_node = r;
+    let is *dom.Node as x with mut = _next(r, r);
+    while (x != null) {
+        if (x.kind == dom.ELEMENT && style.selector_matches(x, sel) == 1) { return cast(i64, x); }
+        x = _next(r, x);
+    }
+    return 0;
+}
+// An id is not a selector: it can hold anything, a colon or a dot.
+fn h_by_id(root as i64, s as i64, sl as i64) as i64 {
     let is *dom.Node as r = cast(*dom.Node, root);
     let is *dom.Node as x with mut = _next(r, r);
     while (x != null) {
-        if (_selector(x, cast(*u8, s), sl) == 1) { return cast(i64, x); }
+        if (x.kind == dom.ELEMENT) {
+            let is *dom.Attr as a = dom.find_attr(x, "id", 2);
+            if (a != null && a.value_len == sl && mem.memcmp(a.value, cast(*u8, s), sl) == 0) { return cast(i64, x); }
+        }
         x = _next(r, x);
     }
     return 0;
 }
 fn h_query_all(root as i64, s as i64, sl as i64, out as i64, cap as i64) as i64 {
+    let is *sheet.Selector as sel = _parsed(s, sl);
+    if (sel == null) { return 0 - 1; }
     let is *dom.Node as r = cast(*dom.Node, root);
+    style.scope_node = r;
     let is *dom.Node as x with mut = _next(r, r);
     let is i64 as n with mut = 0;
     while (x != null && n < cap) {
-        if (_selector(x, cast(*u8, s), sl) == 1) { *cast(*i64, out + n * 8) = cast(i64, x); n = n + 1; }
+        if (x.kind == dom.ELEMENT && style.selector_matches(x, sel) == 1) { *cast(*i64, out + n * 8) = cast(i64, x); n = n + 1; }
         x = _next(r, x);
     }
     return n;
@@ -303,10 +223,24 @@ fn h_get_attr(node as i64, name as i64, nl as i64, out as i64) as i64 {
     *cast(*i64, out) = cast(i64, a.value);
     return a.value_len;
 }
+// A textarea's value is its text, not an attribute. -1 for anything else.
+fn h_area(node as i64, op as i64, v as i64, n as i64, out as i64) as i64 {
+    let is *dom.Node as x = cast(*dom.Node, node);
+    if (x.kind != dom.ELEMENT || x.tag != tg.TEXTAREA) { return -1; }
+    if (op == 1) {
+        forms.set_value(cur_doc, x, cast(*u8, v), n);
+        dirty = 1;
+        return 0;
+    }
+    let is i64 as got with mut = 0;
+    *cast(*i64, out) = cast(i64, forms.value_of(cur_doc, x, &got));
+    return got;
+}
 fn h_set_attr(node as i64, name as i64, nl as i64, v as i64, vl as i64) as i64 {
     dom.set_attr(cur_doc, cast(*dom.Node, node), _attr_name(cast(*dom.Node, node), name, nl), nl, cast(*u8, v), vl);
     dirty = 1;
     if (cast(*dom.Node, node).tag == tg.SCRIPT) { sheets_touched = 1; }
+    if (cast(*dom.Node, node).tag == tg.IMG && (nl == 3 || nl == 6)) { h_img(node, 0); }
     return 0;
 }
 fn h_del_attr(node as i64, name as i64, nl as i64) as i64 {
@@ -504,11 +438,24 @@ let is i64 as view_w with mut = 1280;
 let is i64 as view_h with mut = 800;
 let is *u8 as rect_fn with mut = cast(*u8, 0);
 let is *u8 as computed_fn with mut = cast(*u8, 0);
+let is *u8 as img_fn with mut = cast(*u8, 0);
+fn h_img(node as i64, op as i64) as i64 {
+    if (op >= 4 && cast(*dom.Node, node).tag != tg.IMG) { return -1; }
+    if (cast(i64, img_fn) == 0) { return 0; }
+    return call(img_fn, owner, node, op);
+}
 let is *u8 as fetch_fn with mut = cast(*u8, 0);
 let is *u8 as owner with mut = cast(*u8, 0);
 // A <style> or <link> a script made, for the page to look for.
 let is i64 as sheets_touched with mut = 0;
 fn h_url(which as i64, out as i64) as i64 {
+    if (which == 3) {
+        let is *u8 as lg = net.language();
+        *cast(*i64, out) = cast(i64, lg);
+        let is i64 as ln with mut = 0;
+        while (lg[ln] != 0) { ln = ln + 1; }
+        return ln;
+    }
     if (which == 2) {
         *cast(*i64, out) = cast(i64, net.USER_AGENT);
         let is i64 as un with mut = 0;
@@ -662,6 +609,9 @@ fn _table() as void {
     table[35] = cast(i64, fn_ptr(h_frame));
     table[36] = cast(i64, fn_ptr(h_attr));
     table[37] = cast(i64, fn_ptr(h_submit));
+    table[38] = cast(i64, fn_ptr(h_by_id));
+    table[39] = cast(i64, fn_ptr(h_img));
+    table[40] = cast(i64, fn_ptr(h_area));
     table_ready = 1;
 }
 

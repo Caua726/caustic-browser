@@ -468,6 +468,10 @@ fn _match_simple(n as *dom.Node, s as *sh.Simple) as i64 {
         return 0;
     }
     if (k == sh.S_ATTR) { return _match_attr(n, s); }
+    if (k == sh.S_SCOPE) {
+        if (scope_node != null && scope_node.kind == dom.ELEMENT) { return cast(i64, n == scope_node); }
+        return cast(i64, n.parent != null && n.parent.kind == dom.DOCUMENT);
+    }
     if (k == sh.S_ROOT) {
         if (n.parent != null && n.parent.kind == dom.DOCUMENT) { return 1; }
         return 0;
@@ -533,6 +537,17 @@ fn _match_compound(n as *dom.Node, c as *sh.Compound) as i64 {
         s = s.next;
     }
     return 1;
+}
+
+// What :scope is while a script asks: the element it asked on.
+let is *dom.Node as scope_node with mut = cast(*dom.Node, 0);
+fn selector_matches(n as *dom.Node, list as *sh.Selector) as i64 {
+    let is *sh.Selector as x with mut = list;
+    while (x != null) {
+        if (x.pseudo == 0 && _match_from(n, x.right) == 1) { return 1; }
+        x = x.next;
+    }
+    return 0;
 }
 
 // Whether n matches c and everything to its left.

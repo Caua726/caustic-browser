@@ -41,8 +41,11 @@ fn _relative(b as *bx.Box, cw as f64, dx as *f64, dy as *f64) as void {
     if (bx.prop(b, pr.P_POSITION) != pr.K_RELATIVE) { return; }
     if (bx.is_len(b, pr.P_LEFT) == 1) { *dx = bx.resolve(b, pr.P_LEFT, cw); }
     else if (bx.is_len(b, pr.P_RIGHT) == 1) { *dx = 0.0 - bx.resolve(b, pr.P_RIGHT, cw); }
-    if (bx.is_definite(b, pr.P_TOP, 0.0 - 1.0) == 1) { *dy = bx.resolve(b, pr.P_TOP, 0.0 - 1.0); }
-    else if (bx.is_definite(b, pr.P_BOTTOM, 0.0 - 1.0) == 1) { *dy = 0.0 - bx.resolve(b, pr.P_BOTTOM, 0.0 - 1.0); }
+    // A percentage is of the height its container was given; with none set it means nothing.
+    let is f64 as ch with mut = 0.0 - 1.0;
+    if (b.parent != null && bx.is_len(b.parent, pr.P_HEIGHT) == 1) { ch = b.parent.h; }
+    if (bx.is_definite(b, pr.P_TOP, ch) == 1) { *dy = bx.resolve(b, pr.P_TOP, ch); }
+    else if (bx.is_definite(b, pr.P_BOTTOM, ch) == 1) { *dy = 0.0 - bx.resolve(b, pr.P_BOTTOM, ch); }
 }
 
 // An absolutely positioned box, given the padding box it answers to and where flow

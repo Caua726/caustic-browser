@@ -18,6 +18,8 @@ let is i64 as MAX_TYPE with imut = 128;
 
 type NotifyFn = fn(*u8) as void;
 
+let is i64 as HEAD_MAX with imut = 4608;
+
 struct Job {
     owner as *u8;
     era   as i64;
@@ -33,9 +35,151 @@ struct Job {
     origin  as [MAX_URL]u8;
     has_ref as i64;
     referer as [MAX_URL]u8;
+    // Who is asking and for what, for the request's headers.
+    dest    as i64;
+    by_user as i64;
+    from    as [MAX_URL]u8;
+    head    as [HEAD_MAX]u8;
     r  as net.Resource;
     ok as i64;
     next as *Job;
+}
+
+// What the next job is, set just before asking for it, on the thread that asks.
+let is i64 as D_EMPTY with imut = 0;
+let is i64 as D_DOCUMENT with imut = 1;
+let is i64 as D_IFRAME with imut = 2;
+let is i64 as D_IMAGE with imut = 3;
+let is i64 as D_STYLE with imut = 4;
+let is i64 as D_SCRIPT with imut = 5;
+let is i64 as D_FONT with imut = 6;
+let is i64 as next_dest with mut = 0;
+let is i64 as next_user with mut = 0;
+let is *u8 as next_from with mut = cast(*u8, 0);
+
+fn _head_put(j as *Job, at as i64, s as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) { j.head[at + i] = s[i]; i = i + 1; }
+    j.head[at + n] = cast(u8, 0);
+    return at + n + 1;
+}
+fn _head_name(j as *Job, at as i64, name as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (name[n] != 0) { n = n + 1; }
+    return _head_put(j, at, name, n);
+}
+fn _head_str(j as *Job, at as i64, name as *u8, val as *u8) as i64 {
+    let is i64 as w = _head_name(j, at, name);
+    let is i64 as n with mut = 0;
+    while (val[n] != 0) { n = n + 1; }
+    return _head_put(j, w, val, n);
+}
+// How long scheme://host:port is, or 0.
+fn _origin_len(u as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (u[i] != 0 && u[i] != 58) { i = i + 1; }
+    if (u[i] != 58 || u[i + 1] != 47 || u[i + 2] != 47) { return 0; }
+    i = i + 3;
+    while (u[i] != 0 && u[i] != 47 && u[i] != 63 && u[i] != 35) { i = i + 1; }
+    return i;
+}
+// Where the part that makes it the same site starts in a host: example.com, or example.com.br.
+fn _site_at(u as *u8, n as i64) as i64 {
+    let is i64 as st with mut = 0;
+    while (st < n && u[st] != 47) { st = st + 1; }
+    st = st + 2;
+    let is i64 as end with mut = n;
+    let is i64 as k with mut = st;
+    while (k < n) { if (u[k] == 58) { end = k; break; } k = k + 1; }
+    let is i64 as d1 with mut = end - 1;
+    while (d1 >= st && u[d1] != 46) { d1 = d1 - 1; }
+    if (d1 < st) { return st; }
+    let is i64 as d2 with mut = d1 - 1;
+    while (d2 >= st && u[d2] != 46) { d2 = d2 - 1; }
+    if (d2 < st) { return st; }
+    if (end - d1 - 1 == 2 && d1 - d2 - 1 <= 3) {
+        let is i64 as d3 with mut = d2 - 1;
+        while (d3 >= st && u[d3] != 46) { d3 = d3 - 1; }
+        if (d3 < st) { return st; }
+        return d3 + 1;
+    }
+    return d2 + 1;
+}
+fn _same_bytes(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+// 0 no one asked, 1 cross-site, 2 same-site, 3 same-origin.
+fn _relation(u as *u8, from as *u8) as i64 {
+    if (from[0] == 0) { return 0; }
+    let is i64 as a = _origin_len(u);
+    let is i64 as b = _origin_len(from);
+    if (a == 0 || b == 0) { return 1; }
+    if (a == b && _same_bytes(u, from, a) == 1) { return 3; }
+    let is i64 as sa = _site_at(u, a);
+    let is i64 as sb = _site_at(from, b);
+    if (a - sa == b - sb && _same_bytes(cast(*u8, cast(i64, u) + sa), cast(*u8, cast(i64, from) + sb), a - sa) == 1) {
+        if (u[4] == from[4]) { return 2; }
+    }
+    return 1;
+}
+// What every browser tells a server about a request, by the Fetch standard.
+fn _headers(j as *Job) as void {
+    let is *u8 as u = cast(*u8, &j.url);
+    let is *u8 as from = cast(*u8, &j.from);
+    let is i64 as d = j.dest;
+    let is i64 as w with mut = 0;
+    let is i64 as rel = _relation(u, from);
+    if (d == D_DOCUMENT || d == D_IFRAME) {
+        j.r.req_accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+        w = _head_str(j, w, "Upgrade-Insecure-Requests", "1");
+    } else if (d == D_IMAGE) {
+        j.r.req_accept = "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
+    } else if (d == D_STYLE) {
+        j.r.req_accept = "text/css,*/*;q=0.1";
+    } else {
+        j.r.req_accept = cast(*u8, 0);
+    }
+    w = _head_str(j, w, "Accept-Language", net.accept_language());
+    // Whose page asked goes only as far as the standard's default policy lets it.
+    if (j.posting == 0 && rel != 0 && !(from[4] == 115 && u[4] != 115)) {
+        let is i64 as n with mut = _origin_len(from);
+        w = _head_name(j, w, "Referer");
+        if (rel == 3) {
+            while (from[n] != 0 && from[n] != 35) { n = n + 1; }
+            w = _head_put(j, w, from, n);
+        } else {
+            let is i64 as st = w;
+            w = _head_put(j, st, from, n + 1);
+            j.head[st + n] = cast(u8, 47);
+            j.head[st + n + 1] = cast(u8, 0);
+        }
+    }
+    if ((d == D_EMPTY || d == D_FONT) && j.posting == 0 && rel != 0 && rel != 3) {
+        w = _head_name(j, w, "Origin");
+        w = _head_put(j, w, from, _origin_len(from));
+    }
+    let is *u8 as site with mut = "none";
+    if (rel == 1) { site = "cross-site"; }
+    if (rel == 2) { site = "same-site"; }
+    if (rel == 3) { site = "same-origin"; }
+    w = _head_str(j, w, "Sec-Fetch-Site", site);
+    let is *u8 as mode with mut = "cors";
+    if (d == D_DOCUMENT || d == D_IFRAME) { mode = "navigate"; }
+    else if (d == D_IMAGE || d == D_STYLE || d == D_SCRIPT) { mode = "no-cors"; }
+    w = _head_str(j, w, "Sec-Fetch-Mode", mode);
+    let is *u8 as dest with mut = "empty";
+    if (d == D_DOCUMENT) { dest = "document"; }
+    if (d == D_IFRAME) { dest = "iframe"; }
+    if (d == D_IMAGE) { dest = "image"; }
+    if (d == D_STYLE) { dest = "style"; }
+    if (d == D_SCRIPT) { dest = "script"; }
+    if (d == D_FONT) { dest = "font"; }
+    w = _head_str(j, w, "Sec-Fetch-Dest", dest);
+    if (j.by_user == 1) { w = _head_str(j, w, "Sec-Fetch-User", "?1"); }
+    j.head[w] = cast(u8, 0);
+    j.r.req_extra = cast(*u8, &j.head);
 }
 
 let is sync.Mutex as _lock with mut;
@@ -78,6 +222,7 @@ fn _worker(arg as i64) as i64 {
         }
         j.next = cast(*Job, 0);
         let is *u8 as u = cast(*u8, &j.url);
+        _headers(j);
         if (j.posting == 1) {
             let is *u8 as referer with mut = cast(*u8, 0);
             if (j.has_ref == 1) { referer = cast(*u8, &j.referer); }
@@ -119,6 +264,12 @@ fn _make(owner as *u8, era as i64, tag as i64, data as *u8, u as *u8) as *Job {
     j.tag = tag;
     j.data = data;
     _copy(cast(*u8, &j.url), MAX_URL, u);
+    j.dest = next_dest;
+    j.by_user = next_user;
+    if (cast(i64, next_from) != 0) { _copy(cast(*u8, &j.from), MAX_URL, next_from); }
+    next_dest = 0;
+    next_user = 0;
+    next_from = cast(*u8, 0);
     return j;
 }
 

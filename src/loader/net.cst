@@ -34,11 +34,48 @@ struct Resource {
     error  as *u8;     // why it could not be had, in words a page can show
     xfo    as [32]u8;  // X-Frame-Options, lower case
     fa     as [256]u8; // frame-ancestors from its Content-Security-Policy, lower case
+    req_accept as *u8; // what to ask for; set before the call, null for anything
+    req_extra  as *u8; // more headers: see fetch.req_extra
 }
 
 // Who this browser says it is. "Mozilla/5.0" is the word every browser has opened with since the
 // nineties, and servers still look for it; it claims to be none of them.
-let is *u8 as USER_AGENT with mut = "Mozilla/5.0 (X11; Linux x86_64) CausticBrowser/0.0.2";
+let is *u8 as USER_AGENT with mut = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 CausticBrowser/0.0.2";
+
+// The languages to ask for, from the system's: pt_BR.UTF-8 makes pt-BR, then pt, then English.
+let is [64]u8 as _langs with mut;
+let is [16]u8 as _lang with mut;
+fn _put(to as *u8, at as i64, s as *u8) as i64 {
+    let is i64 as w with mut = at;
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { to[w] = s[i]; w = w + 1; i = i + 1; }
+    to[w] = cast(u8, 0);
+    return w;
+}
+fn _langs_make() as void {
+    let is *u8 as l with mut = env.getenv("LC_ALL");
+    if (l == null || l[0] == 0) { l = env.getenv("LC_MESSAGES"); }
+    if (l == null || l[0] == 0) { l = env.getenv("LANG"); }
+    let is i64 as ok = cast(i64, l != null && l[0] >= 97 && l[0] <= 122 && l[1] >= 97 && l[1] <= 122 && l[2] == 95 && l[3] >= 65 && l[3] <= 90 && l[4] >= 65 && l[4] <= 90);
+    if (ok == 0 || (l[0] == 101 && l[1] == 110)) {
+        _put(cast(*u8, &_lang), 0, "en-US");
+        _put(cast(*u8, &_langs), 0, "en-US,en;q=0.9");
+        return;
+    }
+    _lang[0] = l[0]; _lang[1] = l[1]; _lang[2] = cast(u8, 45); _lang[3] = l[3]; _lang[4] = l[4]; _lang[5] = cast(u8, 0);
+    let is i64 as w with mut = _put(cast(*u8, &_langs), 0, cast(*u8, &_lang));
+    w = _put(cast(*u8, &_langs), w, ",");
+    _langs[w] = l[0]; _langs[w + 1] = l[1];
+    w = _put(cast(*u8, &_langs), w + 2, ";q=0.9,en-US;q=0.8,en;q=0.7");
+}
+fn accept_language() as *u8 {
+    if (_langs[0] == 0) { _langs_make(); }
+    return cast(*u8, &_langs);
+}
+fn language() as *u8 {
+    if (_langs[0] == 0) { _langs_make(); }
+    return cast(*u8, &_lang);
+}
 
 let is trust.TrustStore as _store with mut;
 let is cookie.Jar as _jar with mut;
@@ -383,6 +420,8 @@ fn _exchange(f as *fetch.Fetch, u as *u8, ctype as *u8, body as *u8, n0 as i64, 
         return 0 - 1;
     }
     fetch.fetch_set_jar(f, &_jar);
+    f.req_accept = r.req_accept;
+    f.req_extra = r.req_extra;
     let is i64 as rc with mut = 0;
     if (cast(i64, ctype) != 0) { rc = fetch.fetch_post(f, u, ctype, body, n0, origin, referer, conn.deadline_in(DEADLINE_MS)); }
     else { rc = fetch.fetch_get(f, u, conn.deadline_in(DEADLINE_MS)); }

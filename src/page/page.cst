@@ -61,8 +61,17 @@ struct Loaded {
     url  as *u8;
     n    as i64;
     ok   as i64;
+    done as i64;     // the answer has come, whatever it was
     img  as dl.Image;
     next as *Loaded;
+}
+
+// An <img> a script may be waiting on, in the document or not: it hears load or error once.
+struct ImgWatch {
+    node  as *dom.Node;
+    l     as *Loaded;
+    fired as i64;
+    next  as *ImgWatch;
 }
 
 struct ScriptSlot {
@@ -105,6 +114,9 @@ struct Page {
     js_tick       as i64;
     js_done       as i64;
     scripts_ran   as i64;
+    in_scripts    as i64;
+    win_fired     as i64;
+    win_since     as i64;
     fetches_out   as i64;
     js_list       as dl.List;
     loaded as i64;          // has a document
@@ -130,6 +142,8 @@ struct Page {
     c      as bx.Ctx;
     root   as *bx.Box;
     images as *Loaded;
+    img_watch as *ImgWatch;
+    img_firing as i64;
     nimages as i64;
     era    as i64;      // this load's number, to know an answer for an older one
     started as i64;     // has memory of a document, whether or not it can show yet
@@ -184,6 +198,8 @@ fn unload(p as *Page) as void {
         l = l.next;
     }
     p.images = cast(*Loaded, 0);
+    p.img_watch = cast(*ImgWatch, 0);
+    p.img_firing = 0;
     p.nimages = 0;
     p.root = cast(*bx.Box, 0);
     p.hover = cast(*dom.Node, 0);
@@ -334,7 +350,7 @@ fn _ask_sheet(p as *Page, x as *SheetSlot, href as *u8, n as i64, base as *u8) a
     let is [MAX_URL]u8 as abs with mut;
     if (url.resolve(base, href, n, cast(*u8, &abs), MAX_URL) < 0) { return; }
     p.sheets_out = p.sheets_out + 1;
-    fetcher.get(cast(*u8, p), p.era, TAG_SHEET, cast(*u8, x), cast(*u8, &abs), 0);
+    _asking(p, fetcher.D_STYLE); fetcher.get(cast(*u8, p), p.era, TAG_SHEET, cast(*u8, x), cast(*u8, &abs), 0);
 }
 
 // The text of a sheet into its slot, and what it imports asked for.
@@ -408,6 +424,12 @@ fn _ask_sheets_of(p as *Page, shadows as i64) as void {
 
 // --- Images ---
 
+// This page is about to ask for something of this kind.
+fn _asking(p as *Page, dest as i64) as void {
+    fetcher.next_dest = dest;
+    fetcher.next_from = cast(*u8, &p.url);
+}
+
 fn _find(p as *Page, u as *u8, n as i64) as *Loaded {
     let is *Loaded as l with mut = p.images;
     while (l != null) {
@@ -440,10 +462,11 @@ fn _fetch_image(p as *Page, u as *u8, n as i64) as void {
             if (l.ok == 0) { l.ok = svg_image.decode(r.data, r.len, &l.img); }
         }
         net.free(&r);
+        l.done = 1;
         return;
     }
     p.images_out = p.images_out + 1;
-    fetcher.get(cast(*u8, p), p.era, TAG_IMAGE, cast(*u8, l), l.url, 0);
+    _asking(p, fetcher.D_IMAGE); fetcher.get(cast(*u8, p), p.era, TAG_IMAGE, cast(*u8, l), l.url, 0);
 }
 
 // What layout calls to find an image, by the URL it has.
@@ -480,7 +503,7 @@ fn _ask_use_file(p as *Page, x as *dom.Node) as void {
     let is [MAX_URL]u8 as abs with mut;
     if (url.resolve(cast(*u8, &p.base), h.value, fl, cast(*u8, &abs), MAX_URL) < 0) { return; }
     p.images_out = p.images_out + 1;
-    fetcher.get(cast(*u8, p), p.era, TAG_SVG_FILE, slot, cast(*u8, &abs), 0);
+    _asking(p, fetcher.D_IMAGE); fetcher.get(cast(*u8, p), p.era, TAG_SVG_FILE, slot, cast(*u8, &abs), 0);
 }
 fn _svg_file_arrived(p as *Page, j as *fetcher.Job) as void {
     p.images_out = p.images_out - 1;
@@ -505,24 +528,104 @@ fn _load_images(p as *Page) as void {
             if (mk != null) { _fetch_image(p, mk, url.len_of(mk)); }
             let is *u8 as li = _value_url(st, pr.P_LIST_STYLE_IMAGE);
             if (li != null && st.v.i[pr.P_DISPLAY] == pr.K_LIST_ITEM) { _fetch_image(p, li, url.len_of(li)); }
-            if (x.ns == dom.NS_HTML && x.tag == tg.IMG) {
-                let is i64 as un with mut = 0;
-                let is f64 as density with mut = 1.0;
-                let is *u8 as u = source.pick(&p.docs_a, x, p.vw, p.vh, &un, &density);
-                if (u != cast(*u8, 0)) {
-                    if (un > 5 && u[0] == 100 && u[1] == 97 && u[2] == 116 && u[3] == 97 && u[4] == 58) {
-                        _fetch_image(p, u, un);
-                    } else {
-                        let is [MAX_URL]u8 as abs with mut;
-                        let is i64 as m = url.resolve(cast(*u8, &p.base), u, un, cast(*u8, &abs), MAX_URL);
-                        if (m >= 0) { _fetch_image(p, cast(*u8, &abs), m); }
-                    }
-                }
-            }
+        }
+        // A hidden <img> is fetched all the same, as scripts wait on it; a lazy one only when shown.
+        if (x.ns == dom.NS_HTML && x.tag == tg.IMG) {
+            if ((st != null && st.v.i[pr.P_DISPLAY] != pr.K_NONE) || dom.find_attr(x, "loading", 7) == null) { _img_watch(p, x); }
         }
         x = _next_element(root, x);
     }
 }
+// What this <img> shows now, asked for if nobody has yet.
+fn _img_watch(p as *Page, x as *dom.Node) as *ImgWatch {
+    let is *ImgWatch as w with mut = p.img_watch;
+    while (w != null && w.node != x) { w = w.next; }
+    let is *Loaded as l with mut = cast(*Loaded, 0);
+    let is i64 as un with mut = 0;
+    let is f64 as density with mut = 1.0;
+    let is *u8 as u = source.pick(&p.docs_a, x, p.vw, p.vh, &un, &density);
+    if (u != cast(*u8, 0)) {
+        if (un > 5 && u[0] == 100 && u[1] == 97 && u[2] == 116 && u[3] == 97 && u[4] == 58) {
+            _fetch_image(p, u, un);
+            l = _find(p, u, un);
+        } else {
+            let is [MAX_URL]u8 as abs with mut;
+            let is i64 as m = url.resolve(cast(*u8, &p.base), u, un, cast(*u8, &abs), MAX_URL);
+            if (m >= 0) {
+                _fetch_image(p, cast(*u8, &abs), m);
+                l = _find(p, cast(*u8, &abs), m);
+            }
+        }
+    }
+    if (w == null) {
+        if (l == null) { return w; }
+        w = cast(*ImgWatch, arena.alloc(&p.docs_a, sizeof(ImgWatch)));
+        w.node = x;
+        w.l = cast(*Loaded, 0);
+        w.fired = 0;
+        w.next = p.img_watch;
+        p.img_watch = w;
+    }
+    if (w.l != l) { w.l = l; w.fired = 0; }
+    return w;
+}
+
+// Tells scripts about every picture whose answer has come. Their handlers may ask for more.
+fn _img_fire(p as *Page) as void {
+    if (p.img_firing == 1 || p.in_scripts == 1 || p.js_dispatch == 0) { return; }
+    p.img_firing = 1;
+    let is i64 as was = jshost.dirty;
+    let is i64 as any with mut = 0;
+    let is i64 as again with mut = 1;
+    while (again == 1) {
+        again = 0;
+        let is *ImgWatch as w with mut = p.img_watch;
+        while (w != null) {
+            if (w.fired == 0 && w.l != null && w.l.done == 1) {
+                w.fired = 1;
+                if (w.l.ok != 0) { js_event(p, w.node, "load", 4, cast(*i64, 0)); }
+                else { js_event(p, w.node, "error", 5, cast(*i64, 0)); }
+                any = 1;
+                again = 1;
+                break;
+            }
+            w = w.next;
+        }
+    }
+    if (any == 1) { jshost.dirty = 1; } else { jshost.dirty = was; }
+    p.img_firing = 0;
+}
+
+let is [2]*u8 as _img_dim with mut;
+// From a script: 0 src was set, 1 complete, 2 naturalWidth, 3 naturalHeight, 4 width, 5 height.
+fn _js_img(user as *u8, node as *dom.Node, op as i64) as i64 {
+    let is *Page as p = cast(*Page, user);
+    if (p.started == 0) { return 0; }
+    let is *ImgWatch as w = _img_watch(p, node);
+    if (op == 0) {
+        if (w != null) { w.fired = 0; }
+        return 0;
+    }
+    if (op >= 4) {
+        // img.width and height: what the attribute says, or the picture's own size.
+        let is *dom.Attr as at = dom.find_attr(node, cast(*u8, _img_dim[op - 4]), 5 + op - 4);
+        if (at != null && at.value_len > 0 && at.value[0] >= 48 && at.value[0] <= 57) {
+            let is i64 as v with mut = 0;
+            let is i64 as i with mut = 0;
+            while (i < at.value_len && at.value[i] >= 48 && at.value[i] <= 57) { v = v * 10 + cast(i64, at.value[i]) - 48; i = i + 1; }
+            return v;
+        }
+        if (w == null || w.l == null || w.l.done == 0 || w.l.ok == 0) { return 0; }
+        if (op == 4) { return w.l.img.width; }
+        return w.l.img.height;
+    }
+    if (w == null || w.l == null) { return cast(i64, op == 1); }
+    if (op == 1) { return w.l.done; }
+    if (w.l.done == 0 || w.l.ok == 0) { return 0; }
+    if (op == 2) { return w.l.img.width; }
+    return w.l.img.height;
+}
+
 
 // --- Loading ---
 
@@ -622,6 +725,8 @@ fn _start_document(p as *Page) as void {
     arena.init(&p.tmp_a);
     p.started = 1;
     p.images = cast(*Loaded, 0);
+    p.img_watch = cast(*ImgWatch, 0);
+    p.img_firing = 0;
     p.nimages = 0;
     p.root = cast(*bx.Box, 0);
     p.title_n = 0;
@@ -634,6 +739,9 @@ fn _start_document(p as *Page) as void {
     p.js_tick = 0;
     p.js_done = 0;
     p.scripts_ran = 0;
+    p.in_scripts = 0;
+    p.win_fired = 0;
+    p.win_since = 0;
     p.fetches_out = 0;
 }
 
@@ -683,6 +791,7 @@ fn begin(p as *Page, u as *u8, vw as f64, vh as f64) as void {
     p.waiting_doc = 1;
     p.vw = vw;
     p.vh = vh;
+    if (fetcher.next_dest == 0) { fetcher.next_dest = fetcher.D_DOCUMENT; }
     fetcher.get(cast(*u8, p), p.era, TAG_DOC, cast(*u8, 0), u, 1);
 }
 
@@ -691,12 +800,17 @@ fn begin_post(p as *Page, u as *u8, vw as f64, vh as f64, ctype as *u8, body as 
     p.waiting_doc = 1;
     p.vw = vw;
     p.vh = vh;
+    if (fetcher.next_dest == 0) { fetcher.next_dest = fetcher.D_DOCUMENT; }
     fetcher.post(cast(*u8, p), p.era, TAG_DOC, cast(*u8, 0), u, ctype, body, n, origin, referer);
 }
 
 // Nothing more wanted for what was asked so far.
+// Eras are never used twice, by any page: a frame's memory can come back at the same address
+// for a new frame while an answer for the old one is still on its way.
+let is i64 as _last_era with mut = 0;
 fn cancel(p as *Page) as void {
-    p.era = p.era + 1;
+    _last_era = _last_era + 1;
+    p.era = _last_era;
     p.waiting_doc = 0;
     fetcher.cancel(cast(*u8, p));
 }
@@ -719,6 +833,7 @@ fn _sheets_in(p as *Page) as void {
     p.c.base = cast(*u8, &p.base);
     p.loaded = 1;
     _load_images(p);
+    _img_fire(p);
     _ask_fonts(p);
 }
 
@@ -843,7 +958,7 @@ fn _ask_fonts(p as *Page) as void {
             if (m >= 0 && webfont.have(cast(*u8, &abs), m) == 0) {
                 p.images_out = p.images_out + 1;
                 asked = asked + 1;
-                fetcher.get_font(cast(*u8, p), p.era, TAG_FONT, cast(*u8, f), cast(*u8, &abs));
+                _asking(p, fetcher.D_FONT); fetcher.get_font(cast(*u8, p), p.era, TAG_FONT, cast(*u8, f), cast(*u8, &abs));
             }
         }
         f = f.next;
@@ -933,7 +1048,7 @@ fn _ask_scripts(p as *Page) as void {
                     let is [MAX_URL]u8 as abs with mut;
                     if (url.resolve(cast(*u8, &p.base), src.value, src.value_len, cast(*u8, &abs), MAX_URL) >= 0) {
                         p.scripts_out = p.scripts_out + 1;
-                        fetcher.get(cast(*u8, p), p.era, TAG_SCRIPT, cast(*u8, sl), cast(*u8, &abs), 0);
+                        _asking(p, fetcher.D_SCRIPT); fetcher.get(cast(*u8, p), p.era, TAG_SCRIPT, cast(*u8, sl), cast(*u8, &abs), 0);
                     }
                 } else {
                     let is i64 as n with mut = 0;
@@ -1022,16 +1137,56 @@ fn _all_in(p as *Page) as void {
     if (p.sheets_out != 0 || p.scripts_out != 0 || p.loaded == 1) { return; }
     if (p.scripts_ran == 0) {
         p.scripts_ran = 1;
+        p.win_since = time.now_ms();
+        p.in_scripts = 1;
         _run_scripts(p);
+        p.in_scripts = 0;
         _js_sheets(p);
+        // A script measured something, so the page was styled for it while they ran.
+        if (p.loaded == 1) {
+            if (jshost.dirty == 1) { _style_again(p, p.engine.vw, p.engine.vh); }
+            if (jshost.dirty != 0) { p.dirty = 1; _load_images(p); }
+            _img_fire(p);
+            return;
+        }
         if (p.sheets_out != 0) { return; }
     }
     _sheets_in(p);
 }
 
+// A script asks where something is before the page has been styled: style it now.
+fn _js_ready(p as *Page) as void {
+    if (p.loaded == 0 && p.in_scripts == 1) {
+        _js_sheets(p);
+        _sheets_in(p);
+    }
+}
+
+// The window's load: when everything the document asked for has come, frames included.
+fn _win_ready(p as *Page) as i64 {
+    if (p.js_dispatch == 0 || p.win_fired == 1 || p.loaded == 0) { return 0; }
+    // Something that never answers does not hold the page back for good.
+    if (time.now_ms() - p.win_since >= 15000) { return 1; }
+    if (p.sheets_out != 0 || p.scripts_out != 0 || p.images_out != 0) { return 0; }
+    if (p.frames == null && first_of(p, "iframe") != null) { return 0; }
+    let is *Frame as fr with mut = p.frames;
+    while (fr != null) {
+        if (fr.worker == 0 && fr.fired == 0) { return 0; }
+        fr = fr.next;
+    }
+    return 1;
+}
+fn _window_load(p as *Page) as void {
+    if (_win_ready(p) == 0) { return; }
+    p.win_fired = 1;
+    _img_fire(p);
+    js_event(p, p.doc.node, "__winload", 9, cast(*i64, 0));
+}
+
 // Where an element is, from the layout as of now: what scripts changed has to be laid out first.
 fn _js_rect(user as *u8, node as *dom.Node, which as i64) as i64 {
     let is *Page as p = cast(*Page, user);
+    _js_ready(p);
     if (p.loaded == 0) { return 0; }
     if (jshost.dirty == 1 || p.root == null) {
         _style_again(p, p.engine.vw, p.engine.vh);
@@ -1113,6 +1268,7 @@ fn _cs_color(out as i64, c as i64) as i64 {
 // One of the properties getComputedStyle reports, by its number in the script's list.
 fn _js_computed(user as *u8, node as *dom.Node, which as i64, out as i64) as i64 {
     let is *Page as p = cast(*Page, user);
+    _js_ready(p);
     if (p.loaded == 0 || node.kind != dom.ELEMENT) { return 0; }
     if (jshost.dirty == 1) { _style_again(p, p.engine.vw, p.engine.vh); jshost.dirty = 2; p.dirty = 1; }
     let is *style.Style as st = style.of(node);
@@ -1154,6 +1310,48 @@ fn _js_computed(user as *u8, node as *dom.Node, which as i64, out as i64) as i64
         if (which == 3) { return _cs_num(out, b.w, "px"); }
         return _cs_num(out, b.h, "px");
     }
+    if (which >= 9 && which <= 24) {
+        // Margins, padding, border widths and offsets, in that order, each top, right, bottom, left.
+        if (p.root == null || p.dirty == 1) { relayout(p, p.vw, p.vh, &p.js_list); }
+        if (p.root == null) { return 0; }
+        let is *bx.Box as b = layout.box_of(p.root, node);
+        let is i64 as side = (which - 9) % 4;
+        if (which >= 21) {
+            let is i64 as off = pr.P_TOP + side;
+            if (b == null || st.v.i[off] == pr.K_AUTO) { return _cs_word(out, "auto"); }
+            let is f64 as base with mut = 0.0;
+            if (b.parent != null) { if (side == 0 || side == 2) { base = b.parent.h; } else { base = b.parent.w; } }
+            return _cs_num(out, bx.resolve(b, off, base), "px");
+        }
+        if (b == null) { return _cs_word(out, "0px"); }
+        if (which <= 12) { return _cs_num(out, b.m[side], "px"); }
+        if (which <= 16) { return _cs_num(out, b.p[side], "px"); }
+        return _cs_num(out, b.b[side], "px");
+    }
+    if (which == 25 || which == 26) {
+        let is i64 as v = st.v.i[pr.P_OVERFLOW_X + which - 25];
+        if (v == pr.K_HIDDEN) { return _cs_word(out, "hidden"); }
+        if (v == pr.K_SCROLL) { return _cs_word(out, "scroll"); }
+        if (v == pr.K_AUTO) { return _cs_word(out, "auto"); }
+        if (v == pr.K_CLIP) { return _cs_word(out, "clip"); }
+        return _cs_word(out, "visible");
+    }
+    if (which == 27) {
+        if (st.v.i[pr.P_BOX_SIZING] == pr.K_BORDER_BOX) { return _cs_word(out, "border-box"); }
+        return _cs_word(out, "content-box");
+    }
+    if (which == 28) {
+        if (st.v.i[pr.P_FLOAT] == pr.K_LEFT) { return _cs_word(out, "left"); }
+        if (st.v.i[pr.P_FLOAT] == pr.K_RIGHT) { return _cs_word(out, "right"); }
+        return _cs_word(out, "none");
+    }
+    if (which == 29) {
+        if (st.v.i[pr.P_Z_INDEX] == pr.K_AUTO) { return _cs_word(out, "auto"); }
+        return _cs_num(out, st.v.f[pr.P_Z_INDEX], "");
+    }
+    if (which == 30) { return _cs_num(out, st.v.f[pr.P_FONT_WEIGHT], ""); }
+    if (which == 31) { return _cs_num(out, anim._time_at(st, pr.P_TRANSITION_DURATION, 0), "s"); }
+    if (which == 32) { return _cs_num(out, st.v.f[pr.P_ANIMATION_DURATION], "s"); }
     if (which == 5) { return _cs_num(out, st.v.f[pr.P_OPACITY], ""); }
     if (which == 6) { return _cs_num(out, st.v.f[pr.P_FONT_SIZE], "px"); }
     if (which == 7) { return _cs_color(out, st.v.i[pr.P_COLOR]); }
@@ -1173,9 +1371,9 @@ fn _js_fetch(user as *u8, info as *i64) as i64 {
         let is i64 as i with mut = 0;
         while (i < tn) { ty[i] = *cast(*u8, info[6] + i); i = i + 1; }
         ty[tn] = cast(u8, 0);
-        fetcher.post(cast(*u8, p), p.era, TAG_FETCH, cast(*u8, info[0]), cast(*u8, &abs), cast(*u8, &ty), cast(*u8, info[4]), info[5], cast(*u8, &p.base), cast(*u8, &p.base));
+        _asking(p, fetcher.D_EMPTY); fetcher.post(cast(*u8, p), p.era, TAG_FETCH, cast(*u8, info[0]), cast(*u8, &abs), cast(*u8, &ty), cast(*u8, info[4]), info[5], cast(*u8, &p.base), cast(*u8, &p.base));
     } else {
-        fetcher.get(cast(*u8, p), p.era, TAG_FETCH, cast(*u8, info[0]), cast(*u8, &abs), 0);
+        _asking(p, fetcher.D_EMPTY); fetcher.get(cast(*u8, p), p.era, TAG_FETCH, cast(*u8, info[0]), cast(*u8, &abs), 0);
     }
     return 1;
 }
@@ -1183,6 +1381,9 @@ fn _js_own(p as *Page) as void {
     jshost.owner = cast(*u8, p);
     jshost.rect_fn = cast(*u8, fn_ptr(_js_rect));
     jshost.computed_fn = cast(*u8, fn_ptr(_js_computed));
+    jshost.img_fn = cast(*u8, fn_ptr(_js_img));
+    _img_dim[0] = "width";
+    _img_dim[1] = "height";
     jshost.fetch_fn = cast(*u8, fn_ptr(_js_fetch));
     jshost.frame_fn = cast(*u8, fn_ptr(_js_frame));
     jshost.page_url = cast(*u8, &p.base);
@@ -1212,7 +1413,7 @@ fn _js_script_found(p as *Page, x as *dom.Node) as void {
         let is [MAX_URL]u8 as abs with mut;
         if (url.resolve(cast(*u8, &p.base), src.value, src.value_len, cast(*u8, &abs), MAX_URL) < 0) { return; }
         p.fetches_out = p.fetches_out + 1;
-        fetcher.get(cast(*u8, p), p.era, TAG_JS_SCRIPT, cast(*u8, x), cast(*u8, &abs), 0);
+        _asking(p, fetcher.D_SCRIPT); fetcher.get(cast(*u8, p), p.era, TAG_JS_SCRIPT, cast(*u8, x), cast(*u8, &abs), 0);
         return;
     }
     if (x.first == null) { return; }
@@ -1229,12 +1430,13 @@ fn _js_script_arrived(p as *Page, j as *fetcher.Job) as void {
     jshost.dirty = 0;
     let is i64 as ok with mut = 0;
     if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300) { ok = 1; }
+    _net_note("net: script ", cast(*u8, &j.url), j.r.status);
     let is *u8 as data with mut = j.r.data;
     let is i64 as n with mut = j.r.len;
     if (ok == 0 || cast(i64, data) == 0) { data = ""; n = 0; }
     jshost.script(&p.doc, p.js_script, data, n, cast(*dom.Node, j.data), ok);
     _js_sheets(p);
-    if (jshost.dirty != 0) { _load_images(p); }
+    if (jshost.dirty != 0) { _load_images(p); _img_fire(p); }
 }
 fn _js_sheets(p as *Page) as void {
     while (jshost.sheets_touched != 0) {
@@ -1276,7 +1478,7 @@ fn _net_note(what as *u8, u as *u8, status as i64) as void {
     while (what[n] != 0) { n = n + 1; }
     syscall(1, 2, what, n);
     n = 0;
-    while (u[n] != 0 && n < 160) { n = n + 1; }
+    while (u[n] != 0 && n < 4000) { n = n + 1; }
     syscall(1, 2, u, n);
     let is [24]u8 as t;
     let is i64 as i with mut = 23;
@@ -1300,7 +1502,7 @@ fn _fetch_arrived(p as *Page, j as *fetcher.Job) as void {
     if (j.ok == 0 || cast(i64, data) == 0) { data = ""; n = 0; }
     jshost.deliver(&p.doc, p.js_done, cast(i64, j.data), st, data, n, cast(*u8, &j.r.ctype));
     _js_sheets(p);
-    if (jshost.dirty != 0) { _load_images(p); }
+    if (jshost.dirty != 0) { _load_images(p); _img_fire(p); }
 }
 
 // A click for the page's scripts. Bit 1: something ran. Bit 2: stop the default.
@@ -1310,7 +1512,7 @@ fn js_event(p as *Page, n as *dom.Node, type_s as *u8, tn as i64, info as *i64) 
     jshost.dirty = 0;
     let is i64 as r = jshost.fire(&p.doc, p.js_dispatch, n, type_s, tn, info);
     _js_sheets(p);
-    if (jshost.dirty != 0) { _load_images(p); }
+    if (jshost.dirty != 0) { _load_images(p); _img_fire(p); }
     return r;
 }
 fn js_changed() as i64 { if (jshost.dirty != 0) { return 1; } return 0; }
@@ -1332,6 +1534,8 @@ fn js_on(p as *Page) as i64 { return cast(i64, p.js_dispatch != 0); }
 fn js_wait(p as *Page) as i64 {
     let is i64 as w with mut = jshost.next_timer(p.js_next);
     if (_msg_ready(p) == 1) { return 0; }
+    if (_win_ready(p) == 1) { return 0; }
+    if (p.js_dispatch != 0 && p.win_fired == 0 && p.loaded == 1 && (w < 0 || w > 40)) { w = 40; }
     let is *Frame as fr with mut = p.frames;
     while (fr != null) {
         if (fr.synth == 1) { return 0; }
@@ -1348,10 +1552,11 @@ fn js_step(p as *Page) as i64 {
     let is i64 as r with mut = 0;
     _js_own(p);
     jshost.dirty = 0;
+    _window_load(p);
     jshost.tick(&p.doc, p.js_tick);
     _deliver_messages(p);
     _js_sheets(p);
-    if (jshost.dirty != 0) { _load_images(p); r = 1; }
+    if (jshost.dirty != 0) { _load_images(p); _img_fire(p); r = 1; }
     let is *Frame as fr with mut = p.frames;
     while (fr != null) {
         let is *Frame as next = fr.next;
@@ -1393,16 +1598,20 @@ fn settled(p as *Page) as i64 {
         fr = fr.next;
     }
     if (p.loaded == 0 || p.sheets_out != 0 || p.scripts_out != 0 || p.images_out != 0 || p.fetches_out != 0) { return 0; }
+    if (p.js_dispatch != 0 && p.win_fired == 0) { return 0; }
     return 1;
 }
 
 fn _image_arrived(p as *Page, j as *fetcher.Job) as void {
     p.images_out = p.images_out - 1;
+    _net_note("net: image ", cast(*u8, &j.url), j.r.status);
     let is *Loaded as l = cast(*Loaded, j.data);
     if (j.ok == 1 && j.r.status >= 200 && j.r.status < 300 && j.r.len > 0) {
         l.ok = image.decode(j.r.data, j.r.len, &l.img);
         if (l.ok == 0) { l.ok = svg_image.decode(j.r.data, j.r.len, &l.img); }
     }
+    l.done = 1;
+    _img_fire(p);
 }
 
 // An answer for this page, current or not checked by is_current before this: for the
@@ -1822,6 +2031,7 @@ fn frame_of(p as *Page, n as *dom.Node) as *Frame {
 }
 fn _frame_loaded(fr as *Frame) as i64 {
     let is *Page as c = fr.pg;
+    if (c.js_dispatch != 0 && c.win_fired == 0) { return 0; }
     if (fr.synth == 1 || c.loaded == 0 || c.sheets_out != 0 || c.scripts_out != 0 || c.images_out != 0) { return 0; }
     return 1;
 }
@@ -1876,7 +2086,11 @@ fn _frame_go(p as *Page, fr as *Frame) as void {
     _copy_url(cast(*u8, &fr.src), cast(*u8, &to));
     fr.fired = 0;
     fr.sy = 0.0;
-    if (fetched == 1) { fr.synth = 0; begin(fr.pg, cast(*u8, &to), fr.w, fr.h); }
+    if (fetched == 1) {
+        fr.synth = 0;
+        _asking(p, fetcher.D_IFRAME);
+        begin(fr.pg, cast(*u8, &to), fr.w, fr.h);
+    }
     else { cancel(fr.pg); fr.synth = 1; }
 }
 // The frame for an element in this page, made if it is not there yet. Null when too deep.

@@ -44,6 +44,7 @@ let is i64 as S_FOCUS     with imut = 24;
 let is i64 as S_FOCUS_WITHIN with imut = 25;
 let is i64 as S_FOCUS_VISIBLE with imut = 26;
 let is i64 as S_TARGET    with imut = 27;
+let is i64 as S_SCOPE     with imut = 28;
 
 // Attribute operators.
 let is i64 as A_HAS      with imut = 0;
@@ -467,6 +468,7 @@ fn _pseudo(p as *_P, spec as *i64, sel as *Selector, double as i64) as *Simple {
     *spec = *spec + 1024;
     if (_eq(s, n, "host") == 1) { *spec = *spec + 1024; return _simple(p, S_HOST); }
     if (_eq(s, n, "root") == 1) { return _simple(p, S_ROOT); }
+    if (_eq(s, n, "scope") == 1) { return _simple(p, S_SCOPE); }
     if (_eq(s, n, "empty") == 1) { return _simple(p, S_EMPTY); }
     if (_eq(s, n, "link") == 1 || _eq(s, n, "any-link") == 1 || _eq(s, n, "-webkit-any-link") == 1) { return _simple(p, S_LINK); }
     if (_eq(s, n, "first-child") == 1) { return _nth_simple(p, S_NTH, 0, 1); }
@@ -1465,6 +1467,28 @@ fn media_text_holds(a as *arena.Arena, s as *u8, n as i64, w as f64, h as f64) a
 }
 
 // A style attribute: a declaration list and nothing else.
+// A selector list a script gave, or null when it is not one.
+fn parse_selector(a as *arena.Arena, src as *u8, len as i64) as *Selector {
+    let is tok.List as l with mut;
+    tok.tokenize(a, src, len, &l);
+    let is _P as ps with mut;
+    let is Sheet as none with mut;
+    init(&none, a);
+    ps.sh = &none;
+    ps.a = a;
+    ps.t = l.t;
+    ps.n = l.n;
+    ps.i = 0;
+    ps.inside = cast(*Container, 0);
+    ps.src = cast(*u8, 0);
+    ps.src_n = 0;
+    ps.base = cast(*u8, 0);
+    ps.nfaces = 0;
+    ps.origin = ORIGIN_AUTHOR;
+    _skip_ws(&ps);
+    return _selector_list(&ps, ps.n, 0);
+}
+
 fn parse_inline(a as *arena.Arena, src as *u8, len as i64, out as *v.DeclList, url as *u8) as void {
     let is tok.List as l with mut;
     tok.tokenize(a, src, len, &l);

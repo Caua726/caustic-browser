@@ -769,6 +769,7 @@ fn _service() as void {
                 // window.open: a new tab, if a person has just done something to ask for one.
                 if (time.now_ms() - _last_press_ms < 1000 && new_tab() == 1) { _request(_doc(br.cur), cast(*u8, &jshost.nav_url), 1, 0.0); }
             } else {
+                _from_page(nd);
                 _request(nd, cast(*u8, &jshost.nav_url), np, 0.0);
             }
         } else {
@@ -798,8 +799,10 @@ fn _service() as void {
                 if (_pend_origin[0] == 0) { origin = "null"; }
                 let is *u8 as referer with mut = cast(*u8, &_pend_referer);
                 if (_pend_referer[0] == 0) { referer = cast(*u8, 0); }
+                _nav_context(0);
                 pg.begin_post(c, cast(*u8, &_pend_url), c.vw, c.vh, cast(*u8, &_pend_type), _pend_body, _pend_body_n, origin, referer);
             } else {
+                _nav_context(0);
                 pg.begin(c, cast(*u8, &_pend_url), c.vw, c.vh);
             }
         }
@@ -844,8 +847,10 @@ fn _service() as void {
         if (_pend_origin[0] == 0) { origin = "null"; }
         let is *u8 as referer with mut = cast(*u8, &_pend_referer);
         if (_pend_referer[0] == 0) { referer = cast(*u8, 0); }
+        _nav_context(1);
         pg.begin_post(d.pg, cast(*u8, &u), w, h, cast(*u8, &_pend_type), _pend_body, _pend_body_n, origin, referer);
     } else {
+        _nav_context(1);
         pg.begin(d.pg, cast(*u8, &u), w, h);
     }
 }
@@ -1204,7 +1209,8 @@ fn _close_editor() as void {
 fn _inner_rect(b as *bx.Box, x as *f64, y as *f64, w as *f64, h as *f64) as void {
     *x = b.ax + b.b[bx.LEFT];
     *y = b.ay + b.b[bx.TOP];
-    *w = b.p[bx.LEFT] + b.w + b.p[bx.RIGHT];
+    // Not over the padding on the right: text stops before it, and pages put things there.
+    *w = b.p[bx.LEFT] + b.w;
     *h = b.p[bx.TOP] + b.h + b.p[bx.BOTTOM];
 }
 
@@ -1433,6 +1439,20 @@ fn _follow_editor() as void {
 
 // --- A form, a <select> ---
 
+// Who sent the next navigation: a page, and whether a person did it. Headers say so.
+let is [MAX_URL]u8 as _nav_from with mut;
+let is i64 as _nav_by_page with mut = 0;
+fn _from_page(d as *Doc) as void {
+    if (cast(i64, d.pg) == 0) { return; }
+    _copy_cut(cast(*u8, &_nav_from), cast(*u8, &d.pg.url), MAX_URL);
+    _nav_by_page = 1;
+}
+fn _nav_context(top as i64) as void {
+    if (_nav_by_page == 1) { fetcher.next_from = cast(*u8, &_nav_from); }
+    if (top == 0) { fetcher.next_dest = fetcher.D_IFRAME; }
+    fetcher.next_user = cast(i64, time.now_ms() - _last_press_ms < 1000);
+    _nav_by_page = 0;
+}
 fn _submit(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
     let is [MAX_URL]u8 as to with mut;
     let is i64 as n = forms.submit_url(&d.pg.doc, form, submitter, cast(*u8, &d.pg.base), cast(*u8, &to), MAX_URL);
@@ -1440,7 +1460,10 @@ fn _submit(d as *Doc, form as *dom.Node, submitter as *dom.Node) as void {
         _submit_post(d, form, submitter);
         return;
     }
-    if (n > 0) { _request(d, cast(*u8, &to), 1, 0.0); }
+    if (n > 0) {
+        _from_page(d);
+        _request(d, cast(*u8, &to), 1, 0.0);
+    }
 }
 
 // How much of a page's address is its origin: scheme, host and port. 0 when it has none
@@ -1878,6 +1901,7 @@ fn _activate(d as *Doc, n0 as *dom.Node, mods as i64) as void {
                 if (new_tab() == 1) { _request(_doc(br.cur), cast(*u8, &to), 1, 0.0); }
                 return;
             }
+            _from_page(d);
             _request(d, cast(*u8, &to), 1, 0.0);
             // Out of the frame, to the whole tab.
             if (tg_at != null && (_same_word(tg_at.value, tg_at.value_len, "_top") == 1 || _same_word(tg_at.value, tg_at.value_len, "_parent") == 1)) {

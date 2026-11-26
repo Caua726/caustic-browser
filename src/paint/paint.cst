@@ -113,6 +113,44 @@ fn _radii(b as *bx.Box, c as *dl.Cmd, w as f64, h as f64) as void {
     c.r2 = bx.resolve(b, pr.P_BORDER_TOP_RIGHT_RADIUS, base);
     c.r3 = bx.resolve(b, pr.P_BORDER_BOTTOM_RIGHT_RADIUS, base);
     c.r4 = bx.resolve(b, pr.P_BORDER_BOTTOM_LEFT_RADIUS, base);
+    // Corners that would overlap all shrink by the same factor, CSS Backgrounds 5.5: a 36px
+    // radius on a 36px box is a circle, not four arcs that cross.
+    let is f64 as f with mut = 1.0;
+    if (c.radius + c.r2 > w) { f = _min(f, w / (c.radius + c.r2)); }
+    if (c.r4 + c.r3 > w) { f = _min(f, w / (c.r4 + c.r3)); }
+    if (c.radius + c.r4 > h) { f = _min(f, h / (c.radius + c.r4)); }
+    if (c.r2 + c.r3 > h) { f = _min(f, h / (c.r2 + c.r3)); }
+    if (f < 1.0) {
+        c.radius = c.radius * f;
+        c.r2 = c.r2 * f;
+        c.r3 = c.r3 * f;
+        c.r4 = c.r4 * f;
+    }
+}
+
+// A control the page left alone: its border and background are still the browser's. It is drawn
+// as one thin round line in that 2px box, and once the page sets either, as what it says.
+fn _native_control(b as *bx.Box) as i64 {
+    if (b.node == null || b.node.ns != dom.NS_HTML) { return 0; }
+    if (b.node.tag != tg.INPUT && b.node.tag != tg.BUTTON) { return 0; }
+    let is *pr.Values as s = &b.st.v;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        let is i64 as st = s.i[pr.P_BORDER_TOP_STYLE + k];
+        if ((st != pr.K_INSET && st != pr.K_OUTSET) || b.b[k] != 2.0) { return 0; }
+        k = k + 1;
+    }
+    if (_has_radius(b) == 1 || s.i[pr.P_BACKGROUND_IMAGE] != pr.K_NONE) { return 0; }
+    let is i64 as bg = s.i[pr.P_BACKGROUND_COLOR] & 16777215;
+    if (bg != 16777215 && bg != 15724527 && bg != 15066597 && bg != 16119285) { return 0; }
+    return 1;
+}
+fn _native_radii(c as *dl.Cmd) as void {
+    if (c == null) { return; }
+    c.radius = 2.0;
+    c.r2 = 2.0;
+    c.r3 = 2.0;
+    c.r4 = 2.0;
 }
 
 fn _has_radius(b as *bx.Box) as i64 {
@@ -468,6 +506,7 @@ fn _background(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f
     }
     let is *dl.Cmd as c = _rect(p, x, y, w, h, s.i[pr.P_BACKGROUND_COLOR], alpha);
     if (c != null && _has_radius(b) == 1) { _radii(b, c, w, h); }
+    if (_native_control(b) == 1) { _native_radii(c); }
     if (s.i[pr.P_BACKGROUND_IMAGE] != pr.K_NONE && cast(i64, p.c.images) != 0) {
         let is *u8 as u = cast(*u8, s.i[pr.P_BACKGROUND_IMAGE]);
         let is *dl.Image as im = call(p.c.images, p.c.user, u, url.len_of(u));
@@ -599,6 +638,11 @@ fn _border(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f64, 
     let is f64 as lw = b.b[bx.LEFT];
     if (tw + rw + bw + lw <= 0.0) { return; }
     let is i64 as ct = s.i[pr.P_BORDER_TOP_COLOR];
+    if (_native_control(b) == 1) {
+        let is *dl.Cmd as nc = dl.stroke(p.l, x, y, w, h, 1.0, _rgb(ct), _a(ct) * alpha);
+        if (nc != null) { nc.fixed = p.fixed; _native_radii(nc); }
+        return;
+    }
     if (_has_radius(b) == 1 && tw == rw && rw == bw && bw == lw &&
         ct == s.i[pr.P_BORDER_RIGHT_COLOR] && ct == s.i[pr.P_BORDER_BOTTOM_COLOR] && ct == s.i[pr.P_BORDER_LEFT_COLOR]) {
         let is *dl.Cmd as c = dl.stroke(p.l, x, y, w, h, tw, _rgb(ct), _a(ct) * alpha);
@@ -628,6 +672,11 @@ fn _border(p as *Painter, b as *bx.Box, x as f64, y as f64, w as f64, h as f64, 
     if (rw > 0.0) { _side(p, x + w - rw, y + tw, rw, h - tw - bw, s.i[pr.P_BORDER_RIGHT_STYLE], _shade(s.i[pr.P_BORDER_RIGHT_COLOR], s.i[pr.P_BORDER_RIGHT_STYLE], bx.RIGHT), alpha, 0); }
 }
 
+fn _snap(v0 as f64) as f64 {
+    let is f64 as t = cast(f64, cast(i64, v0 + 0.5));
+    if (v0 + 0.5 < 0.0 && t != v0 + 0.5) { return t - 1.0; }
+    return t;
+}
 fn _box_decorations(p as *Painter, b as *bx.Box, alpha as f64) as void {
     if (b.kind == bx.B_COL || b.kind == bx.B_TEXT || b.kind == bx.B_BR || b.kind == bx.B_INLINE) { return; }
     if (_visible(b) == 0) { return; }
@@ -641,16 +690,21 @@ fn _box_decorations(p as *Painter, b as *bx.Box, alpha as f64) as void {
         e.r3 = bx.resolve(b, pr.P_BORDER_BOTTOM_RIGHT_RADIUS, base);
         e.r4 = bx.resolve(b, pr.P_BORDER_BOTTOM_LEFT_RADIUS, base);
     }
-    _shadows(p, b, b.ax, b.ay, w, h, alpha);
-    _background(p, b, b.ax, b.ay, w, h, alpha);
-    _border(p, b, b.ax, b.ay, w, h, alpha);
+    // A box's edges land on whole pixels, as other browsers put them, or a 1px line is two faint ones.
+    let is f64 as sx = _snap(b.ax);
+    let is f64 as sy = _snap(b.ay);
+    let is f64 as sw = _snap(b.ax + w) - sx;
+    let is f64 as sh = _snap(b.ay + h) - sy;
+    _shadows(p, b, sx, sy, sw, sh, alpha);
+    _background(p, b, sx, sy, sw, sh, alpha);
+    _border(p, b, sx, sy, sw, sh, alpha);
     if (b.control == bx.CTL_SELECT) { _select_arrow(p, b, alpha); }
     if (b.control == bx.CTL_FILE) { _file_button(p, b, b.ax, b.ay, h, alpha); }
     if (b.control == bx.CTL_DATE) {
         _date_icon(p, b, alpha);
         _date_part_mark(p, b, alpha);
     }
-    _outline(p, b, b.ax, b.ay, w, h, alpha);
+    _outline(p, b, sx, sy, sw, sh, alpha);
 }
 
 // A line outside the border, which takes up no room. It marks what has the focus.

@@ -40,3 +40,11 @@ function argsForward(P,I){var q=Array.prototype.slice.call(arguments,1);return f
 console.log(argsForward(0,7)("V","W"));
 function BoundC(a,b){this.a=a;this.b=b}
 var bc=new (BoundC.bind(null,1))(2);console.log(bc.a,bc.b,bc instanceof BoundC,new (Function.prototype.bind.apply(BoundC,[null,3,4]))().b);
+// A loop variable that closures keep, walking something that is kept too.
+(function(){var xs=[1,2];var fs=[];function g(){return xs}for(let x of xs){fs.push(function(){return x})}console.log(fs.map(function(f){return f()}).join(),g().length)})();
+(function(a,b){try{for(let c of b)a(c)}catch(c){console.log('catch',c)}console.log('try-for')})(function(c){console.log('saw',c)},[7]);
+(function(){var o={k:1};var fs=[];for(let k in o){fs.push(function(){return k+o[k]})}console.log(fs[0]())})();
+// Fields, in a class inside a function, whose constructor calls no super.
+(function(){class A{x=1;constructor(){this.y=2}}var a=new A();console.log(a.x,a.y)})();
+console.log(1_000+0x1_0,0b1_1);
+debugger;

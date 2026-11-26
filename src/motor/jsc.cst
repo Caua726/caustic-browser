@@ -190,15 +190,29 @@ fn next() as void {
             if (x == 98) { base = 2.0; }
             if (x == 111) { base = 8.0; }
             pos = pos + 2;
-            while (hexv(at(pos)) >= 0) { v = v * base + cast(f64, hexv(at(pos))); pos = pos + 1; }
+            while (hexv(at(pos)) >= 0 || (at(pos) == 95 && hexv(at(pos + 1)) >= 0)) {
+                if (at(pos) == 95) { pos = pos + 1; }
+                v = v * base + cast(f64, hexv(at(pos)));
+                pos = pos + 1;
+            }
             tk_num = v;
+            if (at(pos) == 110) { pos = pos + 1; }
             return;
         }
-        while (is_dig(at(pos)) == 1) { v = v * 10.0 + cast(f64, at(pos) - 48); pos = pos + 1; }
+        while (is_dig(at(pos)) == 1 || (at(pos) == 95 && is_dig(at(pos + 1)) == 1)) {
+            if (at(pos) == 95) { pos = pos + 1; }
+            v = v * 10.0 + cast(f64, at(pos) - 48);
+            pos = pos + 1;
+        }
         let is i64 as ex with mut = 0;
         if (at(pos) == 46) {
             pos = pos + 1;
-            while (is_dig(at(pos)) == 1) { v = v * 10.0 + cast(f64, at(pos) - 48); ex = ex - 1; pos = pos + 1; }
+            while (is_dig(at(pos)) == 1 || (at(pos) == 95 && is_dig(at(pos + 1)) == 1)) {
+                if (at(pos) == 95) { pos = pos + 1; }
+                v = v * 10.0 + cast(f64, at(pos) - 48);
+                ex = ex - 1;
+                pos = pos + 1;
+            }
         }
         if ((at(pos) | 32) == 101) {
             pos = pos + 1;
@@ -212,7 +226,8 @@ fn next() as void {
         let is f64 as dv with mut = 1.0;
         while (ex < 0) { dv = dv * 10.0; ex = ex + 1; }
         tk_num = v / dv;
-        if (at(pos) == 110) { fail("BigInt literal", cast(*u8, 0)); }
+        // No BigInt yet: as a plain number the rest of the script still runs.
+        if (at(pos) == 110) { pos = pos + 1; }
         return;
     }
     if (c == 34 || c == 39) {
@@ -1146,6 +1161,12 @@ fn stmt() as *N {
             return l;
         }
     }
+    // Stops under a debugger; there is none here.
+    if (tk == T_ID && seq(tk_s, "debugger") == 1) {
+        next();
+        semi();
+        return nn(S_EMPTY);
+    }
     let is *N as e = nn(S_EXPR);
     e.a = expr();
     semi();
@@ -1297,7 +1318,8 @@ fn analyze(n as *N, sc as *Scope, f as *Func, lp as i64) as void {
         n.scope = cs;
         if (cast(i64, n.s) != 0) { declare(cs, n.s, lp); }
         declare(cs, "%parent", lp);
-        declare(cs, "%fields", lp);
+        // A constructor runs them without any super() to say so, from a function of its own.
+        declare(cs, "%fields", lp).captured = 1;
         if (is_null(n.a) == 0) { analyze(n.a, cs, f, lp); }
         if (is_null(n.b) == 0) { analyze_fn(n.b, cs, f); }
         if (is_null(n.c) == 0) { analyze_fn(n.c, cs, f); }
@@ -1448,6 +1470,8 @@ fn e4(fm as *u8, a as *u8, b as *u8, c as *u8, d as *u8) as void {
             if (w == 1) { v = b; }
             if (w == 2) { v = c; }
             if (w == 3) { v = d; }
+            // Something the parser left empty: this script is refused, the browser carries on.
+            if (cast(i64, v) == 0) { fail("nothing to write for ", fm); v = ""; }
             buf_put(cur, v, slen(v));
             w = w + 1;
         } else { buf_put(cur, cast(*u8, cast(i64, fm) + i), 1); }
@@ -2299,10 +2323,11 @@ fn gs(n as *N) as void {
     }
     if (k == S_OF || k == S_FORIN) {
         let is *Scope as old = g_scope;
-        g_scope = n.scope;
         let is *u8 as lbl = pending_label;
         pending_label = cast(*u8, 0);
+        // What it walks is worked out outside the loop's scope, whose variables do not exist yet.
         let is *u8 as subject = gx(n.b);
+        g_scope = n.scope;
         let is *u8 as it = tmp();
         if (k == S_OF && n.flag == 1) { e2("let is i64 as % = rt_aiter(%);\n", it, subject); }
         else if (k == S_OF) { e2("let is i64 as % = rt_iter(%);\n", it, subject); }
