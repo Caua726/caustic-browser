@@ -126,7 +126,48 @@ fn _set_text(c as *bx.Ctx, b as *bx.Box, s as *u8, n as i64) as void {
     b.tlen = w;
 }
 
+// A lowercase letter, for small capitals: ASCII or Latin-1, and how many bytes it takes.
+fn _lower_len(s as *u8, i as i64, n as i64) as i64 {
+    let is i64 as x = cast(i64, s[i]);
+    if (x >= 97 && x <= 122) { return 1; }
+    if (x == 195 && i + 1 < n) {
+        let is i64 as y = cast(i64, s[i + 1]);
+        if (y >= 160 && y <= 190 && y != 183) { return 2; }
+    }
+    return 0;
+}
+
+// Small capitals, made as a browser makes them when the font has none: lowercase letters
+// become capitals at 0.7 of the size, each stretch of them a text box of its own.
+fn _add_small_caps(c as *bx.Ctx, parent as *bx.Box, st as *style.Style, s as *u8, n as i64) as *bx.Box {
+    let is *style.Style as small = cast(*style.Style, arena.alloc(c.a, sizeof(style.Style)));
+    *small = *st;
+    small.v.f[pr.P_FONT_SIZE] = st.v.f[pr.P_FONT_SIZE] * 0.7;
+    small.v.i[pr.P_TEXT_TRANSFORM] = pr.K_UPPERCASE;
+    small.v.i[pr.P_FONT_VARIANT_CAPS] = pr.K_NORMAL;
+    let is *bx.Box as last with mut = cast(*bx.Box, 0);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as from = i;
+        let is i64 as lower = cast(i64, _lower_len(s, i, n) > 0);
+        while (i < n) {
+            let is i64 as l = _lower_len(s, i, n);
+            if (cast(i64, l > 0) != lower) { break; }
+            if (l == 0) { i = i + 1; } else { i = i + l; }
+        }
+        let is *style.Style as use_st with mut = st;
+        if (lower == 1) { use_st = small; }
+        last = bx.alloc_box(c, bx.B_TEXT, cast(*dom.Node, 0), use_st);
+        _set_text(c, last, &s[from], i - from);
+        bx.append(parent, last);
+    }
+    return last;
+}
+
 fn _add_text(c as *bx.Ctx, parent as *bx.Box, st as *style.Style, s as *u8, n as i64) as *bx.Box {
+    if (st.v.i[pr.P_FONT_VARIANT_CAPS] == pr.K_SMALL_CAPS && st.v.i[pr.P_TEXT_TRANSFORM] != pr.K_UPPERCASE && n > 0) {
+        return _add_small_caps(c, parent, st, s, n);
+    }
     let is *bx.Box as b = bx.alloc_box(c, bx.B_TEXT, cast(*dom.Node, 0), st);
     _set_text(c, b, s, n);
     bx.append(parent, b);

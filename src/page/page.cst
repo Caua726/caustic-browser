@@ -102,6 +102,7 @@ struct Frame {
 
 struct Page {
     id     as i64;       // for scripts, which know other windows by number
+    bar_on as i64;       // the window's scrollbar is taking room from the page
     parent as *Page;
     frame  as *Frame;    // this page's own, in its parent
     depth  as i64;
@@ -1656,6 +1657,54 @@ fn images_waiting(p as *Page) as i64 { return p.images_out; }
 
 // Boxes and a display list for a window this size. Styles are only made again when
 // something in them depends on it.
+// What a window's scrollbar takes from the page's width, the same as other browsers on Linux.
+let is f64 as BAR_WIDTH with imut = 15.0;
+
+// How the page asks its window to scroll: 0 never, 1 when it has to, 2 always. The root's
+// overflow says so, or the body's when the root leaves it alone.
+fn _bar_asked(root as *bx.Box) as i64 {
+    if (root == null) { return 1; }
+    let is i64 as o with mut = root.st.v.i[pr.P_OVERFLOW_Y];
+    if (o == pr.K_VISIBLE && root.st.v.i[pr.P_OVERFLOW_X] == pr.K_VISIBLE) {
+        let is *bx.Box as x with mut = root.first;
+        while (x != null) {
+            if (x.node != null && x.node.tag == tg.BODY) { o = x.st.v.i[pr.P_OVERFLOW_Y]; break; }
+            x = x.next;
+        }
+    }
+    if (o == pr.K_HIDDEN || o == pr.K_CLIP) { return 0; }
+    if (o == pr.K_SCROLL) { return 2; }
+    return 1;
+}
+
+// The page again at another width, because the scrollbar came or went.
+fn _lay_out_again(p as *Page, vw as f64) as void {
+    if (p.bar_on == 1) { p.c.vw = vw - BAR_WIDTH; } else { p.c.vw = vw; }
+    arena.free(&p.box_a);
+    arena.free(&p.tmp_a);
+    p.c.hits = cast(*bx.HitItem, 0);
+    p.c.nhits = 0;
+    p.c.caphits = 0;
+    p.root = layout.run(&p.c, &p.doc);
+}
+
+// Whether the bar it was laid out with was the right one. Only a page's own window has one
+// to give room to, and a page that fits without it but not with it keeps it.
+fn _settle_bar(p as *Page, vw as f64, vh as f64) as void {
+    if (p.parent != null || p.root == null || vw <= BAR_WIDTH) { return; }
+    let is i64 as asked = _bar_asked(p.root);
+    let is i64 as want with mut = cast(i64, p.c.doc_h > vh);
+    if (asked == 0) { want = 0; }
+    if (asked == 2) { want = 1; }
+    if (want == p.bar_on) { return; }
+    p.bar_on = want;
+    _lay_out_again(p, vw);
+    if (want == 0 && asked == 1 && p.c.doc_h > vh) {
+        p.bar_on = 1;
+        _lay_out_again(p, vw);
+    }
+}
+
 fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     if (p.loaded == 0) { return; }
     let is i64 as resized = cast(i64, vw != p.engine.vw || vh != p.engine.vh);
@@ -1668,8 +1717,10 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
     p.vw = vw;
     p.vh = vh;
     p.c.vw = vw;
+    if (p.parent == null && p.bar_on == 1) { p.c.vw = vw - BAR_WIDTH; }
     p.c.vh = vh;
     p.root = layout.run(&p.c, &p.doc);
+    _settle_bar(p, vw, vh);
     _let_go_of_styles(p);
     // A style that asks how big its container is can only be answered from a layout, and
     // its answer can change what the next layout finds. Twice more settles what pages do.
@@ -1683,6 +1734,7 @@ fn relayout(p as *Page, vw as f64, vh as f64, l as *dl.List) as void {
         p.c.nhits = 0;
         p.c.caphits = 0;
         p.root = layout.run(&p.c, &p.doc);
+        _settle_bar(p, vw, vh);
         _let_go_of_styles(p);
     }
     if (env.getenv("CAUSTIC_BOXES") != null) { boxdump.boxes(p.root); }

@@ -159,3 +159,91 @@ fn resolve(base as *u8, rel as *u8, rn0 as i64, out as *u8, cap as i64) as i64 {
     out[w] = cast(u8, 0);
     return w;
 }
+
+
+fn _hex_val(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return 0 - 1;
+}
+
+// The byte a %XX at s[i] stands for, or -1.
+fn _escaped(s as *u8, i as i64) as i64 {
+    if (s[i] != 37) { return 0 - 1; }
+    let is i64 as a = _hex_val(cast(i64, s[i + 1]));
+    if (a < 0) { return 0 - 1; }
+    let is i64 as b = _hex_val(cast(i64, s[i + 2]));
+    if (b < 0) { return 0 - 1; }
+    return a * 16 + b;
+}
+
+// An address as a person reads it: escapes that spell a letter of another alphabet become
+// the letter. Only whole, valid UTF-8; anything that means something to a URL stays escaped.
+fn readable(u as *u8, out as *u8, cap as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as w with mut = 0;
+    while (u[i] != 0 && w + 5 < cap) {
+        let is i64 as b0 = _escaped(u, i);
+        let is i64 as more with mut = 0 - 1;
+        if (b0 >= 194 && b0 <= 223) { more = 1; }
+        if (b0 >= 224 && b0 <= 239) { more = 2; }
+        if (b0 >= 240 && b0 <= 244) { more = 3; }
+        let is i64 as good with mut = cast(i64, more > 0);
+        let is i64 as k with mut = 1;
+        let is i64 as cp with mut = 0;
+        if (more == 1) { cp = b0 & 31; }
+        if (more == 2) { cp = b0 & 15; }
+        if (more == 3) { cp = b0 & 7; }
+        while (good == 1 && k <= more) {
+            let is i64 as bk = _escaped(u, i + k * 3);
+            if (bk < 128 || bk > 191) { good = 0; }
+            else { cp = cp * 64 + (bk & 63); }
+            k = k + 1;
+        }
+        // Too long a form, a surrogate, past Unicode, or a control: left as it came.
+        if (good == 1) {
+            if (more == 2 && cp < 2048) { good = 0; }
+            if (more == 3 && cp < 65536) { good = 0; }
+            if (cp >= 55296 && cp <= 57343) { good = 0; }
+            if (cp > 1114111 || cp < 160) { good = 0; }
+        }
+        if (good == 0) {
+            out[w] = u[i];
+            w = w + 1;
+            i = i + 1;
+            continue;
+        }
+        k = 0;
+        while (k <= more) {
+            out[w] = cast(u8, _escaped(u, i + k * 3));
+            w = w + 1;
+            k = k + 1;
+        }
+        i = i + (more + 1) * 3;
+    }
+    out[w] = cast(u8, 0);
+    return w;
+}
+
+// What a person typed, for the wire: every byte that is not ASCII goes as an escape.
+fn escape_high(u as *u8, out as *u8, cap as i64) as i64 {
+    let is *u8 as hex = "0123456789ABCDEF";
+    let is i64 as i with mut = 0;
+    let is i64 as w with mut = 0;
+    while (u[i] != 0 && w + 4 < cap) {
+        let is i64 as x = cast(i64, u[i]);
+        if (x < 128) {
+            out[w] = u[i];
+            w = w + 1;
+        } else {
+            out[w] = cast(u8, 37);
+            out[w + 1] = hex[x >> 4];
+            out[w + 2] = hex[x & 15];
+            w = w + 3;
+        }
+        i = i + 1;
+    }
+    out[w] = cast(u8, 0);
+    return w;
+}

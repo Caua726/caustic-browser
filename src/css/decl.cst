@@ -1123,10 +1123,11 @@ fn _font(s as *_Sh) as i64 {
     weight.kind = v.V_KW;
     weight.kw = pr.K_NORMAL;
     let is i64 as have_size with mut = 0;
+    let is i64 as caps with mut = pr.K_NORMAL;
     while (_done(s.c) == 0) {
         let is *tok.Token as t = _peek(s.c);
         if (_is_ident(t, "normal") == 1) { s.c.i = s.c.i + 1; continue; }
-        if (_is_ident(t, "small-caps") == 1) { s.c.i = s.c.i + 1; continue; }
+        if (_is_ident(t, "small-caps") == 1) { caps = pr.K_SMALL_CAPS; s.c.i = s.c.i + 1; continue; }
         if (t.kind == tok.T_IDENT && pr.in_list(pr.keywords_of(pr.P_FONT_STYLE), t.s, t.n) == 1) {
             style = pr.kw_lookup(t.s, t.n);
             s.c.i = s.c.i + 1;
@@ -1159,6 +1160,7 @@ fn _font(s as *_Sh) as i64 {
     if (_family(s) == 0) { return 0; }
     _emit(s, pr.P_FONT_SIZE, &size);
     _emit_kw(s, pr.P_FONT_STYLE, style);
+    _emit_kw(s, pr.P_FONT_VARIANT_CAPS, caps);
     _emit(s, pr.P_FONT_WEIGHT, &weight);
     if (have_lh == 1) { _emit(s, pr.P_LINE_HEIGHT, &lh); }
     else { _emit_kw(s, pr.P_LINE_HEIGHT, pr.K_NORMAL); }
@@ -2760,6 +2762,7 @@ fn _parse_named(a as *arena.Arena, out as *v.DeclList, name as *u8, nlen as i64,
     else if (eq(name, nlen, "border-spacing") == 1) { ok = _border_spacing(s); }
     else if (eq(name, nlen, "content") == 1) { ok = _content(s); }
     else if (eq(name, nlen, "word-wrap") == 1) { ok = _single(s, pr.P_OVERFLOW_WRAP); }
+    else if (eq(name, nlen, "font-variant") == 1) { ok = _single(s, pr.P_FONT_VARIANT_CAPS); }
     else if (eq(name, nlen, "grid-row-gap") == 1) { ok = _single(s, pr.P_ROW_GAP); }
     else if (eq(name, nlen, "grid-column-gap") == 1) { ok = _single(s, pr.P_COLUMN_GAP); }
     else {

@@ -542,7 +542,16 @@ fn open_address(s as *u8, n as i64) as void {
 fn go_typed(i as i64, s as *u8, n as i64) as void {
     let is [MAX_URL]u8 as u with mut;
     _to_url(s, n, cast(*u8, &u));
-    _request(_doc(i), cast(*u8, &u), 1, 0.0);
+    let is [MAX_URL]u8 as sent with mut;
+    url.escape_high(cast(*u8, &u), cast(*u8, &sent), MAX_URL);
+    _request(_doc(i), cast(*u8, &sent), 1, 0.0);
+}
+
+// The address bar, saying the address as a person reads it.
+fn _show_address(d as *Doc, u as *u8) as void {
+    let is [MAX_URL]u8 as shown with mut;
+    let is i64 as n = url.readable(u, cast(*u8, &shown), MAX_URL);
+    ui.entry.set_text(br.t, d.entry, cast(*u8, &shown), n);
 }
 
 fn _doc_url_len(s as *u8) as i64 {
@@ -824,7 +833,7 @@ fn _service() as void {
         if (push == 1) { _push_history(d, cast(*u8, &u)); }
         _copy_cut(cast(*u8, &d.pg.url), cast(*u8, &u), pg.MAX_URL);
         if (_go_to_fragment(d, cast(*u8, &u)) == 0) { pv.scroll_to(br.t, d.view, 0.0, y0); }
-        ui.entry.set_text(br.t, d.entry, cast(*u8, &u), url.len_of(cast(*u8, &u)));
+        _show_address(d, cast(*u8, &u));
         _nav_buttons(d);
         return;
     }
@@ -836,7 +845,7 @@ fn _service() as void {
         }
     }
     pv.set_hint(br.t, d.view, LOADING, ui.len(LOADING));
-    ui.entry.set_text(br.t, d.entry, cast(*u8, &u), url.len_of(cast(*u8, &u)));
+    _show_address(d, cast(*u8, &u));
     let is f64 as w with mut = 0.0;
     let is f64 as h with mut = 0.0;
     _view_size(d, &w, &h);
@@ -863,8 +872,7 @@ fn _first_paint(d as *Doc) as void {
     _lay_out(d);
     if (_scroll_to_fragment(d, asked) == 0) { pv.scroll_to(br.t, d.view, 0.0, d.load_y); }
     _name_tab(d);
-    let is *u8 as shown = cast(*u8, &d.pg.url);
-    ui.entry.set_text(br.t, d.entry, shown, url.len_of(shown));
+    _show_address(d, cast(*u8, &d.pg.url));
     _nav_buttons(d);
     pv.set_hint(br.t, d.view, cast(*u8, 0), 0);
     if (&br.docs[br.order[br.cur]] == d) { ui.router.focus(br.t, br.r, d.view, 0); }
