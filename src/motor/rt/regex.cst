@@ -624,6 +624,22 @@ fn n_re_tostring(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as
 fn n_re_source(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return rx_of(t).src; }
 fn n_re_flags(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return rx_of(t).flags; }
 fn n_re_global(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_b(cast(i32, rx_of(t).global == 1)); }
+fn n_re_icase(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_b(cast(i32, rx_of(t).icase == 1)); }
+fn n_re_multi(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_b(cast(i32, rx_of(t).multi == 1)); }
+fn n_re_dotall(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_b(cast(i32, rx_of(t).dotall == 1)); }
+fn n_re_sticky(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_b(cast(i32, rx_of(t).sticky == 1)); }
+fn rx_has_flag(t as i64, ch as i64) as i64 {
+    let is *Str as fs = cast(*Str, rx_of(t).flags);
+    let is i64 as i with mut = 0;
+    while (i < fs.len) {
+        if (cast(i64, fs.bytes[i]) == ch) { return box_b(1); }
+        i = i + 1;
+    }
+    return box_b(0);
+}
+fn n_re_unicode(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return rx_has_flag(t, 117); }
+fn n_re_indices(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return rx_has_flag(t, 100); }
+fn n_re_usets(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return rx_has_flag(t, 118); }
 fn expand_repl(out0 as i64, rep as *Str, sv as i64, caps as *i64, ngroups as i64) as i64 {
     let is *Str as s = cast(*Str, sv);
     let is i64 as out with mut = out0;
@@ -919,6 +935,8 @@ fn rt_init() as void {
     let is i64 as G_RegExp = fn_with_proto(fn_ptr(n_regexp), P_REGEX);
     def_n(P_REGEX, "exec", fn_ptr(n_re_exec)); def_n(P_REGEX, "test", fn_ptr(n_re_test)); def_n(P_REGEX, "toString", fn_ptr(n_re_tostring));
     def_get(P_REGEX, "source", fn_ptr(n_re_source)); def_get(P_REGEX, "flags", fn_ptr(n_re_flags)); def_get(P_REGEX, "global", fn_ptr(n_re_global));
+    def_get(P_REGEX, "ignoreCase", fn_ptr(n_re_icase)); def_get(P_REGEX, "multiline", fn_ptr(n_re_multi)); def_get(P_REGEX, "dotAll", fn_ptr(n_re_dotall)); def_get(P_REGEX, "sticky", fn_ptr(n_re_sticky));
+    def_get(P_REGEX, "unicode", fn_ptr(n_re_unicode)); def_get(P_REGEX, "hasIndices", fn_ptr(n_re_indices)); def_get(P_REGEX, "unicodeSets", fn_ptr(n_re_usets));
 
     def_n(P_GEN, "next", fn_ptr(n_gen_next)); def_n(P_GEN, "throw", fn_ptr(n_gen_throw)); def_n(P_GEN, "return", fn_ptr(n_gen_return));
     obj_add_flags(cast(*Obj, P_GEN), SYM_iterator, fn_new(fn_ptr(n_self), cast(*i64, 0)), P_NONENUM);

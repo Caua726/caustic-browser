@@ -48,3 +48,6 @@ var bc=new (BoundC.bind(null,1))(2);console.log(bc.a,bc.b,bc instanceof BoundC,n
 (function(){class A{x=1;constructor(){this.y=2}}var a=new A();console.log(a.x,a.y)})();
 console.log(1_000+0x1_0,0b1_1);
 debugger;
+console.log(/./.dotAll,/./s.dotAll,/a/i.ignoreCase,/a/.ignoreCase,/a/m.multiline,/a/y.sticky,/a/u.unicode,/a/.unicode,/a/d.hasIndices,/a/v.unicodeSets);
+(function(){var o={length:2,0:"a",1:"b"};console.log(Array.prototype.slice.call(o).join("-"),[].join.call(o,"+"),[].indexOf.call(o,"b"));[].push.call(o,"c");console.log(o.length,o[2]);console.log([].pop.call(o),o.length,o[2]);console.log([].shift.call(o),o[0],o.length);[].unshift.call(o,"z");console.log(o[0],o[1],o.length);console.log([].splice.call(o,0,1).join(),o.length,o[0]);console.log([].slice.call("abc").join());(function(){console.log([].slice.call(arguments,1).length)})(1,2,3);try{[].slice.call(null)}catch(e){console.log(e.name)}})();
+var abc=5;console.log(abc,({ab:1}).ab,Math.abs(-2));

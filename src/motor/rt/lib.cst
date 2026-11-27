@@ -88,11 +88,41 @@ fn n_max(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
 fn n_imul(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 { return box_i(cast(i64, cast(i32, to_i32(a) * to_i32(b)))); }
 
 // Arrays.
+fn arr_real(t as i64) as i64 { return cast(i64, is_ptr(t) == 1 && (kind_of(t) == K_ARR || kind_of(t) == K_TYPED)); }
+// Array methods work on anything with a length: arguments, a NodeList, a string. Such a thing
+// is read into an array first, and the methods that change it write it back with like_back.
+fn arr_like(t as i64) as i64 {
+    if (t == UNDEF || t == NULLV) { rt_error("TypeError", "Array.prototype method called on null or undefined"); }
+    let is f64 as lf = to_num_f(rt_geti(t, S_length));
+    let is i64 as n with mut = 0;
+    if (lf > 0.0) { n = cast(i64, lf); }
+    if (n > 67108864) { rt_error("RangeError", "Invalid array length"); }
+    let is i64 as o = arr_new(n);
+    let is i64 as i with mut = 0;
+    while (i < n) { arr_push(o, rt_geti(t, box_i(i))); i = i + 1; }
+    return o;
+}
+fn like_back(t as i64, o as i64, was as i64) as void {
+    let is *Arr as r = cast(*Arr, o);
+    let is i64 as i with mut = 0;
+    while (i < r.len) { rt_seti(t, box_i(i), r.data[i]); i = i + 1; }
+    while (i < was) { rt_delete(t, box_i(i)); i = i + 1; }
+    rt_seti(t, S_length, box_i(r.len));
+}
 fn arr_this(t as i64) as *Arr {
-    if (is_ptr(t) == 0 || (kind_of(t) != K_ARR && kind_of(t) != K_TYPED)) { rt_error("TypeError", "array method on something else"); }
-    return cast(*Arr, t);
+    if (arr_real(t) == 1) { return cast(*Arr, t); }
+    return cast(*Arr, arr_like(t));
 }
 fn n_push(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (arr_real(t) == 0) {
+        let is i64 as argc = rt_argc;
+        let is i64 as tmp = arr_like(t);
+        let is i64 as was = cast(*Arr, tmp).len;
+        rt_argc = argc;
+        let is i64 as res = n_push(e, tmp, a, b, c, d);
+        like_back(t, tmp, was);
+        return res;
+    }
     let is i64 as n = rt_argc;
     arr_this(t);
     if (n > 4) {
@@ -108,12 +138,30 @@ fn n_push(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
     return box_i(cast(*Arr, t).len);
 }
 fn n_pop(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (arr_real(t) == 0) {
+        let is i64 as argc = rt_argc;
+        let is i64 as tmp = arr_like(t);
+        let is i64 as was = cast(*Arr, tmp).len;
+        rt_argc = argc;
+        let is i64 as res = n_pop(e, tmp, a, b, c, d);
+        like_back(t, tmp, was);
+        return res;
+    }
     let is *Arr as r = arr_this(t);
     if (r.len == 0) { return UNDEF; }
     r.len = r.len - 1;
     return r.data[r.len];
 }
 fn n_shift(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (arr_real(t) == 0) {
+        let is i64 as argc = rt_argc;
+        let is i64 as tmp = arr_like(t);
+        let is i64 as was = cast(*Arr, tmp).len;
+        rt_argc = argc;
+        let is i64 as res = n_shift(e, tmp, a, b, c, d);
+        like_back(t, tmp, was);
+        return res;
+    }
     let is *Arr as r = arr_this(t);
     if (r.len == 0) { return UNDEF; }
     let is i64 as v = r.data[0];
@@ -123,6 +171,15 @@ fn n_shift(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
     return v;
 }
 fn n_unshift(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (arr_real(t) == 0) {
+        let is i64 as argc = rt_argc;
+        let is i64 as tmp = arr_like(t);
+        let is i64 as was = cast(*Arr, tmp).len;
+        rt_argc = argc;
+        let is i64 as res = n_unshift(e, tmp, a, b, c, d);
+        like_back(t, tmp, was);
+        return res;
+    }
     let is i64 as n = rt_argc;
     let is i64 as args = rt_rest(0, n, a, b, c, d);
     let is *Arr as r = arr_this(t);
@@ -155,6 +212,15 @@ fn n_arr_slice(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i
     return o;
 }
 fn n_splice(e as *i64, t as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (arr_real(t) == 0) {
+        let is i64 as argc = rt_argc;
+        let is i64 as tmp = arr_like(t);
+        let is i64 as was = cast(*Arr, tmp).len;
+        rt_argc = argc;
+        let is i64 as res = n_splice(e, tmp, a, b, c, d);
+        like_back(t, tmp, was);
+        return res;
+    }
     let is i64 as n = rt_argc;
     let is i64 as args = rt_rest(0, n, a, b, c, d);
     let is *Arr as r = arr_this(t);
