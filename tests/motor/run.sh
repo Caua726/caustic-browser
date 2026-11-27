@@ -60,4 +60,12 @@ m=re.search(r'<pre id="out">(.*?)</pre>',open(sys.argv[1],errors='replace').read
 print(html.unescape(m.group(1)).strip() if m else 'NO RESULT')
 P
 if diff -q $O/frame.txt tests/motor/frame/expected.txt >/dev/null; then echo "frame: same as Chromium"; else echo "frame: DIFFERS"; diff $O/frame.txt tests/motor/frame/expected.txt | head -10 | cut -c1-160; fails=$((fails+1)); fi
+# Transitions written in style="", through restyles that free what the style said.
+Xvfb :88 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 & XP=$!
+build/motor/srv tests/motor/anim 5191 & SP=$!
+sleep 0.5
+# In a window, because frames are what touch a transition. Still alive when time is up.
+env -u WAYLAND_DISPLAY DISPLAY=:88 timeout 25 build/browser http://127.0.0.1:5191/ > /dev/null 2>&1; rc=$?
+kill $SP $XP 2>/dev/null
+if [ $rc -eq 124 ]; then echo "anim: survives"; else echo "anim: rc=$rc"; fails=$((fails+1)); fi
 exit $fails

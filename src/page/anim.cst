@@ -37,7 +37,7 @@ struct Trans {
     to_p   as f64;
     t0     as i64;           // milliseconds, the delay already counted in
     dur    as i64;
-    ease   as *v.Ease;
+    ease   as v.Ease;        // its own copy: what a style says goes with the style
     seen   as i64;
     box    as *bx.Box;
 }
@@ -53,7 +53,7 @@ struct Run {
     count as f64;            // negative: for ever
     dir   as i64;
     fill  as i64;
-    ease  as *v.Ease;
+    ease  as v.Ease;
     box   as *bx.Box;
     pseudo as i64;
     done  as i64;
@@ -304,7 +304,7 @@ fn _element_trans(a as *Anim, n as *dom.Node, pseudo as i64, ns as *style.Style,
                     t.to_p = ns.v.p[p];
                     t.t0 = a.now + cast(i64, delay * 1000.0);
                     t.dur = cast(i64, dur * 1000.0);
-                    t.ease = _ease_at(ns, pr.P_TRANSITION_TIMING_FUNCTION, i);
+                    t.ease = *_ease_at(ns, pr.P_TRANSITION_TIMING_FUNCTION, i);
                     t.seen = a.round;
                     t.box = cast(*bx.Box, 0);
                 }
@@ -340,7 +340,7 @@ fn _element_run(a as *Anim, n as *dom.Node, ns as *style.Style, pseudo as i64) a
     if (ns.v.i[pr.P_ANIMATION_ITERATION_COUNT] == pr.K_INFINITE) { r.count = 0.0 - 1.0; }
     r.dir = ns.v.i[pr.P_ANIMATION_DIRECTION];
     r.fill = ns.v.i[pr.P_ANIMATION_FILL_MODE];
-    r.ease = _ease_at(ns, pr.P_ANIMATION_TIMING_FUNCTION, 0);
+    r.ease = *_ease_at(ns, pr.P_ANIMATION_TIMING_FUNCTION, 0);
     r.box = cast(*bx.Box, 0);
     r.pseudo = pseudo;
     r.done = 0;
@@ -378,7 +378,7 @@ fn _keyframe_prop(a as *Anim, r as *Run, p as i64, tp as f64) as void {
     if (lo != null) { at_lo = lo.at; }
     if (hi != null) { at_hi = hi.at; }
     let is f64 as u with mut = 1.0;
-    if (at_hi > at_lo) { u = v.ease_at(r.ease, (tp - at_lo) / (at_hi - at_lo)); }
+    if (at_hi > at_lo) { u = v.ease_at(&r.ease, (tp - at_lo) / (at_hi - at_lo)); }
     let is i64 as fi with mut = r.base.i[p];
     let is f64 as ff with mut = r.base.f[p];
     let is f64 as fp with mut = r.base.p[p];
@@ -655,7 +655,7 @@ fn tick(a as *Anim, now as i64) as void {
         let is *Trans as t = &a.trans[i];
         let is f64 as u with mut = 0.0;
         if (now >= t.t0 + t.dur) { u = 1.0; }
-        else if (now > t.t0) { u = v.ease_at(t.ease, cast(f64, now - t.t0) / cast(f64, t.dur)); }
+        else if (now > t.t0) { u = v.ease_at(&t.ease, cast(f64, now - t.t0) / cast(f64, t.dur)); }
         if (u >= 1.0) {
             t.st.v.i[t.prop] = t.to_i;
             t.st.v.f[t.prop] = t.to_f;

@@ -1,0 +1,8 @@
+<!doctype html><html><head><meta charset=utf-8><style>.b{opacity:.1;transform:translateX(100px)}</style></head>
+<body><div id=d style="transition:opacity 4s cubic-bezier(.1,.2,.3,.4),transform 4s ease-in-out;width:200px;height:100px;background:#39c">x</div><div id=e style="transition:opacity 4s steps(3);width:200px;height:60px;background:#c93">y</div><pre id=out></pre><script>
+var n=0;function g(i){return document.getElementById(i)}
+requestAnimationFrame(function(){g('d').getBoundingClientRect();g('d').className='b';g('e').className='b';setTimeout(t,60)});
+function t(){n++;var x=document.createElement('div');x.innerHTML='<span style="transition:color 1s linear;color:#'+(100+n)+'">'+n+'</span>'.repeat(300);document.body.appendChild(x);g('out').getBoundingClientRect();
+ if(n%5==0)document.body.removeChild(x);
+ if(n<150)setTimeout(t,50);else g('out').textContent='fim '+n}
+</script></body></html>
